@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TradeClaw — 交易智能体操作系统</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0c0f;
+  --bg1: #0e1117;
+  --bg2: #131720;
+  --bg3: #1a2030;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --text: #e8ecf2;
+  --text2: #8b95a8;
+  --text3: #4d5766;
+  --green: #00e676;
+  --green-dim: rgba(0,230,118,0.12);
+  --green-glow: rgba(0,230,118,0.25);
+  --amber: #ffab00;
+  --amber-dim: rgba(255,171,0,0.12);
+  --red: #ff5252;
+  --red-dim: rgba(255,82,82,0.12);
+  --blue: #40c4ff;
+  --blue-dim: rgba(64,196,255,0.1);
+  --purple: #b388ff;
+  --purple-dim: rgba(179,136,255,0.1);
+  --teal: #64ffda;
+  --teal-dim: rgba(100,255,218,0.1);
+  --font-ui: 'Outfit', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-ui); overflow-x: hidden; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* Layout */
+.app { display: grid; grid-template-rows: 52px 1fr; grid-template-columns: 220px 1fr 280px; height: 100vh; }
+
+/* Topbar */
+.topbar {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; gap: 0;
+  background: var(--bg1); border-bottom: 1px solid var(--border);
+  padding: 0 16px; position: relative; z-index: 10;
+}
+.logo { display: flex; align-items: center; gap: 10px; padding-right: 20px; border-right: 1px solid var(--border); margin-right: 20px; }
+.logo-icon { width: 28px; height: 28px; background: linear-gradient(135deg, var(--green), var(--teal)); border-radius: 6px; display: flex; align-items: center; justify-content: center; }
+.logo-icon svg { width: 16px; height: 16px; }
+.logo-text { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--text); }
+.logo-sub { font-family: var(--font-mono); font-size: 9px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 1px; }
+.nav-tabs { display: flex; gap: 2px; }
+.nav-tab { padding: 6px 14px; font-size: 12px; font-weight: 500; color: var(--text2); border-radius: 6px; cursor: pointer; transition: all 0.15s; border: 1px solid transparent; }
+.nav-tab:hover { color: var(--text); background: var(--bg2); }
+.nav-tab.active { color: var(--green); background: var(--green-dim); border-color: rgba(0,230,118,0.2); }
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+.market-chip { display: flex; align-items: center; gap: 6px; padding: 4px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; font-family: var(--font-mono); font-size: 11px; }
+.chip-sym { color: var(--text2); }
+.chip-val { color: var(--text); font-weight: 600; }
+.chip-chg.up { color: var(--green); }
+.chip-chg.dn { color: var(--red); }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.status-label { font-size: 11px; color: var(--text2); font-weight: 500; }
+
+/* Sidebar */
+.sidebar {
+  background: var(--bg1); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto; padding: 12px 8px;
+}
+.sidebar-section { margin-bottom: 6px; }
+.sidebar-title { font-size: 9px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.12em; padding: 6px 8px 4px; }
+.agent-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; cursor: pointer; transition: all 0.15s;
+  border: 1px solid transparent; margin-bottom: 2px;
+}
+.agent-item:hover { background: var(--bg2); }
+.agent-item.active { background: var(--bg2); border-color: var(--border); }
+.agent-item.selected { background: var(--bg3); border-color: var(--border2); }
+.agent-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.agent-dot.running { animation: pulse 1.5s infinite; }
+.agent-name { font-size: 12px; font-weight: 500; color: var(--text); flex: 1; }
+.agent-status-badge { font-family: var(--font-mono); font-size: 9px; padding: 2px 5px; border-radius: 3px; font-weight: 600; }
+
+.divider { height: 1px; background: var(--border); margin: 10px 8px; }
+
+.sidebar-stat { padding: 6px 10px; display: flex; justify-content: space-between; align-items: center; }
+.stat-label { font-size: 11px; color: var(--text2); }
+.stat-val { font-family: var(--font-mono); font-size: 12px; font-weight: 600; }
+
+/* Main */
+.main { overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Cards */
+.card {
+  background: var(--bg1); border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden;
+}
+.card-header {
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.card-title { font-size: 12px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+.card-title .icon { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; }
+.card-body { padding: 16px; }
+
+/* Grid */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+
+/* Metric boxes */
+.metric { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.metric-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; margin-bottom: 6px; }
+.metric-val { font-family: var(--font-mono); font-size: 22px; font-weight: 600; line-height: 1; }
+.metric-sub { font-family: var(--font-mono); font-size: 10px; margin-top: 4px; }
+.up { color: var(--green); }
+.dn { color: var(--red); }
+.neutral { color: var(--text2); }
+.warn { color: var(--amber); }
+
+/* Chart */
+.chart-wrap { position: relative; height: 160px; }
+canvas { width: 100% !important; }
+
+/* Agent cards */
+.agent-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; cursor: pointer; transition: all 0.2s;
+}
+.agent-card:hover { border-color: var(--border2); background: var(--bg3); }
+.agent-card.active-card { border-color: rgba(0,230,118,0.3); background: rgba(0,230,118,0.04); }
+.agent-card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
+.agent-card-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.agent-card-role { font-size: 10px; color: var(--text3); margin-top: 2px; }
+.progress-bar { height: 3px; background: var(--bg); border-radius: 2px; overflow: hidden; margin-top: 8px; }
+.progress-fill { height: 100%; border-radius: 2px; transition: width 1s ease; }
+.confidence-row { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
+.conf-label { font-size: 10px; color: var(--text3); }
+.conf-val { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+
+/* Signal feed */
+.signal-list { display: flex; flex-direction: column; gap: 1px; }
+.signal-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px; border-radius: 6px;
+  font-size: 12px; transition: background 0.15s; cursor: default;
+  border-left: 2px solid transparent;
+}
+.signal-item:hover { background: var(--bg2); }
+.signal-item.buy { border-color: var(--green); }
+.signal-item.sell { border-color: var(--red); }
+.signal-item.watch { border-color: var(--amber); }
+.sig-type { font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; min-width: 36px; text-align: center; }
+.sig-type.buy { background: var(--green-dim); color: var(--green); }
+.sig-type.sell { background: var(--red-dim); color: var(--red); }
+.sig-type.watch { background: var(--amber-dim); color: var(--amber); }
+.sig-symbol { font-family: var(--font-mono); font-size: 12px; font-weight: 600; min-width: 60px; }
+.sig-desc { flex: 1; color: var(--text2); }
+.sig-conf { font-family: var(--font-mono); font-size: 11px; font-weight: 600; }
+.sig-time { font-family: var(--font-mono); font-size: 10px; color: var(--text3); min-width: 45px; text-align: right; }
+
+/* Log */
+.log-list { font-family: var(--font-mono); font-size: 11px; display: flex; flex-direction: column; gap: 3px; max-height: 160px; overflow-y: auto; }
+.log-item { display: flex; gap: 10px; padding: 3px 0; }
+.log-time { color: var(--text3); flex-shrink: 0; }
+.log-agent { min-width: 100px; flex-shrink: 0; }
+.log-msg { color: var(--text2); }
+.log-msg .hl { color: var(--text); }
+
+/* Right panel */
+.rightpanel {
+  background: var(--bg1); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto;
+}
+.rp-section { padding: 14px; border-bottom: 1px solid var(--border); }
+.rp-title { font-size: 10px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 12px; }
+
+/* Positions */
+.pos-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.pos-item:last-child { border: none; }
+.pos-sym { font-family: var(--font-mono); font-size: 13px; font-weight: 700; min-width: 55px; }
+.pos-dir { font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px; }
+.pos-dir.long { background: var(--green-dim); color: var(--green); }
+.pos-dir.short { background: var(--red-dim); color: var(--red); }
+.pos-info { flex: 1; }
+.pos-size { font-size: 11px; color: var(--text2); }
+.pos-pnl { font-family: var(--font-mono); font-size: 12px; font-weight: 700; text-align: right; }
+
+/* Risk gauge */
+.risk-gauge { position: relative; text-align: center; padding: 8px 0; }
+.gauge-svg { width: 120px; height: 70px; }
+.gauge-label { font-family: var(--font-mono); font-size: 22px; font-weight: 700; color: var(--amber); }
+.gauge-sub { font-size: 11px; color: var(--text3); margin-top: 2px; }
+
+/* Strategy selector */
+.strat-item {
+  padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+  margin-bottom: 6px; cursor: pointer; transition: all 0.15s;
+  display: flex; align-items: center; gap: 10px;
+}
+.strat-item:hover { border-color: var(--border2); background: var(--bg2); }
+.strat-item.active { border-color: rgba(0,230,118,0.4); background: var(--green-dim); }
+.strat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.strat-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.strat-meta { font-size: 10px; color: var(--text3); }
+.strat-toggle { margin-left: auto; }
+
+/* Toggle switch */
+.toggle { position: relative; width: 32px; height: 18px; }
+.toggle input { display: none; }
+.toggle-slider { position: absolute; inset: 0; background: var(--bg); border: 1px solid var(--border2); border-radius: 9px; cursor: pointer; transition: 0.2s; }
+.toggle-slider::before { content:''; position: absolute; width: 12px; height: 12px; left: 2px; top: 2px; background: var(--text3); border-radius: 50%; transition: 0.2s; }
+.toggle input:checked + .toggle-slider { background: var(--green-dim); border-color: var(--green); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(14px); background: var(--green); }
+
+/* Thinking indicator */
+.thinking { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--purple-dim); border: 1px solid rgba(179,136,255,0.2); border-radius: 6px; font-size: 11px; color: var(--purple); }
+.thinking-dots span { animation: blink 1.4s infinite; }
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink { 0%,100%{opacity:0.2} 50%{opacity:1} }
+
+/* Flow arrows animation */
+.flow-arrow { opacity: 0.5; }
+
+/* Tag */
+.tag { display: inline-block; font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* Scrollable area indicator */
+.fade-btm { pointer-events: none; position: sticky; bottom: 0; height: 24px; background: linear-gradient(transparent, var(--bg1)); }
+
+/* Sparkline canvas */
+.sparkline { width: 100%; height: 48px; }
+
+/* Modal backdrop */
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+.modal-overlay.show { display: flex; }
+.modal { background: var(--bg1); border: 1px solid var(--border2); border-radius: 14px; padding: 24px; width: 480px; max-width: 90vw; }
+.modal-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+.modal-close { float: right; cursor: pointer; color: var(--text2); font-size: 18px; line-height: 1; }
+.form-row { margin-bottom: 12px; }
+.form-label { font-size: 11px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; display: block; }
+.form-input { width: 100%; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; font-family: var(--font-ui); outline: none; }
+.form-input:focus { border-color: var(--green); }
+.form-select { width: 100%; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; font-family: var(--font-ui); outline: none; cursor: pointer; }
+.btn { padding: 8px 18px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: all 0.15s; }
+.btn-green { background: var(--green); color: #000; }
+.btn-green:hover { opacity: 0.85; }
+.btn-ghost { background: transparent; border: 1px solid var(--border2); color: var(--text2); }
+.btn-ghost:hover { background: var(--bg2); color: var(--text); }
+
+/* Scan line effect subtle */
+.scanline { pointer-events:none; position:fixed; inset:0; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px); z-index:999; }
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="app">
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-icon">
+      <svg viewBox="0 0 16 16" fill="none">
+        <path d="M8 1L14 4.5V11.5L8 15L2 11.5V4.5L8 1Z" stroke="#000" stroke-width="1.5"/>
+        <circle cx="8" cy="8" r="2" fill="#000"/>
+      </svg>
+    </div>
+    <div>
+      <div class="logo-text">TradeClaw</div>
+      <div class="logo-sub">Agent OS · v2.4.1</div>
+    </div>
+  </div>
+  <div class="nav-tabs">
+    <div class="nav-tab active" onclick="switchTab(this,'overview')">总览</div>
+    <div class="nav-tab" onclick="switchTab(this,'agents')">智能体</div>
+    <div class="nav-tab" onclick="switchTab(this,'signals')">信号</div>
+    <div class="nav-tab" onclick="switchTab(this,'backtest')">回测</div>
+    <div class="nav-tab" onclick="switchTab(this,'settings')">配置</div>
+  </div>
+  <div class="topbar-right">
+    <div class="market-chip"><span class="chip-sym">BTC/USDT</span><span class="chip-val" id="btc-price">67,842</span><span class="chip-chg up" id="btc-chg">+1.24%</span></div>
+    <div class="market-chip"><span class="chip-sym">ETH/USDT</span><span class="chip-val" id="eth-price">3,421</span><span class="chip-chg up" id="eth-chg">+0.87%</span></div>
+    <div class="market-chip"><span class="chip-sym">SOL/USDT</span><span class="chip-val" id="sol-price">182.4</span><span class="chip-chg dn" id="sol-chg">-0.43%</span></div>
+    <div style="display:flex;align-items:center;gap:5px;margin-left:8px">
+      <div class="status-dot"></div>
+      <span class="status-label">实时运行中</span>
+    </div>
+    <button class="btn btn-green" style="font-size:12px;padding:5px 14px" onclick="showModal()">+ 新建策略</button>
+  </div>
+</div>
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+  <div class="sidebar-section">
+    <div class="sidebar-title">智能体集群</div>
+    <div class="agent-item active selected" onclick="selectAgent(this,'orchestrator')">
+      <div class="agent-dot running" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></div>
+      <span class="agent-name">Orchestrator</span>
+      <span class="agent-status-badge" style="background:var(--purple-dim);color:var(--purple)">主控</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'market')">
+      <div class="agent-dot running" style="background:var(--teal);box-shadow:0 0 6px var(--teal)"></div>
+      <span class="agent-name">市场分析</span>
+      <span class="agent-status-badge" style="background:var(--teal-dim);color:var(--teal)">运行</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'sentiment')">
+      <div class="agent-dot running" style="background:var(--blue);box-shadow:0 0 6px var(--blue)"></div>
+      <span class="agent-name">情绪分析</span>
+      <span class="agent-status-badge" style="background:var(--blue-dim);color:var(--blue)">运行</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'risk')">
+      <div class="agent-dot running" style="background:var(--amber);box-shadow:0 0 6px var(--amber)"></div>
+      <span class="agent-name">风险管理</span>
+      <span class="agent-status-badge" style="background:var(--amber-dim);color:var(--amber)">告警</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'strategy')">
+      <div class="agent-dot" style="background:var(--green);box-shadow:0 0 6px var(--green)"></div>
+      <span class="agent-name">策略优化</span>
+      <span class="agent-status-badge" style="background:var(--green-dim);color:var(--green)">运行</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'execution')">
+      <div class="agent-dot running" style="background:var(--green);box-shadow:0 0 6px var(--green)"></div>
+      <span class="agent-name">交易执行</span>
+      <span class="agent-status-badge" style="background:var(--green-dim);color:var(--green)">就绪</span>
+    </div>
+    <div class="agent-item" onclick="selectAgent(this,'backtest')">
+      <div class="agent-dot" style="background:var(--text3)"></div>
+      <span class="agent-name">回测引擎</span>
+      <span class="agent-status-badge" style="background:var(--bg2);color:var(--text3)">待机</span>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-title">账户概况</div>
+    <div class="sidebar-stat"><span class="stat-label">总资产</span><span class="stat-val up">$284,720</span></div>
+    <div class="sidebar-stat"><span class="stat-label">今日盈亏</span><span class="stat-val up">+$3,421</span></div>
+    <div class="sidebar-stat"><span class="stat-label">持仓数</span><span class="stat-val">4</span></div>
+    <div class="sidebar-stat"><span class="stat-label">信号队列</span><span class="stat-val warn">7</span></div>
+    <div class="sidebar-stat"><span class="stat-label">执行任务</span><span class="stat-val">12</span></div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-title">活跃策略</div>
+    <div style="padding:0 2px">
+      <div class="strat-item active">
+        <div class="strat-dot" style="background:var(--green)"></div>
+        <div><div class="strat-name">动量突破</div><div class="strat-meta">BTC · 15m</div></div>
+        <label class="toggle strat-toggle"><input type="checkbox" checked><div class="toggle-slider"></div></label>
+      </div>
+      <div class="strat-item">
+        <div class="strat-dot" style="background:var(--blue)"></div>
+        <div><div class="strat-name">均值回归</div><div class="strat-meta">ETH · 1h</div></div>
+        <label class="toggle strat-toggle"><input type="checkbox" checked><div class="toggle-slider"></div></label>
+      </div>
+      <div class="strat-item">
+        <div class="strat-dot" style="background:var(--purple)"></div>
+        <div><div class="strat-name">套利对冲</div><div class="strat-meta">多品种</div></div>
+        <label class="toggle strat-toggle"><input type="checkbox"><div class="toggle-slider"></div></label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main" id="main-content">
+
+  <!-- Metrics Row -->
+  <div class="grid-3">
+    <div class="metric">
+      <div class="metric-label">净值</div>
+      <div class="metric-val up" id="nav">1.2847</div>
+      <div class="metric-sub up">↑ +0.34% 今日</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">夏普比率</div>
+      <div class="metric-val" style="color:var(--teal)" id="sharpe">2.41</div>
+      <div class="metric-sub neutral">年化 · 滚动30天</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">最大回撤</div>
+      <div class="metric-val warn" id="mdd">-4.2%</div>
+      <div class="metric-sub neutral">本月 · 限额 -8%</div>
+    </div>
+  </div>
+
+  <!-- Chart + Agent Grid -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="12" height="12" viewBox="0 0 12 12"><polyline points="1,9 4,5 7,7 11,2" fill="none" stroke="var(--green)" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          策略净值曲线
+        </span>
+        <div style="display:flex;gap:6px">
+          <span class="tag" style="background:var(--green-dim);color:var(--green)">实盘</span>
+          <select class="form-select" style="padding:2px 8px;font-size:11px;width:auto">
+            <option>近30天</option><option>近90天</option><option>今年</option>
+          </select>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="chart-wrap">
+          <canvas id="pnlChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="5" fill="none" stroke="var(--blue)" stroke-width="1.5"/><line x1="6" y1="3" x2="6" y2="6" stroke="var(--blue)" stroke-width="1.5" stroke-linecap="round"/><circle cx="6" cy="8.5" r="0.8" fill="var(--blue)"/></svg>
+          智能体实时状态
+        </span>
+        <span class="thinking"><span>Orchestrator 规划中</span><span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span></span>
+      </div>
+      <div class="card-body" style="padding:10px">
+        <div class="grid-2" style="gap:8px">
+          <div class="agent-card active-card" id="ac-orchestrator">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">Orchestrator</div>
+                <div class="agent-card-role">任务调度 · 信号聚合</div>
+              </div>
+              <span class="tag" style="background:var(--purple-dim);color:var(--purple)">主控</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">调度效率</span><span class="conf-val up">98.2%</span></div>
+            <div class="progress-bar"><div class="progress-fill" style="width:98%;background:var(--purple)"></div></div>
+          </div>
+          <div class="agent-card" id="ac-market">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">市场分析</div>
+                <div class="agent-card-role">技术指标 · 形态识别</div>
+              </div>
+              <span class="tag" style="background:var(--teal-dim);color:var(--teal)">运行</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">信号置信度</span><span class="conf-val up" id="market-conf">84.7%</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="market-prog" style="width:84.7%;background:var(--teal)"></div></div>
+          </div>
+          <div class="agent-card" id="ac-sentiment">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">情绪分析</div>
+                <div class="agent-card-role">NLP · 社交媒体</div>
+              </div>
+              <span class="tag" style="background:var(--blue-dim);color:var(--blue)">运行</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">情绪评分</span><span class="conf-val up" id="sent-conf">72.3%</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="sent-prog" style="width:72.3%;background:var(--blue)"></div></div>
+          </div>
+          <div class="agent-card" id="ac-risk">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">风险管理</div>
+                <div class="agent-card-role">VaR · 仓位控制</div>
+              </div>
+              <span class="tag" style="background:var(--amber-dim);color:var(--amber)">告警</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">风险水位</span><span class="conf-val warn" id="risk-conf">63.1%</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="risk-prog" style="width:63.1%;background:var(--amber)"></div></div>
+          </div>
+          <div class="agent-card" id="ac-strategy">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">策略优化</div>
+                <div class="agent-card-role">参数调优 · 回测</div>
+              </div>
+              <span class="tag" style="background:var(--green-dim);color:var(--green)">运行</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">优化进度</span><span class="conf-val up" id="strat-conf">91.5%</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="strat-prog" style="width:91.5%;background:var(--green)"></div></div>
+          </div>
+          <div class="agent-card" id="ac-execution">
+            <div class="agent-card-header">
+              <div>
+                <div class="agent-card-name">交易执行</div>
+                <div class="agent-card-role">订单路由 · 滑点</div>
+              </div>
+              <span class="tag" style="background:var(--green-dim);color:var(--green)">就绪</span>
+            </div>
+            <div class="confidence-row"><span class="conf-label">执行质量</span><span class="conf-val up" id="exec-conf">96.8%</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="exec-prog" style="width:96.8%;background:var(--green)"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Signals + Log -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 1L7.5 4.5H11L8 7L9.5 11L6 8.5L2.5 11L4 7L1 4.5H4.5Z" fill="var(--amber)" stroke="none"/></svg>
+          实时信号队列
+        </span>
+        <span class="tag" style="background:var(--amber-dim);color:var(--amber)" id="sig-count">7 待处理</span>
+      </div>
+      <div class="card-body" style="padding:4px 0">
+        <div class="signal-list" id="signal-list">
+          <div class="signal-item buy">
+            <span class="sig-type buy">BUY</span>
+            <span class="sig-symbol" style="color:var(--green)">BTC/USDT</span>
+            <span class="sig-desc">突破关键阻力 68,000 · RSI 背离确认</span>
+            <span class="sig-conf up">91%</span>
+            <span class="sig-time">09:42</span>
+          </div>
+          <div class="signal-item buy">
+            <span class="sig-type buy">BUY</span>
+            <span class="sig-symbol" style="color:var(--green)">SOL/USDT</span>
+            <span class="sig-desc">均线多头排列 · 量能放大 2.3x</span>
+            <span class="sig-conf up">78%</span>
+            <span class="sig-time">09:38</span>
+          </div>
+          <div class="signal-item sell">
+            <span class="sig-type sell">SELL</span>
+            <span class="sig-symbol" style="color:var(--red)">ETH/USDT</span>
+            <span class="sig-desc">触及目标价 3,450 · 止盈条件满足</span>
+            <span class="sig-conf dn">85%</span>
+            <span class="sig-time">09:35</span>
+          </div>
+          <div class="signal-item watch">
+            <span class="sig-type watch">⚠</span>
+            <span class="sig-symbol" style="color:var(--amber)">BNB/USDT</span>
+            <span class="sig-desc">情绪急剧下滑 · 关注风险敞口</span>
+            <span class="sig-conf warn">62%</span>
+            <span class="sig-time">09:31</span>
+          </div>
+          <div class="signal-item buy">
+            <span class="sig-type buy">BUY</span>
+            <span class="sig-symbol" style="color:var(--green)">AVAX/USDT</span>
+            <span class="sig-desc">链上活跃度突增 · 机构流入信号</span>
+            <span class="sig-conf up">74%</span>
+            <span class="sig-time">09:28</span>
+          </div>
+          <div class="signal-item sell">
+            <span class="sig-type sell">SELL</span>
+            <span class="sig-symbol" style="color:var(--red)">MATIC/USDT</span>
+            <span class="sig-desc">跌破支撑 · 空头主导 · 回避风险</span>
+            <span class="sig-conf dn">69%</span>
+            <span class="sig-time">09:22</span>
+          </div>
+          <div class="signal-item watch">
+            <span class="sig-type watch">⚠</span>
+            <span class="sig-symbol" style="color:var(--amber)">ARB/USDT</span>
+            <span class="sig-desc">等待成交量确认 · 突破未验证</span>
+            <span class="sig-conf warn">55%</span>
+            <span class="sig-time">09:15</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1" y="1" width="10" height="10" rx="2" fill="none" stroke="var(--text3)" stroke-width="1"/><line x1="3" y1="4" x2="9" y2="4" stroke="var(--text3)" stroke-width="1"/><line x1="3" y1="6.5" x2="7" y2="6.5" stroke="var(--text3)" stroke-width="1"/></svg>
+          智能体通信日志
+        </span>
+        <span class="tag" style="background:var(--bg2);color:var(--text3)">实时</span>
+      </div>
+      <div class="card-body" style="padding:10px 12px">
+        <div class="log-list" id="log-list">
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- RIGHT PANEL -->
+<div class="rightpanel">
+  <div class="rp-section">
+    <div class="rp-title">当前持仓</div>
+    <div id="positions">
+      <div class="pos-item">
+        <span class="pos-sym" style="color:var(--amber)">BTC</span>
+        <span class="pos-dir long">LONG</span>
+        <div class="pos-info"><div class="pos-size">0.42 BTC · $28,494</div></div>
+        <span class="pos-pnl up">+$842</span>
+      </div>
+      <div class="pos-item">
+        <span class="pos-sym" style="color:var(--blue)">ETH</span>
+        <span class="pos-dir long">LONG</span>
+        <div class="pos-info"><div class="pos-size">8.5 ETH · $29,078</div></div>
+        <span class="pos-pnl up">+$1,204</span>
+      </div>
+      <div class="pos-item">
+        <span class="pos-sym" style="color:var(--teal)">SOL</span>
+        <span class="pos-dir long">LONG</span>
+        <div class="pos-info"><div class="pos-size">120 SOL · $21,888</div></div>
+        <span class="pos-pnl dn">-$215</span>
+      </div>
+      <div class="pos-item">
+        <span class="pos-sym" style="color:var(--red)">MATIC</span>
+        <span class="pos-dir short">SHORT</span>
+        <div class="pos-info"><div class="pos-size">4800 · $3,312</div></div>
+        <span class="pos-pnl up">+$188</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="rp-section">
+    <div class="rp-title">风险仪表盘</div>
+    <div class="risk-gauge">
+      <svg class="gauge-svg" viewBox="0 0 120 70">
+        <defs>
+          <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#00e676"/>
+            <stop offset="60%" stop-color="#ffab00"/>
+            <stop offset="100%" stop-color="#ff5252"/>
+          </linearGradient>
+        </defs>
+        <path d="M10 60 A 50 50 0 0 1 110 60" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="8" stroke-linecap="round"/>
+        <path d="M10 60 A 50 50 0 0 1 110 60" fill="none" stroke="url(#gaugeGrad)" stroke-width="8" stroke-linecap="round" stroke-dasharray="157" stroke-dashoffset="63"/>
+        <line x1="60" y1="60" x2="38" y2="22" stroke="var(--amber)" stroke-width="2" stroke-linecap="round" id="needle"/>
+        <circle cx="60" cy="60" r="4" fill="var(--bg1)" stroke="var(--amber)" stroke-width="2"/>
+        <text x="10" y="70" font-size="9" fill="var(--text3)" font-family="IBM Plex Mono">低</text>
+        <text x="95" y="70" font-size="9" fill="var(--text3)" font-family="IBM Plex Mono">高</text>
+      </svg>
+      <div class="gauge-label" id="risk-level">中等</div>
+      <div class="gauge-sub">整体风险评级</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+      <div class="metric" style="padding:8px 10px">
+        <div class="metric-label" style="font-size:9px">日VaR(95%)</div>
+        <div class="metric-val warn" style="font-size:16px">-2.1%</div>
+      </div>
+      <div class="metric" style="padding:8px 10px">
+        <div class="metric-label" style="font-size:9px">贝塔系数</div>
+        <div class="metric-val" style="font-size:16px;color:var(--blue)">0.87</div>
+      </div>
+      <div class="metric" style="padding:8px 10px">
+        <div class="metric-label" style="font-size:9px">仓位集中度</div>
+        <div class="metric-val warn" style="font-size:16px">38%</div>
+      </div>
+      <div class="metric" style="padding:8px 10px">
+        <div class="metric-label" style="font-size:9px">胜率</div>
+        <div class="metric-val up" style="font-size:16px">64.3%</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="rp-section">
+    <div class="rp-title">近期执行</div>
+    <div style="font-family:var(--font-mono);font-size:11px">
+      <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+        <span style="color:var(--green)">BUY BTC</span><span style="color:var(--text2)">0.15 @67,820</span><span style="color:var(--text3)">09:41</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+        <span style="color:var(--red)">SELL ETH</span><span style="color:var(--text2)">2.0 @3,418</span><span style="color:var(--text3)">09:38</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)">
+        <span style="color:var(--green)">BUY SOL</span><span style="color:var(--text2)">25 @181.5</span><span style="color:var(--text3)">09:32</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:5px 0">
+        <span style="color:var(--red)">SHORT MATIC</span><span style="color:var(--text2)">800 @0.692</span><span style="color:var(--text3)">09:21</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="rp-section">
+    <div class="rp-title">模型调用统计</div>
+    <div style="font-size:12px;display:flex;flex-direction:column;gap:6px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text2)">今日 API 调用</span>
+        <span style="font-family:var(--font-mono);font-weight:600" id="api-calls">2,847</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text2)">平均响应时间</span>
+        <span style="font-family:var(--font-mono);font-weight:600;color:var(--green)">124ms</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text2)">Token 消耗</span>
+        <span style="font-family:var(--font-mono);font-weight:600">1.2M</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text2)">推理成功率</span>
+        <span style="font-family:var(--font-mono);font-weight:600;color:var(--green)">99.7%</span>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <div class="modal-title">
+      <span style="font-size:16px;font-weight:700;color:var(--text)">创建新策略</span>
+      <span class="modal-close" onclick="hideModal()">✕</span>
+    </div>
+    <div class="form-row">
+      <label class="form-label">策略名称</label>
+      <input class="form-input" type="text" placeholder="例：BTC 高频动量策略">
+    </div>
+    <div class="form-row">
+      <label class="form-label">交易品种</label>
+      <select class="form-select">
+        <option>BTC/USDT</option><option>ETH/USDT</option><option>SOL/USDT</option><option>多品种组合</option>
+      </select>
+    </div>
+    <div class="grid-2" style="gap:12px">
+      <div class="form-row">
+        <label class="form-label">策略类型</label>
+        <select class="form-select"><option>趋势跟踪</option><option>均值回归</option><option>套利对冲</option><option>市场中性</option></select>
+      </div>
+      <div class="form-row">
+        <label class="form-label">时间周期</label>
+        <select class="form-select"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option></select>
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="form-label">启用智能体</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+        <span style="padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;background:var(--teal-dim);color:var(--teal);border:1px solid rgba(100,255,218,0.3)">市场分析</span>
+        <span style="padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;background:var(--blue-dim);color:var(--blue);border:1px solid rgba(64,196,255,0.3)">情绪分析</span>
+        <span style="padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;background:var(--amber-dim);color:var(--amber);border:1px solid rgba(255,171,0,0.3)">风险管理</span>
+        <span style="padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;background:var(--green-dim);color:var(--green);border:1px solid rgba(0,230,118,0.3)">策略优化</span>
+        <span style="padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;background:var(--bg2);color:var(--text3);border:1px solid var(--border)">回测引擎</span>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="hideModal()">取消</button>
+      <button class="btn btn-green" onclick="hideModal()">先回测，再部署</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script>
+// PnL Chart
+function buildChart() {
+  const ctx = document.getElementById('pnlChart').getContext('2d');
+  const days = 30;
+  const labels = Array.from({length:days}, (_,i) => {
+    const d = new Date(); d.setDate(d.getDate() - (days - i)); 
+    return (d.getMonth()+1)+'/'+(d.getDate());
+  });
+  let v = 1.0; const data = [v];
+  for(let i=1;i<days;i++){v += (Math.random()-0.45)*0.015; data.push(parseFloat(v.toFixed(4)));}
+
+  new Chart(ctx, {
+    type:'line',
+    data:{ labels, datasets:[{
+      label:'净值',data,
+      borderColor:'#00e676', borderWidth:1.5,
+      pointRadius:0, tension:0.4, fill:true,
+      backgroundColor:(c)=>{
+        const g = c.chart.ctx.createLinearGradient(0,0,0,160);
+        g.addColorStop(0,'rgba(0,230,118,0.15)'); g.addColorStop(1,'rgba(0,230,118,0)'); return g;
+      }
+    },{
+      label:'基准',data:data.map((_,i)=>parseFloat((1+i*0.001).toFixed(4))),
+      borderColor:'rgba(255,255,255,0.15)', borderWidth:1, borderDash:[4,4],
+      pointRadius:0, tension:0.4, fill:false
+    }]},
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{ legend:{display:false}, tooltip:{
+        backgroundColor:'rgba(14,17,23,0.95)', titleColor:'#e8ecf2', bodyColor:'#8b95a8',
+        borderColor:'rgba(255,255,255,0.1)', borderWidth:1,
+        callbacks:{ label: ctx => ' '+ctx.dataset.label+': '+ctx.parsed.y.toFixed(4) }
+      }},
+      scales:{
+        x:{ grid:{color:'rgba(255,255,255,0.03)'}, ticks:{color:'#4d5766',font:{size:10,family:'IBM Plex Mono'},maxTicksLimit:8} },
+        y:{ grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#4d5766',font:{size:10,family:'IBM Plex Mono'},callback:v=>v.toFixed(3)} }
+      }
+    }
+  });
+}
+buildChart();
+
+// Live ticker simulation
+const btcBase = 67842, ethBase = 3421, solBase = 182.4;
+let btcPrice = btcBase, ethPrice = ethBase, solPrice = solBase;
+function updateTickers() {
+  btcPrice += (Math.random()-0.5)*80; ethPrice += (Math.random()-0.5)*12; solPrice += (Math.random()-0.5)*1.5;
+  const fmtBTC = btcPrice.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',');
+  const btcChg = ((btcPrice-btcBase)/btcBase*100).toFixed(2);
+  const ethChg = ((ethPrice-ethBase)/ethBase*100).toFixed(2);
+  const solChg = ((solPrice-solBase)/solBase*100).toFixed(2);
+  document.getElementById('btc-price').textContent = fmtBTC;
+  document.getElementById('eth-price').textContent = ethPrice.toFixed(0);
+  document.getElementById('sol-price').textContent = solPrice.toFixed(1);
+  const bc = document.getElementById('btc-chg'), ec = document.getElementById('eth-chg'), sc = document.getElementById('sol-chg');
+  bc.textContent = (btcChg>0?'+':'')+btcChg+'%'; bc.className='chip-chg '+(btcChg>0?'up':'dn');
+  ec.textContent = (ethChg>0?'+':'')+ethChg+'%'; ec.className='chip-chg '+(ethChg>0?'up':'dn');
+  sc.textContent = (solChg>0?'+':'')+solChg+'%'; sc.className='chip-chg '+(solChg>0?'up':'dn');
+}
+setInterval(updateTickers, 1800);
+
+// Agent confidence fluctuation
+function updateAgentMetrics() {
+  const agents = [
+    {id:'market', min:70, max:95, color:'var(--teal)'},
+    {id:'sent', min:55, max:85, color:'var(--blue)'},
+    {id:'risk', min:50, max:75, color:'var(--amber)'},
+    {id:'strat', min:80, max:98, color:'var(--green)'},
+    {id:'exec', min:90, max:99, color:'var(--green)'},
+  ];
+  agents.forEach(a => {
+    const el = document.getElementById(a.id+'-conf');
+    const pg = document.getElementById(a.id+'-prog');
+    if(!el) return;
+    const cur = parseFloat(el.textContent);
+    const next = Math.max(a.min, Math.min(a.max, cur + (Math.random()-0.48)*3));
+    el.textContent = next.toFixed(1)+'%';
+    pg.style.width = next.toFixed(1)+'%';
+  });
+}
+setInterval(updateAgentMetrics, 2500);
+
+// Log generator
+const logTemplates = [
+  ['var(--purple)', 'Orchestrator', '→ 市场分析', '触发扫描任务 · BTC 信号强度 <span class="hl">HIGH</span>'],
+  ['var(--teal)', '市场分析', '→ 风险管理', 'RSI 超买预警 · 建议减仓 <span class="hl">10%</span>'],
+  ['var(--blue)', '情绪分析', '→ Orchestrator', 'Twitter 情绪分 <span class="hl">+72</span> · 多头偏强'],
+  ['var(--amber)', '风险管理', '→ 执行', '仓位上限预警 · BTC 敞口 <span class="hl">38%</span>'],
+  ['var(--green)', '策略优化', '→ Orchestrator', '参数更新完成 · 预期收益 <span class="hl">+2.1%</span>'],
+  ['var(--green)', '执行', '→ Orchestrator', '订单成交 BTC 0.15 · 滑点 <span class="hl">0.02%</span>'],
+  ['var(--purple)', 'Orchestrator', '→ 情绪分析', '请求新闻快速扫描 · 优先级 <span class="hl">HIGH</span>'],
+  ['var(--teal)', '市场分析', '→ 策略优化', 'SOL 突破确认 · 信号置信 <span class="hl">84%</span>'],
+];
+let logIdx = 0;
+function addLog() {
+  const t = logTemplates[logIdx % logTemplates.length]; logIdx++;
+  const list = document.getElementById('log-list');
+  const now = new Date();
+  const time = now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0')+':'+now.getSeconds().toString().padStart(2,'0');
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `<span class="log-time">${time}</span><span class="log-agent" style="color:${t[0]}">${t[1]}</span><span class="log-msg">${t[2]} · ${t[3]}</span>`;
+  list.insertBefore(item, list.firstChild);
+  while(list.children.length > 20) list.removeChild(list.lastChild);
+}
+for(let i=0;i<8;i++) addLog();
+setInterval(addLog, 3200);
+
+// API calls counter
+let apiCalls = 2847;
+setInterval(()=>{ apiCalls += Math.floor(Math.random()*5+1); document.getElementById('api-calls').textContent = apiCalls.toLocaleString(); }, 4000);
+
+// Tab navigation
+function switchTab(el, tab) {
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+}
+
+// Agent selection
+function selectAgent(el, agent) {
+  document.querySelectorAll('.agent-item').forEach(a => a.classList.remove('selected'));
+  el.classList.add('selected');
+}
+
+// Modal
+function showModal() { document.getElementById('modal').classList.add('show'); }
+function hideModal() { document.getElementById('modal').classList.remove('show'); }
+document.getElementById('modal').addEventListener('click', e => { if(e.target === document.getElementById('modal')) hideModal(); });
+</script>
+</body>
+</html>

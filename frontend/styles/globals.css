@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+
+@tailwind utilities;
+
+/* Mobile responsive styles */
+@layer utilities {
+  .mobile-container {
+    @apply px-4 py-3;
+  }
+  
+  .desktop-container {
+    @apply px-6 py-4;
+  }
+  
+  /* Prevent body scroll when mobile menu is open */
+  .overflow-hidden {
+    overflow: hidden;
+  }
+  
+  /* Custom scrollbar for mobile devices */
+  @media (max-width: 768px) {
+    ::-webkit-scrollbar {
+      width: 4px;
+    }
+    
+    ::-webkit-scrollbar-track {
+      background: #f1f1f1;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+      background: #888;
+      border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+      background: #555;
+    }
+  }
+}
+
+/* Custom styles for mobile responsiveness */
+html, body {
+  @apply overscroll-none;
+}
+
+/* Fix for iOS Safari 100vh issue */
+@supports (-webkit-touch-callout: none) {
+  .h-screen {
+    height: -webkit-fill-available;
+  }
+}
