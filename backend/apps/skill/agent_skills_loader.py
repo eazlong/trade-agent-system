@@ -11,8 +11,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default search root: ~/.tradelogx/agents/
-_HOME_AGENTS = Path.home() / '.tradelogx' / 'agents'
+# Default search root: {project_root}/skills/
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 
 
 @dataclass
@@ -38,7 +38,7 @@ class AgentSkillsLoader:
     """
 
     def __init__(self, search_root: Path | None = None):
-        self.search_root: Path = search_root or _HOME_AGENTS
+        self.search_root: Path = search_root or (PROJECT_ROOT / 'skills')
         self.search_root.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ #
