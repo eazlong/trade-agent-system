@@ -11,6 +11,7 @@ from .llm_client import LLMClient, is_fallback
 from .prompt_loader import PromptLoader
 from .frame_manager import FrameManager
 from .session_manager import get_session_manager, SessionState
+from apps.skill.agent_skills_loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,11 @@ class SupervisorAgent(BaseAgent):
         super().__init__()
         self._llm = LLMClient.get_instance()
         self._frame = FrameManager.get_instance()
+        self._prompt_loader = PromptLoader
+        self._skills_loader = get_skills_loader()
         self._system_prompt = PromptLoader.load('supervisor')
+        self._skills_summary = self._skills_loader.build_summary()
+        self._always_skills = self._skills_loader.get_always_skills()
 
     @classmethod
     def get_instance(cls) -> 'SupervisorAgent':
@@ -310,6 +315,22 @@ class SupervisorAgent(BaseAgent):
             logger.error('Routing to %s failed: %s', agent_name, e)
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
 
+    def _load_skills_for_context(self, skill_names: list[str]) -> str:
+        """
+        Load full content for a list of skill names.
+
+        Resolves references recursively and strips frontmatter.
+        """
+        if not skill_names:
+            return ''
+        resolved = self._skills_loader.resolve_references(skill_names)
+        return self._skills_loader.load_skills_content(resolved)
+
+    def _get_skills_summary(self) -> str:
+        """Get the skills inventory XML block for progressive loading."""
+        # Rebuild summary on demand in case skills were added
+        return self._skills_loader.build_summary()
+
     async def handle_text(self, text: str) -> str:
         """Channel收到自然语言文本的便捷入口"""
         msg = AgentMessage(sender='user', recipient='supervisor', payload={'text': text})
@@ -343,9 +364,13 @@ class SupervisorAgent(BaseAgent):
         if exclude_agents:
             exclude_block = f'Exclude these agents (already tried): {exclude_agents}\n\n'
 
+        skills_summary = self._get_skills_summary()
+        skills_block = f'Available agent skills:\n{skills_summary}\n\n' if skills_summary else ''
+
         user_prompt = (
             f'{context_block}'
             f'{exclude_block}'
+            f'{skills_block}'
             f'User message: {text}\n\n'
             f'Valid intents: {json.dumps(valid_intents)}\n\n'
             'Reply with a JSON object. '
