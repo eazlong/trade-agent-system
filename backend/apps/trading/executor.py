@@ -90,6 +90,7 @@ class OrderExecutor:
         quantity: Decimal,
         price: Optional[Decimal],
         exchange_account_id: str,
+        user_id: Optional[str] = None,
     ) -> dict:
         """
         下单主流程。
@@ -102,6 +103,7 @@ class OrderExecutor:
             quantity: 数量
             price: 价格（市价单可为空）
             exchange_account_id: ExchangeAccount UUID
+            user_id: User UUID（供 RiskGuard 风控校验）
 
         Returns:
             包含 exchange_order_id 和 order_id 的字典
@@ -111,6 +113,7 @@ class OrderExecutor:
             ValueError: 交易所适配器不存在
             PermissionError: RiskGuard 拒绝下单
         """
+        uid = user_id  # 保留引用供 finally 使用
         if not self._running:
             raise RuntimeError('OrderExecutor is not running')
 
@@ -128,13 +131,14 @@ class OrderExecutor:
             price=price,
         )
         if self._riskguard:
-            approved, reason = await self._riskguard.pre_trade_check(request, str(exchange_account_id))
+            approved, reason = await self._riskguard.pre_trade_check(request, user_id)
             if not approved:
                 raise PermissionError(f'RiskGuard拒绝下单: {reason}')
 
         # 2. 持久化订单 (status=pending)
         order = await self._persist_order(
             exchange_account_id=exchange_account_id,
+            user_id=user_id,
             symbol=symbol,
             side=side,
             order_type=order_type,
@@ -151,6 +155,8 @@ class OrderExecutor:
                 status='submitted',
                 exchange_order_id=response.exchange_order_id,
             )
+            if self._riskguard:
+                await self._riskguard.record_order_success(uid)
             logger.info(
                 f'Order submitted: order_id={order.id} '
                 f'exchange_order_id={response.exchange_order_id}'
@@ -166,6 +172,8 @@ class OrderExecutor:
                 status='failed',
                 error_message=str(e),
             )
+            if self._riskguard:
+                await self._riskguard.record_order_failure(uid)
             logger.error(f'Order failed: order_id={order.id} - {e}')
             raise
 
@@ -268,6 +276,7 @@ class OrderExecutor:
     async def _persist_order(
         self,
         exchange_account_id: str,
+        user_id: Optional[str],
         symbol: str,
         side: str,
         order_type: str,
@@ -280,16 +289,19 @@ class OrderExecutor:
 
         @sync_to_async
         def _create():
-            return Order.objects.create(
-                exchange_account_id=exchange_account_id,
-                symbol=symbol.upper(),
-                side=side.lower(),
-                order_type=order_type.lower(),
-                quantity=quantity,
-                price=price,
-                status=status,
-                request_id=uuid.uuid4(),
-            )
+            kwargs_create = {
+                'exchange_account_id': exchange_account_id,
+                'symbol': symbol.upper(),
+                'side': side.lower(),
+                'order_type': order_type.lower(),
+                'quantity': quantity,
+                'price': price,
+                'status': status,
+                'request_id': uuid.uuid4(),
+            }
+            if user_id:
+                kwargs_create['user_id'] = user_id
+            return Order.objects.create(**kwargs_create)
 
         return await _create()
 
