@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     'apps.exchange',
     'apps.trading',
     'apps.risk',
+    'apps.riskguard',
     'apps.backtest',
     'apps.memory',
     'apps.channel',
@@ -158,3 +159,6 @@ BRAVE_SEARCH_API_KEY = os.environ.get('BRAVE_SEARCH_API_KEY', '')
 TAVILY_API_KEY       = os.environ.get('TAVILY_API_KEY', '')
 SEARXNG_BASE_URL     = os.environ.get('SEARXNG_BASE_URL', '')
 JINA_API_KEY         = os.environ.get('JINA_API_KEY', '')
+
+# Fernet encryption key for API secrets (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+FERNET_KEY = os.environ.get('FERNET_KEY', '')

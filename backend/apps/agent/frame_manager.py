@@ -23,6 +23,8 @@ class FrameManager:
         self._trading_state = FrameState.STOPPED
         self._assist_state = FrameState.STOPPED
         self._risk_guard_refs = 0  # 引用计数：trading+assist共享单实例
+        self._riskguard = None
+        self._order_executor = None
 
     @classmethod
     def get_instance(cls) -> FrameManager:
@@ -35,6 +37,7 @@ class FrameManager:
             'trading': self._trading_state,
             'assist': self._assist_state,
             'risk_guard': 'running' if self._risk_guard_refs > 0 else 'stopped',
+            'order_executor': 'running' if self._order_executor is not None else 'stopped',
         }
 
     # --- Trading Frame ---
@@ -48,6 +51,7 @@ class FrameManager:
         try:
             await self._start_data_feed()
             await self._start_risk_guard()
+            await self._start_order_executor()
             await self._start_order_consumer(mode)
             self._trading_state = FrameState.RUNNING
             logger.info(f'[FrameManager] trading frame started (mode={mode})')
@@ -60,6 +64,7 @@ class FrameManager:
             return
         self._trading_state = FrameState.STOPPING
         await self._stop_order_consumer()
+        await self._stop_order_executor()
         await self._stop_risk_guard()
         await self._stop_data_feed()
         self._trading_state = FrameState.STOPPED
@@ -125,14 +130,17 @@ class FrameManager:
     async def _start_risk_guard(self) -> None:
         self._risk_guard_refs += 1
         if self._risk_guard_refs == 1:
-            logger.info('[FrameManager] RiskGuard starting...')
-            # TODO: 启动RiskGuard进程（gRPC）
+            from apps.riskguard.guard import RiskGuard
+            self._riskguard = RiskGuard()
+            await self._riskguard.start()
+            logger.info('[FrameManager] RiskGuard started')
 
     async def _stop_risk_guard(self) -> None:
         self._risk_guard_refs = max(0, self._risk_guard_refs - 1)
-        if self._risk_guard_refs == 0:
+        if self._risk_guard_refs == 0 and self._riskguard:
+            await self._riskguard.stop()
+            self._riskguard = None
             logger.info('[FrameManager] RiskGuard stopped')
-            # TODO: 停止RiskGuard进程
 
     async def _start_order_consumer(self, mode: str) -> None:
         logger.info(f'[FrameManager] order consumer starting (mode={mode})...')
@@ -147,3 +155,15 @@ class FrameManager:
 
     async def _stop_signal_monitor(self) -> None:
         logger.info('[FrameManager] signal monitor stopped')
+
+    async def _start_order_executor(self) -> None:
+        from apps.trading import OrderExecutor
+        self._order_executor = OrderExecutor()
+        await self._order_executor.initialize()
+        logger.info('[FrameManager] OrderExecutor started')
+
+    async def _stop_order_executor(self) -> None:
+        if self._order_executor:
+            await self._order_executor.shutdown()
+            self._order_executor = None
+            logger.info('[FrameManager] OrderExecutor stopped')
