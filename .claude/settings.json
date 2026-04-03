@@ -151,6 +151,17 @@
           }
         ],
         "description": "Run ruff lint check on Python files after edits"
+      },
+      {
+        "matcher": "tool == \"Edit\" && tool_input.file_path matches \"backend/apps/.*\\\\.py$\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const{execSync}=require('child_process');const path=require('path');let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const i=JSON.parse(d);const p=i.tool_input?.file_path;if(p&&p.includes('/apps/')){try{const root=path.resolve(p.replace(/\\/backend\\/.*/,''));execSync('python3 .agents/skills/code-change-verification/run.py',{cwd:root,timeout:60000,stdio:['pipe','pipe','pipe']});console.error('[Hook] ✅ Verification passed')}catch(e){console.error('[Hook] ⚠️ Verification failed (run manually to see details)')}}console.log(d)})\"",
+            "timeout": 120
+          }
+        ],
+        "description": "Run verification pyramid checks after editing backend apps"
       }
     ],
     "Stop": [
@@ -163,6 +174,16 @@
           }
         ],
         "description": "Check for console.log in modified files after each response"
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const{execSync}=require('child_process');const fs=require('fs');const path=require('path');try{const root=process.cwd();const script=path.join(root,'.agents/skills/code-change-verification/run.py');if(fs.existsSync(script)){console.error('[Hook] 🔍 Running verification pyramid checks...');execSync('python3 '+script,{cwd:root,timeout:120000,stdio:['pipe','pipe','pipe']});console.error('[Hook] ✅ All verifications passed')}else{console.error('[Hook] ⚠️ Verification script not found')}}catch(e){console.error('[Hook] ⚠️ Verification failed - run manually: python3 .agents/skills/code-change-verification/run.py')}\""
+          }
+        ],
+        "description": "Run verification pyramid on session end"
       }
     ],
     "SessionEnd": [
