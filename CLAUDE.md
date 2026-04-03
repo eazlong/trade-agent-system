@@ -2,144 +2,139 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Architecture Overview
+## 项目概述
 
-This is a **multi-application crypto trading platform** with a **Django backend** and **Next.js frontend**, focused on cryptocurrency trading strategies, analysis, and automated trading assistance.
+这是一个 **AI Agent 驱动的量化交易辅助系统**，用户通过 Telegram Bot 与 SupervisorAgent 交互，Agent 解析意图后路由到专业子 Agent（分析、策略、风控、教练）执行任务。所有子 Agent 和交易框架均为懒加载。
 
-### Technology Stack
-- **Backend**: Django 4.x with Django REST Framework, WebSockets (Channels), Redis, InfluxDB
-- **Frontend**: Next.js 15.x (React 18.x), Mantine UI 8.x, Redux Toolkit, Lightweight Charts 5.x
-- **Trading Integration**: CCXT for exchange APIs (Binance, OKX), custom WebSocket feeds
-- **AI/ML**: OpenAI, CrewAI agents, scikit-learn, pandas-ta for technical analysis
-- **Database**: SQLite (dev), Redis (caching/WebSockets), InfluxDB (time-series)
-- **Package Manager**: uv for Python dependencies
+## 开发命令
 
-### Multi-App Architecture
-
-#### Backend (`/backend/`)
-Django apps under `backend/`:
-- `authentication/` - User auth with JWT, captcha, password reset
-- `assistant/` - AI-powered trading assistance and chat
-- `trade/` - Trading records, portfolio management
-- `qtbot/` - Quantitative trading bot logic
-- `qtcore/` - Core trading engine (Binance/OKX WebSocket, scheduler)
-- `strategy/` - Strategy definitions and backtesting
-- `ai_agent/` - CrewAI-based autonomous trading agents
-- `notify/` - Notification system (WebSocket consumers)
-
-#### Frontend (`/frontend/`)
-- **Main trading interface** (Next.js 15.x): Real-time charts, AI chat, portfolio tracking
-- **Electron desktop app**: `electron/main.js` - Cross-platform desktop support (Mac/Windows/Linux)
-- **Cross-platform**: Android (Capacitor), Tauri desktop support
-
-## Development Commands
-
-### Backend
+### 环境初始化
 ```bash
 cd backend
-
-# Environment setup
-uv venv && source venv/bin/activate
+uv venv
 uv pip install -r requirements.txt
-
-# Database
-uv run python manage.py makemigrations
-uv run python manage.py migrate
-uv run python manage.py createsuperuser
-
-# Development server (REST API)
-uv run python manage.py runserver  # http://localhost:8000
-
-# WebSocket server
-uv run daphne -b 0.0.0.0 -p 8000 core.asgi:application
-
-# Run tests
-uv run python manage.py test
-uv run python manage.py test assistant.tests.test_views
+cp .env.example .env
+# 填入 .env 中的必填项（OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, FERNET_KEY 等）
 ```
 
-### Frontend
+### 数据库
 ```bash
-cd frontend
+# 开发环境使用 SQLite（dev settings 已配置）
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run python manage.py migrate
 
-# Install dependencies
-npm install
-
-# Development server
-npm run dev  # http://localhost:3000
-
-# Build for production
-npm run build
-
-# Lint
-npm run lint
-
-# Electron development
-npm run electron-dev  # Runs Next.js + Electron concurrently
+# 生产环境（PostgreSQL）
+python manage.py migrate
 ```
 
-### Infrastructure
+### 运行服务（开发需要同时跑多个进程）
 ```bash
-# Redis (required for WebSockets) - default port 6379
-redis-server
+# 终端 1: Django ASGI 服务器
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run python manage.py runserver
 
-# InfluxDB (time-series data) - default port 8086
-influxd
+# 终端 2: Celery Worker
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app worker -l info
 
-# Reset database
-rm backend/db.sqlite3 && cd backend && uv run python manage.py migrate
+# 终端 3: Celery Beat（定时调度）
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app beat -l info
 ```
 
-## Key Integration Points
-
-### API Routes
-All APIs under `/api/`:
-- `/api/strategy/` - Strategy management
-- `/api/notify/` - Notifications
-- `/api/trade/` - Trading records
-- `/api/qtbot/` - Bot configuration
-- `/api/assistant/` - AI assistant
-- `/api/ai_agent/` - CrewAI agents
-
-### WebSocket Endpoints
-- `/ws/market-data/` - Market data streams
-- `/ws/trading/` - Trading operations
-- `/ws/assistant/` - AI chat
-- `/ws/notify/` - Notifications
-
-### Environment Variables (`backend/.env`)
+### 测试
 ```bash
-# AI
-OPENAI_API_KEY
+# 运行所有测试
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest
 
-# Exchanges (code-configured)
-BINANCE_API_KEY, BINANCE_SECRET
-OKX_API_KEY, OKX_SECRET
+# 运行单个测试文件
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest apps/agent/tests/test_xxx.py
 
-# Database
-INFLUXDB_URL, INFLUXDB_TOKEN
-REDIS_URL
-
-# Frontend
-FRONTEND_URL
+# 带覆盖率
+DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest --cov=apps --cov-report=term-missing
 ```
 
-## Code Patterns
+### Docker 完整栈
+```bash
+docker-compose up --build
+```
 
-### Frontend
-- **State**: Redux Toolkit (`/store/modules/`)
-- **API**: Axios services (`/services/`)
-- **Charts**: Lightweight Charts for trading views
-- **Editor**: BlockNote for trading plans
-- **Components**: Organized by feature under `/Components/`
+## 关键架构模式
 
-### Backend
-- **WebSocket Consumers**: `qtcore/consumers/`, `notify/consumers/`
-- **Exchange Integration**: `qtcore/binance_*.py`, `qtcore/okx_*.py`
-- **Serializers**: DRF serializers for API responses
-- **Tasks**: django-apscheduler in `qtcore/scheduler.py`
+### 1. 注册中心模式（Agent / Skill / SkillRegistry）
 
-## Deployment
-- Frontend Docker: `frontend/Dockerfile` (multi-stage Alpine build)
-- Desktop builds: `npm run dist` (electron-builder)
-- Environment-specific settings in `backend/core/settings.py`
+**Agent 注册** — `AgentRegistry` 使用类装饰器实现懒加载单例：
+```python
+# backend/apps/agent/registry.py
+@AgentRegistry.register_class
+class MyAgent(_LLMAgent):
+    name = 'my_agent'
+```
+首次调用 `AgentRegistry.get('my_agent')` 时才实例化。
+
+**Skill 注册** — `SkillRegistry` 使用类装饰器：
+```python
+# backend/apps/skill/registry.py
+@SkillRegistry.register
+class MySkill(BaseSkill):
+    name = 'MySkill'
+```
+只需在 `apps/skill/skills/__init__.py` 中 import，装饰器自动注册。
+
+**意图路由** — `apps/agent/supervisor.py` 中 `INTENT_TO_AGENT` 字典映射意图到 Agent 名称，新增 Agent 需同时更新此映射。
+
+### 2. 分层记忆架构
+
+| 层 | 存储 | TTL | 管理 |
+|----|------|-----|------|
+| L1 | 进程内 `OrderedDict`（LRU，50条/agent） | 进程生命周期 | `apps/memory/l1.py` |
+| L2 | Redis LIST | 24h | `apps/memory/l2.py` |
+| L3 | PostgreSQL + pgvector（向量检索） | 永久 | `apps/memory/l3.py` |
+
+### 3. LLM 降级链
+
+```
+OpenAI GPT-4o → (超时/429/错误) → Anthropic Claude Opus → (失败) → FALLBACK_MARKER
+```
+实现在 `apps/agent/llm_client.py`，Skill 内检测 `FALLBACK_MARKER` 走规则引擎兜底。
+
+### 4. Redis Stream 消息总线
+
+各 Stream 使用独立 DB：
+- `agent:tasks` (DB3) — Agent 任务队列
+- `trading:orders` (DB4) — 订单执行
+- `trading:positions` (DB4) — 持仓同步
+- `risk:events` (DB4) — 风险事件
+
+### 5. Prompt 版本管理
+
+所有 Prompt 文件在 `backend/prompts/v{N}/` 下，变更必须新建版本目录。通过 `PromptLoader`（`apps/agent/prompt_loader.py`）加载。
+
+### 6. 设置分层
+
+| 文件 | 用途 |
+|------|------|
+| `core/settings/base.py` | 通用配置（所有环境共享） |
+| `core/settings/dev.py` | 开发覆盖（SQLite fallback、verbose 日志） |
+| `core/settings/prod.py` | 生产覆盖（强制 PostgreSQL、严格安全设置） |
+
+切换方式：`DJANGO_SETTINGS_MODULE=core.settings.dev`（或 `prod`）。
+
+## 新增功能指南
+
+### 新增 Skill
+1. 创建 `apps/skill/skills/my_skill.py`，继承 `BaseSkill`
+2. 用 `@SkillRegistry.register` 装饰
+3. 在 `apps/skill/skills/__init__.py` 中 import
+
+### 新增 Agent
+1. 在 `apps/agent/sub_agents.py` 中继承 `_LLMAgent`
+2. 用 `@AgentRegistry.register_class` 装饰
+3. 在 `INTENT_TO_AGENT` 映射中添加路由规则
+
+### 新增 Celery 定时任务
+在 `backend/celery_app.py` 的 `beat_schedule` 中添加条目。
+
+## 核心依赖说明
+
+- **LLM**: `openai>=1.35.0`, `anthropic>=0.29.0` — 通过 `llm_client.py` 统一调用
+- **交易所**: `ccxt>=4.3.50` — 支持 Binance/OKX/Bybit
+- **消息队列**: Celery + Redis Stream — 非 Celery 的高吞吐任务走 Stream 直连
+- **向量检索**: pgvector — 用于 L3 语义记忆的相似度搜索
+- **加密**: `cryptography` Fernet — 交易所 API Key 加密存储

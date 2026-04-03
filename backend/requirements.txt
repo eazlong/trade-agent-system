@@ -1,84 +1,51 @@
-aiodns                       
-aiohappyeyeballs             
-aiohttp                      
-aiosignal                    
-asgiref                      
-attrs                        
-autobahn                     
-Automat                      
-autopep8                     
-ccxt                         
-certifi                      
-cffi                         
-channels                     
-channels_redis               
-charset-normalizer           
-constantly                   
-coreapi                      
-coreschema                   
-cryptography                 
-daphne                       
-defusedxml                   
-Django                       
-django-cors-headers          
-django-extensions            
-django-js-asset              
-django-mptt                  
-django-templated-mail        
-django_apscheduler
-djangorestframework          
-djangorestframework-simplejwt
-djoser                       
-drf-generators               
-frozenlist                   
-hyperlink                    
-idna                         
-incremental                  
-itypes                       
-Jinja2                       
-MarkupSafe                   
-msgpack                      
-multidict                    
-numpy                        
-oauthlib                     
-pandas                       
-pandas_ta                    
-pillow                       
-pip                          
-propcache                    
-pyasn1                       
-pyasn1_modules               
-pycares                      
-pycodestyle                  
-pycparser                    
-PyJWT                        
-pyOpenSSL                    
-python-dateutil              
-python3-openid               
-pytz                         
-redis                        
-requests                     
-requests-oauthlib            
-scipy                        
-service-identity             
-setuptools                   
-six                          
-social-auth-app-django       
-social-auth-core             
-sqlparse                     
-toml                         
-Twisted                      
-txaio                        
-typing_extensions            
-tzdata                       
-uritemplate                  
-urllib3                      
-websocket-client             
-yarl                         
-zope.interface            
-dotenv
-django-simple-captcha
-influxdb_client
-scikit-learn
-yfinance
-crewai
+# Core
+Django==5.0.6
+djangorestframework==3.15.2
+djangorestframework-simplejwt==5.3.1
+django-cors-headers==4.4.0
+django-extensions==3.2.3
+
+# Async / WebSocket
+channels==4.1.0
+channels-redis==4.2.0
+daphne==4.1.2
+
+# Database
+psycopg2-binary==2.9.9
+pgvector==0.3.2
+
+# Cache / Queue
+redis==5.0.7
+celery==5.4.0
+
+# LLM
+openai==1.35.0
+anthropic==0.29.0
+tiktoken==0.7.0
+
+# Exchange
+ccxt==4.3.50
+
+# Telegram Channel
+python-telegram-bot==21.3
+
+# Risk / Crypto
+cryptography==42.0.8
+grpcio==1.64.1
+grpcio-tools==1.64.1
+
+# Data / Backtest
+numpy==1.26.4
+pandas==2.2.2
+
+# Env / Config
+python-dotenv==1.0.1
+
+# Monitoring
+prometheus-client==0.20.0
+
+# Testing
+pytest==8.2.2
+pytest-django==4.8.0
+pytest-asyncio==0.23.7
+factory-boy==3.3.0
