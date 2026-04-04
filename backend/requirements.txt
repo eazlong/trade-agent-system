@@ -28,6 +28,7 @@ ccxt==4.3.50
 
 # Telegram Channel
 python-telegram-bot==21.3
+socksio==1.0.0
 
 # Risk / Crypto
 cryptography==42.0.8
@@ -40,6 +41,7 @@ pandas==2.2.2
 
 # Env / Config
 python-dotenv==1.0.1
+uvicorn==0.42.0
 
 # Monitoring
 prometheus-client==0.20.0

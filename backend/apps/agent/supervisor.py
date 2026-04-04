@@ -11,7 +11,7 @@ from .llm_client import LLMClient, is_fallback
 from .prompt_loader import PromptLoader
 from .frame_manager import FrameManager
 from .session_manager import get_session_manager, SessionState
-from apps.skill.agent_skills_loader import get_skills_loader
+from ..skill.loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
