@@ -24,4 +24,14 @@ app.conf.beat_schedule = {
         'task': 'apps.agent.tasks.clean_old_audit_logs',
         'schedule': crontab(hour=2, minute=0),
     },
+    # Check signal monitors every 30 seconds
+    'check-signals': {
+        'task': 'apps.signal_monitor.tasks.check_signals',
+        'schedule': 30.0,
+    },
+    # Clean expired signal monitors every hour
+    'clean-expired-monitors': {
+        'task': 'apps.signal_monitor.tasks.clean_expired_monitors',
+        'schedule': crontab(minute=15),
+    },
 }
