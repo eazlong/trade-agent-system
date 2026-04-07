@@ -80,6 +80,7 @@ class TUIChannel(BaseChannel):
         self._conv_history: list[dict] = []
         self._streaming_panel: Optional[StreamingPanel] = None
         self._streaming_task: Optional[asyncio.Task] = None
+        self._use_redis = supervisor_agent is None
 
     async def send_message(self, text: str) -> None:
         """向终端用户发送消息（Rich Markdown 渲染）"""
@@ -231,7 +232,38 @@ class TUIChannel(BaseChannel):
             pass
 
     async def _stream_agent_response(self, text: str) -> Optional[str]:
-        """流式调用 Agent 并实时显示 token"""
+        """调用 Agent 并返回响应（支持进程内调用和 Redis 通信）"""
+        if self._use_redis:
+            return await self._call_agent_via_redis(text)
+        return await self._call_agent_direct(text)
+
+    async def _call_agent_via_redis(self, text: str) -> Optional[str]:
+        """通过 Redis Streams 与已运行的 SupervisorAgent 通信"""
+        from apps.agent.bus import publish, build_agent_task, wait_reply, AGENT_TASKS
+        import json
+
+        msg = build_agent_task(user_id=self._user_id, payload={'text': text})
+        await publish(AGENT_TASKS, msg)
+
+        reply = await wait_reply(msg['task_id'], timeout=120)
+        if reply is None:
+            return None
+
+        # 提取 content（与 TelegramChannel 逻辑一致）
+        try:
+            if isinstance(reply, str) and reply.strip().startswith('{'):
+                parsed = json.loads(reply)
+                if isinstance(parsed, dict) and 'content' in parsed:
+                    return parsed['content']
+                return reply
+            elif isinstance(reply, dict) and 'content' in reply:
+                return reply['content']
+            return str(reply)
+        except (json.JSONDecodeError, TypeError):
+            return str(reply)
+
+    async def _call_agent_direct(self, text: str) -> Optional[str]:
+        """进程内直接调用 SupervisorAgent（保留向后兼容）"""
         from apps.agent.llm_client import LLMClient
         from apps.agent.prompt_loader import PromptLoader
 
@@ -253,7 +285,6 @@ class TUIChannel(BaseChannel):
         except Exception as e:
             logger.warning(f'流式调用失败，降级为同步: {e}')
             console.print('[dim]（降级为同步模式）[/]')
-            # 降级：同步调用
             result = await llm.chat(
                 system=system_prompt,
                 user=user_prompt,
