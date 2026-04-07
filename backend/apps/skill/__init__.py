@@ -1,2 +1,2 @@
-# Auto-import skills so registry is populated on startup
-from apps.skill import skills  # noqa: F401
+# Skills are loaded by AgentSkillsLoader from ~/.tradelogx/ directories.
+# See apps.skill.loader for details.

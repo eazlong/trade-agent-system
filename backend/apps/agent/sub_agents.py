@@ -9,6 +9,7 @@ from .base import BaseAgent, AgentMessage, AgentResult
 from .llm_client import LLMClient, is_fallback
 from .prompt_loader import PromptLoader
 from .registry import AgentRegistry
+from ..skill.loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,14 @@ class _LLMAgent(BaseAgent):
     def __init__(self):
         super().__init__()
         self._llm = LLMClient.get_instance()
+        self._skills_loader = get_skills_loader(self.name)
         self._system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
+
+        # 注入 agent 独有技能到 system prompt
+        always_skills = self._skills_loader.get_always_skills()
+        if always_skills:
+            skills_content = self._skills_loader.load_skills_content(always_skills)
+            self._system_prompt = f'{self._system_prompt}\n\n### Agent Skills\n{skills_content}'
 
     def _get_tools_schema(self) -> list[dict]:
         """获取当前可用工具的OpenAI function calling schema"""
