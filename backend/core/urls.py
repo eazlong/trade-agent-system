@@ -11,4 +11,5 @@ urlpatterns = [
     path('api/notify/', include('apps.notify.urls')),
     path('api/memory/', include('apps.memory.urls')),
     path('api/skill/', include('apps.skill.urls')),
+    path('api/datasource/', include('apps.datasource.urls')),
 ]
