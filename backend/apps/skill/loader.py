@@ -155,16 +155,24 @@ class AgentSkillsLoader:
                 parts.append(self._format_skill_block(name, content))
         return '\n\n---\n\n'.join(parts)
 
-    def build_summary(self) -> str:
+    def build_summary(self, exclude_always: bool = True) -> str:
         """
-        Build an XML summary of all skills for progressive loading.
+        Build an XML summary of skills for progressive loading.
 
         The agent reads this to decide which skills to load for the current task.
+
+        Args:
+            exclude_always: If True, exclude skills marked as always=true
+                           (those are already injected in full).
 
         Returns:
             XML-formatted skills inventory.
         """
         skills = self.list_skills()
+
+        if exclude_always:
+            always_names = set(self.get_always_skills())
+            skills = [s for s in skills if s['name'] not in always_names]
         if not skills:
             return ''
 

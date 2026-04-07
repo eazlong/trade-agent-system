@@ -28,16 +28,34 @@ class _LLMAgent(BaseAgent):
         self._skills_loader = get_skills_loader(self.name)
         self._system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
 
-        # 注入 agent 独有技能到 system prompt
+        # 注入 always 技能到 system prompt（完整内容）
         always_skills = self._skills_loader.get_always_skills()
         if always_skills:
             skills_content = self._skills_loader.load_skills_content(always_skills)
             self._system_prompt = f'{self._system_prompt}\n\n### Agent Skills\n{skills_content}'
 
+        # 注入非 always 技能的摘要，供 LLM 按需加载
+        skill_summary = self._skills_loader.build_summary()
+        if skill_summary:
+            self._system_prompt = (
+                f'{self._system_prompt}\n\n'
+                f'### 可用技能（按需加载）\n'
+                f'你可以使用 load_skill 工具加载以下技能的完整内容：\n\n'
+                f'{skill_summary}'
+            )
+
     def _get_tools_schema(self) -> list[dict]:
-        """获取当前可用工具的OpenAI function calling schema"""
+        """获取当前可用工具的OpenAI function calling schema，包括技能加载工具"""
         from apps.agent.tools.base import ToolRegistry
-        return ToolRegistry.get_all_schemas()
+        schemas = ToolRegistry.get_all_schemas()
+        # 如果有非 always 技能可按需加载，注册 load_skill 工具
+        all_skills = self._skills_loader.list_skills()
+        always_skills = set(self._skills_loader.get_always_skills())
+        on_demand_skills = [s for s in all_skills if s['name'] not in always_skills]
+        if on_demand_skills:
+            from apps.agent.tools.load_skill import LoadSkillTool
+            schemas.append(LoadSkillTool(agent_name=self.name).schema)
+        return schemas
 
     def _get_memory_manager(self, message: AgentMessage):
         from apps.memory.manager import MemoryManager
@@ -164,7 +182,14 @@ class _LLMAgent(BaseAgent):
             for tc in resp.tool_calls:
                 try:
                     logger.debug('[%s] Executing tool call: %s with arguments %s', self.name, tc.name, tc.arguments)
-                    result = await self.run_tool(tc.name, **tc.arguments)
+                    # 处理 load_skill 工具：使用 agent 特定的 loader
+                    if tc.name == 'load_skill':
+                        from apps.agent.tools.load_skill import LoadSkillTool
+                        skill_name = tc.arguments.get('skill_name', '')
+                        tool = LoadSkillTool(agent_name=self.name)
+                        result = await tool.execute(skill_name=skill_name)
+                    else:
+                        result = await self.run_tool(tc.name, **tc.arguments)
                     tool_results.append({
                         'role': 'tool',
                         'tool_call_id': tc.call_id,
