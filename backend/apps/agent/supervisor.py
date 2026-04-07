@@ -61,7 +61,7 @@ class SupervisorAgent(BaseAgent):
         self._llm = LLMClient.get_instance()
         self._frame = FrameManager.get_instance()
         self._prompt_loader = PromptLoader
-        self._skills_loader = get_skills_loader()
+        self._skills_loader = get_skills_loader(self.name)
         self._system_prompt = PromptLoader.load('supervisor')
         self._skills_summary = self._skills_loader.build_summary()
         self._always_skills = self._skills_loader.get_always_skills()
