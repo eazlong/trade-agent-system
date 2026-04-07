@@ -11,8 +11,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default search root: {project_root}/skills/
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+# Workspace root: ~/.tradelogx/
+TRADELOGX_ROOT = Path.home() / '.tradelogx'
+# Global shared skills directory
+GLOBAL_SKILLS_DIR = TRADELOGX_ROOT / 'skills'
+# Agent workspace root: ~/.tradelogx/workspace/{agent_name}/
+WORKSPACE_ROOT = TRADELOGX_ROOT / 'workspace'
 
 
 @dataclass
@@ -31,15 +35,54 @@ class AgentSkillsLoader:
     """
     Loader for agent SKILL.md files.
 
+    Searches two skill directories (agent-specific shadows global):
+    - Global shared skills:  ~/.tradelogx/skills/{skill_name}/SKILL.md
+    - Agent-specific skills: ~/.tradelogx/workspace/{agent_name}/skills/{skill_name}/SKILL.md
+
     Supports progressive loading:
     - list_skills()     → brief summary for selection
     - load_skill()      → full content for context injection
     - build_summary()   → XML block for system prompt
     """
 
-    def __init__(self, search_root: Path | None = None):
-        self.search_root: Path = search_root or (PROJECT_ROOT / 'skills')
-        self.search_root.mkdir(parents=True, exist_ok=True)
+    def __init__(self, agent_name: str = '', search_root: Path | None = None):
+        self.agent_name = agent_name
+
+        if search_root is not None:
+            # Legacy / custom override — treat as global skills dir only
+            self.global_skills_dir = search_root
+            self.agent_skills_dir: Path | None = None
+        else:
+            self.global_skills_dir = GLOBAL_SKILLS_DIR
+            self.agent_skills_dir = (
+                WORKSPACE_ROOT / agent_name / 'skills' if agent_name else None
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Directory helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _iter_skill_dirs(self) -> list[tuple[Path, str]]:
+        """
+        Return (skill_dir, source_label) pairs from all directories.
+
+        Priority: agent-specific shadows global.
+        """
+        seen: dict[str, tuple[Path, str]] = {}
+
+        # 1. Global shared skills
+        if self.global_skills_dir.exists():
+            for skill_dir in sorted(self.global_skills_dir.iterdir()):
+                if skill_dir.is_dir() and (skill_dir / 'SKILL.md').exists():
+                    seen[skill_dir.name] = (skill_dir, 'global')
+
+        # 2. Agent-specific skills (higher priority)
+        if self.agent_skills_dir and self.agent_skills_dir.exists():
+            for skill_dir in sorted(self.agent_skills_dir.iterdir()):
+                if skill_dir.is_dir() and (skill_dir / 'SKILL.md').exists():
+                    seen[skill_dir.name] = (skill_dir, 'agent')
+
+        return list(seen.values())
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -51,20 +94,12 @@ class AgentSkillsLoader:
 
         Returns:
             List of dicts with 'name', 'path', 'description', 'when_to_use',
-            'source' (always 'agents'), 'available' (always True for md-based skills).
+            'source', 'available'.
         """
         result: list[dict[str, Any]] = []
 
-        if not self.search_root.exists():
-            return result
-
-        for skill_dir in sorted(self.search_root.iterdir()):
-            if not skill_dir.is_dir():
-                continue
+        for skill_dir, source in self._iter_skill_dirs():
             skill_file = skill_dir / 'SKILL.md'
-            if not skill_file.exists():
-                continue
-
             meta = self._parse_frontmatter(skill_file.read_text(encoding='utf-8'))
             result.append({
                 'name': skill_dir.name,
@@ -72,7 +107,7 @@ class AgentSkillsLoader:
                 'description': meta.description or skill_dir.name,
                 'when_to_use': meta.when_to_use,
                 'references': meta.references,
-                'source': 'agents',
+                'source': source,
                 'available': True,
             })
 
@@ -82,17 +117,25 @@ class AgentSkillsLoader:
         """
         Load the full content of a skill by name.
 
+        Agent-specific skill takes precedence over global skill with same name.
+
         Args:
             name: Skill directory name.
 
         Returns:
             Raw SKILL.md content (including frontmatter), or None if not found.
         """
-        if not self.search_root.exists():
-            return None
-        skill_file = self.search_root / name / 'SKILL.md'
-        if skill_file.exists():
-            return skill_file.read_text(encoding='utf-8')
+        # Agent-specific first
+        if self.agent_skills_dir:
+            agent_skill = self.agent_skills_dir / name / 'SKILL.md'
+            if agent_skill.exists():
+                return agent_skill.read_text(encoding='utf-8')
+
+        # Fallback to global
+        global_skill = self.global_skills_dir / name / 'SKILL.md'
+        if global_skill.exists():
+            return global_skill.read_text(encoding='utf-8')
+
         return None
 
     def load_skills_content(self, names: list[str]) -> str:
@@ -271,13 +314,24 @@ class AgentSkillsLoader:
         return list(seen)
 
 
-# Singleton instance
-_loader_instance: AgentSkillsLoader | None = None
+# Per-agent loader cache
+_loader_cache: dict[str, AgentSkillsLoader] = {}
 
 
-def get_skills_loader() -> AgentSkillsLoader:
-    """Get the singleton AgentSkillsLoader instance."""
-    global _loader_instance
-    if _loader_instance is None:
-        _loader_instance = AgentSkillsLoader()
-    return _loader_instance
+def get_skills_loader(agent_name: str = '') -> AgentSkillsLoader:
+    """
+    Get an AgentSkillsLoader for the given agent.
+
+    Each agent gets its own loader instance that searches both:
+    - ~/.tradelogx/skills/             (global shared skills)
+    - ~/.tradelogx/workspace/{agent}/skills/  (agent-specific skills)
+
+    Args:
+        agent_name: Agent name for agent-specific skill lookup.
+
+    Returns:
+        Cached AgentSkillsLoader instance.
+    """
+    if agent_name not in _loader_cache:
+        _loader_cache[agent_name] = AgentSkillsLoader(agent_name=agent_name)
+    return _loader_cache[agent_name]
