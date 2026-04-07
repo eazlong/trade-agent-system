@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from django.conf import settings
@@ -166,6 +167,192 @@ class LLMClient:
             )
             resp.raise_for_status()
             return resp.json()['content'][0]['text']
+
+    async def chat_stream(
+        self,
+        system: str,
+        user: str,
+        on_chunk: Callable[[str], Any] | None = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+    ) -> str:
+        """
+        流式调用 LLM，边接收 token 边调用 on_chunk 回调。
+
+        on_chunk: 回调函数，接收每个 token 字符串。
+                  如果返回 False，停止接收后续 token。
+
+        主用 OpenAI 流式，自动降级到非流式。
+        """
+        try:
+            return await self._call_openai_stream(
+                system, user, on_chunk, max_tokens, temperature
+            )
+        except Exception as e:
+            logger.warning(f'OpenAI stream failed ({e}), falling back to non-stream')
+            result = await self.chat(system, user, max_tokens, temperature)
+            if on_chunk:
+                # 一次性输出全部 chunks
+                for i in range(0, len(result), 50):
+                    stop = on_chunk(result[i:i+50])
+                    if stop is False:
+                        break
+            return result
+
+    async def _call_openai_stream(
+        self,
+        system: str,
+        user: str,
+        on_chunk: Callable[[str], Any] | None,
+        max_tokens: int,
+        temperature: float,
+    ) -> str:
+        """OpenAI SSE 流式调用"""
+        api_key = settings.OPENAI_API_KEY
+        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY not configured')
+        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
+        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
+
+        chunks: list[str] = []
+        async with httpx.AsyncClient(timeout=120.0, proxy=proxy) as client:
+            async with client.stream(
+                'POST',
+                f'{base_url}/chat/completions',
+                headers={'Authorization': f'Bearer {api_key}'},
+                json={
+                    'model': model,
+                    'messages': [
+                        {'role': 'system', 'content': system},
+                        {'role': 'user', 'content': user},
+                    ],
+                    'max_tokens': max_tokens,
+                    'temperature': temperature,
+                    'stream': True,
+                },
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith('data: '):
+                        continue
+                    data = line[6:].strip()
+                    if data == '[DONE]':
+                        break
+                    try:
+                        delta = json.loads(data)['choices'][0]['delta']
+                        token = delta.get('content', '') or delta.get('text', '')
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                    if token:
+                        chunks.append(token)
+                        if on_chunk:
+                            stop = on_chunk(token)
+                            if stop is False:
+                                # 通知停止，但继续消费流以避免截断
+                                pass
+        return ''.join(chunks)
+
+    async def chat_stream_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        on_chunk: Callable[[str], Any] | None = None,
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+    ) -> LLMToolResponse:
+        """
+        支持工具调用的流式 LLM 接口。
+        注意：工具调用模式下流式只用于 content，
+        tool_calls 在完全接收后返回。
+        """
+        try:
+            return await self._call_openai_stream_with_tools(
+                system, messages, tools, on_chunk, max_tokens, temperature
+            )
+        except Exception as e:
+            logger.warning(f'OpenAI tool stream failed ({e}), falling back to non-stream')
+            return await self.chat_with_tools(system, messages, tools, max_tokens, temperature)
+
+    async def _call_openai_stream_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        on_chunk: Callable[[str], Any] | None,
+        max_tokens: int,
+        temperature: float,
+    ) -> LLMToolResponse:
+        """OpenAI 流式 + 工具调用"""
+        api_key = settings.OPENAI_API_KEY
+        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY not configured')
+        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
+        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
+
+        chunks: list[str] = []
+        tool_calls_map: dict[int, dict] = {}  # index → {name, arguments}
+        full_messages = [{'role': 'system', 'content': system}] + messages
+
+        async with httpx.AsyncClient(timeout=120.0, proxy=proxy) as client:
+            async with client.stream(
+                'POST',
+                f'{base_url}/chat/completions',
+                headers={'Authorization': f'Bearer {api_key}'},
+                json={
+                    'model': model,
+                    'messages': full_messages,
+                    'tools': tools,
+                    'tool_choice': 'auto',
+                    'max_tokens': max_tokens,
+                    'temperature': temperature,
+                    'stream': True,
+                },
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith('data: '):
+                        continue
+                    data = line[6:].strip()
+                    if data == '[DONE]':
+                        break
+                    try:
+                        delta = json.loads(data)['choices'][0]['delta']
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+                    # content delta
+                    content_token = delta.get('content', '') or delta.get('text', '')
+                    if content_token:
+                        chunks.append(content_token)
+                        if on_chunk:
+                            on_chunk(content_token)
+
+                    # tool_call delta
+                    for tc_delta in delta.get('tool_calls', []):
+                        idx = tc_delta.get('index', 0)
+                        if idx not in tool_calls_map:
+                            tool_calls_map[idx] = {'name': '', 'arguments': ''}
+                        if 'function' in tc_delta:
+                            tc_map = tool_calls_map[idx]
+                            if 'name' in tc_delta['function']:
+                                tc_map['name'] += tc_delta['function']['name']
+                            if 'arguments' in tc_delta['function']:
+                                tc_map['arguments'] += tc_delta['function']['arguments']
+
+        tool_calls = [
+            ToolCallRequest(
+                call_id=f'tc_{i}',
+                name=tc_map['name'],
+                arguments=json.loads(tc_map['arguments']) if tc_map['arguments'] else {},
+            )
+            for i, tc_map in sorted(tool_calls_map.items())
+        ]
+        return LLMToolResponse(content=''.join(chunks), tool_calls=tool_calls)
 
 
 def is_fallback(response: str) -> bool:
