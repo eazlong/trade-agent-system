@@ -26,23 +26,28 @@ class _LLMAgent(BaseAgent):
         super().__init__()
         self._llm = LLMClient.get_instance()
         self._skills_loader = get_skills_loader(self.name)
-        self._system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
+
+    def _build_system_prompt(self) -> str:
+        """动态构建 system prompt，避免单例 Agent 缓存旧技能内容。"""
+        system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
 
         # 注入 always 技能到 system prompt（完整内容）
         always_skills = self._skills_loader.get_always_skills()
         if always_skills:
             skills_content = self._skills_loader.load_skills_content(always_skills)
-            self._system_prompt = f'{self._system_prompt}\n\n### Agent Skills\n{skills_content}'
+            system_prompt = f'{system_prompt}\n\n### Agent Skills\n{skills_content}'
 
         # 注入非 always 技能的摘要，供 LLM 按需加载
         skill_summary = self._skills_loader.build_summary()
         if skill_summary:
-            self._system_prompt = (
-                f'{self._system_prompt}\n\n'
+            system_prompt = (
+                f'{system_prompt}\n\n'
                 f'### 可用技能（按需加载）\n'
                 f'你可以使用 load_skill 工具加载以下技能的完整内容：\n\n'
                 f'{skill_summary}'
             )
+
+        return system_prompt
 
     def _get_tools_schema(self) -> list[dict]:
         """获取当前可用工具的OpenAI function calling schema，包括技能加载工具"""
@@ -95,7 +100,7 @@ class _LLMAgent(BaseAgent):
         # 检索相关记忆，注入system prompt
         mem = self._get_memory_manager(message)
         memories = await mem.retrieve(query=text, top_k=5)
-        system = self._system_prompt
+        system = self._build_system_prompt()
         if memories:
             mem_lines = '\n'.join(f'- [{m["source"]}] {m["content"]}' for m in memories)
             system = f'{system}\n\n### 相关记忆\n{mem_lines}'
@@ -224,7 +229,7 @@ class _LLMAgent(BaseAgent):
             f"[{m.get('role', 'user')}]: {m.get('content', '')}" for m in messages
         )
         final = await self._llm.chat(
-            system=self._system_prompt,
+            system=system,
             user=f'{history_text}\n\n请根据以上工具调用结果给出最终回答。',
             max_tokens=2048,
         )

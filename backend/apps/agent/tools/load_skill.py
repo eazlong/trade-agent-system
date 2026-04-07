@@ -46,13 +46,15 @@ class LoadSkillTool(BaseTool):
             return ToolResult(success=False, error='skill_name 参数缺失')
 
         loader = get_skills_loader(self._agent_name)
-        content = loader.load_skill(skill_name)
-        if content is None:
+
+        # 先解析 references，确保依赖技能一并加载
+        resolved = loader.resolve_references([skill_name])
+        if not resolved:
             available = [s['name'] for s in loader.list_skills()]
             return ToolResult(
                 success=False,
                 error=f'技能 {skill_name!r} 不存在。可用技能: {", ".join(available)}',
             )
 
-        body = loader._strip_frontmatter(content)
-        return ToolResult(success=True, data=f'### Skill: {skill_name}\n\n{body}')
+        content = loader.load_skills_content(resolved)
+        return ToolResult(success=True, data=content)
