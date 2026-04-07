@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     'apps.channel',
     'apps.notify',
     'apps.datasource',
+    'apps.signal_monitor',
 ]
 
 MIDDLEWARE = [
