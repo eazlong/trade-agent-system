@@ -3,6 +3,9 @@ run_tui.py — 启动 TUI Channel
 
 用法:
     python manage.py run_tui
+
+注意：TUI Channel 通过 Redis Streams 与已运行的 Django ASGI 服务器通信，
+      不会自行创建 SupervisorAgent 实例。请确保 Django 服务已启动。
 """
 import asyncio
 import logging
@@ -45,11 +48,11 @@ class Command(BaseCommand):
 
     async def _run(self):
         from apps.channel.tui import TUIChannel
-        from apps.agent.supervisor import SupervisorAgent
+        from apps.agent.bus import ensure_groups
 
-        # 初始化 SupervisorAgent（单例）
-        supervisor = SupervisorAgent.get_instance()
+        # 确保 Redis Stream consumer groups 存在
+        await ensure_groups()
 
-        # 启动 TUI
-        channel = TUIChannel(supervisor_agent=supervisor)
+        # 启动 TUI —— 通过 Redis Streams 与已运行的 SupervisorAgent 通信
+        channel = TUIChannel()
         await channel.start()
