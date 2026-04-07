@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     'apps.memory',
     'apps.channel',
     'apps.notify',
+    'apps.datasource',
 ]
 
 MIDDLEWARE = [
