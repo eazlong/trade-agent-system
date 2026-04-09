@@ -1,0 +1,170 @@
+---
+name: trading-system
+description: 创建、查看和更新用户的交易系统文档，支持版本管理
+when_to_use: 用户请求创建交易系统、查看交易系统、更新交易系统时激活
+---
+
+# 交易系统技能
+
+管理用户的交易系统文档，支持创建、查看和版本化更新。
+
+## 工作目录
+
+- 默认根目录：`~/.tradelogx/`
+- 交易系统目录：`~/.tradelogx/trading_systems/`
+- 文件命名：`trading_systems_{version}.md`，其中 `latest` 始终指向最新版本
+
+## 流程
+
+### 1. 读取交易系统
+
+用户请求查看或操作交易系统时，首先读取最新版本：
+
+```python
+from pathlib import Path
+
+root = Path.home() / '.tradelogx'
+ts_dir = root / 'trading_systems'
+version = payload.get('version', 'latest')
+ts_file = ts_dir / f'trading_systems_{version}.md'
+
+if ts_file.exists():
+    content = ts_file.read_text(encoding='utf-8')
+    # 展示给用户
+else:
+    # 交易系统不存在，走创建流程
+```
+
+### 2. 已存在：展示并询问是否更新
+
+如果交易系统文件存在：
+
+1. 向用户展示当前交易系统的完整内容
+2. 询问用户：**是否需要更新交易系统？**
+3. 如果用户不需要更新，结束流程
+
+### 3. 更新交易系统
+
+用户确认需要更新时：
+
+1. **询问更新内容** — 让用户描述想要修改的部分
+2. **判断更新合理性** — 基于以下标准评估：
+   - 更新是否与现有系统逻辑冲突
+   - 风控规则是否被削弱（止损放宽、仓位上限提高等需要特别说明理由）
+   - 参数变更是否有明确依据
+   - 如果不合理，向用户解释原因并建议修改方案
+3. **执行版本归档** — 用户确认更新后：
+   - 将 `trading_system_latest.md.md` 重命名为 `trading_system_v{N}.md`
+   - 版本号规则：从文件内容或现有版本号推导，递增（v1 → v2 → v3）
+   - 创建新的 `trading_system_latest.md.md`，写入更新后的内容
+
+```python
+import re
+
+def get_next_version(ts_dir: Path) -> str:
+    """推导下一个版本号"""
+    max_ver = 0
+    for f in ts_dir.iterdir():
+        m = re.match(r'trading_system_v(\d+)\.md', f.name)
+        if m:
+            max_ver = max(max_ver, int(m.group(1)))
+    return f'v{max_ver + 1}'
+
+def archive_and_save(ts_dir: Path, new_content: str):
+    """归档旧版本，保存新版本"""
+    latest = ts_dir / 'trading_system_latest.md.md'
+    if latest.exists():
+        next_ver = get_next_version(ts_dir)
+        latest.rename(ts_dir / f'trading_systems_{next_ver}.md')
+    latest.write_text(new_content, encoding='utf-8')
+```
+
+### 4. 不存在：创建新交易系统
+
+如果交易系统目录或文件不存在：
+
+1. **询问必要信息** — 收集以下内容：
+   - 交易品种和市场（如 BTC/USDT、股票等）
+   - 交易风格（日内、波段、趋势跟踪等）
+   - 时间周期偏好
+   - 风险承受能力
+   - 可用资金规模
+   - 其他偏好或约束
+2. **生成交易系统** — 基于收集的信息，生成结构化交易系统文档
+3. **保存文件** — 创建 `trading_systems/` 目录，写入 `trading_system_latest.md.md`
+
+## 交易系统文档结构
+
+生成的交易系统文档必须包含以下章节：
+
+```markdown
+# 交易系统：{系统名称}
+
+## 系统概述
+- 交易品种：
+- 交易风格：
+- 适用市场环境：
+- 时间周期：
+
+## 入场规则
+### 做多条件
+- 技术条件：
+- 确认信号：
+
+### 做空条件
+- 技术条件：
+- 确认信号：
+
+## 出场规则
+### 止盈策略
+- 目标位：
+- 移动止盈规则：
+
+### 止损策略
+- 固定止损：
+- 追踪止损：
+- 最大单笔亏损：
+
+## 风控规则
+- 单笔仓位上限：{X}% 资金
+- 最大持仓：{X}% 资金
+- 日亏损上限：{X}% 资金
+- 连续亏损暂停规则：
+- 相关性限制（如适用）：
+
+## 资金管理
+- 初始资金：
+- 仓位计算方式：
+- 加减仓规则：
+
+## 交易时间
+- 活跃交易时段：
+- 避开时段：
+
+## 纪律要求
+- 每日复盘：
+- 交易日志记录：
+- 系统回顾周期：
+
+## 版本历史
+| 版本 | 日期 | 变更摘要 |
+|------|------|----------|
+| v1 | {date} | 初始版本 |
+```
+
+## 输入参数
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| action | str | 是 | — | `create` / `view` / `update` |
+| version | str | 否 | latest | 查看指定版本 |
+| work_dir | str | 否 | ~/.tradelogx/ | 工作目录 |
+| update_content | str | 否 | — | 更新内容描述（update 时使用） |
+
+## 注意事项
+
+- `latest` 版本始终是用户当前正在使用的版本
+- 归档版本（v1、v2...）不可修改，只能查看
+- 更新风控规则时必须明确提示用户风险
+- 生成的交易系统应该具体可执行，避免模糊描述
+- 多轮交互：创建交易系统时可能需要多次询问用户细节
