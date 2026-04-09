@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/suggest-compact.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/suggest-compact.js\""
           }
         ]
       }
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/pre-compact.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/pre-compact.js\""
           }
         ]
       }
@@ -64,7 +64,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/session-start.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/session-start.js\""
           }
         ]
       }
@@ -152,7 +152,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/check-console-log.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/check-console-log.js\""
           }
         ]
       },
@@ -172,7 +172,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/session-end.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/session-end.js\""
           }
         ]
       },
@@ -181,7 +181,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/everything-claude-code/scripts/hooks/evaluate-session.js\""
+            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/evaluate-session.js\""
           }
         ]
       }
