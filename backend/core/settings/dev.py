@@ -16,25 +16,5 @@ DATABASES = {
     }
 }
 
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'formatters': {
-        'verbose': {
-            'format': '{levelname} {name} {message}',
-            'style': '{',
-        },
-    },
-    'handlers': {
-        'console': {'class': 'logging.StreamHandler', 'formatter': 'verbose'},
-    },
-    'root': {
-        'handlers': ['console'],
-        'level': 'DEBUG',
-    },
-    'loggers': {
-        'httpx':    {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-        'httpcore': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-        'telegram': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-    },
-}
+# dev settings override: root logger at DEBUG
+LOGGING['root']['level'] = 'DEBUG'  # noqa: F405

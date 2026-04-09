@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'apps.notify',
     'apps.datasource',
     'apps.signal_monitor',
+    'apps.logging_app',
 ]
 
 MIDDLEWARE = [
@@ -164,3 +165,37 @@ JINA_API_KEY         = os.environ.get('JINA_API_KEY', '')
 
 # Fernet encryption key for API secrets (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
 FERNET_KEY = os.environ.get('FERNET_KEY', '')
+
+# ===================================================
+# Logging Configuration — unified log collection
+# ===================================================
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{asctime} {levelname} [{name}] {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+        'system_log': {
+            'class': 'apps.logging_app.handler.SystemLogHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console', 'system_log'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'httpx':    {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'httpcore': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'telegram': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+    },
+}
