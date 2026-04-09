@@ -271,7 +271,7 @@ class AgentSkillsLoader:
 
         # Parse references list (indented '- ' lines after 'references:')
         ref_section_match = re.search(
-            r'^references:\s*\n((?:\s+- .+\n)*)',
+            r'^references:\s*\n((?:\s+- .+(?:\n|$))*)',
             match.group(1),
             re.MULTILINE,
         )
