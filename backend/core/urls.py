@@ -13,4 +13,5 @@ urlpatterns = [
     path('api/skill/', include('apps.skill.urls')),
     path('api/datasource/', include('apps.datasource.urls')),
     path('api/signal-monitor/', include('apps.signal_monitor.api.urls')),
+    path('api/logs/', include('apps.logging_app.urls')),
 ]
