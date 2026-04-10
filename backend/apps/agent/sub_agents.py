@@ -13,45 +13,26 @@ from ..skill.loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
-_MAX_TOOL_ROUNDS = 5  # 防止无限循环
-
 
 class _LLMAgent(BaseAgent):
     """所有基于LLM的子Agent的公共基类，支持工具调用循环"""
 
     prompt_name: str = ''
     domain_description: str = ''  # 子类覆盖：领域边界描述
+    _agent_tools: list[str] = ['web_search', 'web_fetch', 'load_skill']  # 默认工具列表
 
     def __init__(self):
         super().__init__()
         self._llm = LLMClient.get_instance()
-        self._skills_loader = get_skills_loader(self.name)
         # 每个 Agent 声明的可用工具列表（由 Prompt 元数据或子类指定）
-        self._agent_tools: list[str] = []
+        # 子类 __init__ 可通过 _agent_tools.extend() 追加
         # 从 message.payload 中提取的上下文字段列表
         self._context_fields: list[str] = []
 
     def _build_system_prompt(self) -> str:
-        """动态构建 system prompt，避免单例 Agent 缓存旧技能内容。"""
+        """动态构建 system prompt，注入技能内容。"""
         system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
-
-        # 注入 always 技能到 system prompt（完整内容）
-        always_skills = self._skills_loader.get_always_skills()
-        if always_skills:
-            skills_content = self._skills_loader.load_skills_content(always_skills)
-            system_prompt = f'{system_prompt}\n\n### Agent Skills\n{skills_content}'
-
-        # 注入非 always 技能的摘要，供 LLM 按需加载
-        skill_summary = self._skills_loader.build_summary()
-        if skill_summary:
-            system_prompt = (
-                f'{system_prompt}\n\n'
-                f'### 可用技能（按需加载）\n'
-                f'你可以使用 load_skill 工具加载以下技能的完整内容：\n\n'
-                f'{skill_summary}'
-            )
-
-        return system_prompt
+        return self._build_skills_section(system_prompt)
 
     def _get_tools_schema(self) -> list[dict]:
         """获取当前 Agent 可用的工具 schema。
@@ -68,7 +49,9 @@ class _LLMAgent(BaseAgent):
                     schemas.append(tool.schema)
                 else:
                     logger.warning('[%s] tool %s not found in registry', self.name, tool_name)
+
             return schemas
+
         # 回退：未声明工具列表时返回全部
         return ToolRegistry.get_all_schemas()
 
@@ -115,7 +98,7 @@ class _LLMAgent(BaseAgent):
             mem_lines = '\n'.join(f'- [{m["source"]}] {m["content"]}' for m in memories)
             system = f'{system}\n\n### 相关记忆\n{mem_lines}'
 
-        logger.debug('[%s] Final system prompt:\n%s', self.name, system[:1000])
+        logger.debug('[%s] Final system prompt:\n%s', self.name, system)
 
         # 获取最近的对话上下文
         recent_context = await self._get_recent_conversation_context(message)
@@ -126,128 +109,58 @@ class _LLMAgent(BaseAgent):
         messages = recent_context + [{'role': 'user', 'content': user_prompt}]
         logger.debug('[%s] Final user prompt:\n%s', self.name, user_prompt[:1000])
 
-        for _ in range(_MAX_TOOL_ROUNDS):
-            resp = await self._llm.chat_with_tools(
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=2048,
+        content, is_fb = await self._run_tool_loop(system, messages, tools, max_tokens=2048)
+
+        if is_fb:
+            return AgentResult(task_id=message.task_id, success=False, error='LLM暂时不可用')
+
+        # 检查拒收信号
+        rejection = self._check_rejection(content)
+        if rejection:
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                need_reroute=True,
+                reroute_reason=rejection.get('reason', '不属于本Agent职责范围'),
+                reroute_suggestion=rejection.get('suggested_agent', ''),
             )
 
-            if not resp.has_tool_calls:
-                # 最终文本回复
-                content = resp.content
-                if is_fallback(content):
-                    return AgentResult(task_id=message.task_id, success=False, error='LLM暂时不可用')
+        # 分析内容以确定是否需要继续多轮对话
+        continue_conversation = self._should_continue_conversation(content)
 
-                # 检查拒收信号
-                rejection = self._check_rejection(content)
-                if rejection:
-                    return AgentResult(
-                        task_id=message.task_id,
-                        success=False,
-                        need_reroute=True,
-                        reroute_reason=rejection.get('reason', '不属于本Agent职责范围'),
-                        reroute_suggestion=rejection.get('suggested_agent', ''),
-                    )
-
-                # 分析内容以确定是否需要继续多轮对话
-                continue_conversation = self._should_continue_conversation(content)
-
-                # 准备返回数据，包含多轮对话控制信息
-                response_data = {
-                    'content': content,
-                    'continue_conversation': continue_conversation,
-                    'start_multi_turn': continue_conversation,  # 开始多轮对话模式
-                    'agent_name': self.name
-                }
-
-                # 写入记忆
-                mem.write_l1(message.task_id, f'Q:{text[:200]}|A:{content[:200]}')
-
-                # 更新对话历史到L1记忆
-                conv_history = mem._l1.get('conv_history', [])
-
-                # 添加用户消息
-                conv_history.append({
-                    'role': 'user',
-                    'text': text[:200],
-                    'ts': int(time.time())
-                })
-                # 添加助手回复
-                conv_history.append({
-                    'role': 'assistant',
-                    'text': content[:200],
-                    'ts': int(time.time())
-                })
-                # 限制对话历史长度
-                mem._l1['conv_history'] = conv_history[-20:]  # 保留最近10轮对话
-
-                await mem.write_l2(
-                    content=f'user: {text}\nassistant: {content}',
-                    memory_type='conversation',
-                )
-                return AgentResult(task_id=message.task_id, success=True, data=response_data)
-
-            # 执行工具调用，收集结果
-            tool_results = []
-            for tc in resp.tool_calls:
-                try:
-                    logger.debug('[%s] Executing tool call: %s with arguments %s', self.name, tc.name, tc.arguments)
-                    # 处理 load_skill 工具：使用 agent 特定的 loader
-                    if tc.name == 'load_skill':
-                        from apps.agent.tools.load_skill import LoadSkillTool
-                        skill_name = tc.arguments.get('skill_name', '')
-                        tool = LoadSkillTool(agent_name=self.name)
-                        result = await tool.execute(skill_name=skill_name)
-                    else:
-                        result = await self.run_tool(tc.name, **tc.arguments)
-                    tool_results.append({
-                        'role': 'tool',
-                        'tool_call_id': tc.call_id,
-                        'content': str(result.data) if result.success else f'Error: {result.error}',
-                    })
-                except Exception as e:
-                    tool_results.append({
-                        'role': 'tool',
-                        'tool_call_id': tc.call_id,
-                        'content': f'Error: {e}',
-                    })
-                    logger.warning('[%s] tool %s failed: %s', self.name, tc.name, e)
-
-            # 把assistant的tool_calls消息和工具结果追加到对话
-            messages.append({
-                'role': 'assistant',
-                'content': resp.content or '',
-                'tool_calls': [
-                    {
-                        'id': tc.call_id,
-                        'type': 'function',
-                        'function': {'name': tc.name, 'arguments': str(tc.arguments)},
-                    }
-                    for tc in resp.tool_calls
-                ],
-            })
-            messages.extend(tool_results)
-
-        # 超出轮次，直接让LLM总结
-        # 将对话历史拼接为文本，因为 chat() 只接受 system/user 两个字符串参数
-        history_text = '\n'.join(
-            f"[{m.get('role', 'user')}]: {m.get('content', '')}" for m in messages
-        )
-        final = await self._llm.chat(
-            system=system,
-            user=f'{history_text}\n\n请根据以上工具调用结果给出最终回答。',
-            max_tokens=2048,
-        )
-
-        # 默认认为超出轮次时不再继续对话
+        # 准备返回数据，包含多轮对话控制信息
         response_data = {
-            'content': final,
-            'continue_conversation': False,
-            'start_multi_turn': False,
+            'content': content,
+            'continue_conversation': continue_conversation,
+            'start_multi_turn': continue_conversation,  # 开始多轮对话模式
             'agent_name': self.name
         }
+
+        # 写入记忆
+        mem.write_l1(message.task_id, f'Q:{text[:200]}|A:{content[:200]}')
+
+        # 更新对话历史到L1记忆
+        conv_history = mem._l1.get('conv_history', [])
+
+        # 添加用户消息
+        conv_history.append({
+            'role': 'user',
+            'text': text[:200],
+            'ts': int(time.time())
+        })
+        # 添加助手回复
+        conv_history.append({
+            'role': 'assistant',
+            'text': content[:200],
+            'ts': int(time.time())
+        })
+        # 限制对话历史长度
+        mem._l1['conv_history'] = conv_history[-20:]  # 保留最近10轮对话
+
+        await mem.write_l2(
+            content=f'user: {text}\nassistant: {content}',
+            memory_type='conversation',
+        )
         return AgentResult(task_id=message.task_id, success=True, data=response_data)
 
     def _build_context(self, message: AgentMessage) -> str:
@@ -315,7 +228,7 @@ def _build_dynamic_agent_class(meta: dict) -> type:
 
     def make_init(self):
         _LLMAgent.__init__(self)
-        self._agent_tools = tools
+        self._agent_tools.extend(tools)
         self._context_fields = context_fields
 
     agent_cls = type(
