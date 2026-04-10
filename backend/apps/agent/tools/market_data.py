@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import logging
 import uuid
@@ -143,18 +145,60 @@ class FetchOHLCVTool(BaseTool):
 
 class CalculateIndicatorsTool(BaseTool):
     """
-    Calculate technical indicators (EMA, MACD, RSI, KDJ, ATR, Bollinger Bands).
+    Calculate technical indicators using pandas_ta.
     Reads OHLCV data from the temp file created by fetch_ohlcv.
+    Supports 150+ indicators across all pandas_ta categories.
     """
 
     name = 'calculate_indicators'
     description = (
         '计算技术指标。从 fetch_ohlcv 生成的临时文件中读取K线数据，'
-        '返回EMA、MACD、RSI、KDJ、ATR、布林带等指标。'
+        '使用 pandas_ta 库计算 150+ 技术指标。'
+        '常用指标：ema, sma, macd, rsi, kdj, atr, bbands, ichimoku, vwap, adx 等。'
+        '支持自定义参数，如 {"rsi": {"length": 7}}。'
     )
+
+    # Legacy name mapping: old indicator names -> pandas_ta function names
+    _LEGACY_MAP = {
+        'bollinger': 'bbands',
+    }
+
+    _EMA_DEFAULTS = [20, 50, 200]
+
+    _COLUMN_RENAMES = {
+        'MACD_12_26_9': 'macd',
+        'MACDh_12_26_9': 'histogram',
+        'MACDs_12_26_9': 'signal',
+        'BBL_5_2.0': 'lower',
+        'BBL_5_2.0_2.0': 'lower',
+        'BBM_5_2.0': 'middle',
+        'BBM_5_2.0_2.0': 'middle',
+        'BBU_5_2.0': 'upper',
+        'BBU_5_2.0_2.0': 'upper',
+        'K_9_3': 'K',
+        'D_9_3': 'D',
+        'J_9_3': 'J',
+        'ADX_14': 'adx',
+        'DMP_14': 'dmp',
+        'DMN_14': 'dmn',
+    }
+
+    @staticmethod
+    def _get_available_indicators() -> list[str]:
+        """Return list of all available pandas_ta indicator names."""
+        try:
+            import pandas_ta as ta
+
+            df = pd.DataFrame()
+            return df.ta.indicators(as_list=True) or []
+        except Exception:
+            return []
 
     @property
     def parameters_schema(self) -> dict:
+        available = self._get_available_indicators()
+        all_names = sorted(set(available) | set(self._LEGACY_MAP.keys()))
+
         return {
             'type': 'object',
             'properties': {
@@ -164,72 +208,118 @@ class CalculateIndicatorsTool(BaseTool):
                 },
                 'indicators': {
                     'type': 'array',
-                    'description': '要计算的指标列表',
+                    'description': (
+                        '要计算的指标列表。支持 pandas_ta 全部 150+ 指标，'
+                        '如 ema, sma, macd, rsi, kdj, atr, bbands, adx, vwap, ichimoku 等。'
+                        '旧名称自动映射：bollinger -> bbands。'
+                    ),
                     'items': {
                         'type': 'string',
-                        'enum': ['ema', 'macd', 'rsi', 'kdj', 'atr', 'bollinger'],
+                        'enum': all_names,
                     },
                     'default': ['ema', 'macd', 'rsi', 'kdj', 'atr'],
+                },
+                'params': {
+                    'type': 'object',
+                    'description': (
+                        '各指标的自定义参数，键为指标名，值为参数字典。'
+                        '例如：{"rsi": {"length": 7}, "ema": {"length": 21}, '
+                        '"macd": {"fast": 8, "slow": 21, "signal": 5}}'
+                    ),
+                    'default': {},
+                    'additionalProperties': {
+                        'type': 'object',
+                    },
+                },
+                'return_full_series': {
+                    'type': 'boolean',
+                    'description': '是否返回完整时间序列（默认 false，仅返回最新值）',
+                    'default': False,
                 },
             },
             'required': ['temp_file'],
         }
 
-    def _calc_ema(self, series: pd.Series, period: int) -> pd.Series:
-        return series.ewm(span=period, adjust=False).mean()
+    def _resolve_indicator_name(self, name: str) -> str:
+        """Resolve legacy indicator name to pandas_ta function name."""
+        return self._LEGACY_MAP.get(name.lower(), name.lower())
 
-    def _calc_macd(self, series: pd.Series) -> dict:
-        ema_fast = self._calc_ema(series, 12)
-        ema_slow = self._calc_ema(series, 26)
-        macd_line = ema_fast - ema_slow
-        signal_line = self._calc_ema(macd_line, 9)
-        histogram = macd_line - signal_line
-        return {'macd': macd_line, 'signal': signal_line, 'histogram': histogram}
+    def _call_indicator(
+        self,
+        df: pd.DataFrame,
+        func_name: str,
+        params: dict | None = None,
+    ) -> pd.DataFrame | pd.Series | tuple:
+        """Call a pandas_ta indicator function on the DataFrame."""
+        ta_func = getattr(df.ta, func_name, None)
+        if ta_func is None:
+            raise ValueError(f'pandas_ta 不支持的指标: {func_name}')
 
-    def _calc_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0).ewm(alpha=1 / period, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1 / period, adjust=False).mean()
-        rs = gain / loss
-        return 100.0 - (100.0 / (1.0 + rs))
+        kwargs = params or {}
+        kwargs['append'] = False
+        # Suppress pandas_ta verbose print output
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return ta_func(**kwargs)
 
-    def _calc_kdj(self, high: pd.Series, low: pd.Series, close: pd.Series) -> dict:
-        lowest_low = low.rolling(window=9).min()
-        highest_high = high.rolling(window=9).max()
-        rsv = (close - lowest_low) / (highest_high - lowest_low) * 100.0
-        k_val = rsv.ewm(alpha=1 / 3, adjust=False).mean()
-        d_val = k_val.ewm(alpha=1 / 3, adjust=False).mean()
-        j_val = 3.0 * k_val - 2.0 * d_val
-        return {'K': k_val, 'D': d_val, 'J': j_val}
+    def _extract_latest(
+        self, result: pd.DataFrame | pd.Series, func_name: str
+    ) -> dict | float | None:
+        """Extract the latest value(s) from a pandas_ta result."""
+        if isinstance(result, pd.Series):
+            val = result.iloc[-1]
+            return float(val) if pd.notna(val) else None
 
-    def _calc_atr(
-        self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
-    ) -> pd.Series:
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(span=period, adjust=False).mean()
+        if isinstance(result, pd.DataFrame):
+            out = {}
+            last_row = result.iloc[-1]
+            for col in result.columns:
+                val = last_row.get(col)
+                if val is None or pd.isna(val):
+                    continue
+                clean_name = self._COLUMN_RENAMES.get(str(col), col)
+                out[clean_name] = float(val)
+            return out
 
-    def _calc_bollinger(self, series: pd.Series) -> dict:
-        middle = series.rolling(window=20).mean()
-        std = series.rolling(window=20).std()
-        return {
-            'middle': middle,
-            'upper': middle + 2.0 * std,
-            'lower': middle - 2.0 * std,
-        }
+        return None
+
+    def _extract_full_series(
+        self, result: pd.DataFrame | pd.Series, func_name: str
+    ) -> dict | list:
+        """Extract full time series from pandas_ta result."""
+        if isinstance(result, pd.Series):
+            return result.dropna().to_list()
+
+        if isinstance(result, pd.DataFrame):
+            out = {}
+            for col in result.columns:
+                clean_name = self._COLUMN_RENAMES.get(str(col), col)
+                series = result[col].dropna()
+                out[clean_name] = series.to_list()
+            return out
+
+        return None
 
     async def execute(
         self,
         temp_file: str = '',
         indicators: list[str] = None,
+        params: dict = None,
+        return_full_series: bool = False,
         **kwargs,
     ) -> ToolResult:
         if not temp_file:
             return ToolResult(success=False, error='temp_file 参数缺失')
 
         indicators = indicators or ['ema', 'macd', 'rsi', 'kdj', 'atr']
+        params = params or {}
+
+        try:
+            import pandas_ta as ta  # noqa: F811
+        except ImportError:
+            return ToolResult(
+                success=False,
+                error='pandas_ta 未安装，请先运行 pip install pandas-ta',
+            )
 
         try:
             path = Path(temp_file)
@@ -242,53 +332,53 @@ class CalculateIndicatorsTool(BaseTool):
             records = json.loads(path.read_text(encoding='utf-8'))
             df = pd.DataFrame(records)
 
-            # Parse timestamp if present
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-            close = df['close']
-            high = df['high']
-            low = df['low']
-
             result = {}
+            errors = {}
 
-            if 'ema' in indicators:
-                result['ema'] = {
-                    'ema20': float(self._calc_ema(close, 20).iloc[-1]),
-                    'ema50': float(self._calc_ema(close, 50).iloc[-1]),
-                    'ema200': float(self._calc_ema(close, 200).iloc[-1]),
-                }
+            for indicator_name in indicators:
+                try:
+                    func_name = self._resolve_indicator_name(indicator_name)
+                    indicator_params = params.get(
+                        indicator_name, params.get(func_name, {})
+                    )
 
-            if 'macd' in indicators:
-                macd = self._calc_macd(close)
-                result['macd'] = {
-                    'macd': float(macd['macd'].iloc[-1]),
-                    'signal': float(macd['signal'].iloc[-1]),
-                    'histogram': float(macd['histogram'].iloc[-1]),
-                }
+                    # Special handling for EMA: support multiple periods
+                    if func_name == 'ema':
+                        ema_result = {}
+                        periods = indicator_params.pop('lengths', self._EMA_DEFAULTS)
+                        if isinstance(periods, int):
+                            periods = [periods]
 
-            if 'rsi' in indicators:
-                result['rsi'] = float(self._calc_rsi(close).iloc[-1])
+                        for period in periods:
+                            period_params = {'length': period, **indicator_params}
+                            ema_series = self._call_indicator(df, 'ema', period_params)
+                            key = f'ema{period}'
+                            if return_full_series:
+                                ema_result[key] = ema_series.dropna().to_list()
+                            else:
+                                val = ema_series.iloc[-1]
+                                ema_result[key] = float(val) if pd.notna(val) else None
+                        result['ema'] = ema_result
+                        continue
 
-            if 'kdj' in indicators:
-                kdj = self._calc_kdj(high, low, close)
-                result['kdj'] = {
-                    'K': float(kdj['K'].iloc[-1]),
-                    'D': float(kdj['D'].iloc[-1]),
-                    'J': float(kdj['J'].iloc[-1]),
-                }
+                    raw_result = self._call_indicator(df, func_name, indicator_params)
 
-            if 'atr' in indicators:
-                result['atr'] = float(self._calc_atr(high, low, close).iloc[-1])
+                    if return_full_series:
+                        result[indicator_name] = self._extract_full_series(
+                            raw_result, func_name
+                        )
+                    else:
+                        result[indicator_name] = self._extract_latest(
+                            raw_result, func_name
+                        )
 
-            if 'bollinger' in indicators:
-                bb = self._calc_bollinger(close)
-                result['bollinger'] = {
-                    'middle': float(bb['middle'].iloc[-1]),
-                    'upper': float(bb['upper'].iloc[-1]),
-                    'lower': float(bb['lower'].iloc[-1]),
-                }
+                except Exception as e:
+                    errors[indicator_name] = str(e)
 
+            # Always include latest OHLCV snapshot
             result['latest'] = {
                 'open': float(df['open'].iloc[-1]),
                 'high': float(df['high'].iloc[-1]),
@@ -296,6 +386,9 @@ class CalculateIndicatorsTool(BaseTool):
                 'close': float(df['close'].iloc[-1]),
                 'volume': float(df['volume'].iloc[-1]),
             }
+
+            if errors:
+                result['_errors'] = errors
 
             # Cleanup temp file
             try:
