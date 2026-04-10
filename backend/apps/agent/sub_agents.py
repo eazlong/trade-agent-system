@@ -117,9 +117,6 @@ class _LLMAgent(BaseAgent):
 
         logger.debug('[%s] Final system prompt:\n%s', self.name, system[:1000])
 
-        # 更新system prompt以包含多轮对话说明
-        system += "\n\n### 多轮对话说明\n如果用户的问题需要持续的多轮交互来完成任务或者你为用户提供了继续对话的选项时，你需要：\n1. 询问用户更多细节或澄清问题\n2. 在回答最后加上'请提供您的反馈'。\n3. 根据上下文判断是否需要继续对话\n如果你认为对话已完成，请在回答末尾加入'任务完成'。"
-
         # 获取最近的对话上下文
         recent_context = await self._get_recent_conversation_context(message)
 
