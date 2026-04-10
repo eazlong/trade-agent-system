@@ -10,7 +10,7 @@ from apps.datasource.registry import DataSourceRegistry
 from apps.datasource.store import MemoryDataStore
 from apps.datasource.subscription import DataSubscriptionManager
 from apps.datasource.monitor import DataQualityMonitor
-from apps.datasource.base import DataType, KlineInterval, MarketType, ConnectionStatus
+from apps.datasource.base import DataType, KlineInterval, MarketType, ConnectionStatus, BaseDataSource
 
 
 class TestDataSourceRegistry:
@@ -327,6 +327,75 @@ class TestDataQualityMonitor:
 
         # 应该触发报警（如果状态不是 good）
         # 注：具体是否触发取决于报告状态
+
+
+class TestMarketTypeConfig:
+    """市场类型配置测试"""
+
+    def test_set_market_types(self):
+        """测试设置市场类型"""
+        @DataSourceRegistry.register('test_mt_source')
+        class TestMTSource(BaseDataSource):
+            name = 'test_mt_source'
+            supported_market_types = [MarketType.SPOT, MarketType.FUTURES]
+
+            async def connect_websocket(self): return True
+            async def disconnect_websocket(self): return True
+            async def _handle_websocket_message(self, msg): pass
+            async def fetch_klines(self, *args, **kwargs): return []
+            async def fetch_trades(self, *args, **kwargs): return []
+            async def fetch_ticker(self, *args, **kwargs): return {}
+            async def subscribe(self, *args, **kwargs): return True
+            async def unsubscribe(self, *args, **kwargs): return True
+            def normalize_kline(self, raw): return {}
+            def normalize_trade(self, raw): return {}
+            def normalize_ticker(self, raw): return {}
+
+        ds = DataSourceRegistry.get('test_mt_source')
+
+        # 默认应返回所有支持类型
+        assert ds._get_active_market_types() == [MarketType.SPOT, MarketType.FUTURES]
+
+        # 设置仅现货
+        ds.set_market_types([MarketType.SPOT])
+        assert ds._get_active_market_types() == [MarketType.SPOT]
+
+        # 清除配置应返回默认
+        ds.set_market_types(None)
+        assert ds._get_active_market_types() == [MarketType.SPOT, MarketType.FUTURES]
+
+        DataSourceRegistry.unload('test_mt_source')
+
+    def test_registry_get_with_market_types(self):
+        """测试 DataSourceRegistry.get 传入 market_types"""
+        @DataSourceRegistry.register('test_mt_source2')
+        class TestMTSource2(BaseDataSource):
+            name = 'test_mt_source2'
+            supported_market_types = [MarketType.SPOT, MarketType.FUTURES]
+
+            async def connect_websocket(self): return True
+            async def disconnect_websocket(self): return True
+            async def _handle_websocket_message(self, msg): pass
+            async def fetch_klines(self, *args, **kwargs): return []
+            async def fetch_trades(self, *args, **kwargs): return []
+            async def fetch_ticker(self, *args, **kwargs): return {}
+            async def subscribe(self, *args, **kwargs): return True
+            async def unsubscribe(self, *args, **kwargs): return True
+            def normalize_kline(self, raw): return {}
+            def normalize_trade(self, raw): return {}
+            def normalize_ticker(self, raw): return {}
+
+        # 传入 market_types 应设置到实例
+        ds = DataSourceRegistry.get('test_mt_source2', market_types=[MarketType.FUTURES])
+        assert ds._get_active_market_types() == [MarketType.FUTURES]
+
+        DataSourceRegistry.unload('test_mt_source2')
+
+    def test_resolve_market_types_no_config(self):
+        """测试 _resolve_market_types 无配置时返回 None"""
+        sub = DataSubscriptionManager()
+        result = sub._resolve_market_types('nonexistent_source')
+        assert result is None
 
 
 class TestDataTypeEnums:

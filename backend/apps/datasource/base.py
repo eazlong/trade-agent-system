@@ -137,6 +137,29 @@ class BaseDataSource(ABC):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
 
+        # 用户配置的市场类型（None/空 = 全部支持类型）
+        self._market_types: Optional[List[MarketType]] = None
+
+    def set_market_types(self, market_types: List[MarketType]) -> None:
+        """
+        设置要连接的市场类型。空/None 表示全部支持类型。
+
+        Args:
+            market_types: 市场类型列表，如 [MarketType.SPOT]
+        """
+        self._market_types = market_types
+
+    def _get_active_market_types(self) -> List[MarketType]:
+        """
+        返回已配置的市场类型，未配置时返回所有支持的类型。
+
+        Returns:
+            活跃的市场类型列表
+        """
+        if self._market_types:
+            return self._market_types
+        return self.supported_market_types
+
     # ==================== WebSocket 管理 ====================
 
     @abstractmethod

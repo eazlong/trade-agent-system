@@ -76,12 +76,13 @@ class DataSourceRegistry:
         return decorator
 
     @classmethod
-    def get(cls, name: str) -> Any:
+    def get(cls, name: str, market_types=None) -> Any:
         """
         获取数据源实例（懒加载）
 
         Args:
             name: 数据源名称
+            market_types: 可选的市场类型列表，用于配置数据源只连接特定市场
 
         Returns:
             数据源实例（首次调用时创建）
@@ -107,6 +108,10 @@ class DataSourceRegistry:
             # 实例化数据源
             source_class = cls._registry[name]
             instance = source_class()
+
+            # 如果传入了市场类型配置，设置到实例上
+            if market_types is not None and hasattr(instance, 'set_market_types'):
+                instance.set_market_types(market_types)
 
             # 存储实例
             cls._instances[name] = instance
