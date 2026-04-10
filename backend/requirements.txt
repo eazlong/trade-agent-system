@@ -38,8 +38,9 @@ grpcio==1.64.1
 grpcio-tools==1.64.1
 
 # Data / Backtest
-numpy==1.26.4
-pandas==2.2.2
+numpy>=1.26.4
+pandas>=2.2.2
+pandas-ta>=0.3.14b0
 
 # TUI
 rich>=13.0.0
