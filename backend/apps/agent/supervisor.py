@@ -7,7 +7,7 @@ import time
 from typing import Optional
 
 from .base import BaseAgent, AgentMessage, AgentResult
-from .llm_client import LLMClient, is_fallback, ToolCallRequest, LLMToolResponse
+from .llm_client import LLMClient, is_fallback
 from .prompt_loader import PromptLoader
 from .frame_manager import FrameManager
 from .session_manager import get_session_manager, SessionState
@@ -200,13 +200,16 @@ FALLBACK_RULES = _router._fallback_rules
 
 MAX_REROUTE = 2
 PAUSE_TTL = 300  # 5 minutes
-_MAX_TOOL_ROUNDS = 5  # 工具调用最大循环轮数
 
 
 class SupervisorAgent(BaseAgent):
     """主管Agent：LLM解析用户意图、路由子Agent、管理框架生命周期"""
 
     name = 'supervisor'
+    _agent_tools: list[str] = [
+        'web_search', 'web_fetch', 'read_file', 'write_file',
+        'load_skill', 'get_system_status',
+    ]
 
     _instance: Optional['SupervisorAgent'] = None
 
@@ -216,7 +219,6 @@ class SupervisorAgent(BaseAgent):
         self._frame = FrameManager.get_instance()
         self._prompt_loader = PromptLoader
         self._router = IntentRouter.get_instance()
-        self._skills_loader = get_skills_loader(self.name)
 
         # 动态发现并注册所有 Agent（从 Prompt 文件）
         from .registry import AgentRegistry
@@ -226,67 +228,10 @@ class SupervisorAgent(BaseAgent):
         self._register_intents_from_prompts()
 
         self._system_prompt = PromptLoader.load('supervisor')
-        self._skills_summary = self._skills_loader.build_summary()
-        self._always_skills = self._skills_loader.get_always_skills()
-
-        # Supervisor 可用的工具列表
-        self._agent_tools: list[str] = [
-            'web_search', 'web_fetch', 'read_file', 'write_file',
-            'load_skill', 'get_system_status',
-        ]
-
-    def _get_tools_schema(self) -> list[dict]:
-        """获取当前 Agent 可用的工具 schema。"""
-        from apps.agent.tools.base import ToolRegistry
-        schemas = []
-        for tool_name in self._agent_tools:
-            tool = ToolRegistry.get(tool_name)
-            if tool:
-                schemas.append(tool.schema)
-            else:
-                logger.warning('[%s] tool %s not found in registry', self.name, tool_name)
-        return schemas
 
     def _build_system_prompt_with_skills(self) -> str:
         """动态构建 system prompt，注入 always 技能内容。"""
-        system_prompt = self._system_prompt
-
-        # 注入 always 技能到 system prompt（完整内容）
-        always_skills = self._skills_loader.get_always_skills()
-        if always_skills:
-            skills_content = self._skills_loader.load_skills_content(always_skills)
-            system_prompt = f'{system_prompt}\n\n### Agent Skills\n{skills_content}'
-
-        # 注入非 always 技能的摘要，供 LLM 按需加载
-        skill_summary = self._skills_loader.build_summary()
-        if skill_summary:
-            system_prompt = (
-                f'{system_prompt}\n\n'
-                f'### Skills\n'
-                f'以下技能扩展了你的能力。使用 load_skill 工具加载完整内容。\n'
-                f'如果用户需求与以下技能描述相关，**一定要**使用 load_skill 工具。\n'
-                f'{skill_summary}'
-            )
-
-        return system_prompt
-
-    async def _execute_tool_call(self, tc: ToolCallRequest) -> str:
-        """执行单个工具调用，返回结果字符串。"""
-        try:
-            if tc.name == 'load_skill':
-                from apps.agent.tools.load_skill import LoadSkillTool
-                skill_name = tc.arguments.get('skill_name', '')
-                tool = LoadSkillTool(agent_name=self.name)
-                result = await tool.execute(skill_name=skill_name)
-            else:
-                result = await self.run_tool(tc.name, **tc.arguments)
-
-            if result.success:
-                return str(result.data)
-            return f'Error: {result.error}'
-        except Exception as e:
-            logger.warning('[%s] tool %s failed: %s', self.name, tc.name, e)
-            return f'Error: {e}'
+        return self._build_skills_section(self._system_prompt)
 
     def _register_intents_from_prompts(self) -> None:
         """从 Prompt 元数据注册意图映射。"""
@@ -699,68 +644,25 @@ class SupervisorAgent(BaseAgent):
         tools = self._get_tools_schema()
         messages = [{'role': 'user', 'content': user_prompt}]
 
-        for _ in range(_MAX_TOOL_ROUNDS):
-            resp = await self._llm.chat_with_tools(
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=2048,
+        content, is_fb = await self._run_tool_loop(system, messages, tools, max_tokens=2048)
+
+        if is_fb:
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                error='LLM暂时不可用，请稍后再试',
             )
 
-            if not resp.has_tool_calls:
-                content = resp.content
-                if is_fallback(content):
-                    return AgentResult(
-                        task_id=message.task_id,
-                        success=False,
-                        error='LLM暂时不可用，请稍后再试',
-                    )
+        if mm:
+            updated = conv_history[-18:] + [
+                {'role': 'user', 'text': text[:200], 'ts': int(time.time())},
+                {'role': 'assistant', 'text': content[:200], 'ts': int(time.time())},
+            ]
+            mm.write_l1('conv_history', updated)
+            await mm.write_l2(
+                content=f'user: {text}\nassistant: {content}',
+                memory_type='conversation',
+                importance=1,
+            )
 
-                if mm:
-                    updated = conv_history[-18:] + [
-                        {'role': 'user', 'text': text[:200], 'ts': int(time.time())},
-                        {'role': 'assistant', 'text': content[:200], 'ts': int(time.time())},
-                    ]
-                    mm.write_l1('conv_history', updated)
-                    await mm.write_l2(
-                        content=f'user: {text}\nassistant: {content}',
-                        memory_type='conversation',
-                        importance=1,
-                    )
-
-                return AgentResult(task_id=message.task_id, success=True, data=content)
-
-            # 执行工具调用
-            tool_results = []
-            for tc in resp.tool_calls:
-                result_text = await self._execute_tool_call(tc)
-                tool_results.append({
-                    'role': 'tool',
-                    'tool_call_id': tc.call_id,
-                    'content': result_text,
-                })
-
-            messages.append({
-                'role': 'assistant',
-                'content': resp.content or '',
-                'tool_calls': [
-                    {
-                        'id': tc.call_id,
-                        'type': 'function',
-                        'function': {'name': tc.name, 'arguments': json.dumps(tc.arguments)},
-                    }
-                    for tc in resp.tool_calls
-                ],
-            })
-            messages.extend(tool_results)
-
-        # 超出轮次，让 LLM 基于已有工具结果总结
-        history_text = '\n'.join(
-            f"[{m.get('role', 'user')}]: {m.get('content', '')}" for m in messages
-        )
-        final = await self._llm.chat(
-            system=system,
-            user=f'{history_text}\n\n请根据以上工具调用结果给出最终回答。',
-            max_tokens=2048,
-        )
-        return AgentResult(task_id=message.task_id, success=True, data=final)
+        return AgentResult(task_id=message.task_id, success=True, data=content)
