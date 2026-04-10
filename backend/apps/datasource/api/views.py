@@ -15,7 +15,8 @@ from .serializers import (
     TickerRequestSerializer, TickerResponseSerializer,
     TradeRequestSerializer, TradeResponseSerializer,
     SubscriptionRequestSerializer, SubscriptionResponseSerializer,
-    DataSourceStatusSerializer, QualityReportSerializer
+    DataSourceStatusSerializer, QualityReportSerializer,
+    ConnectRequestSerializer, DataSourceConfigSerializer
 )
 from ..registry import DataSourceRegistry
 from ..store import get_data_store
@@ -90,6 +91,7 @@ class DataSourceViewSet(viewsets.ViewSet):
 
     @extend_schema(
         summary="连接数据源",
+        request=ConnectRequestSerializer,
         responses={200: dict}
     )
     @action(detail=False, methods=['post'], url_path='connect/(?P<source_name>[^/.]+)')
@@ -97,6 +99,12 @@ class DataSourceViewSet(viewsets.ViewSet):
         """连接指定数据源的 WebSocket"""
         try:
             source = DataSourceRegistry.get(source_name)
+
+            # 如果传入了 market_types，设置到数据源实例
+            market_types_raw = request.data.get('market_types')
+            if market_types_raw:
+                market_types = [MarketType(mt) for mt in market_types_raw]
+                source.set_market_types(market_types)
 
             # 在新事件循环中执行异步连接
             loop = asyncio.new_event_loop()
@@ -144,6 +152,41 @@ class DataSourceViewSet(viewsets.ViewSet):
             return Response({
                 'error': f'DataSource "{source_name}" not found'
             }, status=status.HTTP_404_NOT_FOUND)
+
+    @extend_schema(
+        summary="配置数据源市场类型",
+        request=DataSourceConfigSerializer,
+        responses={200: dict}
+    )
+    @action(detail=False, methods=['post'], url_path='config/(?P<source_name>[^/.]+)')
+    def set_config(self, request, source_name=None):
+        """持久化配置数据源的市场类型"""
+        serializer = DataSourceConfigSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        from ..models import DataSourceConfig
+
+        market_types = request.data.get('market_types', [])
+
+        config, created = DataSourceConfig.objects.update_or_create(
+            name=source_name,
+            defaults={'market_types': market_types}
+        )
+
+        # 如果数据源已加载，更新其实例配置
+        if DataSourceRegistry.is_loaded(source_name):
+            source = DataSourceRegistry.get(source_name)
+            if market_types:
+                source.set_market_types([MarketType(mt) for mt in market_types])
+            else:
+                source.set_market_types(None)
+
+        return Response({
+            'source': source_name,
+            'market_types': config.market_types,
+            'created': created
+        })
 
 
 class MarketDataViewSet(viewsets.ViewSet):

@@ -75,29 +75,38 @@ class BybitDataSource(BaseDataSource):
         self._monitor = get_quality_monitor()
 
     async def connect_websocket(self) -> bool:
-        """建立 WebSocket 连接"""
+        """建立 WebSocket 连接（仅连接已配置的市场类型）"""
         try:
             self._ws_status = ConnectionStatus.CONNECTING
+
+            # 获取需要连接的市场类型
+            active_types = self._get_active_market_types()
 
             if self._http_client is None:
                 self._http_client = aiohttp.ClientSession()
 
-            self._ws_spot = await self._http_client.ws_connect(
-                self.ws_spot_endpoint,
-                heartbeat=20,
-                receive_timeout=30
-            )
+            # 仅在配置了现货时连接现货 WebSocket
+            if MarketType.SPOT in active_types:
+                self._ws_spot = await self._http_client.ws_connect(
+                    self.ws_spot_endpoint,
+                    heartbeat=20,
+                    receive_timeout=30
+                )
 
-            self._ws_futures = await self._http_client.ws_connect(
-                self.ws_futures_endpoint,
-                heartbeat=20,
-                receive_timeout=30
-            )
+            # 仅在配置了合约时连接合约 WebSocket
+            if MarketType.FUTURES in active_types:
+                self._ws_futures = await self._http_client.ws_connect(
+                    self.ws_futures_endpoint,
+                    heartbeat=20,
+                    receive_timeout=30
+                )
 
-            self._ws_tasks = [
-                asyncio.create_task(self._ws_spot_receiver()),
-                asyncio.create_task(self._ws_futures_receiver()),
-            ]
+            # 只为活跃连接启动消息处理任务
+            self._ws_tasks = []
+            if MarketType.SPOT in active_types:
+                self._ws_tasks.append(asyncio.create_task(self._ws_spot_receiver()))
+            if MarketType.FUTURES in active_types:
+                self._ws_tasks.append(asyncio.create_task(self._ws_futures_receiver()))
 
             self._ws_status = ConnectionStatus.CONNECTED
             self._connected_at = datetime.now()
