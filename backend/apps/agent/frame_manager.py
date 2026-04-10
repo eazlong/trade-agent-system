@@ -1,8 +1,10 @@
 from __future__ import annotations
-import asyncio
 import logging
 from enum import Enum
 from typing import Optional
+
+from django.conf import settings
+import redis
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +28,101 @@ class FrameManager:
         self._riskguard = None
         self._order_executor = None
 
+        # 从 Redis 恢复持久化的框架状态
+        self._restore_frame_states()
+
     @classmethod
     def get_instance(cls) -> FrameManager:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    # ------------------------------------------------------------------ #
+    #  Redis 持久化
+    # ------------------------------------------------------------------ #
+
+    def _get_redis(self) -> redis.Redis:
+        """获取 Redis 连接（DB8，无 TTL）。"""
+        url = settings.REDIS_URL
+        db = getattr(settings, 'REDIS_DB_FRAME', 8)
+        return redis.Redis.from_url(url, db=db, decode_responses=True)
+
+    def _persist_frame_state(self) -> None:
+        """将当前框架状态持久化到 Redis。"""
+        try:
+            r = self._get_redis()
+            pipe = r.pipeline()
+            pipe.set('frame:trading:state', self._trading_state.value)
+            pipe.set('frame:assist:state', self._assist_state.value)
+            pipe.set('frame:risk_guard_refs', self._risk_guard_refs)
+            pipe.set('frame:order_executor', '1' if self._order_executor else '0')
+            pipe.execute()
+        except Exception as e:
+            logger.warning('[FrameManager] persist state failed: %s', e)
+
+    def _restore_frame_states(self) -> None:
+        """从 Redis 恢复框架状态。"""
+        try:
+            r = self._get_redis()
+            trading = r.get('frame:trading:state')
+            assist = r.get('frame:assist:state')
+            risk_refs = r.get('frame:risk_guard_refs')
+            order_exec = r.get('frame:order_executor')
+
+            if trading == FrameState.RUNNING.value:
+                self._trading_state = FrameState.RUNNING
+            elif trading == FrameState.STOPPED.value:
+                self._trading_state = FrameState.STOPPED
+
+            if assist == FrameState.RUNNING.value:
+                self._assist_state = FrameState.RUNNING
+            elif assist == FrameState.STOPPED.value:
+                self._assist_state = FrameState.STOPPED
+
+            if risk_refs is not None:
+                self._risk_guard_refs = int(risk_refs)
+
+            if order_exec == '1':
+                # 标记需要恢复，但实际对象在 start 时重新初始化
+                pass  # _order_executor 保持 None，start 时会重建
+
+            if trading == FrameState.RUNNING.value or assist == FrameState.RUNNING.value:
+                logger.info(
+                    '[FrameManager] restored frame states: trading=%s, assist=%s',
+                    self._trading_state.value, self._assist_state.value,
+                )
+        except Exception as e:
+            logger.warning('[FrameManager] restore state failed: %s', e)
+
+    async def restore_and_restart_frames(self) -> None:
+        """系统启动时调用：检查持久化状态并自动重启运行中的框架。"""
+        # 如果框架标记为 running，但底层组件未初始化，需要重启
+        need_restart_trading = (self._trading_state == FrameState.RUNNING
+                                and self._risk_guard_refs == 0)
+        need_restart_assist = (self._assist_state == FrameState.RUNNING
+                               and self._risk_guard_refs == 0)
+
+        if need_restart_trading:
+            logger.info('[FrameManager] trading frame was running before restart, auto-restarting...')
+            try:
+                await self.start_trading_frame(mode='live')
+                logger.info('[FrameManager] trading frame auto-restarted')
+            except Exception as e:
+                logger.error('[FrameManager] trading frame auto-restart failed: %s', e)
+                self._trading_state = FrameState.STOPPED
+
+        if need_restart_assist:
+            logger.info('[FrameManager] assist frame was running before restart, auto-restarting...')
+            try:
+                await self.start_assist_frame()
+                logger.info('[FrameManager] assist frame auto-restarted')
+            except Exception as e:
+                logger.error('[FrameManager] assist frame auto-restart failed: %s', e)
+                self._assist_state = FrameState.STOPPED
+
+    # ------------------------------------------------------------------ #
+    #  Public API
+    # ------------------------------------------------------------------ #
 
     def status(self) -> dict:
         return {
@@ -54,9 +146,11 @@ class FrameManager:
             await self._start_order_executor()
             await self._start_order_consumer(mode)
             self._trading_state = FrameState.RUNNING
+            self._persist_frame_state()
             logger.info(f'[FrameManager] trading frame started (mode={mode})')
         except Exception as e:
             self._trading_state = FrameState.STOPPED
+            self._persist_frame_state()
             raise
 
     async def stop_trading_frame(self) -> None:
@@ -68,6 +162,7 @@ class FrameManager:
         await self._stop_risk_guard()
         await self._stop_data_feed()
         self._trading_state = FrameState.STOPPED
+        self._persist_frame_state()
         logger.info('[FrameManager] trading frame stopped')
 
     # --- Assist Frame ---
@@ -81,9 +176,11 @@ class FrameManager:
             await self._start_risk_guard()
             await self._start_signal_monitor()
             self._assist_state = FrameState.RUNNING
+            self._persist_frame_state()
             logger.info('[FrameManager] assist frame started')
         except Exception as e:
             self._assist_state = FrameState.STOPPED
+            self._persist_frame_state()
             raise
 
     async def stop_assist_frame(self) -> None:
@@ -94,6 +191,7 @@ class FrameManager:
         await self._stop_risk_guard()
         await self._stop_data_feed()
         self._assist_state = FrameState.STOPPED
+        self._persist_frame_state()
         logger.info('[FrameManager] assist frame stopped')
 
     async def stop_all(self) -> None:
@@ -134,6 +232,7 @@ class FrameManager:
             self._riskguard = RiskGuard()
             await self._riskguard.start()
             logger.info('[FrameManager] RiskGuard started')
+        self._persist_frame_state()
 
     async def _stop_risk_guard(self) -> None:
         self._risk_guard_refs = max(0, self._risk_guard_refs - 1)
@@ -141,6 +240,7 @@ class FrameManager:
             await self._riskguard.stop()
             self._riskguard = None
             logger.info('[FrameManager] RiskGuard stopped')
+        self._persist_frame_state()
 
     async def _start_order_consumer(self, mode: str) -> None:
         logger.info(f'[FrameManager] order consumer starting (mode={mode})...')
@@ -161,9 +261,11 @@ class FrameManager:
         self._order_executor = OrderExecutor()
         await self._order_executor.initialize()
         logger.info('[FrameManager] OrderExecutor started')
+        self._persist_frame_state()
 
     async def _stop_order_executor(self) -> None:
         if self._order_executor:
             await self._order_executor.shutdown()
             self._order_executor = None
             logger.info('[FrameManager] OrderExecutor stopped')
+        self._persist_frame_state()

@@ -48,6 +48,9 @@ class LifespanHandler:
                         await _consumer.start()
                         logger.info('[ASGI] AgentTaskConsumer started')
 
+                        # 恢复并自动重启之前运行的框架
+                        await self._restore_frames()
+
                         # 启动 TelegramChannel
                         await self._start_telegram_channel()
 
@@ -97,6 +100,15 @@ class LifespanHandler:
             logger.info('[ASGI] TelegramChannel started successfully')
         except Exception as e:
             logger.error(f'[ASGI] Failed to start TelegramChannel: {e}')
+
+    async def _restore_frames(self):
+        """恢复并自动重启之前运行的框架。"""
+        try:
+            from apps.agent.frame_manager import FrameManager
+            fm = FrameManager.get_instance()
+            await fm.restore_and_restart_frames()
+        except Exception as e:
+            logger.warning('[ASGI] Frame restore failed: %s', e)
 
 
 # 创建 ASGI 应用程序，确保包含所有协议处理器
