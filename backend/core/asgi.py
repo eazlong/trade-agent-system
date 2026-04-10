@@ -3,7 +3,7 @@ import asyncio
 import logging
 from django.core.asgi import get_asgi_application
 from channels.routing import ProtocolTypeRouter, URLRouter
-from channels.auth import AuthMiddlewareStack
+from apps.notify.middleware import TokenAuthMiddleware
 
 # 导入 WebSocket 路由
 from apps.notify import routing as notify_routing
@@ -100,7 +100,7 @@ lifespan_handler = LifespanHandler()
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
-    "websocket": AuthMiddlewareStack(
+    "websocket": TokenAuthMiddleware(
         URLRouter(
             notify_routing.websocket_urlpatterns
         )
