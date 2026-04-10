@@ -7,8 +7,6 @@ from .system_status import GetSystemStatusTool
 # Register default tools
 ToolRegistry.register(WebSearchTool())
 ToolRegistry.register(WebFetchTool())
-ToolRegistry.register(FetchOHLCVTool())
-ToolRegistry.register(CalculateIndicatorsTool())
 
 __all__ = [
     'BaseTool',
@@ -18,7 +16,5 @@ __all__ = [
     'WebFetchTool',
     'FetchOHLCVTool',
     'CalculateIndicatorsTool',
+    'GetSystemStatusTool'
 ]
-ToolRegistry.register(GetSystemStatusTool())
-
-__all__ = ['BaseTool', 'ToolRegistry', 'ToolResult', 'WebSearchTool', 'WebFetchTool', 'GetSystemStatusTool']
