@@ -502,13 +502,14 @@ class SupervisorAgent(BaseAgent):
         """
         if not skill_names:
             return ''
-        resolved = self._skills_loader.resolve_references(skill_names)
-        return self._skills_loader.load_skills_content(resolved)
+        loader = self._get_skills_loader()
+        resolved = loader.resolve_references(skill_names)
+        return loader.load_skills_content(resolved)
 
     def _get_skills_summary(self) -> str:
         """Get the skills inventory XML block for progressive loading."""
         # Rebuild summary on demand in case skills were added
-        return self._skills_loader.build_summary()
+        return self._get_skills_loader().build_summary()
 
     async def handle_text(self, text: str) -> str:
         """Channel收到自然语言文本的便捷入口"""
