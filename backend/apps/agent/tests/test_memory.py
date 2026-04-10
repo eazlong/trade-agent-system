@@ -175,10 +175,10 @@ class TestLLMAgentMemoryIntegration(unittest.TestCase):
 
     def test_memory_retrieved_and_injected(self):
         """记忆应出现在LLM调用的system prompt中"""
-        from apps.agent.sub_agents import AnalystAgent
+        from apps.agent.registry import AgentRegistry
         from apps.agent.base import AgentMessage
 
-        agent = AnalystAgent()
+        agent = AgentRegistry.get('analyst')
 
         # 预写L1记忆
         mem = MemoryManager(agent_type='analyst', user_id='u1')
@@ -206,11 +206,11 @@ class TestLLMAgentMemoryIntegration(unittest.TestCase):
 
     def test_memory_written_after_response(self):
         """成功响应后应将对话写入L1"""
-        from apps.agent.sub_agents import AnalystAgent
+        from apps.agent.registry import AgentRegistry
         from apps.agent.base import AgentMessage
 
         _L1_CACHE.clear()
-        agent = AnalystAgent()
+        agent = AgentRegistry.get('analyst')
 
         async def fake_chat_with_tools(system, messages, tools, max_tokens):
             resp = MagicMock()

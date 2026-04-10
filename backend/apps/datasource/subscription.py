@@ -434,6 +434,27 @@ class DataSubscriptionManager:
 
     # ==================== 数据源控制 ====================
 
+    def _resolve_market_types(self, source: str):
+        """
+        从 DataSourceConfig 中解析用户配置的市场类型
+
+        Args:
+            source: 数据源名称
+
+        Returns:
+            MarketType 列表，或 None（表示使用默认全部）
+        """
+        try:
+            from .models import DataSourceConfig
+            from .base import MarketType
+
+            config = DataSourceConfig.objects.filter(name=source, is_active=True).first()
+            if config and config.market_types:
+                return [MarketType(mt) for mt in config.market_types]
+        except Exception:
+            pass
+        return None
+
     def _trigger_source_load(
         self,
         source: str,
@@ -456,8 +477,11 @@ class DataSubscriptionManager:
         # 检查数据源是否已加载
         if not DataSourceRegistry.is_loaded(source):
             try:
+                # 读取用户配置的市场类型
+                market_types = self._resolve_market_types(source)
+
                 # 获取数据源实例（首次调用时加载）
-                ds = DataSourceRegistry.get(source)
+                ds = DataSourceRegistry.get(source, market_types=market_types)
 
                 # 启动 WebSocket 连接（异步）
                 # 这里需要通过事件循环来启动
