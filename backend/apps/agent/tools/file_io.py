@@ -10,7 +10,7 @@ from .base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 # Default workspace root: ~/.tradelogx/
-WORKSPACE_ROOT = Path.home() / '.tradelogx' / 'workspace'
+WORKSPACE_ROOT = Path.home() / '.tradelogx'
 
 
 class ReadFileTool(BaseTool):
@@ -22,7 +22,7 @@ class ReadFileTool(BaseTool):
     name = 'read_file'
     description = (
         '读取工作区中的文件内容。'
-        '路径相对于 ~/.tradelogx/workspace/{agent_name}/ 目录。'
+        '路径相对于 ~/.tradelogx/ 目录。'
         '如果文件不存在或路径无效，返回错误。'
     )
 
@@ -64,7 +64,7 @@ class ReadFileTool(BaseTool):
 
         try:
             # Resolve path relative to agent workspace
-            base = WORKSPACE_ROOT / agent_name
+            base = WORKSPACE_ROOT #/ agent_name
             # Allow absolute paths for safety, but prefer relative
             if Path(file_path).is_absolute():
                 full_path = Path(file_path)
@@ -118,13 +118,13 @@ class ReadFileTool(BaseTool):
 class WriteFileTool(BaseTool):
     """
     Write content to a file in the agent workspace.
-    Paths are relative to the workspace root: ~/.tradelogx/workspace/{agent_name}/
+    Paths are relative to the workspace root: ~/.tradelogx/
     """
 
     name = 'write_file'
     description = (
         '将内容写入工作区中的文件。'
-        '路径相对于 ~/.tradelogx/workspace/{agent_name}/ 目录。'
+        '路径相对于 ~/.tradelogx/ 目录。'
         '如果父目录不存在，会自动创建。'
     )
 
@@ -171,7 +171,7 @@ class WriteFileTool(BaseTool):
 
         try:
             # Resolve path relative to agent workspace
-            base = WORKSPACE_ROOT / agent_name
+            base = WORKSPACE_ROOT #/ agent_name
             if Path(file_path).is_absolute():
                 full_path = Path(file_path)
             else:

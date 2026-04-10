@@ -12,6 +12,9 @@ ToolRegistry.register(WebFetchTool())
 ToolRegistry.register(ReadFileTool())
 ToolRegistry.register(WriteFileTool())
 ToolRegistry.register(LoadSkillTool())
+ToolRegistry.register(FetchOHLCVTool())
+ToolRegistry.register(CalculateIndicatorsTool())
+ToolRegistry.register(GetSystemStatusTool())
 
 __all__ = [
     'BaseTool',

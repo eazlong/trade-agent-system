@@ -25,6 +25,7 @@ class FrameManager:
         self._trading_state = FrameState.STOPPED
         self._assist_state = FrameState.STOPPED
         self._risk_guard_refs = 0  # 引用计数：trading+assist共享单实例
+        self._data_feed_refs = 0  # 引用计数：trading+assist共享数据源
         self._riskguard = None
         self._order_executor = None
 
@@ -55,6 +56,7 @@ class FrameManager:
             pipe.set('frame:trading:state', self._trading_state.value)
             pipe.set('frame:assist:state', self._assist_state.value)
             pipe.set('frame:risk_guard_refs', self._risk_guard_refs)
+            pipe.set('frame:data_feed_refs', self._data_feed_refs)
             pipe.set('frame:order_executor', '1' if self._order_executor else '0')
             pipe.execute()
         except Exception as e:
@@ -67,6 +69,7 @@ class FrameManager:
             trading = r.get('frame:trading:state')
             assist = r.get('frame:assist:state')
             risk_refs = r.get('frame:risk_guard_refs')
+            data_feed_refs = r.get('frame:data_feed_refs')
             order_exec = r.get('frame:order_executor')
 
             if trading == FrameState.RUNNING.value:
@@ -81,6 +84,9 @@ class FrameManager:
 
             if risk_refs is not None:
                 self._risk_guard_refs = int(risk_refs)
+
+            if data_feed_refs is not None:
+                self._data_feed_refs = int(data_feed_refs)
 
             if order_exec == '1':
                 # 标记需要恢复，但实际对象在 start 时重新初始化
@@ -219,11 +225,121 @@ class FrameManager:
     # --- Internal lifecycle methods (to be implemented) ---
 
     async def _start_data_feed(self) -> None:
-        logger.info('[FrameManager] data feed starting...')
-        # TODO: 启动WebSocket实时数据流
+        """连接所有已注册的数据源 WebSocket，并订阅信号监控所需的 K 线流。"""
+        self._data_feed_refs += 1
+        if self._data_feed_refs > 1:
+            # 已有其他 frame 启动了数据源，只需增加引用计数
+            self._persist_frame_state()
+            logger.info('[FrameManager] data feed already running (refs=%d)', self._data_feed_refs)
+            return
+
+        from apps.datasource.registry import DataSourceRegistry
+        from apps.datasource.base import DataType, KlineInterval, MarketType
+
+        # 1. 加载并连接所有已注册的 crypto 数据源
+        sources = DataSourceRegistry.list_registered()
+        for source_name in sources:
+            try:
+                ds = DataSourceRegistry.get(source_name)
+                if not ds.is_connected():
+                    connected = await ds.connect_websocket()
+                    if connected:
+                        logger.info('[FrameManager] data source %s connected', source_name)
+                    else:
+                        logger.warning('[FrameManager] data source %s connection failed', source_name)
+            except Exception as e:
+                logger.warning('[FrameManager] failed to load data source %s: %s', source_name, e)
+
+        # 2. 根据活跃信号监控自动订阅对应的 K 线数据
+        try:
+            monitors = self._get_active_signal_monitors()
+            for monitor in monitors:
+                symbol = monitor.symbol
+                interval_str = monitor.timeframe or '1h'
+                try:
+                    interval = KlineInterval(interval_str)
+                except ValueError:
+                    interval = KlineInterval.H1
+                    logger.warning(
+                        '[FrameManager] unknown timeframe %s, defaulting to 1h',
+                        interval_str,
+                    )
+
+                # 对每个已连接的数据源订阅 K 线
+                for source_name in DataSourceRegistry.list_registered():
+                    ds = DataSourceRegistry.get(source_name)
+                    if ds.is_connected() and DataType.KLINE in ds.supported_data_types:
+                        # 确定市场类型
+                        market = MarketType.SPOT
+                        if hasattr(monitor, 'market_type') and monitor.market_type == 'futures':
+                            market = MarketType.FUTURES
+
+                        await ds.subscribe(
+                            symbol=symbol,
+                            data_type=DataType.KLINE,
+                            interval=interval,
+                            market_type=market,
+                            callback=lambda data, m=monitor: self._on_kline_data(data, m),
+                        )
+                        logger.info(
+                            '[FrameManager] subscribed %s kline %s @%s (%s)',
+                            source_name, symbol, interval.value, market.value,
+                        )
+        except Exception as e:
+            logger.warning('[FrameManager] signal monitor subscription failed: %s', e)
+
+        self._persist_frame_state()
+        logger.info('[FrameManager] data feed started')
 
     async def _stop_data_feed(self) -> None:
+        """断开所有数据源 WebSocket 连接（引用计数为 0 时）。"""
+        self._data_feed_refs = max(0, self._data_feed_refs - 1)
+        if self._data_feed_refs > 0:
+            # 还有其他 frame 在使用数据源，不断开
+            self._persist_frame_state()
+            return
+
+        from apps.datasource.registry import DataSourceRegistry
+
+        for source_name in DataSourceRegistry.list_registered():
+            if DataSourceRegistry.is_loaded(source_name):
+                try:
+                    ds = DataSourceRegistry.get(source_name)
+                    if ds.is_connected():
+                        await ds.disconnect_websocket()
+                        logger.info('[FrameManager] data source %s disconnected', source_name)
+                except Exception as e:
+                    logger.warning('[FrameManager] failed to disconnect %s: %s', source_name, e)
+
+        self._persist_frame_state()
         logger.info('[FrameManager] data feed stopped')
+
+    def _get_active_signal_monitors(self) -> list:
+        """获取活跃的信号监控列表（同步，不依赖异步）。"""
+        try:
+            from apps.signal_monitor.models import SignalMonitor
+            from django.utils import timezone
+
+            monitors = list(SignalMonitor.objects.filter(status='active'))
+            now = timezone.now()
+            return [
+                m for m in monitors
+                if not m.expires_at or m.expires_at > now
+            ]
+        except Exception:
+            return []
+
+    def _on_kline_data(self, kline: dict, monitor) -> None:
+        """K 线数据回调：触发信号检查。"""
+        try:
+            from apps.signal_monitor.engine import SignalMonitorEngine
+            engine = SignalMonitorEngine.get_instance()
+            symbol = kline.get('symbol', '')
+            klines = engine._load_klines_for_monitors([monitor]).get(symbol, [])
+            if len(klines) >= 2:
+                engine.check_signals_for_kline(symbol, klines)
+        except Exception as e:
+            logger.warning('[FrameManager] kline callback error: %s', e)
 
     async def _start_risk_guard(self) -> None:
         self._risk_guard_refs += 1
