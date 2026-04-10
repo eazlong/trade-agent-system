@@ -1,14 +1,19 @@
 import os
 import asyncio
 import logging
+
+# MUST be set before any Django-dependent imports
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.dev')
+
+import django
+django.setup()
+
 from django.core.asgi import get_asgi_application
 from channels.routing import ProtocolTypeRouter, URLRouter
 from apps.notify.middleware import TokenAuthMiddleware
 
 # 导入 WebSocket 路由
 from apps.notify import routing as notify_routing
-
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.dev')
 
 # 获取基础 Django ASGI 应用
 django_asgi_app = get_asgi_application()
