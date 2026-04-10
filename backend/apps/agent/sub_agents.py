@@ -26,6 +26,10 @@ class _LLMAgent(BaseAgent):
         super().__init__()
         self._llm = LLMClient.get_instance()
         self._skills_loader = get_skills_loader(self.name)
+        # 每个 Agent 声明的可用工具列表（由 Prompt 元数据或子类指定）
+        self._agent_tools: list[str] = []
+        # 从 message.payload 中提取的上下文字段列表
+        self._context_fields: list[str] = []
 
     def _build_system_prompt(self) -> str:
         """动态构建 system prompt，避免单例 Agent 缓存旧技能内容。"""
@@ -50,17 +54,23 @@ class _LLMAgent(BaseAgent):
         return system_prompt
 
     def _get_tools_schema(self) -> list[dict]:
-        """获取当前可用工具的OpenAI function calling schema，包括技能加载工具"""
+        """获取当前 Agent 可用的工具 schema。
+
+        优先使用 _agent_tools 中声明的工具列表（由 Prompt 元数据注入）；
+        如果未声明，回退到全局所有工具。
+        """
         from apps.agent.tools.base import ToolRegistry
-        schemas = ToolRegistry.get_all_schemas()
-        # 如果有非 always 技能可按需加载，注册 load_skill 工具
-        all_skills = self._skills_loader.list_skills()
-        always_skills = set(self._skills_loader.get_always_skills())
-        on_demand_skills = [s for s in all_skills if s['name'] not in always_skills]
-        if on_demand_skills:
-            from apps.agent.tools.load_skill import LoadSkillTool
-            schemas.append(LoadSkillTool(agent_name=self.name).schema)
-        return schemas
+        if self._agent_tools:
+            schemas = []
+            for tool_name in self._agent_tools:
+                tool = ToolRegistry.get(tool_name)
+                if tool:
+                    schemas.append(tool.schema)
+                else:
+                    logger.warning('[%s] tool %s not found in registry', self.name, tool_name)
+            return schemas
+        # 回退：未声明工具列表时返回全部
+        return ToolRegistry.get_all_schemas()
 
     def _get_memory_manager(self, message: AgentMessage):
         from apps.memory.manager import MemoryManager
@@ -107,7 +117,7 @@ class _LLMAgent(BaseAgent):
 
         logger.debug('[%s] Final system prompt:\n%s', self.name, system[:1000])
 
-        # 更新system prompt以包含多轮对话指导
+        # 更新system prompt以包含多轮对话说明
         system += "\n\n### 多轮对话说明\n如果用户的问题需要持续的多轮交互来完成任务或者你为用户提供了继续对话的选项时，你需要：\n1. 询问用户更多细节或澄清问题\n2. 在回答最后加上'请提供您的反馈'。\n3. 根据上下文判断是否需要继续对话\n如果你认为对话已完成，请在回答末尾加入'任务完成'。"
 
         # 获取最近的对话上下文
@@ -160,7 +170,7 @@ class _LLMAgent(BaseAgent):
 
                 # 更新对话历史到L1记忆
                 conv_history = mem._l1.get('conv_history', [])
-                
+
                 # 添加用户消息
                 conv_history.append({
                     'role': 'user',
@@ -244,8 +254,14 @@ class _LLMAgent(BaseAgent):
         return AgentResult(task_id=message.task_id, success=True, data=response_data)
 
     def _build_context(self, message: AgentMessage) -> str:
-        """子类可覆写，提取payload中的结构化数据拼入prompt"""
-        return ''
+        """根据声明的 context_fields 从 payload 提取上下文"""
+        if not self._context_fields:
+            return ''
+        parts = []
+        for field in self._context_fields:
+            if value := message.payload.get(field):
+                parts.append(f'{field}: {value}')
+        return '\n'.join(parts)
 
     def _should_continue_conversation(self, content: str) -> bool:
         """
@@ -260,7 +276,7 @@ class _LLMAgent(BaseAgent):
             '是否还有', '还有什么', '下一步', '后续步骤', '想了解更多',
             '继续帮你', '接下来我', '下一步是', '后续是', '然后呢',
             '要不要', '是否想', '你想知道', '我可以帮你', '我可以继续',
-            '继续讨论', '深入探讨', '详细说明', '具体介绍','请提供您的反馈'
+            '继续讨论', '深入探讨', '详细说明', '具体介绍', '请提供您的反馈'
         ]
 
         # 检查是否有表示结束对话的词汇
@@ -288,84 +304,34 @@ class _LLMAgent(BaseAgent):
 
     def _should_reject(self, text: str) -> bool:
         """
-        在 LLM 回复前，通过规则快速预检是否明显不属于本 Agent。
+        在 LLM 回复前，通过规则预检是否明显不属于本 Agent。
         子类可覆写。
         """
         return False
 
 
-@AgentRegistry.register_class
-class AnalystAgent(_LLMAgent):
-    """市场分析Agent：技术面+基本面分析，信号生成"""
+def _build_dynamic_agent_class(meta: dict) -> type:
+    """根据 Prompt 元数据动态创建 Agent 类。"""
+    name = meta['name']
+    tools = meta.get('tools', [])
+    context_fields = meta.get('context_fields', [])
 
-    name = 'analyst'
-    prompt_name = 'analyst'
-    domain_description = (
-        '市场行情分析（技术面/基本面）、K线解读、趋势判断、交易信号生成。'
-        '不负责：交易计划制定、风控规则、仓位管理、策略代码编写。'
+    def make_init(self):
+        _LLMAgent.__init__(self)
+        self._agent_tools = tools
+        self._context_fields = context_fields
+
+    agent_cls = type(
+        f'{name.capitalize()}Agent',
+        (_LLMAgent,),
+        {
+            'name': name,
+            'prompt_name': name,
+            'domain_description': '',
+            '__init__': make_init,
+        },
     )
-
-    def _build_context(self, message: AgentMessage) -> str:
-        parts = []
-        if symbol := message.payload.get('symbol'):
-            parts.append(f'Symbol: {symbol}')
-        if timeframe := message.payload.get('timeframe'):
-            parts.append(f'Timeframe: {timeframe}')
-        if kline_data := message.payload.get('kline_data'):
-            parts.append(f'K-line data (latest 20 bars):\n{kline_data}')
-        return '\n'.join(parts)
-
-
-@AgentRegistry.register_class
-class QuantEngineerAgent(_LLMAgent):
-    """量化工程师Agent：策略代码生成与优化"""
-
-    name = 'quant'
-    prompt_name = 'quant'
-    domain_description = (
-        '量化策略代码编写、策略优化、回测执行。'
-        '不负责：市场分析、交易计划制定、风控建议。'
-    )
-
-
-@AgentRegistry.register_class
-class CoachAgent(_LLMAgent):
-    """交易教练Agent：计划制定、复盘总结"""
-
-    name = 'coach'
-    prompt_name = 'coach'
-    domain_description = (
-        '交易计划制定、交易复盘、周报总结、交易心理辅导。'
-        '不负责：实时行情分析、策略代码编写、仓位计算。'
-    )
-
-
-@AgentRegistry.register_class
-class RiskAdvisorAgent(_LLMAgent):
-    """风险顾问Agent：仓位评估、风控建议"""
-
-    name = 'risk_advisor'
-    prompt_name = 'risk_advisor'
-    domain_description = (
-        '仓位管理、止损建议、风险评估、风控规则制定。'
-        '不负责：行情预测、策略代码编写、交易复盘。'
-    )
-
-    def _build_context(self, message: AgentMessage) -> str:
-        parts = []
-        if position := message.payload.get('position_pct'):
-            parts.append(f'Current position: {position}%')
-        if daily_pnl := message.payload.get('daily_pnl_pct'):
-            parts.append(f'Daily PnL: {daily_pnl}%')
-        return '\n'.join(parts)
-
-
-# @AgentRegistry.register_class
-# class PlannerAgent(_LLMAgent):
-#     """计划制定Agent：制定交易计划"""
-
-#     name = 'planner'
-#     prompt_name = 'coach'   # 复用coach prompt，phase2独立
+    return agent_cls
 
 
 @AgentRegistry.register_class

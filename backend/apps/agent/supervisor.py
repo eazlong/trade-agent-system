@@ -15,7 +15,155 @@ from ..skill.loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
-INTENT_TO_AGENT = {
+
+# ------------------------------------------------------------------ #
+#  动态意图注册中心                                                     #
+# ------------------------------------------------------------------ #
+
+class IntentRouter:
+    """动态意图路由注册表
+
+    支持运行时注册意图与Agent的映射、框架操作意图、降级规则。
+    SubAgent 可通过装饰器或调用注册方法动态添加意图。
+    """
+
+    _instance: Optional['IntentRouter'] = None
+
+    def __init__(self):
+        # 意图 → Agent 名称
+        self._intent_to_agent: dict[str, str] = {}
+        # Agent 名称 → 意图（反向映射）
+        self._agent_to_intent: dict[str, str] = {}
+        # 框架意图 → (frame_type, action)
+        self._frame_intents: dict[str, tuple[str, str]] = {}
+        # 降级规则列表 [(regex_pattern, intent), ...]
+        self._fallback_rules: list[tuple[str, str]] = []
+
+    @classmethod
+    def get_instance(cls) -> 'IntentRouter':
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        """重置单例（主要用于测试）"""
+        cls._instance = None
+
+    # ---- 意图注册 ----
+
+    def register_intent(self, intent: str, agent_name: str) -> None:
+        """注册单个意图到Agent的映射"""
+        self._intent_to_agent[intent] = agent_name
+        self._agent_to_intent[agent_name] = intent
+
+    def register_intents(self, intent_map: dict[str, str]) -> None:
+        """批量注册意图映射 {intent: agent_name}"""
+        for intent, agent in intent_map.items():
+            self.register_intent(intent, agent)
+
+    def unregister_intent(self, intent: str) -> None:
+        """移除意图映射"""
+        agent = self._intent_to_agent.pop(intent, None)
+        if agent and self._agent_to_intent.get(agent) == intent:
+            del self._agent_to_intent[agent]
+
+    # ---- 框架意图注册 ----
+
+    def register_frame_intent(self, intent: str, frame_type: str, action: str) -> None:
+        """注册框架操作意图（如 start_trading, stop_monitor）"""
+        self._frame_intents[intent] = (frame_type, action)
+
+    def unregister_frame_intent(self, intent: str) -> None:
+        self._frame_intents.pop(intent, None)
+
+    # ---- 降级规则注册 ----
+
+    def register_fallback_rule(self, pattern: str, intent: str) -> None:
+        """注册降级规则（正则匹配 → 意图）"""
+        self._fallback_rules.append((pattern, intent))
+
+    def register_fallback_rules(self, rules: list[tuple[str, str]]) -> None:
+        """批量注册降级规则"""
+        for pattern, intent in rules:
+            self.register_fallback_rule(pattern, intent)
+
+    # ---- 查询 ----
+
+    def get_agent_for_intent(self, intent: str) -> str | None:
+        return self._intent_to_agent.get(intent)
+
+    def get_intent_for_agent(self, agent_name: str) -> str | None:
+        return self._agent_to_intent.get(agent_name)
+
+    def get_frame_intent(self, intent: str) -> tuple[str, str] | None:
+        return self._frame_intents.get(intent)
+
+    def is_frame_intent(self, intent: str) -> bool:
+        return intent in self._frame_intents
+
+    def all_intents(self) -> list[str]:
+        return list(self._intent_to_agent.keys())
+
+    def all_frame_intents(self) -> list[str]:
+        return list(self._frame_intents.keys())
+
+    def match_fallback(self, text: str) -> str | None:
+        for pattern, intent in self._fallback_rules:
+            if re.search(pattern, text):
+                return intent
+        return None
+
+    def valid_intents_for_prompt(self) -> list[str]:
+        """返回LLM Prompt中可用的意图列表"""
+        return self.all_intents() + self.all_frame_intents()
+
+
+def register_intent(intent: str, agent_name: str):
+    """装饰器：在函数或类上注册意图映射
+
+    用法:
+        @register_intent('analyze_market', 'analyst')
+        class AnalystAgent(_LLMAgent): ...
+
+        @register_intent('custom_intent', 'my_agent')
+        def some_setup(): ...
+    """
+    def decorator(target):
+        IntentRouter.get_instance().register_intent(intent, agent_name)
+        return target
+    return decorator
+
+
+def register_frame_intent(intent: str, frame_type: str, action: str):
+    """装饰器：注册框架操作意图"""
+    def decorator(target):
+        IntentRouter.get_instance().register_frame_intent(intent, frame_type, action)
+        return target
+    return decorator
+
+
+def register_fallback_rule(pattern: str, intent: str):
+    """装饰器：注册降级规则
+
+    用法:
+        @register_fallback_rule(r'(分析|行情).*(BTC|ETH)', 'analyze_market')
+        class AnalystAgent(_LLMAgent): ...
+    """
+    def decorator(target):
+        IntentRouter.get_instance().register_fallback_rule(pattern, intent)
+        return target
+    return decorator
+
+
+# ------------------------------------------------------------------ #
+#  内置意图注册（保持向后兼容）                                          #
+# ------------------------------------------------------------------ #
+
+_router = IntentRouter.get_instance()
+
+# 默认意图映射
+_router.register_intents({
     'analyze_market':    'analyst',
     'generate_signal':   'analyst',
     'generate_strategy': 'quant',
@@ -25,25 +173,30 @@ INTENT_TO_AGENT = {
     'review_trade':      'coach',
     'summarize_week':    'coach',
     'assess_risk':       'risk_advisor',
-}
+})
 
-AGENT_TO_INTENT = {v: k for k, v in INTENT_TO_AGENT.items()}
+# 默认框架意图
+_router.register_frame_intent('start_trading',  'trading', 'start')
+_router.register_frame_intent('stop_trading',   'trading', 'stop')
+_router.register_frame_intent('start_monitor',  'assist', 'start')
+_router.register_frame_intent('stop_monitor',   'assist', 'stop')
 
-FRAME_INTENTS = {
-    'start_trading':  ('trading', 'start'),
-    'stop_trading':   ('trading', 'stop'),
-    'start_monitor':  ('assist', 'start'),
-    'stop_monitor':   ('assist', 'stop'),
-}
-
-# 意图解析降级规则
-FALLBACK_RULES = [
+# 默认降级规则
+_router.register_fallback_rules([
     (r'(分析|行情|走势|K线|趋势).*(BTC|ETH|币|市场)', 'analyze_market'),
     (r'(回测|测试策略|历史数据)', 'run_backtest'),
     (r'(风险|止损|仓位|风控)', 'assess_risk'),
     (r'(计划|复盘|总结|周报)', 'create_plan'),
     (r'(策略|代码|编写)', 'generate_strategy'),
-]
+])
+
+
+# 保持旧模块级变量的向后兼容（指向 router 的数据）
+# 新代码应直接使用 IntentRouter.get_instance()
+INTENT_TO_AGENT = _router._intent_to_agent
+AGENT_TO_INTENT = _router._agent_to_intent
+FRAME_INTENTS = _router._frame_intents
+FALLBACK_RULES = _router._fallback_rules
 
 MAX_REROUTE = 2
 PAUSE_TTL = 300  # 5 minutes
@@ -62,9 +215,30 @@ class SupervisorAgent(BaseAgent):
         self._frame = FrameManager.get_instance()
         self._prompt_loader = PromptLoader
         self._skills_loader = get_skills_loader(self.name)
+
+        # 动态发现并注册所有 Agent（从 Prompt 文件）
+        from .registry import AgentRegistry
+        AgentRegistry.discover_from_prompts()
+
+        # 从 Prompt 元数据动态注册意图映射
+        self._register_intents_from_prompts()
+
         self._system_prompt = PromptLoader.load('supervisor')
         self._skills_summary = self._skills_loader.build_summary()
         self._always_skills = self._skills_loader.get_always_skills()
+        self._router = IntentRouter.get_instance()
+
+    def _register_intents_from_prompts(self) -> None:
+        """从 Prompt 元数据注册意图映射。"""
+        from .registry import AgentRegistry
+        from .prompt_loader import PromptLoader
+
+        agents = PromptLoader.list_agents()
+        for meta in agents:
+            name = meta.get('name')
+            intent = meta.get('intent')
+            if name and intent:
+                self._router.register_intent(intent, name)
 
     @classmethod
     def get_instance(cls) -> 'SupervisorAgent':
@@ -180,7 +354,7 @@ class SupervisorAgent(BaseAgent):
             # 尝试用新意图路由
             new_intent = await self._parse_intent(message.payload.get('text', ''))
             if new_intent and new_intent != 'free_chat':
-                new_agent = INTENT_TO_AGENT.get(new_intent)
+                new_agent = self._router.get_agent_for_intent(new_intent)
                 if new_agent and new_agent != agent_name:
                     return await self._route_with_fallback(message, new_intent, {agent_name})
 
@@ -234,11 +408,11 @@ class SupervisorAgent(BaseAgent):
         message.intent = intent
 
         # 框架生命周期
-        if intent in FRAME_INTENTS:
+        if self._router.is_frame_intent(intent):
             return await self._handle_frame(intent, message)
 
         # 路由子Agent
-        agent_name = INTENT_TO_AGENT.get(intent)
+        agent_name = self._router.get_agent_for_intent(intent)
         if agent_name:
             result = await self._route_with_fallback(message, intent)
 
@@ -268,7 +442,7 @@ class SupervisorAgent(BaseAgent):
                                    attempted: set | None = None) -> AgentResult:
         """带拒收重路由的 Agent 调用"""
         attempted = attempted or set()
-        agent_name = INTENT_TO_AGENT.get(intent)
+        agent_name = self._router.get_agent_for_intent(intent)
 
         if not agent_name or agent_name in attempted or len(attempted) >= MAX_REROUTE:
             return await self._free_chat(message)
@@ -282,7 +456,7 @@ class SupervisorAgent(BaseAgent):
 
             # 优先用 SubAgent 建议的目标
             if result.reroute_suggestion and result.reroute_suggestion not in attempted:
-                suggested_intent = AGENT_TO_INTENT.get(result.reroute_suggestion)
+                suggested_intent = self._router.get_intent_for_agent(result.reroute_suggestion)
                 if suggested_intent:
                     return await self._route_with_fallback(message, suggested_intent, attempted)
 
@@ -293,7 +467,7 @@ class SupervisorAgent(BaseAgent):
                 exclude_agents=exclude_agents,
             )
             if new_intent and new_intent != 'free_chat':
-                new_agent = INTENT_TO_AGENT.get(new_intent)
+                new_agent = self._router.get_agent_for_intent(new_intent)
                 if new_agent and new_agent not in attempted:
                     return await self._route_with_fallback(message, new_intent, attempted)
 
@@ -355,7 +529,7 @@ class SupervisorAgent(BaseAgent):
         if not text:
             return 'unknown'
 
-        valid_intents = list(INTENT_TO_AGENT.keys()) + list(FRAME_INTENTS.keys())
+        valid_intents = self._router.valid_intents_for_prompt()
         context_block = ''
         if context:
             context_block = f'Recent routing history (for reference): {json.dumps(context)}\n\n'
@@ -412,13 +586,14 @@ class SupervisorAgent(BaseAgent):
 
     def _rule_based_intent(self, text: str) -> str | None:
         """规则引擎降级"""
-        for pattern, intent in FALLBACK_RULES:
-            if re.search(pattern, text):
-                return intent
-        return None
+        return self._router.match_fallback(text)
 
     async def _handle_frame(self, intent: str, message: AgentMessage) -> AgentResult:
-        frame_type, action = FRAME_INTENTS[intent]
+        frame_action = self._router.get_frame_intent(intent)
+        if not frame_action:
+            return AgentResult(task_id=message.task_id, success=False, error=f'Unknown frame intent: {intent}')
+
+        frame_type, action = frame_action
         try:
             if action == 'start':
                 await self._frame.start(frame_type)

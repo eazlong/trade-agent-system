@@ -16,6 +16,10 @@ class DataSourceConfig(models.Model):
     """
     name = models.CharField(max_length=64, unique=True)
     config = models.JSONField(default=dict)
+    market_types = models.JSONField(
+        default=list, blank=True,
+        help_text='["spot"], ["futures"], 或同时配置。空列表=全部。'
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -123,3 +123,19 @@ class QualityReportSerializer(serializers.Serializer):
     latency_violations = serializers.IntegerField()
     status = serializers.CharField()
     issues = serializers.ListField(child=serializers.CharField())
+
+
+class ConnectRequestSerializer(serializers.Serializer):
+    """数据源连接请求"""
+    market_types = serializers.ListField(
+        child=serializers.CharField(), required=False,
+        help_text='["spot"], ["futures"], 或两者。默认：全部。'
+    )
+
+
+class DataSourceConfigSerializer(serializers.Serializer):
+    """数据源配置请求"""
+    market_types = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_empty=True,
+        help_text='["spot"], ["futures"], 或两者。空列表=全部。'
+    )
