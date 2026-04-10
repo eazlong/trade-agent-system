@@ -8,32 +8,17 @@ when_to_use: 用户请求创建交易系统、查看交易系统、更新交易�
 
 管理用户的交易系统文档，支持创建、查看和版本化更新。
 
-## 工作目录
+## 文件目录
 
-- 默认根目录：`~/.tradelogx/`
-- 交易系统目录：`~/.tradelogx/trading_systems/`
+- 交易系统文件位于目录下：`~/.tradelogx/trading_systems/`
 - 文件命名：`trading_systems_{version}.md`，其中 `latest` 始终指向最新版本
 
 ## 流程
 
 ### 1. 读取交易系统
 
-用户请求查看或操作交易系统时，首先读取最新版本：
-
-```python
-from pathlib import Path
-
-root = Path.home() / '.tradelogx'
-ts_dir = root / 'trading_systems'
-version = payload.get('version', 'latest')
-ts_file = ts_dir / f'trading_systems_{version}.md'
-
-if ts_file.exists():
-    content = ts_file.read_text(encoding='utf-8')
-    # 展示给用户
-else:
-    # 交易系统不存在，走创建流程
-```
+用户请求查看或操作交易系统时，首先在文件目录下读取latest版本：
+判断交易系统文件是否存在，如不存在走创建流程，如已存在，则使用read_file读取内容并展示给用户。
 
 ### 2. 已存在：展示并询问是否更新
 
@@ -72,7 +57,7 @@ def get_next_version(ts_dir: Path) -> str:
 
 def archive_and_save(ts_dir: Path, new_content: str):
     """归档旧版本，保存新版本"""
-    latest = ts_dir / 'trading_system_latest.md.md'
+    latest = ts_dir / 'trading_system_latest.md'
     if latest.exists():
         next_ver = get_next_version(ts_dir)
         latest.rename(ts_dir / f'trading_systems_{next_ver}.md')
@@ -91,7 +76,7 @@ def archive_and_save(ts_dir: Path, new_content: str):
    - 可用资金规模
    - 其他偏好或约束
 2. **生成交易系统** — 基于收集的信息，生成结构化交易系统文档
-3. **保存文件** — 创建 `trading_systems/` 目录，写入 `trading_system_latest.md.md`
+3. **保存文件** — 创建 `trading_systems/` 目录，写入 `trading_system_latest.md`
 
 ## 交易系统文档结构
 
@@ -151,15 +136,6 @@ def archive_and_save(ts_dir: Path, new_content: str):
 |------|------|----------|
 | v1 | {date} | 初始版本 |
 ```
-
-## 输入参数
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| action | str | 是 | — | `create` / `view` / `update` |
-| version | str | 否 | latest | 查看指定版本 |
-| work_dir | str | 否 | ~/.tradelogx/ | 工作目录 |
-| update_content | str | 否 | — | 更新内容描述（update 时使用） |
 
 ## 注意事项
 
