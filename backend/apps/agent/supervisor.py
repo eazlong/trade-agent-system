@@ -169,9 +169,9 @@ _router.register_intents({
     'generate_strategy': 'quant',
     'run_backtest':      'backtest',
     'create_plan':       'coach',
-    'create_trading_system': 'coach',
+    'trading_system':    'coach',
     'review_trade':      'coach',
-    'summarize_week':    'coach',
+    'summarize_trades':  'coach',
     'assess_risk':       'risk_advisor',
 })
 
@@ -214,6 +214,7 @@ class SupervisorAgent(BaseAgent):
         self._llm = LLMClient.get_instance()
         self._frame = FrameManager.get_instance()
         self._prompt_loader = PromptLoader
+        self._router = IntentRouter.get_instance()
         self._skills_loader = get_skills_loader(self.name)
 
         # 动态发现并注册所有 Agent（从 Prompt 文件）
@@ -226,7 +227,6 @@ class SupervisorAgent(BaseAgent):
         self._system_prompt = PromptLoader.load('supervisor')
         self._skills_summary = self._skills_loader.build_summary()
         self._always_skills = self._skills_loader.get_always_skills()
-        self._router = IntentRouter.get_instance()
 
     def _register_intents_from_prompts(self) -> None:
         """从 Prompt 元数据注册意图映射。"""
