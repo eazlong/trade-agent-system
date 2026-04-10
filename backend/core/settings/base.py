@@ -95,6 +95,7 @@ REDIS_DB_TRADING_STREAM = 4
 REDIS_DB_POSITION = 5
 REDIS_DB_MEMORY = 6
 REDIS_DB_RISK = 7
+REDIS_DB_FRAME = 8  # 框架状态持久化
 
 CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379') + '/2'
 CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://localhost:6379') + '/2'
@@ -197,5 +198,6 @@ LOGGING = {
         'httpx':    {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
         'httpcore': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
         'telegram': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'markdown_it': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
     },
 }
