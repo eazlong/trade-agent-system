@@ -247,6 +247,18 @@ class FrameManager:
                         logger.info('[FrameManager] data source %s connected', source_name)
                     else:
                         logger.warning('[FrameManager] data source %s connection failed', source_name)
+                else:
+                    logger.info('[FrameManager] data source %s already connected', source_name)
+
+                # 输出当前运行状态
+                status = ds.get_status()
+                logger.info(
+                    '[FrameManager] data source %s status: connected=%s, subs=%d, '
+                    'last_data_age=%ss, market_types=%s, types=%s',
+                    source_name, status['connected'], status['subscriptions'],
+                    status.get('last_data_age_seconds'), status['market_types'],
+                    status['supported_data_types'],
+                )
             except Exception as e:
                 logger.warning('[FrameManager] failed to load data source %s: %s', source_name, e)
 
@@ -289,6 +301,16 @@ class FrameManager:
             logger.warning('[FrameManager] signal monitor subscription failed: %s', e)
 
         self._persist_frame_state()
+        # 输出所有数据源最终状态
+        for source_name in DataSourceRegistry.list_registered():
+            if DataSourceRegistry.is_loaded(source_name):
+                ds = DataSourceRegistry.get(source_name)
+                s = ds.get_status()
+                logger.info(
+                    '[FrameManager] data source %s final: connected=%s, subs=%d, '
+                    'sub_keys=%s',
+                    source_name, s['connected'], s['subscriptions'], s['subscription_keys'],
+                )
         logger.info('[FrameManager] data feed started')
 
     async def _stop_data_feed(self) -> None:
@@ -297,6 +319,7 @@ class FrameManager:
         if self._data_feed_refs > 0:
             # 还有其他 frame 在使用数据源，不断开
             self._persist_frame_state()
+            logger.info('[FrameManager] data feed refs=%d, keeping alive', self._data_feed_refs)
             return
 
         from apps.datasource.registry import DataSourceRegistry
@@ -305,6 +328,12 @@ class FrameManager:
             if DataSourceRegistry.is_loaded(source_name):
                 try:
                     ds = DataSourceRegistry.get(source_name)
+                    status = ds.get_status()
+                    logger.info(
+                        '[FrameManager] stopping data source %s: connected=%s, subs=%d, keys=%s',
+                        source_name, status['connected'], status['subscriptions'],
+                        status['subscription_keys'],
+                    )
                     if ds.is_connected():
                         await ds.disconnect_websocket()
                         logger.info('[FrameManager] data source %s disconnected', source_name)

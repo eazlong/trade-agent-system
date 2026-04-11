@@ -8,6 +8,7 @@ OKX 数据源
 """
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Callable
@@ -21,6 +22,8 @@ from apps.datasource.base import (
 from apps.datasource.registry import DataSourceRegistry
 from apps.datasource.store import get_data_store
 from apps.datasource.monitor import get_quality_monitor
+
+logger = logging.getLogger(__name__)
 
 
 @DataSourceRegistry.register('okx')
@@ -76,6 +79,7 @@ class OKXDataSource(BaseDataSource):
         """建立 WebSocket 连接"""
         try:
             self._ws_status = ConnectionStatus.CONNECTING
+            logger.info('[OKX] connecting WebSocket, endpoint=%s', self.ws_endpoint)
 
             if self._http_client is None:
                 self._http_client = aiohttp.ClientSession()
@@ -93,16 +97,21 @@ class OKXDataSource(BaseDataSource):
 
             await self._resubscribe_all()
 
+            status = self.get_status()
+            logger.info('[OKX] WebSocket connected: status=%s, subs=%d',
+                        status['status'], status['subscriptions'])
             return True
 
         except Exception as e:
             self._ws_status = ConnectionStatus.ERROR
-            print(f"OKX WebSocket connection error: {e}")
+            logger.error('[OKX] WebSocket connection error: %s', e)
             return False
 
     async def disconnect_websocket(self) -> bool:
         """断开 WebSocket 连接"""
         try:
+            logger.info('[OKX] disconnecting WebSocket, current_subs=%d', len(self._subscriptions))
+
             if self._ws_task:
                 self._ws_task.cancel()
                 try:
@@ -115,10 +124,11 @@ class OKXDataSource(BaseDataSource):
             self._ws = None
 
             self._ws_status = ConnectionStatus.DISCONNECTED
+            logger.info('[OKX] WebSocket disconnected')
             return True
 
         except Exception as e:
-            print(f"OKX WebSocket disconnect error: {e}")
+            logger.error('[OKX] WebSocket disconnect error: %s', e)
             return False
 
     async def _ws_receiver(self) -> None:
