@@ -208,6 +208,26 @@ class BaseDataSource(ABC):
         """获取最后接收数据时间"""
         return self._last_data_time
 
+    def get_status(self) -> Dict[str, Any]:
+        """获取数据源当前运行状态"""
+        import time
+        now = time.time()
+        last_data_age = round(now - self._last_data_time, 1) if self._last_data_time > 0 else None
+
+        return {
+            'name': self.name,
+            'source_type': self.source_type,
+            'status': self._ws_status.value,
+            'connected': self.is_connected(),
+            'connected_at': self._connected_at.isoformat() if self._connected_at else None,
+            'subscriptions': len(self._subscriptions),
+            'subscription_keys': list(self._subscriptions.keys()),
+            'last_data_time': datetime.fromtimestamp(self._last_data_time).isoformat() if self._last_data_time > 0 else None,
+            'last_data_age_seconds': last_data_age,
+            'market_types': [mt.value for mt in (self._market_types or self.supported_market_types)],
+            'supported_data_types': [dt.value for dt in self.supported_data_types],
+        }
+
     # ==================== REST API ====================
 
     @abstractmethod

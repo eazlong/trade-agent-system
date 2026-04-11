@@ -8,6 +8,7 @@ Bybit 数据源
 """
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
@@ -21,6 +22,8 @@ from apps.datasource.base import (
 from apps.datasource.registry import DataSourceRegistry
 from apps.datasource.store import get_data_store
 from apps.datasource.monitor import get_quality_monitor
+
+logger = logging.getLogger(__name__)
 
 
 @DataSourceRegistry.register('bybit')
@@ -78,9 +81,9 @@ class BybitDataSource(BaseDataSource):
         """建立 WebSocket 连接（仅连接已配置的市场类型）"""
         try:
             self._ws_status = ConnectionStatus.CONNECTING
-
-            # 获取需要连接的市场类型
             active_types = self._get_active_market_types()
+            logger.info('[Bybit] connecting WebSocket, markets=%s',
+                        [mt.value for mt in active_types])
 
             if self._http_client is None:
                 self._http_client = aiohttp.ClientSession()
@@ -113,16 +116,21 @@ class BybitDataSource(BaseDataSource):
 
             await self._resubscribe_all()
 
+            status = self.get_status()
+            logger.info('[Bybit] WebSocket connected: status=%s, subs=%d',
+                        status['status'], status['subscriptions'])
             return True
 
         except Exception as e:
             self._ws_status = ConnectionStatus.ERROR
-            print(f"Bybit WebSocket connection error: {e}")
+            logger.error('[Bybit] WebSocket connection error: %s', e)
             return False
 
     async def disconnect_websocket(self) -> bool:
         """断开 WebSocket 连接"""
         try:
+            logger.info('[Bybit] disconnecting WebSocket, current_subs=%d', len(self._subscriptions))
+
             for task in self._ws_tasks:
                 task.cancel()
                 try:
@@ -140,10 +148,11 @@ class BybitDataSource(BaseDataSource):
             self._ws_futures = None
 
             self._ws_status = ConnectionStatus.DISCONNECTED
+            logger.info('[Bybit] WebSocket disconnected')
             return True
 
         except Exception as e:
-            print(f"Bybit WebSocket disconnect error: {e}")
+            logger.error('[Bybit] WebSocket disconnect error: %s', e)
             return False
 
     async def _ws_spot_receiver(self) -> None:

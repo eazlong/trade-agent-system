@@ -8,6 +8,7 @@ Binance 数据源
 """
 import asyncio
 import json
+import logging
 import time
 import threading
 from datetime import datetime, timedelta
@@ -22,6 +23,8 @@ from apps.datasource.base import (
 from apps.datasource.registry import DataSourceRegistry
 from apps.datasource.store import get_data_store
 from apps.datasource.monitor import get_quality_monitor
+
+logger = logging.getLogger(__name__)
 
 
 @DataSourceRegistry.register('binance')
@@ -102,13 +105,14 @@ class BinanceDataSource(BaseDataSource):
         """建立 WebSocket 连接（仅连接已配置的市场类型）"""
         try:
             self._ws_status = ConnectionStatus.CONNECTING
-
-            # 获取需要连接的市场类型
             active_types = self._get_active_market_types()
+            logger.info('[Binance] connecting WebSocket, markets=%s, spot_endpoint=%s, futures_endpoint=%s',
+                        [mt.value for mt in active_types], self.ws_spot_endpoint, self.ws_futures_endpoint)
 
             # 创建 HTTP 客户端
             if self._http_client is None:
                 self._http_client = aiohttp.ClientSession()
+                logger.info('[Binance] HTTP client created')
 
             # 仅在配置了现货时连接现货 WebSocket
             if MarketType.SPOT in active_types:
@@ -141,16 +145,21 @@ class BinanceDataSource(BaseDataSource):
             # 发送活跃订阅
             await self._resubscribe_all()
 
+            status = self.get_status()
+            logger.info('[Binance] WebSocket connected: status=%s, subs=%d, last_data=%s',
+                        status['status'], status['subscriptions'], status['last_data_time'])
             return True
 
         except Exception as e:
             self._ws_status = ConnectionStatus.ERROR
-            print(f"Binance WebSocket connection error: {e}")
+            logger.error('[Binance] WebSocket connection error: %s', e)
             return False
 
     async def disconnect_websocket(self) -> bool:
         """断开 WebSocket 连接"""
         try:
+            logger.info('[Binance] disconnecting WebSocket, current_subs=%d', len(self._subscriptions))
+
             # 取消消息处理任务
             for task in self._ws_tasks:
                 task.cancel()
@@ -171,10 +180,11 @@ class BinanceDataSource(BaseDataSource):
 
             self._ws_status = ConnectionStatus.DISCONNECTED
 
+            logger.info('[Binance] WebSocket disconnected')
             return True
 
         except Exception as e:
-            print(f"Binance WebSocket disconnect error: {e}")
+            logger.error('[Binance] WebSocket disconnect error: %s', e)
             return False
 
     async def _ws_spot_receiver(self) -> None:
