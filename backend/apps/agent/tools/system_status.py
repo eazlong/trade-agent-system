@@ -95,11 +95,14 @@ class GetSystemStatusTool(BaseTool):
 
         # Supervisor 状态
         from apps.agent.supervisor import SupervisorAgent
+        from apps.skill.loader import get_skills_loader
+
         supervisor = SupervisorAgent._instance
+        loader = get_skills_loader('supervisor') if supervisor else None
         sup_status = {
             'name': 'supervisor',
             'running': supervisor is not None,
-            'skills_loaded': len(supervisor._always_skills) if supervisor else 0,
+            'skills_loaded': len(loader.get_always_skills()) if loader else 0,
         } if supervisor else {'name': 'supervisor', 'running': False, 'skills_loaded': 0}
 
         # 意图路由
