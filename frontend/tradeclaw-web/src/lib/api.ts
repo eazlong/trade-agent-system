@@ -189,6 +189,11 @@ export interface RiskConfig {
   daily_loss_warning_pct: number;
   consecutive_loss_alert: number;
   position_suggestion_limit: number;
+  max_position_pct: number;
+  max_drawdown_pct: number;
+  var_limit_pct: number;
+  stop_loss_pct: number;
+  auto_stop: boolean;
   updated_at: string;
 }
 
@@ -197,6 +202,33 @@ export const riskApi = {
   getConfig: () => request<RiskConfig>("/api/risk/config/"),
   updateConfig: (data: Partial<RiskConfig>) =>
     request<RiskConfig>("/api/risk/config/", "PUT", data),
+};
+
+// ── Exchange API ──
+
+export interface ExchangeAccount {
+  id: string;
+  exchange: string;
+  label: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface CreateExchangeAccountPayload {
+  exchange: string;
+  label?: string;
+  api_key: string;
+  api_secret: string;
+  testnet?: boolean;
+  leverage?: number;
+}
+
+export const exchangeApi = {
+  getAccounts: () => request<ExchangeAccount[]>("/api/exchange/accounts/"),
+  createAccount: (data: CreateExchangeAccountPayload) =>
+    request<ExchangeAccount>("/api/exchange/accounts/", "POST", data),
+  deleteAccount: (id: string) =>
+    request<void>(`/api/exchange/accounts/${id}/`, "DELETE"),
 };
 
 // ── Agent API ──

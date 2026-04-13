@@ -85,8 +85,9 @@ class _LLMAgent(BaseAgent):
         return context_messages
 
     async def handle(self, message: AgentMessage) -> AgentResult:
-        logger.info('[%s] Handling message with intent: %s, payload keys: %s', self.name, message.intent, list(message.payload.keys()))
         text = message.payload.get('text', '')
+        logger.info('[%s] Handling message with intent: %s, payload keys: %s， %s', self.name, message.intent, list(message.payload.keys()), text)
+
         extra = self._build_context(message)
         user_prompt = f'{extra}\n\n{text}'.strip() if extra else text
 

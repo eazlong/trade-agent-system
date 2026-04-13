@@ -2,19 +2,48 @@
 WebSocket consumer for real-time log streaming.
 Reads from Redis Stream 'system:logs' and pushes to connected clients,
 with optional level/module/search filtering.
+
+Auth: JWT token passed via query parameter '?token=xxx',
+validated directly in the consumer.
 """
 import asyncio
 import json
 import logging
+from urllib.parse import parse_qs
 
 import redis.asyncio as aioredis
+from asgiref.sync import sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import AccessToken
 
 logger = logging.getLogger(__name__)
 
 LOG_STREAM_KEY = "system:logs"
 LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+
+
+def _get_user_by_token(token_string):
+    """Validate JWT and return user. Must run via sync_to_async."""
+    from django.contrib.auth import get_user_model
+
+    try:
+        access_token = AccessToken(token_string)
+        user_id = access_token["user_id"]
+    except (TokenError, KeyError) as e:
+        logger.warning(f"[LogWebSocket] Token decode error: {e}")
+        return None
+
+    User = get_user_model()
+    try:
+        return User.objects.get(id=user_id, is_active=True)
+    except User.DoesNotExist:
+        logger.warning(f"[LogWebSocket] User {user_id} not found or inactive")
+        return None
+    except Exception as e:
+        logger.warning(f"[LogWebSocket] User lookup error: {e}")
+        return None
 
 
 class LogConsumer(AsyncWebsocketConsumer):
@@ -36,14 +65,30 @@ class LogConsumer(AsyncWebsocketConsumer):
         self._min_level_rank = 0
         self._module_filter = None
         self._search_filter = None
+        self.user_id = None
 
     async def connect(self):
-        if self.scope["user"].is_anonymous:
+        # Parse query string for JWT token
+        query_string = self.scope.get("query_string", b"").decode()
+        query_params = parse_qs(query_string)
+        token_list = query_params.get("token", [])
+
+        if not token_list:
+            logger.warning("[LogWebSocket] No token in query string")
             await self.close(code=4001)
             return
 
+        token = token_list[0]
+        user = await sync_to_async(_get_user_by_token)(token)
+
+        if not user:
+            logger.warning("[LogWebSocket] Auth failed: invalid token or user not found")
+            await self.close(code=4001)
+            return
+
+        self.user_id = user.id
         await self.accept()
-        logger.info(f"[LogWebSocket] User {self.scope['user'].id} connected")
+        logger.info(f"[LogWebSocket] User {user.id} connected")
 
     async def disconnect(self, close_code):
         if self._read_task:
@@ -54,7 +99,7 @@ class LogConsumer(AsyncWebsocketConsumer):
                 pass
         if self._redis:
             await self._redis.aclose()
-        logger.info(f"[LogWebSocket] User {self.scope['user'].id} disconnected")
+        logger.info(f"[LogWebSocket] User {self.user_id} disconnected")
 
     async def receive(self, text_data):
         try:

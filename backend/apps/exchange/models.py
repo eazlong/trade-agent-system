@@ -1,6 +1,6 @@
 import uuid
-from django.db import models
 from django.conf import settings
+from django.db import models
 
 
 class ExchangeAccount(models.Model):
@@ -17,3 +17,22 @@ class ExchangeAccount(models.Model):
 
     def __str__(self):
         return f'{self.exchange} ({self.label})'
+
+    def _get_fernet(self):
+        from cryptography.fernet import Fernet
+        key = getattr(settings, 'FERNET_KEY', '')
+        if not key:
+            raise ValueError('FERNET_KEY not configured')
+        return Fernet(key.encode())
+
+    def encrypt_api_key(self, value: str) -> bytes:
+        return self._get_fernet().encrypt(value.encode())
+
+    def encrypt_api_secret(self, value: str) -> bytes:
+        return self._get_fernet().encrypt(value.encode())
+
+    def decrypt_api_key(self) -> str:
+        return self._get_fernet().decrypt(bytes(self.api_key_enc)).decode()
+
+    def decrypt_api_secret(self) -> str:
+        return self._get_fernet().decrypt(bytes(self.api_secret_enc)).decode()
