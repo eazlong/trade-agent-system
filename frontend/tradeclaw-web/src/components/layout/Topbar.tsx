@@ -8,6 +8,8 @@ import { useRightPanel } from "@/components/layout/DashboardShell";
 const NAV_ITEMS = [
   { key: "overview", label: "总览" },
   { key: "agents", label: "智能体" },
+  { key: "backtest", label: "回测" },
+  { key: "trading", label: "交易" },
   { key: "logs", label: "日志" },
   { key: "settings", label: "配置" },
 ];

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 
 from django.test import TestCase
 
-from apps.backtest.models import BacktestResult
+from apps.backtest.models import BacktestResult, BacktestTrade
 
 
 class TestBacktestResultModel(TestCase):
@@ -90,3 +90,87 @@ class TestBacktestResultModel(TestCase):
         self.assertIsNone(result.sharpe_ratio)
         self.assertIsNone(result.max_drawdown_pct)
         self.assertIsNone(result.win_rate)
+
+    def test_backtest_result_equity_curve(self):
+        """测试权益曲线 JSON 字段"""
+        curve = [
+            {'timestamp': '2024-01-01T00:00:00Z', 'equity': 10000.0, 'drawdown': 0.0},
+            {'timestamp': '2024-01-02T00:00:00Z', 'equity': 10150.0, 'drawdown': -0.002},
+        ]
+        dd_curve = [
+            {'timestamp': '2024-01-01T00:00:00Z', 'drawdown': 0.0},
+            {'timestamp': '2024-01-02T00:00:00Z', 'drawdown': -0.002},
+        ]
+        result = BacktestResult.objects.create(
+            strategy=self.strategy,
+            symbol='BTC/USDT',
+            timeframe='1d',
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            initial_capital=Decimal('10000.00'),
+            final_capital=Decimal('10150.00'),
+            total_return_pct=1.5,
+            equity_curve=curve,
+            drawdown_curve=dd_curve,
+        )
+        self.assertEqual(len(result.equity_curve), 2)
+        self.assertEqual(result.equity_curve[0]['equity'], 10000.0)
+        self.assertEqual(len(result.drawdown_curve), 2)
+
+    def test_backtest_trade(self):
+        """测试交易日志模型"""
+        result = BacktestResult.objects.create(
+            strategy=self.strategy,
+            symbol='BTC/USDT',
+            timeframe='1h',
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            initial_capital=Decimal('10000.00'),
+            final_capital=Decimal('10500.00'),
+            total_return_pct=5.0,
+        )
+        trade = BacktestTrade.objects.create(
+            backtest=result,
+            entry_time=datetime(2024, 1, 5, 8, 0),
+            exit_time=datetime(2024, 1, 6, 14, 0),
+            symbol='BTC/USDT',
+            side='long',
+            entry_price=Decimal('42000.00'),
+            exit_price=Decimal('42800.00'),
+            quantity=Decimal('0.5'),
+            pnl=Decimal('400.00'),
+            pnl_pct=1.90,
+            cumulative_pnl=Decimal('400.00'),
+            fees=Decimal('4.20'),
+            tags=['take_profit'],
+        )
+        self.assertEqual(trade.side, 'long')
+        self.assertEqual(trade.pnl, Decimal('400.00'))
+        self.assertEqual(trade.tags, ['take_profit'])
+
+    def test_backtest_trade_related_name(self):
+        """测试通过 backtest.trades 反向查询"""
+        result = BacktestResult.objects.create(
+            strategy=self.strategy,
+            symbol='ETH/USDT',
+            timeframe='4h',
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            initial_capital=Decimal('5000.00'),
+            final_capital=Decimal('5200.00'),
+            total_return_pct=4.0,
+        )
+        for i in range(3):
+            BacktestTrade.objects.create(
+                backtest=result,
+                entry_time=datetime(2024, 1, 5 + i, 8, 0),
+                exit_time=datetime(2024, 1, 6 + i, 14, 0),
+                symbol='ETH/USDT',
+                side='long' if i % 2 == 0 else 'short',
+                entry_price=Decimal('2200.00'),
+                exit_price=Decimal('2250.00'),
+                quantity=Decimal('1.0'),
+                pnl=Decimal('50.00'),
+            )
+        self.assertEqual(result.trades.count(), 3)
+        self.assertEqual(result.trades.filter(side='long').count(), 2)

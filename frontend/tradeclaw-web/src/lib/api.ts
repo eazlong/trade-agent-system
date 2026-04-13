@@ -171,7 +171,54 @@ export const tradingApi = {
   getStrategies: () => request<Strategy[]>("/api/trading/strategies/"),
   createStrategy: (data: Partial<Strategy>) =>
     request<Strategy>("/api/trading/strategies/", "POST", data),
+  getSummary: () =>
+    request<TradingSummary>("/api/trading/summary/"),
+  getPositions: () =>
+    request<PositionResponse>("/api/trading/positions/"),
+  getAccounts: () =>
+    request<ExchangeAccountWithBalance[]>("/api/trading/accounts/"),
 };
+
+// ── Trading Page Types ──
+
+export interface PositionInfo {
+  exchange: string;
+  exchange_account_id?: string;
+  symbol: string;
+  side: "long" | "short";
+  quantity: string;
+  entry_price: string;
+  mark_price: string;
+  unrealized_pnl: string;
+}
+
+export interface PositionResponse {
+  positions: PositionInfo[];
+  executor_running: boolean;
+  message?: string;
+}
+
+export interface TradingSummary {
+  total_equity: string;
+  today_realized_pnl: string;
+  active_orders_count: number;
+  total_orders_today: number;
+  account_count: number;
+}
+
+export interface ExchangeAccountWithBalance {
+  id: string;
+  exchange: string;
+  label: string;
+  is_active: boolean;
+  testnet: boolean;
+  created_at: string;
+  balance?: {
+    total: string;
+    available: string;
+    used: string;
+  };
+}
 
 // ── Risk API ──
 
@@ -211,7 +258,13 @@ export interface ExchangeAccount {
   exchange: string;
   label: string;
   is_active: boolean;
+  testnet: boolean;
   created_at: string;
+  balance?: {
+    total: string;
+    available: string;
+    used: string;
+  };
 }
 
 export interface CreateExchangeAccountPayload {
@@ -281,5 +334,107 @@ export const loggingApi = {
     if (params?.before) query.set("before", params.before);
     const qs = query.toString();
     return request<SystemLog[]>(`/api/logs/${qs ? `?${qs}` : ""}`);
+  },
+};
+
+// ── Backtest API ──
+
+export interface BacktestResult {
+  id: string;
+  strategy: number;
+  symbol: string;
+  timeframe: string;
+  start_date: string;
+  end_date: string;
+  initial_capital: string;
+  final_capital: string;
+  total_return_pct: number;
+  sharpe_ratio: number | null;
+  max_drawdown_pct: number | null;
+  win_rate: number | null;
+  total_trades: number;
+  git_commit_hash: string;
+  parameters: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface EquityPoint {
+  timestamp: string;
+  equity: number;
+  drawdown: number;
+}
+
+export interface DrawdownPoint {
+  timestamp: string;
+  drawdown: number;
+}
+
+export interface OHLCVPoint {
+  timestamp: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface IndicatorData {
+  ma7?: number[];
+  ma25?: number[];
+  ma99?: number[];
+  boll?: { upper: number[]; mid: number[]; lower: number[] };
+  macd?: { dif: number[]; dea: number[]; hist: number[] };
+  rsi?: number[];
+}
+
+export interface BacktestDetail extends BacktestResult {
+  equity_curve: EquityPoint[];
+  drawdown_curve: DrawdownPoint[];
+  ohlcv_data: OHLCVPoint[];
+  indicator_data: IndicatorData;
+}
+
+export interface BacktestTrade {
+  id: string;
+  entry_time: string;
+  exit_time: string | null;
+  symbol: string;
+  side: "long" | "short";
+  entry_price: string;
+  exit_price: string | null;
+  quantity: string;
+  pnl: string | null;
+  pnl_pct: number | null;
+  cumulative_pnl: string | null;
+  fees: string | null;
+  tags: string[];
+  created_at: string;
+}
+
+export interface PaginatedTrades {
+  count: number;
+  num_pages: number;
+  current_page: number;
+  results: BacktestTrade[];
+}
+
+export const backtestApi = {
+  getList: () => request<BacktestResult[]>("/api/backtest/results/"),
+  getDetail: (id: string) =>
+    request<BacktestResult>(`/api/backtest/results/${id}/`),
+  getFullDetail: (id: string) =>
+    request<BacktestDetail>(`/api/backtest/results/${id}/detail/`),
+  getTrades: (
+    id: string,
+    params?: { page?: number; page_size?: number; sort?: string }
+  ) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    if (params?.sort) query.set("sort", params.sort);
+    const qs = query.toString();
+    return request<PaginatedTrades>(
+      `/api/backtest/results/${id}/trades/${qs ? `?${qs}` : ""}`
+    );
   },
 };
