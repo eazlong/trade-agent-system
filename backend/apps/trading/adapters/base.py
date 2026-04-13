@@ -15,10 +15,11 @@ from typing import Optional
 @dataclass
 class OrderRequest:
     """下单请求"""
+
     exchange: str
     symbol: str
-    order_type: str           # 'limit' | 'market' | 'stop'
-    side: str                # 'buy' | 'sell'
+    order_type: str  # 'limit' | 'market' | 'stop'
+    side: str  # 'buy' | 'sell'
     quantity: Decimal
     price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
@@ -29,19 +30,21 @@ class OrderRequest:
 @dataclass
 class OrderResponse:
     """下单响应"""
+
     exchange_order_id: str
-    status: str               # 'NEW' | 'FILLED' | 'PARTIALLY_FILLED' | etc.
+    status: str  # 'NEW' | 'FILLED' | 'PARTIALLY_FILLED' | etc.
     filled_qty: Decimal
     avg_price: Optional[Decimal]
     fee: Optional[Decimal]
-    raw: dict                 # 交易所原始响应，便于调试
+    raw: dict  # 交易所原始响应，便于调试
 
 
 @dataclass
 class Position:
     """持仓信息"""
+
     symbol: str
-    side: str                 # 'long' | 'short'
+    side: str  # 'long' | 'short'
     quantity: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal

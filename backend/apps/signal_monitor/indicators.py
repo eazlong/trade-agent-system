@@ -4,6 +4,7 @@
 支持并行计算，确保完成时间不超过 100ms。
 使用 numpy 向量化计算提高性能。
 """
+
 import time
 import logging
 from typing import Any
@@ -14,7 +15,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # 全局线程池，用于并行计算指标
-_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='indicator')
+_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="indicator")
 
 
 def compute_sma(closes: np.ndarray, period: int) -> np.ndarray:
@@ -23,8 +24,10 @@ def compute_sma(closes: np.ndarray, period: int) -> np.ndarray:
         return np.array([])
     cumsum = np.cumsum(closes)
     result = np.empty(len(closes))
-    result[:period - 1] = np.nan
-    result[period - 1:] = (cumsum[period - 1:] - np.concatenate([[0], cumsum[:-period]])) / period
+    result[: period - 1] = np.nan
+    result[period - 1 :] = (
+        cumsum[period - 1 :] - np.concatenate([[0], cumsum[:-period]])
+    ) / period
     return result
 
 
@@ -33,7 +36,7 @@ def compute_ema(closes: np.ndarray, period: int) -> np.ndarray:
     if len(closes) < period:
         return np.array([])
     result = np.empty(len(closes))
-    result[:period - 1] = np.nan
+    result[: period - 1] = np.nan
     result[period - 1] = np.mean(closes[:period])
     multiplier = 2.0 / (period + 1)
     for i in range(period, len(closes)):
@@ -91,9 +94,9 @@ def compute_macd(
 
     histogram = macd_line - signal_line
     return {
-        'macd': macd_line,
-        'signal': signal_line,
-        'histogram': histogram,
+        "macd": macd_line,
+        "signal": signal_line,
+        "histogram": histogram,
     }
 
 
@@ -105,19 +108,19 @@ def compute_bollinger(
     """布林带"""
     sma = compute_sma(closes, period)
     result = {
-        'upper': np.full_like(closes, np.nan),
-        'middle': sma,
-        'lower': np.full_like(closes, np.nan),
+        "upper": np.full_like(closes, np.nan),
+        "middle": sma,
+        "lower": np.full_like(closes, np.nan),
     }
 
     if len(closes) < period:
         return result
 
     for i in range(period - 1, len(closes)):
-        window = closes[i - period + 1:i + 1]
+        window = closes[i - period + 1 : i + 1]
         std = np.std(window)
-        result['upper'][i] = sma[i] + std_dev * std
-        result['lower'][i] = sma[i] - std_dev * std
+        result["upper"][i] = sma[i] + std_dev * std
+        result["lower"][i] = sma[i] - std_dev * std
 
     return result
 
@@ -159,8 +162,8 @@ def compute_stoch(
     """随机指标 (Stochastic)"""
     k_line = np.full_like(closes, np.nan)
     for i in range(k_period - 1, len(closes)):
-        h = highs[i - k_period + 1:i + 1]
-        l = lows[i - k_period + 1:i + 1]
+        h = highs[i - k_period + 1 : i + 1]
+        l = lows[i - k_period + 1 : i + 1]
         highest = np.max(h)
         lowest = np.min(l)
         if highest == lowest:
@@ -170,23 +173,23 @@ def compute_stoch(
 
     d_line = np.full_like(closes, np.nan)
     for i in range(k_period - 1 + d_period - 1, len(closes)):
-        window = k_line[i - d_period + 1:i + 1]
+        window = k_line[i - d_period + 1 : i + 1]
         valid = window[~np.isnan(window)]
         if len(valid) == d_period:
             d_line[i] = np.mean(valid)
 
-    return {'k': k_line, 'd': d_line}
+    return {"k": k_line, "d": d_line}
 
 
 # 指标注册表
 INDICATOR_REGISTRY: dict[str, Any] = {
-    'sma': compute_sma,
-    'ema': compute_ema,
-    'rsi': compute_rsi,
-    'macd': compute_macd,
-    'bollinger': compute_bollinger,
-    'atr': compute_atr,
-    'stoch': compute_stoch,
+    "sma": compute_sma,
+    "ema": compute_ema,
+    "rsi": compute_rsi,
+    "macd": compute_macd,
+    "bollinger": compute_bollinger,
+    "atr": compute_atr,
+    "stoch": compute_stoch,
 }
 
 
@@ -209,27 +212,27 @@ def compute_indicator(
     params = params or {}
     func = INDICATOR_REGISTRY.get(indicator_type)
     if func is None:
-        raise ValueError(f'Unknown indicator type: {indicator_type}')
+        raise ValueError(f"Unknown indicator type: {indicator_type}")
 
-    closes = np.array([k['close'] for k in klines], dtype=np.float64)
+    closes = np.array([k["close"] for k in klines], dtype=np.float64)
 
-    if indicator_type in ('sma', 'ema', 'rsi'):
+    if indicator_type in ("sma", "ema", "rsi"):
         return func(closes, **params)
 
-    if indicator_type == 'macd':
+    if indicator_type == "macd":
         return func(closes, **params)
 
-    if indicator_type == 'bollinger':
+    if indicator_type == "bollinger":
         return func(closes, **params)
 
-    if indicator_type == 'atr':
-        highs = np.array([k['high'] for k in klines], dtype=np.float64)
-        lows = np.array([k['low'] for k in klines], dtype=np.float64)
+    if indicator_type == "atr":
+        highs = np.array([k["high"] for k in klines], dtype=np.float64)
+        lows = np.array([k["low"] for k in klines], dtype=np.float64)
         return func(highs, lows, closes, **params)
 
-    if indicator_type == 'stoch':
-        highs = np.array([k['high'] for k in klines], dtype=np.float64)
-        lows = np.array([k['low'] for k in klines], dtype=np.float64)
+    if indicator_type == "stoch":
+        highs = np.array([k["high"] for k in klines], dtype=np.float64)
+        lows = np.array([k["low"] for k in klines], dtype=np.float64)
         return func(highs, lows, closes, **params)
 
     return func(closes, **params)
@@ -260,9 +263,9 @@ def compute_indicators_parallel(
     for i, task in enumerate(tasks):
         future = _executor.submit(
             compute_indicator,
-            task['indicator_type'],
-            task['klines'],
-            task.get('params'),
+            task["indicator_type"],
+            task["klines"],
+            task.get("params"),
         )
         futures[future] = i
 
@@ -273,27 +276,27 @@ def compute_indicators_parallel(
         try:
             result = future.result(timeout=0.1)
             results[idx] = {
-                'indicator_type': task['indicator_type'],
-                'result': result,
-                'error': None,
+                "indicator_type": task["indicator_type"],
+                "result": result,
+                "error": None,
             }
         except Exception as e:
             results[idx] = {
-                'indicator_type': task['indicator_type'],
-                'result': None,
-                'error': str(e),
+                "indicator_type": task["indicator_type"],
+                "result": None,
+                "error": str(e),
             }
 
     total_ms = (time.monotonic() - start) * 1000
     if total_ms > 100:
         logger.warning(
-            'Parallel indicator computation took %.1fms (target: <100ms), '
-            'tasks=%d',
-            total_ms, len(tasks),
+            "Parallel indicator computation took %.1fms (target: <100ms), tasks=%d",
+            total_ms,
+            len(tasks),
         )
 
     for r in results:
         if r is not None:
-            r['duration_ms'] = total_ms
+            r["duration_ms"] = total_ms
 
     return results

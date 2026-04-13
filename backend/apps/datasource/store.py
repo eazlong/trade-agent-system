@@ -7,25 +7,26 @@
 - 按交易对/数据类型分组存储
 - 高效访问接口
 """
+
 import time
 import threading
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass, field
-import asyncio
 
 
 @dataclass
 class DataEntry:
     """数据条目"""
-    key: str                           # 数据键
-    data: Dict                         # 数据内容
-    data_type: str                     # 数据类型
-    symbol: str                        # 交易对/股票代码
-    source: str                        # 数据源
+
+    key: str  # 数据键
+    data: Dict  # 数据内容
+    data_type: str  # 数据类型
+    symbol: str  # 交易对/股票代码
+    source: str  # 数据源
     timestamp: float = field(default_factory=time.time)  # 创建时间戳
-    expire_at: float = 0               # 过期时间戳
+    expire_at: float = 0  # 过期时间戳
 
 
 class MemoryDataStore:
@@ -40,7 +41,7 @@ class MemoryDataStore:
     - 后台清理线程定期检查过期数据
     """
 
-    _instance: Optional['MemoryDataStore'] = None
+    _instance: Optional["MemoryDataStore"] = None
     _lock = threading.Lock()
 
     # 默认过期时间（4小时 = 14400秒）
@@ -52,7 +53,7 @@ class MemoryDataStore:
     # 清理间隔（5分钟）
     CLEANUP_INTERVAL = 300
 
-    def __new__(cls) -> 'MemoryDataStore':
+    def __new__(cls) -> "MemoryDataStore":
         """单例模式"""
         if cls._instance is None:
             with cls._lock:
@@ -75,10 +76,10 @@ class MemoryDataStore:
 
         # 统计信息
         self._stats = {
-            'total_entries': 0,
-            'expired_cleaned': 0,
-            'lru_cleaned': 0,
-            'last_cleanup_time': None,
+            "total_entries": 0,
+            "expired_cleaned": 0,
+            "lru_cleaned": 0,
+            "last_cleanup_time": None,
         }
 
         # 锁（按数据类型）
@@ -96,8 +97,7 @@ class MemoryDataStore:
         if self._cleanup_thread is None or not self._cleanup_thread.is_alive():
             self._cleanup_running = True
             self._cleanup_thread = threading.Thread(
-                target=self._cleanup_loop,
-                daemon=True
+                target=self._cleanup_loop, daemon=True
             )
             self._cleanup_thread.start()
 
@@ -126,7 +126,7 @@ class MemoryDataStore:
         data: Dict,
         source: str,
         expire_seconds: Optional[float] = None,
-        key: Optional[str] = None
+        key: Optional[str] = None,
     ) -> bool:
         """
         存储数据
@@ -144,9 +144,9 @@ class MemoryDataStore:
         """
         # 生成键
         if key is None:
-            timestamp = data.get('timestamp', datetime.now())
+            timestamp = data.get("timestamp", datetime.now())
             if isinstance(timestamp, datetime):
-                ts_str = timestamp.strftime('%Y%m%d%H%M%S%f')
+                ts_str = timestamp.strftime("%Y%m%d%H%M%S%f")
             else:
                 ts_str = str(int(timestamp * 1000))
             key = f"{source}:{symbol}:{data_type}:{ts_str}"
@@ -162,7 +162,7 @@ class MemoryDataStore:
             data_type=data_type,
             symbol=symbol,
             source=source,
-            expire_at=expire_at
+            expire_at=expire_at,
         )
 
         # 获取锁
@@ -181,7 +181,7 @@ class MemoryDataStore:
             self._time_index[data_type][key] = entry
 
             # 更新统计
-            self._stats['total_entries'] += 1
+            self._stats["total_entries"] += 1
 
             # LRU 检查
             symbol_store = self._store[data_type][symbol]
@@ -196,7 +196,7 @@ class MemoryDataStore:
         symbol: str,
         data_list: List[Dict],
         source: str,
-        expire_seconds: Optional[float] = None
+        expire_seconds: Optional[float] = None,
     ) -> int:
         """
         批量存储数据
@@ -219,12 +219,7 @@ class MemoryDataStore:
 
     # ==================== 数据读取 ====================
 
-    def get(
-        self,
-        data_type: str,
-        symbol: str,
-        key: str
-    ) -> Optional[Dict]:
+    def get(self, data_type: str, symbol: str, key: str) -> Optional[Dict]:
         """
         获取单条数据
 
@@ -257,12 +252,7 @@ class MemoryDataStore:
 
             return entry.data
 
-    def get_latest(
-        self,
-        data_type: str,
-        symbol: str,
-        limit: int = 100
-    ) -> List[Dict]:
+    def get_latest(self, data_type: str, symbol: str, limit: int = 100) -> List[Dict]:
         """
         获取最新数据
 
@@ -309,7 +299,7 @@ class MemoryDataStore:
         symbol: str,
         start_time: datetime,
         end_time: datetime,
-        limit: int = 1000
+        limit: int = 1000,
     ) -> List[Dict]:
         """
         获取时间范围内的数据
@@ -343,7 +333,7 @@ class MemoryDataStore:
                     continue
 
                 # 检查时间范围
-                data_ts = entry.data.get('timestamp')
+                data_ts = entry.data.get("timestamp")
                 if data_ts:
                     if isinstance(data_ts, datetime):
                         if start_time <= data_ts <= end_time:
@@ -367,12 +357,7 @@ class MemoryDataStore:
 
     # ==================== 数据删除 ====================
 
-    def delete(
-        self,
-        data_type: str,
-        symbol: str,
-        key: str
-    ) -> bool:
+    def delete(self, data_type: str, symbol: str, key: str) -> bool:
         """删除单条数据"""
         lock = self._get_lock(data_type)
         with lock:
@@ -395,7 +380,7 @@ class MemoryDataStore:
 
             # 删除
             del self._store[data_type][symbol]
-            self._stats['total_entries'] -= count
+            self._stats["total_entries"] -= count
 
             return count
 
@@ -406,13 +391,13 @@ class MemoryDataStore:
             if data_type not in self._store:
                 return 0
 
-            count = self._stats['total_entries']
+            count = self._stats["total_entries"]
             for symbol in self._store[data_type]:
                 count -= len(self._store[data_type][symbol])
 
             del self._store[data_type]
             del self._time_index[data_type]
-            self._stats['total_entries'] = count
+            self._stats["total_entries"] = count
 
             return count
 
@@ -426,7 +411,7 @@ class MemoryDataStore:
         if key in self._store[data_type][symbol]:
             del self._store[data_type][symbol][key]
             self._time_index[data_type].pop(key, None)
-            self._stats['total_entries'] -= 1
+            self._stats["total_entries"] -= 1
             return True
 
         return False
@@ -461,8 +446,8 @@ class MemoryDataStore:
                         total_cleaned += 1
 
         if total_cleaned > 0:
-            self._stats['expired_cleaned'] += total_cleaned
-            self._stats['last_cleanup_time'] = datetime.now()
+            self._stats["expired_cleaned"] += total_cleaned
+            self._stats["last_cleanup_time"] = datetime.now()
 
         return total_cleaned
 
@@ -489,8 +474,8 @@ class MemoryDataStore:
             cleaned += 1
 
         if cleaned > 0:
-            self._stats['lru_cleaned'] += cleaned
-            self._stats['total_entries'] -= cleaned
+            self._stats["lru_cleaned"] += cleaned
+            self._stats["total_entries"] -= cleaned
 
         return cleaned
 
@@ -499,13 +484,15 @@ class MemoryDataStore:
     def get_stats(self) -> Dict:
         """获取统计信息"""
         stats = self._stats.copy()
-        stats['data_types_count'] = len(self._store)
-        stats['symbols_per_type'] = {
+        stats["data_types_count"] = len(self._store)
+        stats["symbols_per_type"] = {
             dt: len(symbols) for dt, symbols in self._store.items()
         }
         return stats
 
-    def get_count(self, data_type: Optional[str] = None, symbol: Optional[str] = None) -> int:
+    def get_count(
+        self, data_type: Optional[str] = None, symbol: Optional[str] = None
+    ) -> int:
         """
         获取数据数量
 
@@ -517,7 +504,7 @@ class MemoryDataStore:
             数据数量
         """
         if data_type is None:
-            return self._stats['total_entries']
+            return self._stats["total_entries"]
 
         if data_type not in self._store:
             return 0
@@ -544,10 +531,10 @@ class MemoryDataStore:
 
     def clear_all(self) -> int:
         """清空所有数据"""
-        total = self._stats['total_entries']
+        total = self._stats["total_entries"]
         self._store.clear()
         self._time_index.clear()
-        self._stats['total_entries'] = 0
+        self._stats["total_entries"] = 0
         return total
 
     def stop_cleanup(self) -> None:

@@ -5,29 +5,40 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
-    dependencies = [
-    ]
+    dependencies = []
 
     operations = [
         migrations.CreateModel(
-            name='User',
+            name="User",
             fields=[
-                ('password', models.CharField(max_length=128, verbose_name='password')),
-                ('last_login', models.DateTimeField(blank=True, null=True, verbose_name='last login')),
-                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('email', models.EmailField(max_length=254, unique=True)),
-                ('username', models.CharField(max_length=64, unique=True)),
-                ('is_active', models.BooleanField(default=True)),
-                ('is_frozen', models.BooleanField(default=False)),
-                ('is_admin', models.BooleanField(default=False)),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('last_login_at', models.DateTimeField(blank=True, null=True)),
+                ("password", models.CharField(max_length=128, verbose_name="password")),
+                (
+                    "last_login",
+                    models.DateTimeField(
+                        blank=True, null=True, verbose_name="last login"
+                    ),
+                ),
+                (
+                    "id",
+                    models.UUIDField(
+                        default=uuid.uuid4,
+                        editable=False,
+                        primary_key=True,
+                        serialize=False,
+                    ),
+                ),
+                ("email", models.EmailField(max_length=254, unique=True)),
+                ("username", models.CharField(max_length=64, unique=True)),
+                ("is_active", models.BooleanField(default=True)),
+                ("is_frozen", models.BooleanField(default=False)),
+                ("is_admin", models.BooleanField(default=False)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("last_login_at", models.DateTimeField(blank=True, null=True)),
             ],
             options={
-                'db_table': 'users',
+                "db_table": "users",
             },
         ),
     ]

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -11,7 +10,7 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_MARKER = '__FALLBACK__'
+FALLBACK_MARKER = "__FALLBACK__"
 
 
 class LLMClient:
@@ -20,10 +19,10 @@ class LLMClient:
     主用 OpenAI (gpt-4o)，失败后自动切换 Anthropic (claude-opus-4-6)。
     """
 
-    _instance: Optional['LLMClient'] = None
+    _instance: Optional["LLMClient"] = None
 
     @classmethod
-    def get_instance(cls) -> 'LLMClient':
+    def get_instance(cls) -> "LLMClient":
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -39,45 +38,46 @@ class LLMClient:
         t0 = time.monotonic()
         try:
             result = await self._call_openai(system, user, max_tokens, temperature)
-            logger.debug(f'OpenAI OK ({(time.monotonic()-t0)*1000:.0f}ms)')
+            logger.debug(f"OpenAI OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
             return result
         except Exception as e:
-            logger.warning(f'OpenAI failed ({e}), falling back to Anthropic')
+            logger.warning(f"OpenAI failed ({e}), falling back to Anthropic")
 
         try:
             result = await self._call_anthropic(system, user, max_tokens, temperature)
-            logger.debug(f'Anthropic OK ({(time.monotonic()-t0)*1000:.0f}ms)')
+            logger.debug(f"Anthropic OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
             return result
         except Exception as e:
-            logger.error(f'Anthropic fallback also failed: {e}')
+            logger.error(f"Anthropic fallback also failed: {e}")
             return FALLBACK_MARKER
 
     async def _call_openai(
         self, system: str, user: str, max_tokens: int, temperature: float
     ) -> str:
         api_key = settings.OPENAI_API_KEY
-        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        base_url = getattr(
+            settings, "OPENAI_API_BASE_URL", "https://api.openai.com/v1/"
+        )
         if not api_key:
-            raise ValueError('OPENAI_API_KEY not configured')
-        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
-        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
+            raise ValueError("OPENAI_API_KEY not configured")
+        model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
+        proxy = getattr(settings, "OPENAI_PROXY", "") or None
         async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
             resp = await client.post(
-                f'{base_url}/chat/completions',
-                headers={'Authorization': f'Bearer {api_key}'},
-
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    'model': model,
-                    'messages': [
-                        {'role': 'system', 'content': system},
-                        {'role': 'user', 'content': user},
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
                     ],
-                    'max_tokens': max_tokens,
-                    'temperature': temperature,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
                 },
             )
             resp.raise_for_status()
-            return resp.json()['choices'][0]['message']['content']
+            return resp.json()["choices"][0]["message"]["content"]
 
     async def chat_with_tools(
         self,
@@ -89,16 +89,18 @@ class LLMClient:
     ) -> LLMToolResponse:
         """支持工具调用的LLM接口（OpenAI function calling格式）"""
         try:
-            return await self._call_openai_with_tools(system, messages, tools, max_tokens, temperature)
+            return await self._call_openai_with_tools(
+                system, messages, tools, max_tokens, temperature
+            )
         except Exception as e:
-            logger.warning(f'OpenAI tool call failed ({e}), falling back to plain chat')
+            logger.warning(f"OpenAI tool call failed ({e}), falling back to plain chat")
             # 降级：拼接工具描述到system prompt，让LLM输出JSON
             tool_desc = json.dumps(tools, ensure_ascii=False)
-            fallback_system = (
-                f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
+            fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
+            user_text = messages[-1].get("content", "") if messages else ""
+            result = await self.chat(
+                fallback_system, user_text, max_tokens, temperature
             )
-            user_text = messages[-1].get('content', '') if messages else ''
-            result = await self.chat(fallback_system, user_text, max_tokens, temperature)
             return LLMToolResponse(content=result)
 
     async def _call_openai_with_tools(
@@ -110,63 +112,67 @@ class LLMClient:
         temperature: float,
     ) -> LLMToolResponse:
         api_key = settings.OPENAI_API_KEY
-        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        base_url = getattr(
+            settings, "OPENAI_API_BASE_URL", "https://api.openai.com/v1/"
+        )
         if not api_key:
-            raise ValueError('OPENAI_API_KEY not configured')
-        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
-        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
-        full_messages = [{'role': 'system', 'content': system}] + messages
+            raise ValueError("OPENAI_API_KEY not configured")
+        model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
+        proxy = getattr(settings, "OPENAI_PROXY", "") or None
+        full_messages = [{"role": "system", "content": system}] + messages
         async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
             resp = await client.post(
-                f'{base_url}/chat/completions',
-                headers={'Authorization': f'Bearer {api_key}'},
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    'model': model,
-                    'messages': full_messages,
-                    'tools': tools,
-                    'tool_choice': 'auto',
-                    'max_tokens': max_tokens,
-                    'temperature': temperature,
+                    "model": model,
+                    "messages": full_messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
                 },
             )
             resp.raise_for_status()
-            msg = resp.json()['choices'][0]['message']
-            raw_calls = msg.get('tool_calls') or []
+            msg = resp.json()["choices"][0]["message"]
+            raw_calls = msg.get("tool_calls") or []
             tool_calls = [
                 ToolCallRequest(
-                    call_id=tc['id'],
-                    name=tc['function']['name'],
-                    arguments=json.loads(tc['function']['arguments']),
+                    call_id=tc["id"],
+                    name=tc["function"]["name"],
+                    arguments=json.loads(tc["function"]["arguments"]),
                 )
                 for tc in raw_calls
             ]
-            return LLMToolResponse(content=msg.get('content') or '', tool_calls=tool_calls)
+            return LLMToolResponse(
+                content=msg.get("content") or "", tool_calls=tool_calls
+            )
 
     async def _call_anthropic(
         self, system: str, user: str, max_tokens: int, temperature: float
     ) -> str:
         api_key = settings.ANTHROPIC_API_KEY
         if not api_key:
-            raise ValueError('ANTHROPIC_API_KEY not configured')
-        model = getattr(settings, 'ANTHROPIC_MODEL_FALLBACK', 'claude-opus-4-6')
-        proxy = getattr(settings, 'ANTHROPIC_PROXY', '') or None
+            raise ValueError("ANTHROPIC_API_KEY not configured")
+        model = getattr(settings, "ANTHROPIC_MODEL_FALLBACK", "claude-opus-4-6")
+        proxy = getattr(settings, "ANTHROPIC_PROXY", "") or None
         async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
             resp = await client.post(
-                'https://api.anthropic.com/v1/messages',
+                "https://api.anthropic.com/v1/messages",
                 headers={
-                    'x-api-key': api_key,
-                    'anthropic-version': '2023-06-01',
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
                 },
                 json={
-                    'model': model,
-                    'system': system,
-                    'messages': [{'role': 'user', 'content': user}],
-                    'max_tokens': max_tokens,
-                    'temperature': temperature,
+                    "model": model,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
                 },
             )
             resp.raise_for_status()
-            return resp.json()['content'][0]['text']
+            return resp.json()["content"][0]["text"]
 
     async def chat_stream(
         self,
@@ -189,12 +195,12 @@ class LLMClient:
                 system, user, on_chunk, max_tokens, temperature
             )
         except Exception as e:
-            logger.warning(f'OpenAI stream failed ({e}), falling back to non-stream')
+            logger.warning(f"OpenAI stream failed ({e}), falling back to non-stream")
             result = await self.chat(system, user, max_tokens, temperature)
             if on_chunk:
                 # 一次性输出全部 chunks
                 for i in range(0, len(result), 50):
-                    stop = on_chunk(result[i:i+50])
+                    stop = on_chunk(result[i : i + 50])
                     if stop is False:
                         break
             return result
@@ -209,40 +215,42 @@ class LLMClient:
     ) -> str:
         """OpenAI SSE 流式调用"""
         api_key = settings.OPENAI_API_KEY
-        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        base_url = getattr(
+            settings, "OPENAI_API_BASE_URL", "https://api.openai.com/v1/"
+        )
         if not api_key:
-            raise ValueError('OPENAI_API_KEY not configured')
-        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
-        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
+            raise ValueError("OPENAI_API_KEY not configured")
+        model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
+        proxy = getattr(settings, "OPENAI_PROXY", "") or None
 
         chunks: list[str] = []
         async with httpx.AsyncClient(timeout=120.0, proxy=proxy) as client:
             async with client.stream(
-                'POST',
-                f'{base_url}/chat/completions',
-                headers={'Authorization': f'Bearer {api_key}'},
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    'model': model,
-                    'messages': [
-                        {'role': 'system', 'content': system},
-                        {'role': 'user', 'content': user},
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
                     ],
-                    'max_tokens': max_tokens,
-                    'temperature': temperature,
-                    'stream': True,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": True,
                 },
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     line = line.strip()
-                    if not line or not line.startswith('data: '):
+                    if not line or not line.startswith("data: "):
                         continue
                     data = line[6:].strip()
-                    if data == '[DONE]':
+                    if data == "[DONE]":
                         break
                     try:
-                        delta = json.loads(data)['choices'][0]['delta']
-                        token = delta.get('content', '') or delta.get('text', '')
+                        delta = json.loads(data)["choices"][0]["delta"]
+                        token = delta.get("content", "") or delta.get("text", "")
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
                     if token:
@@ -252,7 +260,7 @@ class LLMClient:
                             if stop is False:
                                 # 通知停止，但继续消费流以避免截断
                                 pass
-        return ''.join(chunks)
+        return "".join(chunks)
 
     async def chat_stream_with_tools(
         self,
@@ -273,8 +281,12 @@ class LLMClient:
                 system, messages, tools, on_chunk, max_tokens, temperature
             )
         except Exception as e:
-            logger.warning(f'OpenAI tool stream failed ({e}), falling back to non-stream')
-            return await self.chat_with_tools(system, messages, tools, max_tokens, temperature)
+            logger.warning(
+                f"OpenAI tool stream failed ({e}), falling back to non-stream"
+            )
+            return await self.chat_with_tools(
+                system, messages, tools, max_tokens, temperature
+            )
 
     async def _call_openai_stream_with_tools(
         self,
@@ -287,72 +299,76 @@ class LLMClient:
     ) -> LLMToolResponse:
         """OpenAI 流式 + 工具调用"""
         api_key = settings.OPENAI_API_KEY
-        base_url = getattr(settings, 'OPENAI_API_BASE_URL', 'https://api.openai.com/v1/')
+        base_url = getattr(
+            settings, "OPENAI_API_BASE_URL", "https://api.openai.com/v1/"
+        )
         if not api_key:
-            raise ValueError('OPENAI_API_KEY not configured')
-        model = getattr(settings, 'OPENAI_MODEL_PRIMARY', 'gpt-4o')
-        proxy = getattr(settings, 'OPENAI_PROXY', '') or None
+            raise ValueError("OPENAI_API_KEY not configured")
+        model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
+        proxy = getattr(settings, "OPENAI_PROXY", "") or None
 
         chunks: list[str] = []
         tool_calls_map: dict[int, dict] = {}  # index → {name, arguments}
-        full_messages = [{'role': 'system', 'content': system}] + messages
+        full_messages = [{"role": "system", "content": system}] + messages
 
         async with httpx.AsyncClient(timeout=120.0, proxy=proxy) as client:
             async with client.stream(
-                'POST',
-                f'{base_url}/chat/completions',
-                headers={'Authorization': f'Bearer {api_key}'},
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    'model': model,
-                    'messages': full_messages,
-                    'tools': tools,
-                    'tool_choice': 'auto',
-                    'max_tokens': max_tokens,
-                    'temperature': temperature,
-                    'stream': True,
+                    "model": model,
+                    "messages": full_messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": True,
                 },
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     line = line.strip()
-                    if not line or not line.startswith('data: '):
+                    if not line or not line.startswith("data: "):
                         continue
                     data = line[6:].strip()
-                    if data == '[DONE]':
+                    if data == "[DONE]":
                         break
                     try:
-                        delta = json.loads(data)['choices'][0]['delta']
+                        delta = json.loads(data)["choices"][0]["delta"]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 
                     # content delta
-                    content_token = delta.get('content', '') or delta.get('text', '')
+                    content_token = delta.get("content", "") or delta.get("text", "")
                     if content_token:
                         chunks.append(content_token)
                         if on_chunk:
                             on_chunk(content_token)
 
                     # tool_call delta
-                    for tc_delta in delta.get('tool_calls', []):
-                        idx = tc_delta.get('index', 0)
+                    for tc_delta in delta.get("tool_calls", []):
+                        idx = tc_delta.get("index", 0)
                         if idx not in tool_calls_map:
-                            tool_calls_map[idx] = {'name': '', 'arguments': ''}
-                        if 'function' in tc_delta:
+                            tool_calls_map[idx] = {"name": "", "arguments": ""}
+                        if "function" in tc_delta:
                             tc_map = tool_calls_map[idx]
-                            if 'name' in tc_delta['function']:
-                                tc_map['name'] += tc_delta['function']['name']
-                            if 'arguments' in tc_delta['function']:
-                                tc_map['arguments'] += tc_delta['function']['arguments']
+                            if "name" in tc_delta["function"]:
+                                tc_map["name"] += tc_delta["function"]["name"]
+                            if "arguments" in tc_delta["function"]:
+                                tc_map["arguments"] += tc_delta["function"]["arguments"]
 
         tool_calls = [
             ToolCallRequest(
-                call_id=f'tc_{i}',
-                name=tc_map['name'],
-                arguments=json.loads(tc_map['arguments']) if tc_map['arguments'] else {},
+                call_id=f"tc_{i}",
+                name=tc_map["name"],
+                arguments=json.loads(tc_map["arguments"])
+                if tc_map["arguments"]
+                else {},
             )
             for i, tc_map in sorted(tool_calls_map.items())
         ]
-        return LLMToolResponse(content=''.join(chunks), tool_calls=tool_calls)
+        return LLMToolResponse(content="".join(chunks), tool_calls=tool_calls)
 
 
 def is_fallback(response: str) -> bool:
@@ -362,6 +378,7 @@ def is_fallback(response: str) -> bool:
 
 class ToolCallRequest:
     """LLM返回的工具调用请求"""
+
     def __init__(self, call_id: str, name: str, arguments: dict):
         self.call_id = call_id
         self.name = name
@@ -370,7 +387,10 @@ class ToolCallRequest:
 
 class LLMToolResponse:
     """chat_with_tools的返回值"""
-    def __init__(self, content: str = '', tool_calls: list[ToolCallRequest] | None = None):
+
+    def __init__(
+        self, content: str = "", tool_calls: list[ToolCallRequest] | None = None
+    ):
         self.content = content
         self.tool_calls: list[ToolCallRequest] = tool_calls or []
 
