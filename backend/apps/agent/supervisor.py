@@ -172,7 +172,7 @@ _router.register_intents({
     'trading_system':    'coach',
     'review_trade':      'coach',
     'summarize_trades':  'coach',
-    'assess_risk':       'risk_advisor',
+    'assess_risk':       'risk_advisor'
 })
 
 # 默认框架意图

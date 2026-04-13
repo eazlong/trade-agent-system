@@ -38,12 +38,14 @@ class LogWebSocket {
   private callbacks: Set<Callback> = new Set();
   private currentParams: LogSubscribeParams | null = null;
 
-  private getWSUrl(): string {
+  private getWsUrl(): string {
     const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
     const httpBase = apiBase.replace(/^https?/, "ws");
-    const token = getAccessToken();
     const url = new URL("/ws/logs/", httpBase);
-    if (token) url.searchParams.set("token", token);
+    const token = getAccessToken();
+    if (token) {
+      url.searchParams.set("token", token);
+    }
     return url.toString();
   }
 
@@ -56,7 +58,7 @@ class LogWebSocket {
       return;
     }
 
-    this.ws = new WebSocket(this.getWSUrl());
+    this.ws = new WebSocket(this.getWsUrl());
 
     this.ws.onopen = () => {
       if (this.currentParams) {
