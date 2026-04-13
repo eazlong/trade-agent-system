@@ -1,16 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import DashboardShell from "@/components/layout/DashboardShell";
-import { backtestApi, type BacktestDetail, type BacktestTrade } from "@/lib/api";
+import { backtestApi, type BacktestDetail, type BacktestTrade, type OHLCVPoint, type IndicatorData } from "@/lib/api";
+import { resampleOHLCV, computeIndicators, timeframeToMinutes } from "@/lib/resample";
 import CandlestickChart from "@/components/backtest/CandlestickChart";
 import EquityChart from "@/components/backtest/EquityChart";
 import DrawdownChart from "@/components/backtest/DrawdownChart";
 import TradeLog from "@/components/backtest/TradeLog";
 
+/** Timeframes available for client-side resampling */
+const RESAMPLE_TARGETS = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
+
 type TabKey = "kline" | "equity" | "drawdown" | "trades";
+
+interface CachedTimeframeData {
+  ohlcv: OHLCVPoint[];
+  indicators: IndicatorData;
+}
 
 export default function BacktestDetailPage() {
   const params = useParams();
@@ -20,6 +29,69 @@ export default function BacktestDetailPage() {
   const [trades, setTrades] = useState<BacktestTrade[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<TabKey>("kline");
+
+  // ── Timeframe switching with cache ──
+  const [activeTf, setActiveTf] = useState<string | null>(null);
+  const [tfCache, setTfCache] = useState<Record<string, CachedTimeframeData>>({});
+  const [tfLoading, setTfLoading] = useState(false);
+
+  /** Resample data for target timeframe, using cache if available */
+  const switchTimeframe = useCallback(
+    (targetTf: string) => {
+      if (!detail) return;
+
+      // Check cache first
+      if (tfCache[targetTf]) {
+        setActiveTf(targetTf);
+        return;
+      }
+
+      // Resample synchronously (fast for typical dataset sizes < 10k bars)
+      setTfLoading(true);
+      // Use requestAnimationFrame to show loading spinner for at least one frame
+      requestAnimationFrame(() => {
+        const ohlcv = resampleOHLCV(detail.ohlcv_data, detail.timeframe, targetTf);
+        const indicators = computeIndicators(ohlcv, detail.indicator_data);
+        setTfCache((prev) => ({ ...prev, [targetTf]: { ohlcv, indicators } }));
+        setActiveTf(targetTf);
+        setTfLoading(false);
+      });
+    },
+    [detail, tfCache]
+  );
+
+  // Initialize active timeframe from detail
+  useEffect(() => {
+    if (detail && !activeTf) {
+      setActiveTf(detail.timeframe);
+      // Pre-cache the base timeframe
+      setTfCache((prev) => ({
+        ...prev,
+        [detail.timeframe]: {
+          ohlcv: detail.ohlcv_data,
+          indicators: detail.indicator_data,
+        },
+      }));
+    }
+  }, [detail, activeTf]);
+
+  /** Current OHLCV + indicators for the active timeframe */
+  const currentData = useMemo((): { ohlcv: OHLCVPoint[]; indicators: IndicatorData } => {
+    if (!activeTf || !detail) return { ohlcv: [], indicators: {} };
+    // Base timeframe: use original data
+    if (activeTf === detail.timeframe) {
+      return { ohlcv: detail.ohlcv_data, indicators: detail.indicator_data };
+    }
+    // Resampled timeframe: use cache
+    return tfCache[activeTf] ?? { ohlcv: [], indicators: {} };
+  }, [activeTf, detail, tfCache]);
+
+  // Determine which timeframes to show (only >= base timeframe)
+  const availableTimeframes = useMemo(() => {
+    if (!detail) return RESAMPLE_TARGETS;
+    const baseMin = timeframeToMinutes(detail.timeframe);
+    return RESAMPLE_TARGETS.filter((tf) => timeframeToMinutes(tf) >= baseMin);
+  }, [detail]);
 
   useEffect(() => {
     backtestApi
@@ -145,12 +217,23 @@ export default function BacktestDetailPage() {
       {/* Chart / Log Area */}
       <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl px-4 py-4">
         {activeTab === "kline" && detail && (
-          <CandlestickChart
-            ohlcv={detail.ohlcv_data}
-            indicators={detail.indicator_data}
-            trades={trades}
-            timeframe={detail.timeframe}
-          />
+          <>
+            {tfLoading && activeTf && (
+              <div className="text-xs text-text3 py-4 text-center animate-pulse">
+                聚合 {activeTf} K 线数据...
+              </div>
+            )}
+            {!tfLoading && (
+              <CandlestickChart
+                ohlcv={currentData.ohlcv}
+                indicators={currentData.indicators}
+                trades={trades}
+                timeframe={activeTf}
+                availableTimeframes={availableTimeframes}
+                onTimeframeChange={switchTimeframe}
+              />
+            )}
+          </>
         )}
         {activeTab === "equity" && (
           <EquityChart data={detail.equity_curve} showBenchmark />
