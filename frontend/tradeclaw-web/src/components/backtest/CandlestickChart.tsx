@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import {
   createChart,
   ColorType,
@@ -14,10 +14,19 @@ import {
 } from "lightweight-charts";
 import type { OHLCVPoint, IndicatorData, BacktestTrade } from "@/lib/api";
 
+const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
+
 interface CandlestickChartProps {
   ohlcv: OHLCVPoint[];
   indicators: IndicatorData;
   trades: BacktestTrade[];
+  timeframe?: string;
+  onTimeframeChange?: (tf: string) => void;
+}
+
+interface IndicatorLegend {
+  label: string;
+  color: string;
 }
 
 /** Convert ISO timestamp to UTCTimestamp (seconds) */
@@ -66,8 +75,29 @@ export default function CandlestickChart({
   ohlcv,
   indicators,
   trades,
+  timeframe,
+  onTimeframeChange,
 }: CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [activeTf, setActiveTf] = useState(timeframe || "15m");
+
+  // Build indicator legend
+  const legendItems = useMemo<IndicatorLegend[]>(() => {
+    const items: IndicatorLegend[] = [];
+    if (indicators.ma7?.length) items.push({ label: "MA(7)", color: "#f59e0b" });
+    if (indicators.ma25?.length) items.push({ label: "MA(25)", color: "#3b82f6" });
+    if (indicators.ma99?.length) items.push({ label: "MA(99)", color: "#a855f7" });
+    if (indicators.macd?.dif?.length) items.push({ label: "MACD(12,26,9)", color: "#3b82f6" });
+    if (indicators.rsi?.length) items.push({ label: "RSI(14)", color: "#a855f7" });
+    items.push({ label: "VOL", color: "#6b7280" });
+    return items;
+  }, [indicators]);
+
+  useEffect(() => {
+    if (timeframe && timeframe !== activeTf) {
+      setActiveTf(timeframe);
+    }
+  }, [timeframe]);
 
   useEffect(() => {
     if (!containerRef.current || !ohlcv.length) return;
@@ -270,5 +300,43 @@ export default function CandlestickChart({
     );
   }
 
-  return <div ref={containerRef} className="w-full" />;
+  return (
+    <div className="relative w-full">
+      {/* Timeframe switcher */}
+      <div className="absolute top-2 left-2 z-10 flex gap-1">
+        {TIMEFRAMES.map((tf) => (
+          <button
+            key={tf}
+            onClick={() => {
+              setActiveTf(tf);
+              onTimeframeChange?.(tf);
+            }}
+            className={`px-2 py-0.5 text-[10px] font-medium rounded cursor-pointer transition-all border ${
+              activeTf === tf
+                ? "text-green bg-green-dim border-green/20"
+                : "text-text3 border-transparent hover:text-text hover:bg-bg2"
+            }`}
+          >
+            {tf}
+          </button>
+        ))}
+      </div>
+
+      {/* Indicator legend */}
+      <div className="flex flex-wrap gap-3 px-2 py-1 text-[10px] text-text3">
+        {legendItems.map((item) => (
+          <span key={item.label} className="flex items-center gap-1">
+            <span
+              className="inline-block h-2 w-2 rounded-full"
+              style={{ backgroundColor: item.color }}
+            />
+            {item.label}
+          </span>
+        ))}
+      </div>
+
+      {/* Chart */}
+      <div ref={containerRef} className="w-full" />
+    </div>
+  );
 }
