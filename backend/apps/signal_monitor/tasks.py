@@ -3,13 +3,14 @@
 
 定时检查所有活跃信号，由 Celery Beat 调度。
 """
+
 import logging
 from celery import shared_task
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(name='apps.signal_monitor.tasks.check_signals')
+@shared_task(name="apps.signal_monitor.tasks.check_signals")
 def check_signals():
     """
     定时检查所有活跃信号。
@@ -24,34 +25,34 @@ def check_signals():
     results = engine.check_all_signals()
 
     if results:
-        logger.info('Signal check triggered %d signals', len(results))
+        logger.info("Signal check triggered %d signals", len(results))
         for r in results:
             logger.info(
-                'Signal triggered: %s (%s %s) - %s',
-                r['monitor_name'],
-                r['symbol'],
-                r['indicator_type'],
-                r['trigger_type'],
+                "Signal triggered: %s (%s %s) - %s",
+                r["monitor_name"],
+                r["symbol"],
+                r["indicator_type"],
+                r["trigger_type"],
             )
 
     return {
-        'triggered_count': len(results),
-        'results': results,
+        "triggered_count": len(results),
+        "results": results,
     }
 
 
-@shared_task(name='apps.signal_monitor.tasks.clean_expired_monitors')
+@shared_task(name="apps.signal_monitor.tasks.clean_expired_monitors")
 def clean_expired_monitors():
     """清理过期的信号监控"""
     from django.utils import timezone
     from .models import SignalMonitor
 
     count = SignalMonitor.objects.filter(
-        status='active',
+        status="active",
         expires_at__lt=timezone.now(),
-    ).update(status='expired')
+    ).update(status="expired")
 
     if count > 0:
-        logger.info('Expired %d signal monitors', count)
+        logger.info("Expired %d signal monitors", count)
 
-    return {'expired_count': count}
+    return {"expired_count": count}

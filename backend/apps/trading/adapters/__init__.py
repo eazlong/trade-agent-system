@@ -3,16 +3,16 @@ from .binance import BinanceAdapter
 from .okx import OKXAdapter
 
 __all__ = [
-    'BaseExchangeAdapter',
-    'OrderRequest',
-    'OrderResponse',
-    'Position',
-    'BinanceAdapter',
-    'OKXAdapter',
+    "BaseExchangeAdapter",
+    "OrderRequest",
+    "OrderResponse",
+    "Position",
+    "BinanceAdapter",
+    "OKXAdapter",
 ]
 
 # Exchange name → Adapter class mapping
 ADAPTER_MAP = {
-    'binance': BinanceAdapter,
-    'okx': OKXAdapter,
+    "binance": BinanceAdapter,
+    "okx": OKXAdapter,
 }

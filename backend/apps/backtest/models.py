@@ -4,7 +4,7 @@ from django.db import models
 
 class BacktestResult(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    strategy = models.ForeignKey('trading.Strategy', on_delete=models.CASCADE)
+    strategy = models.ForeignKey("trading.Strategy", on_delete=models.CASCADE)
     symbol = models.CharField(max_length=32)
     timeframe = models.CharField(max_length=8)
     start_date = models.DateField()
@@ -21,4 +21,4 @@ class BacktestResult(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = 'backtest_results'
+        db_table = "backtest_results"

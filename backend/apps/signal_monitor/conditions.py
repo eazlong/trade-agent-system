@@ -22,6 +22,7 @@
     "right": {"field": "signal"}  // 另一个指标字段
 }
 """
+
 from __future__ import annotations
 
 import operator
@@ -34,16 +35,18 @@ logger = logging.getLogger(__name__)
 
 # 比较运算符映射
 _COMPARATORS = {
-    'gt': operator.gt,
-    'gte': operator.ge,
-    'lt': operator.lt,
-    'lte': operator.le,
-    'eq': operator.eq,
-    'ne': operator.ne,
+    "gt": operator.gt,
+    "gte": operator.ge,
+    "lt": operator.lt,
+    "lte": operator.le,
+    "eq": operator.eq,
+    "ne": operator.ne,
 }
 
 
-def _resolve_operand(op: dict, indicator_result: Any, prev_result: Any | None = None) -> float | None:
+def _resolve_operand(
+    op: dict, indicator_result: Any, prev_result: Any | None = None
+) -> float | None:
     """
     解析操作数的值。
 
@@ -51,10 +54,10 @@ def _resolve_operand(op: dict, indicator_result: Any, prev_result: Any | None = 
     - {"value": 50000} — 固定值
     - {"field": "rsi"} — 指标结果中的字段
     """
-    if 'value' in op:
-        return float(op['value'])
+    if "value" in op:
+        return float(op["value"])
 
-    field = op.get('field', '')
+    field = op.get("field", "")
     # 从指标结果中提取最新有效值
     val = _extract_latest(indicator_result, field)
     return val
@@ -118,21 +121,24 @@ def evaluate_condition(
     Returns:
         条件是否满足
     """
-    cond_operator = condition.get('operator', '')
-    left_op = condition.get('left', {})
-    right_op = condition.get('right', {})
+    cond_operator = condition.get("operator", "")
+    left_op = condition.get("left", {})
+    right_op = condition.get("right", {})
 
     # 交叉类型需要前后两期数据
-    if cond_operator in ('cross_above', 'cross_below'):
+    if cond_operator in ("cross_above", "cross_below"):
         return _evaluate_cross(
-            cond_operator, left_op, right_op,
-            indicator_result, prev_indicator_result,
+            cond_operator,
+            left_op,
+            right_op,
+            indicator_result,
+            prev_indicator_result,
         )
 
     # 简单比较
     comp = _COMPARATORS.get(cond_operator)
     if comp is None:
-        logger.warning('Unknown condition operator: %s', cond_operator)
+        logger.warning("Unknown condition operator: %s", cond_operator)
         return False
 
     left_val = _resolve_operand(left_op, indicator_result)
@@ -171,9 +177,9 @@ def _evaluate_cross(
     if any(v is None for v in [curr_left, curr_right, prev_left, prev_right]):
         return False
 
-    if cross_type == 'cross_above':
+    if cross_type == "cross_above":
         return prev_left <= prev_right and curr_left > curr_right
-    elif cross_type == 'cross_below':
+    elif cross_type == "cross_below":
         return prev_left >= prev_right and curr_left < curr_right
 
     return False

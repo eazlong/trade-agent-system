@@ -21,9 +21,7 @@ import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Tuple
 
-import redis.asyncio as aioredis
 from asgiref.sync import sync_to_async
-from django.conf import settings
 
 if TYPE_CHECKING:
     from apps.trading.adapters.base import OrderRequest
@@ -38,29 +36,29 @@ class RiskGuard:
     风控守卫（随交易框架或辅助框架启动）。
     """
 
-    _instance: 'RiskGuard | None' = None
+    _instance: "RiskGuard | None" = None
 
     # 风控阈值（可由管理员通过 RiskConfig 覆盖）
-    MAX_POSITION_RATIO = Decimal('0.20')     # 单仓不超过总资产20%
-    MAX_DAILY_DRAWDOWN = Decimal('0.05')     # 日内最大回撤5%
-    MAX_DAILY_TRADES = 50                     # 日内最大交易次数
-    FLOATING_LOSS_ALERT = Decimal('-0.03')  # 浮亏-3%预警
+    MAX_POSITION_RATIO = Decimal("0.20")  # 单仓不超过总资产20%
+    MAX_DAILY_DRAWDOWN = Decimal("0.05")  # 日内最大回撤5%
+    MAX_DAILY_TRADES = 50  # 日内最大交易次数
+    FLOATING_LOSS_ALERT = Decimal("-0.03")  # 浮亏-3%预警
 
-    def __init__(self, mode: str = 'trading'):
+    def __init__(self, mode: str = "trading"):
         self.mode = mode
         self._running = False
         self._monitor_task: asyncio.Task | None = None
 
     @classmethod
-    def get_instance(cls) -> 'RiskGuard | None':
+    def get_instance(cls) -> "RiskGuard | None":
         return cls._instance
 
     async def start(self) -> None:
         RiskGuard._instance = self
         self._running = True
-        if self.mode in ('trading', 'monitor'):
+        if self.mode in ("trading", "monitor"):
             self._monitor_task = asyncio.create_task(self._monitor_loop())
-        logger.info(f'RiskGuard started (mode={self.mode})')
+        logger.info(f"RiskGuard started (mode={self.mode})")
 
     async def stop(self) -> None:
         self._running = False
@@ -72,14 +70,14 @@ class RiskGuard:
                 pass
             self._monitor_task = None
         RiskGuard._instance = None
-        logger.info('RiskGuard stopped')
+        logger.info("RiskGuard stopped")
 
     # ------------------------------------------------------------------ #
     #  前置校验                                                          #
     # ------------------------------------------------------------------ #
 
     async def pre_trade_check(
-        self, request: 'OrderRequest', user_id: str | None
+        self, request: "OrderRequest", user_id: str | None
     ) -> Tuple[bool, str]:
         """
         返回 (approved, reason)，approved=False 时 OrderExecutor 禁止下单。
@@ -91,16 +89,16 @@ class RiskGuard:
         4. 日内回撤
         """
         if not user_id:
-            return True, 'OK'
+            return True, "OK"
 
         # 1. 熔断器检查
         if await self._is_circuit_open(user_id):
-            return False, '熔断器触发，今日禁止交易'
+            return False, "熔断器触发，今日禁止交易"
 
         # 2. 日内交易次数
         daily_count = await self._get_daily_trade_count(user_id)
         if daily_count >= self.MAX_DAILY_TRADES:
-            return False, f'日内交易次数已达上限 {self.MAX_DAILY_TRADES}'
+            return False, f"日内交易次数已达上限 {self.MAX_DAILY_TRADES}"
 
         # 3. 仓位上限
         position_ok, reason = await self._check_position_limit(request, user_id)
@@ -112,7 +110,7 @@ class RiskGuard:
         if not drawdown_ok:
             return False, reason
 
-        return True, 'OK'
+        return True, "OK"
 
     async def _is_circuit_open(self, user_id: str) -> bool:
         """检查熔断器是否打开"""
@@ -145,45 +143,45 @@ class RiskGuard:
             return Order.objects.filter(
                 user_id=user_id,
                 created_at__date=today,
-                status__in=['submitted', 'filled'],
+                status__in=["submitted", "filled"],
             ).count()
 
         return await count()
 
     async def _check_position_limit(
-        self, request: 'OrderRequest', user_id: str
+        self, request: "OrderRequest", user_id: str
     ) -> Tuple[bool, str]:
         """单笔仓位不超过总资产20%"""
         from apps.trading.executor import OrderExecutor
 
         executor = OrderExecutor.get_instance()
         if not executor:
-            return True, ''
+            return True, ""
 
         adapter = executor._adapters.get(request.exchange)
         if not adapter:
-            return True, ''
+            return True, ""
 
         try:
             balance = await adapter.get_balance()
         except Exception:
-            return True, ''
+            return True, ""
 
-        total_usdt = balance.get('USDT', Decimal('0'))
+        total_usdt = balance.get("USDT", Decimal("0"))
         if total_usdt == 0:
-            return True, ''
+            return True, ""
 
         if request.price is None:
             # 市价单无法预知价格，跳过仓位校验
-            return True, ''
+            return True, ""
 
         order_value = request.price * request.quantity
         ratio = order_value / total_usdt
         if ratio > self.MAX_POSITION_RATIO:
             return False, (
-                f'单笔仓位 {ratio:.1%} 超过上限 {self.MAX_POSITION_RATIO:.0%}'
+                f"单笔仓位 {ratio:.1%} 超过上限 {self.MAX_POSITION_RATIO:.0%}"
             )
-        return True, ''
+        return True, ""
 
     async def _check_drawdown(self, user_id: str) -> Tuple[bool, str]:
         """
@@ -200,20 +198,25 @@ class RiskGuard:
         def get_today_pnl():
             result = Order.objects.filter(
                 user_id=user_id,
-                status='filled',
+                status="filled",
                 created_at__date=today,
-            ).aggregate(total_pnl=Sum('realized_pnl'))
-            return result['total_pnl'] or Decimal('0')
+            ).aggregate(total_pnl=Sum("realized_pnl"))
+            return result["total_pnl"] or Decimal("0")
 
         @sync_to_async
         def get_initial_balance():
             """从 daily_account_snapshot 读取期初余额"""
             try:
                 from apps.trading.models import DailySnapshot
-                snap = DailySnapshot.objects.filter(
-                    user_id=user_id,
-                    date__lt=today,
-                ).order_by('-date').first()
+
+                snap = (
+                    DailySnapshot.objects.filter(
+                        user_id=user_id,
+                        date__lt=today,
+                    )
+                    .order_by("-date")
+                    .first()
+                )
                 if snap:
                     return snap.total_equity
             except Exception:
@@ -222,18 +225,18 @@ class RiskGuard:
 
         pnl = await get_today_pnl()
         if pnl >= 0:
-            return True, ''
+            return True, ""
 
         initial = await get_initial_balance()
         if initial is None or initial == 0:
-            return True, ''
+            return True, ""
 
         drawdown = abs(pnl) / initial
         if drawdown > self.MAX_DAILY_DRAWDOWN:
             return False, (
-                f'日内回撤 {drawdown:.1%} 超过上限 {self.MAX_DAILY_DRAWDOWN:.0%}'
+                f"日内回撤 {drawdown:.1%} 超过上限 {self.MAX_DAILY_DRAWDOWN:.0%}"
             )
-        return True, ''
+        return True, ""
 
     # ------------------------------------------------------------------ #
     #  实时监控 Loop                                                     #
@@ -245,7 +248,7 @@ class RiskGuard:
             try:
                 await self._check_floating_pnl()
             except Exception as e:
-                logger.error(f'RiskGuard monitor error: {e}')
+                logger.error(f"RiskGuard monitor error: {e}")
             await asyncio.sleep(60)
 
     async def _check_floating_pnl(self) -> None:
@@ -261,12 +264,12 @@ class RiskGuard:
                 positions = await adapter.get_positions()
                 balance = await adapter.get_balance()
             except Exception as e:
-                logger.error(f'Failed to fetch positions from {exchange}: {e}')
+                logger.error(f"Failed to fetch positions from {exchange}: {e}")
                 continue
 
-            total = balance.get('USDT', Decimal('1'))
+            total = balance.get("USDT", Decimal("1"))
             if total <= 0:
-                total = Decimal('1')
+                total = Decimal("1")
 
             for pos in positions:
                 pnl_ratio = pos.unrealized_pnl / total
@@ -274,9 +277,9 @@ class RiskGuard:
                     await self._send_floating_loss_alert(exchange, pos, pnl_ratio)
                     # 记录风控事件
                     await self._record_risk_event(
-                        level='P1',
-                        event_type='floating_loss',
-                        message=f'{exchange}:{pos.symbol} 浮亏 {pnl_ratio:.2%}',
+                        level="P1",
+                        event_type="floating_loss",
+                        message=f"{exchange}:{pos.symbol} 浮亏 {pnl_ratio:.2%}",
                     )
 
     async def _send_floating_loss_alert(
@@ -284,16 +287,15 @@ class RiskGuard:
     ) -> None:
         """发送 Telegram 浮亏预警"""
         try:
-            from apps.channel.telegram import TelegramChannel
             # TelegramChannel 需要 app 实例，通过日志作为 fallback
             logger.warning(
-                f'浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | '
-                f'方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}'
+                f"浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | "
+                f"方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}"
             )
-        except Exception as e:
+        except Exception:
             logger.warning(
-                f'浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | '
-                f'方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}'
+                f"浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | "
+                f"方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}"
             )
 
     async def _record_risk_event(
@@ -316,4 +318,4 @@ class RiskGuard:
 
             await create()
         except Exception as e:
-            logger.error(f'Failed to record risk event: {e}')
+            logger.error(f"Failed to record risk event: {e}")

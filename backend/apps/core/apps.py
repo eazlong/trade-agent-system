@@ -9,12 +9,12 @@ logger = logging.getLogger(__name__)
 
 
 class CoreConfig(AppConfig):
-    default_auto_field = 'django.db.models.BigAutoField'
-    name = 'apps.core'
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "apps.core"
 
     def ready(self):
         # 避免重复初始化（Django 会运行两次）
-        if os.environ.get('RUN_MAIN') != 'true':
+        if os.environ.get("RUN_MAIN") != "true":
             return
 
         logger.info("Core app ready, initializing background services...")
@@ -56,12 +56,13 @@ class CoreConfig(AppConfig):
 
         # 启动 AgentTaskConsumer
         from apps.agent.consumer import AgentTaskConsumer
+
         consumer = AgentTaskConsumer(concurrency=4)
         await consumer.start()
-        logger.info('AgentTaskConsumer started')
+        logger.info("AgentTaskConsumer started")
 
         # 启动 TelegramChannel
-        token = getattr(settings, 'TELEGRAM_BOT_TOKEN', '')
+        token = getattr(settings, "TELEGRAM_BOT_TOKEN", "")
         if token:
             from apps.channel.telegram import TelegramChannel
             from apps.agent.supervisor import SupervisorAgent
@@ -70,10 +71,10 @@ class CoreConfig(AppConfig):
             telegram_channel = TelegramChannel(token=token, supervisor_agent=supervisor)
 
             await telegram_channel.start()
-            logger.info('TelegramChannel started')
+            logger.info("TelegramChannel started")
 
             # 保存引用以便稍后清理
             self.telegram_channel = telegram_channel
 
         else:
-            logger.warning('TELEGRAM_BOT_TOKEN not set, skipping TelegramChannel')
+            logger.warning("TELEGRAM_BOT_TOKEN not set, skipping TelegramChannel")

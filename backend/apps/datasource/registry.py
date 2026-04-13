@@ -3,11 +3,9 @@
 
 使用装饰器模式实现懒加载单例，按需加载数据源。
 """
-import asyncio
+
 import threading
 from typing import Dict, Type, Optional, Any, Callable
-from functools import wraps
-from collections import OrderedDict
 
 
 class DataSourceRegistry:
@@ -20,7 +18,7 @@ class DataSourceRegistry:
     - 支持异步初始化
     """
 
-    _instance: Optional['DataSourceRegistry'] = None
+    _instance: Optional["DataSourceRegistry"] = None
     _lock = threading.Lock()
 
     # 注册表：{name: class}
@@ -32,7 +30,7 @@ class DataSourceRegistry:
     # 实例化锁（防止并发创建同一实例）
     _instance_locks: Dict[str, threading.Lock] = {}
 
-    def __new__(cls) -> 'DataSourceRegistry':
+    def __new__(cls) -> "DataSourceRegistry":
         """单例模式"""
         if cls._instance is None:
             with cls._lock:
@@ -55,11 +53,14 @@ class DataSourceRegistry:
             class BinanceDataSource(BaseDataSource):
                 name = 'binance'
         """
+
         def decorator(source_class: Type) -> Type:
             # 获取数据源名称
-            source_name = name or getattr(source_class, 'name', None)
+            source_name = name or getattr(source_class, "name", None)
             if not source_name:
-                raise ValueError(f"DataSource must have a 'name' attribute or be registered with explicit name")
+                raise ValueError(
+                    "DataSource must have a 'name' attribute or be registered with explicit name"
+                )
 
             # 注册类（不实例化）
             cls._registry[source_name] = source_class
@@ -88,7 +89,9 @@ class DataSourceRegistry:
             数据源实例（首次调用时创建）
         """
         if name not in cls._registry:
-            raise KeyError(f"DataSource '{name}' not registered. Available: {list(cls._registry.keys())}")
+            raise KeyError(
+                f"DataSource '{name}' not registered. Available: {list(cls._registry.keys())}"
+            )
 
         # 检查是否已实例化
         if name in cls._instances:
@@ -110,7 +113,7 @@ class DataSourceRegistry:
             instance = source_class()
 
             # 如果传入了市场类型配置，设置到实例上
-            if market_types is not None and hasattr(instance, 'set_market_types'):
+            if market_types is not None and hasattr(instance, "set_market_types"):
                 instance.set_market_types(market_types)
 
             # 存储实例
@@ -148,7 +151,7 @@ class DataSourceRegistry:
             instance = cls._instances[name]
 
             # 如果有 cleanup 方法，调用它
-            if hasattr(instance, 'cleanup'):
+            if hasattr(instance, "cleanup"):
                 try:
                     instance.cleanup()
                 except Exception as e:

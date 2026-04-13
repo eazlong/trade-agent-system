@@ -6,10 +6,10 @@ from .models import ExchangeAccount
 from .serializers import ExchangeAccountSerializer
 
 
-@api_view(['GET', 'POST'])
+@api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def account_list(request):
-    if request.method == 'GET':
+    if request.method == "GET":
         accounts = ExchangeAccount.objects.filter(is_active=True)
         return Response(ExchangeAccountSerializer(accounts, many=True).data)
     serializer = ExchangeAccountSerializer(data=request.data)
@@ -18,10 +18,10 @@ def account_list(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['DELETE'])
+@api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def account_detail(request, pk):
     account = ExchangeAccount.objects.get(pk=pk)
     account.is_active = False
-    account.save(update_fields=['is_active'])
+    account.save(update_fields=["is_active"])
     return Response(status=status.HTTP_204_NO_CONTENT)

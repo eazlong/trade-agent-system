@@ -8,54 +8,58 @@
 - 连接管理
 - 错误处理
 """
+
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Callable, Union
-from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
+from datetime import datetime
 from enum import Enum
 import threading
-import json
 
 
 class DataType(Enum):
     """数据类型"""
-    KLINE = 'kline'         # K线数据
-    TICKER = 'ticker'       # 行情快照
-    TRADE = 'trade'         # 成交数据
-    DEPTH = 'depth'         # 深度数据（订单簿）
-    FUNDING = 'funding'     # 资费率
-    OPEN_INTEREST = 'oi'    # 持仓量
+
+    KLINE = "kline"  # K线数据
+    TICKER = "ticker"  # 行情快照
+    TRADE = "trade"  # 成交数据
+    DEPTH = "depth"  # 深度数据（订单簿）
+    FUNDING = "funding"  # 资费率
+    OPEN_INTEREST = "oi"  # 持仓量
 
 
 class KlineInterval(Enum):
     """K线周期"""
-    M1 = '1m'
-    M3 = '3m'
-    M5 = '5m'
-    M15 = '15m'
-    M30 = '30m'
-    H1 = '1h'
-    H4 = '4h'
-    D1 = '1d'
-    W1 = '1w'
-    M1_MONTH = '1M'
+
+    M1 = "1m"
+    M3 = "3m"
+    M5 = "5m"
+    M15 = "15m"
+    M30 = "30m"
+    H1 = "1h"
+    H4 = "4h"
+    D1 = "1d"
+    W1 = "1w"
+    M1_MONTH = "1M"
 
 
 class MarketType(Enum):
     """市场类型"""
-    SPOT = 'spot'           # 现货
-    FUTURES = 'futures'     # 合约（永续）
-    MARGIN = 'margin'       # 杠杆
+
+    SPOT = "spot"  # 现货
+    FUTURES = "futures"  # 合约（永续）
+    MARGIN = "margin"  # 杠杆
 
 
 class ConnectionStatus(Enum):
     """连接状态"""
-    DISCONNECTED = 'disconnected'
-    CONNECTING = 'connecting'
-    CONNECTED = 'connected'
-    RECONNECTING = 'reconnecting'
-    ERROR = 'error'
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    ERROR = "error"
 
 
 class BaseDataSource(ABC):
@@ -78,10 +82,10 @@ class BaseDataSource(ABC):
     """
 
     # 数据源名称（必须由子类定义）
-    name: str = ''
+    name: str = ""
 
     # 数据源类型
-    source_type: str = ''  # 'crypto' | 'stock'
+    source_type: str = ""  # 'crypto' | 'stock'
 
     # 支持的数据类型
     supported_data_types: List[DataType] = []
@@ -93,10 +97,10 @@ class BaseDataSource(ABC):
     supported_intervals: List[KlineInterval] = []
 
     # WebSocket 端点
-    ws_endpoint: str = ''
+    ws_endpoint: str = ""
 
     # REST API 端点
-    rest_endpoint: str = ''
+    rest_endpoint: str = ""
 
     # 连接超时（秒）
     connection_timeout: float = 10.0
@@ -210,22 +214,30 @@ class BaseDataSource(ABC):
 
     def get_status(self) -> Dict[str, Any]:
         """获取数据源当前运行状态"""
-        import time
+
         now = time.time()
-        last_data_age = round(now - self._last_data_time, 1) if self._last_data_time > 0 else None
+        last_data_age = (
+            round(now - self._last_data_time, 1) if self._last_data_time > 0 else None
+        )
 
         return {
-            'name': self.name,
-            'source_type': self.source_type,
-            'status': self._ws_status.value,
-            'connected': self.is_connected(),
-            'connected_at': self._connected_at.isoformat() if self._connected_at else None,
-            'subscriptions': len(self._subscriptions),
-            'subscription_keys': list(self._subscriptions.keys()),
-            'last_data_time': datetime.fromtimestamp(self._last_data_time).isoformat() if self._last_data_time > 0 else None,
-            'last_data_age_seconds': last_data_age,
-            'market_types': [mt.value for mt in (self._market_types or self.supported_market_types)],
-            'supported_data_types': [dt.value for dt in self.supported_data_types],
+            "name": self.name,
+            "source_type": self.source_type,
+            "status": self._ws_status.value,
+            "connected": self.is_connected(),
+            "connected_at": self._connected_at.isoformat()
+            if self._connected_at
+            else None,
+            "subscriptions": len(self._subscriptions),
+            "subscription_keys": list(self._subscriptions.keys()),
+            "last_data_time": datetime.fromtimestamp(self._last_data_time).isoformat()
+            if self._last_data_time > 0
+            else None,
+            "last_data_age_seconds": last_data_age,
+            "market_types": [
+                mt.value for mt in (self._market_types or self.supported_market_types)
+            ],
+            "supported_data_types": [dt.value for dt in self.supported_data_types],
         }
 
     # ==================== REST API ====================
@@ -238,7 +250,7 @@ class BaseDataSource(ABC):
         market_type: MarketType = MarketType.SPOT,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        limit: int = 1000
+        limit: int = 1000,
     ) -> List[Dict]:
         """
         获取历史 K 线数据
@@ -263,7 +275,7 @@ class BaseDataSource(ABC):
         market_type: MarketType = MarketType.SPOT,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        limit: int = 1000
+        limit: int = 1000,
     ) -> List[Dict]:
         """
         获取历史成交数据
@@ -282,9 +294,7 @@ class BaseDataSource(ABC):
 
     @abstractmethod
     async def fetch_ticker(
-        self,
-        symbol: str,
-        market_type: MarketType = MarketType.SPOT
+        self, symbol: str, market_type: MarketType = MarketType.SPOT
     ) -> Dict:
         """
         获取实时行情快照
@@ -307,7 +317,7 @@ class BaseDataSource(ABC):
         data_type: DataType,
         interval: Optional[KlineInterval] = None,
         market_type: MarketType = MarketType.SPOT,
-        callback: Optional[Callable] = None
+        callback: Optional[Callable] = None,
     ) -> bool:
         """
         订阅数据
@@ -330,7 +340,7 @@ class BaseDataSource(ABC):
         symbol: str,
         data_type: DataType,
         interval: Optional[KlineInterval] = None,
-        market_type: MarketType = MarketType.SPOT
+        market_type: MarketType = MarketType.SPOT,
     ) -> bool:
         """
         取消订阅
@@ -486,8 +496,7 @@ class BaseDataSource(ABC):
                 # 在异步循环中执行断开
                 if self._loop and self._loop.is_running():
                     asyncio.run_coroutine_threadsafe(
-                        self.disconnect_websocket(),
-                        self._loop
+                        self.disconnect_websocket(), self._loop
                     )
             except Exception as e:
                 print(f"Error disconnecting WebSocket: {e}")

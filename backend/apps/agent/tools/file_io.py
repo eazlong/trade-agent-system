@@ -10,7 +10,7 @@ from .base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 # Default workspace root: ~/.tradelogx/
-WORKSPACE_ROOT = Path.home() / '.tradelogx'
+WORKSPACE_ROOT = Path.home() / ".tradelogx"
 
 
 class ReadFileTool(BaseTool):
@@ -19,52 +19,52 @@ class ReadFileTool(BaseTool):
     Paths are relative to the workspace root: ~/.tradelogx/workspace/{agent_name}/
     """
 
-    name = 'read_file'
+    name = "read_file"
     description = (
-        '读取工作区中的文件内容。'
-        '路径相对于 ~/.tradelogx/ 目录。'
-        '如果文件不存在或路径无效，返回错误。'
+        "读取工作区中的文件内容。"
+        "路径相对于 ~/.tradelogx/ 目录。"
+        "如果文件不存在或路径无效，返回错误。"
     )
 
     @property
     def parameters_schema(self) -> dict:
         return {
-            'type': 'object',
-            'properties': {
-                'file_path': {
-                    'type': 'string',
-                    'description': '要读取的文件路径（相对于 workspace 根目录）',
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "要读取的文件路径（相对于 workspace 根目录）",
                 },
-                'agent_name': {
-                    'type': 'string',
-                    'description': '所属 agent 名称，用于定位工作区',
+                "agent_name": {
+                    "type": "string",
+                    "description": "所属 agent 名称，用于定位工作区",
                 },
-                'max_chars': {
-                    'type': 'integer',
-                    'description': '最大读取字符数，默认 10000',
-                    'default': 10000,
-                    'minimum': 1,
-                    'maximum': 50000,
+                "max_chars": {
+                    "type": "integer",
+                    "description": "最大读取字符数，默认 10000",
+                    "default": 10000,
+                    "minimum": 1,
+                    "maximum": 50000,
                 },
             },
-            'required': ['file_path', 'agent_name'],
+            "required": ["file_path", "agent_name"],
         }
 
     async def execute(
         self,
-        file_path: str = '',
-        agent_name: str = '',
+        file_path: str = "",
+        agent_name: str = "",
         max_chars: int = 10000,
         **kwargs,
     ) -> ToolResult:
         if not file_path:
-            return ToolResult(success=False, error='file_path 参数缺失')
+            return ToolResult(success=False, error="file_path 参数缺失")
         if not agent_name:
-            return ToolResult(success=False, error='agent_name 参数缺失')
+            return ToolResult(success=False, error="agent_name 参数缺失")
 
         try:
             # Resolve path relative to agent workspace
-            base = WORKSPACE_ROOT #/ agent_name
+            base = WORKSPACE_ROOT  # / agent_name
             # Allow absolute paths for safety, but prefer relative
             if Path(file_path).is_absolute():
                 full_path = Path(file_path)
@@ -77,22 +77,22 @@ class ReadFileTool(BaseTool):
             except ValueError:
                 return ToolResult(
                     success=False,
-                    error=f'路径越界，只允许访问 {base} 目录下的文件',
+                    error=f"路径越界，只允许访问 {base} 目录下的文件",
                 )
 
             if not full_path.exists():
                 return ToolResult(
                     success=False,
-                    error=f'文件不存在: {full_path}',
+                    error=f"文件不存在: {full_path}",
                 )
 
             if not full_path.is_file():
                 return ToolResult(
                     success=False,
-                    error=f'路径不是文件: {full_path}',
+                    error=f"路径不是文件: {full_path}",
                 )
 
-            content = full_path.read_text(encoding='utf-8')
+            content = full_path.read_text(encoding="utf-8")
             truncated = len(content) > max_chars
             if truncated:
                 content = content[:max_chars]
@@ -100,19 +100,19 @@ class ReadFileTool(BaseTool):
             return ToolResult(
                 success=True,
                 data={
-                    'content': content,
-                    'truncated': truncated,
-                    'total_chars': len(full_path.read_text(encoding='utf-8')),
-                    'file_path': str(full_path),
-                    'line_count': len(content.splitlines()),
+                    "content": content,
+                    "truncated": truncated,
+                    "total_chars": len(full_path.read_text(encoding="utf-8")),
+                    "file_path": str(full_path),
+                    "line_count": len(content.splitlines()),
                 },
             )
 
         except UnicodeDecodeError:
-            return ToolResult(success=False, error='文件不是 UTF-8 编码，无法读取')
+            return ToolResult(success=False, error="文件不是 UTF-8 编码，无法读取")
         except Exception as e:
-            logger.error('[ReadFileTool] error: %s', e)
-            return ToolResult(success=False, error=f'读取文件失败: {e}')
+            logger.error("[ReadFileTool] error: %s", e)
+            return ToolResult(success=False, error=f"读取文件失败: {e}")
 
 
 class WriteFileTool(BaseTool):
@@ -121,57 +121,57 @@ class WriteFileTool(BaseTool):
     Paths are relative to the workspace root: ~/.tradelogx/
     """
 
-    name = 'write_file'
+    name = "write_file"
     description = (
-        '将内容写入工作区中的文件。'
-        '路径相对于 ~/.tradelogx/ 目录。'
-        '如果父目录不存在，会自动创建。'
+        "将内容写入工作区中的文件。"
+        "路径相对于 ~/.tradelogx/ 目录。"
+        "如果父目录不存在，会自动创建。"
     )
 
     @property
     def parameters_schema(self) -> dict:
         return {
-            'type': 'object',
-            'properties': {
-                'file_path': {
-                    'type': 'string',
-                    'description': '要写入的文件路径（相对于 workspace 根目录）',
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "要写入的文件路径（相对于 workspace 根目录）",
                 },
-                'agent_name': {
-                    'type': 'string',
-                    'description': '所属 agent 名称，用于定位工作区',
+                "agent_name": {
+                    "type": "string",
+                    "description": "所属 agent 名称，用于定位工作区",
                 },
-                'content': {
-                    'type': 'string',
-                    'description': '要写入的文件内容',
+                "content": {
+                    "type": "string",
+                    "description": "要写入的文件内容",
                 },
-                'append': {
-                    'type': 'boolean',
-                    'description': '是否追加模式（追加到文件末尾），默认 False（覆盖）',
-                    'default': False,
+                "append": {
+                    "type": "boolean",
+                    "description": "是否追加模式（追加到文件末尾），默认 False（覆盖）",
+                    "default": False,
                 },
             },
-            'required': ['file_path', 'agent_name', 'content'],
+            "required": ["file_path", "agent_name", "content"],
         }
 
     async def execute(
         self,
-        file_path: str = '',
-        agent_name: str = '',
-        content: str = '',
+        file_path: str = "",
+        agent_name: str = "",
+        content: str = "",
         append: bool = False,
         **kwargs,
     ) -> ToolResult:
         if not file_path:
-            return ToolResult(success=False, error='file_path 参数缺失')
+            return ToolResult(success=False, error="file_path 参数缺失")
         if not agent_name:
-            return ToolResult(success=False, error='agent_name 参数缺失')
+            return ToolResult(success=False, error="agent_name 参数缺失")
         if content is None:
-            return ToolResult(success=False, error='content 参数缺失')
+            return ToolResult(success=False, error="content 参数缺失")
 
         try:
             # Resolve path relative to agent workspace
-            base = WORKSPACE_ROOT #/ agent_name
+            base = WORKSPACE_ROOT  # / agent_name
             if Path(file_path).is_absolute():
                 full_path = Path(file_path)
             else:
@@ -183,26 +183,26 @@ class WriteFileTool(BaseTool):
             except ValueError:
                 return ToolResult(
                     success=False,
-                    error=f'路径越界，只允许写入 {base} 目录下的文件',
+                    error=f"路径越界，只允许写入 {base} 目录下的文件",
                 )
 
             # Create parent directories if needed
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
-            mode = 'a' if append else 'w'
-            with open(full_path, mode, encoding='utf-8') as f:
+            mode = "a" if append else "w"
+            with open(full_path, mode, encoding="utf-8") as f:
                 f.write(content)
 
             return ToolResult(
                 success=True,
                 data={
-                    'file_path': str(full_path),
-                    'bytes_written': len(content.encode('utf-8')),
-                    'lines_written': len(content.splitlines()),
-                    'append': append,
+                    "file_path": str(full_path),
+                    "bytes_written": len(content.encode("utf-8")),
+                    "lines_written": len(content.splitlines()),
+                    "append": append,
                 },
             )
 
         except Exception as e:
-            logger.error('[WriteFileTool] error: %s', e)
-            return ToolResult(success=False, error=f'写入文件失败: {e}')
+            logger.error("[WriteFileTool] error: %s", e)
+            return ToolResult(success=False, error=f"写入文件失败: {e}")

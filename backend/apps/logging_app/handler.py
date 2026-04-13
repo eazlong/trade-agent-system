@@ -3,7 +3,7 @@ Custom logging handler that writes logs to:
 1. Django DB (SystemLog model) — async, non-blocking
 2. Redis Stream — for real-time SSE streaming
 """
-import json
+
 import logging
 import os
 import threading
@@ -23,13 +23,13 @@ def _get_redis():
         return _redis_client
     with _redis_lock:
         if _redis_client is None:
-            url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+            url = os.environ.get("REDIS_URL", "redis://localhost:6379")
             _redis_client = redis.Redis.from_url(url, decode_responses=True)
         return _redis_client
 
 
 # Stream key for real-time log broadcasting
-LOG_STREAM_KEY = 'system:logs'
+LOG_STREAM_KEY = "system:logs"
 # Max stream length (keep last 10000 entries)
 LOG_STREAM_MAXLEN = 10000
 
@@ -45,33 +45,41 @@ class SystemLogHandler(logging.Handler):
             msg = self.format(record)
             module = resolve_module(record.name)
             level_name = record.levelname
-            trace_id = getattr(record, 'trace_id', '')
+            trace_id = getattr(record, "trace_id", "")
             extra_data = {}
             # Collect extra fields from the log record
-            for key in ('request_id', 'user_id', 'task_id', 'duration_ms', 'token_used'):
+            for key in (
+                "request_id",
+                "user_id",
+                "task_id",
+                "duration_ms",
+                "token_used",
+            ):
                 val = getattr(record, key, None)
                 if val is not None:
                     extra_data[key] = val
 
             entry = {
-                'level': level_name,
-                'module': module,
-                'logger': record.name,
-                'message': msg,
-                'trace_id': trace_id,
-                'extra': extra_data,
-                'ts': datetime.now(timezone.utc).isoformat(),
+                "level": level_name,
+                "module": module,
+                "logger": record.name,
+                "message": msg,
+                "trace_id": trace_id,
+                "extra": extra_data,
+                "ts": datetime.now(timezone.utc).isoformat(),
             }
 
             # Push to Redis Stream (non-blocking, fire-and-forget)
             try:
                 r = _get_redis()
-                r.xadd(LOG_STREAM_KEY, entry, maxlen=LOG_STREAM_MAXLEN, approximate=True)
+                r.xadd(
+                    LOG_STREAM_KEY, entry, maxlen=LOG_STREAM_MAXLEN, approximate=True
+                )
             except Exception:
                 pass  # Redis unavailable — don't block the app
 
             # Write to DB asynchronously (best-effort, non-blocking)
-            if not getattr(record, '_suppress_db', False):
+            if not getattr(record, "_suppress_db", False):
                 threading.Thread(
                     target=self._save_to_db,
                     args=(level_name, module, record.name, msg, trace_id, extra_data),
@@ -87,6 +95,7 @@ class SystemLogHandler(logging.Handler):
         try:
             # Lazy import to avoid AppRegistryNotReady at module load time
             from apps.logging_app.models import SystemLog
+
             SystemLog.objects.create(
                 level=level_name,
                 module=module,
@@ -113,7 +122,7 @@ class DBOnlyLogHandler(logging.Handler):
                     module=module,
                     logger_name=record.name,
                     message=msg[:4000],
-                    trace_id=getattr(record, 'trace_id', ''),
+                    trace_id=getattr(record, "trace_id", ""),
                     extra_data={},
                 )
         except Exception:
@@ -123,6 +132,7 @@ class DBOnlyLogHandler(logging.Handler):
     def _get_model():
         try:
             from apps.logging_app.models import SystemLog
+
             return SystemLog
         except Exception:
             return None

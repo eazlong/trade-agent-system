@@ -1,4 +1,5 @@
 """Tests for OrderExecutor (L2 — mock adapter + ORM)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -26,8 +27,8 @@ class TestOrderExecutorL2(unittest.TestCase):
         """initialize() 应设置 _instance"""
         self.assertIsNone(OrderExecutor._instance)
         # Mock the internal methods
-        with patch.object(self.executor, '_load_adapters', new_callable=AsyncMock):
-            with patch.object(self.executor, '_load_riskguard'):
+        with patch.object(self.executor, "_load_adapters", new_callable=AsyncMock):
+            with patch.object(self.executor, "_load_riskguard"):
                 asyncio.run(self.executor.initialize())
         self.assertIs(OrderExecutor._instance, self.executor)
 
@@ -35,106 +36,116 @@ class TestOrderExecutorL2(unittest.TestCase):
         """submit_order() 在未运行时抛 RuntimeError"""
         self.executor._running = False
         with self.assertRaises(RuntimeError):
-            asyncio.run(self.executor.submit_order(
-                exchange='binance',
-                symbol='BTCUSDT',
-                side='buy',
-                order_type='market',
-                quantity=Decimal('0.001'),
-                price=None,
-                exchange_account_id='uuid-placeholder',
-            ))
+            asyncio.run(
+                self.executor.submit_order(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=Decimal("0.001"),
+                    price=None,
+                    exchange_account_id="uuid-placeholder",
+                )
+            )
 
     def test_submit_order_requires_adapter(self):
         """submit_order() 在 adapter 不存在时抛 ValueError"""
         self.executor._adapters = {}
         self.executor._riskguard = None
         with self.assertRaises(ValueError):
-            asyncio.run(self.executor.submit_order(
-                exchange='binance',
-                symbol='BTCUSDT',
-                side='buy',
-                order_type='market',
-                quantity=Decimal('0.001'),
-                price=None,
-                exchange_account_id='uuid-placeholder',
-            ))
+            asyncio.run(
+                self.executor.submit_order(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=Decimal("0.001"),
+                    price=None,
+                    exchange_account_id="uuid-placeholder",
+                )
+            )
 
     def test_submit_order_riskguard_rejection(self):
         """RiskGuard 拒绝时抛 PermissionError"""
         mock_adapter = AsyncMock()
-        self.executor._adapters = {'binance': mock_adapter}
+        self.executor._adapters = {"binance": mock_adapter}
 
         mock_riskguard = AsyncMock()
-        mock_riskguard.pre_trade_check.return_value = (False, '日内交易次数已达上限')
+        mock_riskguard.pre_trade_check.return_value = (False, "日内交易次数已达上限")
         self.executor._riskguard = mock_riskguard
 
         with self.assertRaises(PermissionError) as ctx:
-            asyncio.run(self.executor.submit_order(
-                exchange='binance',
-                symbol='BTCUSDT',
-                side='buy',
-                order_type='market',
-                quantity=Decimal('0.001'),
-                price=None,
-                exchange_account_id='uuid-placeholder',
-            ))
-        self.assertIn('RiskGuard拒绝下单', str(ctx.exception))
+            asyncio.run(
+                self.executor.submit_order(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=Decimal("0.001"),
+                    price=None,
+                    exchange_account_id="uuid-placeholder",
+                )
+            )
+        self.assertIn("RiskGuard拒绝下单", str(ctx.exception))
 
-    @patch('apps.trading.models.Order.objects')
+    @patch("apps.trading.models.Order.objects")
     def test_submit_order_success_path(self, mock_order_mgr):
         """下单成功流程：RiskGuard通过 → 写DB → 发交易所 → 更新DB"""
         mock_adapter = AsyncMock()
         mock_response = MagicMock()
-        mock_response.exchange_order_id = '123456'
-        mock_response.status = 'NEW'
+        mock_response.exchange_order_id = "123456"
+        mock_response.status = "NEW"
         mock_adapter.place_order.return_value = mock_response
-        self.executor._adapters = {'binance': mock_adapter}
+        self.executor._adapters = {"binance": mock_adapter}
         self.executor._riskguard = None  # 跳过风控
 
         # Mock Order.objects.create
         mock_order = MagicMock()
-        mock_order.id = 'order-uuid-123'
+        mock_order.id = "order-uuid-123"
         mock_order_mgr.create.return_value = mock_order
         mock_order_mgr.filter.return_value.update = MagicMock()
 
-        result = asyncio.run(self.executor.submit_order(
-            exchange='binance',
-            symbol='BTCUSDT',
-            side='buy',
-            order_type='market',
-            quantity=Decimal('0.001'),
-            price=None,
-            exchange_account_id='uuid-placeholder',
-        ))
+        result = asyncio.run(
+            self.executor.submit_order(
+                exchange="binance",
+                symbol="BTCUSDT",
+                side="buy",
+                order_type="market",
+                quantity=Decimal("0.001"),
+                price=None,
+                exchange_account_id="uuid-placeholder",
+            )
+        )
 
-        self.assertEqual(result['order_id'], 'order-uuid-123')
-        self.assertEqual(result['exchange_order_id'], '123456')
+        self.assertEqual(result["order_id"], "order-uuid-123")
+        self.assertEqual(result["exchange_order_id"], "123456")
         mock_adapter.place_order.assert_called_once()
 
-    @patch('apps.trading.models.Order.objects')
+    @patch("apps.trading.models.Order.objects")
     def test_submit_order_exchange_error_updates_status(self, mock_order_mgr):
         """交易所发送失败时订单状态应更新为 failed"""
         mock_adapter = AsyncMock()
-        mock_adapter.place_order.side_effect = Exception('network error')
-        self.executor._adapters = {'binance': mock_adapter}
+        mock_adapter.place_order.side_effect = Exception("network error")
+        self.executor._adapters = {"binance": mock_adapter}
         self.executor._riskguard = None
 
         mock_order = MagicMock()
-        mock_order.id = 'order-uuid-fail'
+        mock_order.id = "order-uuid-fail"
         mock_order_mgr.create.return_value = mock_order
         mock_order_mgr.filter.return_value.update = MagicMock()
 
         with self.assertRaises(Exception):
-            asyncio.run(self.executor.submit_order(
-                exchange='binance',
-                symbol='BTCUSDT',
-                side='buy',
-                order_type='market',
-                quantity=Decimal('0.001'),
-                price=None,
-                exchange_account_id='uuid-placeholder',
-            ))
+            asyncio.run(
+                self.executor.submit_order(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    side="buy",
+                    order_type="market",
+                    quantity=Decimal("0.001"),
+                    price=None,
+                    exchange_account_id="uuid-placeholder",
+                )
+            )
 
         # 验证 update 被调用了（failed 状态）
         mock_order_mgr.filter.return_value.update.assert_called()
@@ -143,30 +154,30 @@ class TestOrderExecutorL2(unittest.TestCase):
         """cancel_order() 在未运行时抛 RuntimeError"""
         self.executor._running = False
         with self.assertRaises(RuntimeError):
-            asyncio.run(self.executor.cancel_order('binance', '123', 'BTCUSDT'))
+            asyncio.run(self.executor.cancel_order("binance", "123", "BTCUSDT"))
 
     def test_cancel_order_no_adapter(self):
         """cancel_order() 在 adapter 不存在时抛 ValueError"""
         self.executor._adapters = {}
         with self.assertRaises(ValueError):
-            asyncio.run(self.executor.cancel_order('binance', '123', 'BTCUSDT'))
+            asyncio.run(self.executor.cancel_order("binance", "123", "BTCUSDT"))
 
     def test_get_positions_requires_running(self):
         """get_positions() 在未运行时抛 RuntimeError"""
         self.executor._running = False
         with self.assertRaises(RuntimeError):
-            asyncio.run(self.executor.get_positions('binance'))
+            asyncio.run(self.executor.get_positions("binance"))
 
     def test_get_balance_requires_running(self):
         """get_balance() 在未运行时抛 RuntimeError"""
         self.executor._running = False
         with self.assertRaises(RuntimeError):
-            asyncio.run(self.executor.get_balance('binance'))
+            asyncio.run(self.executor.get_balance("binance"))
 
     def test_shutdown_resets_instance(self):
         """shutdown() 应重置单例"""
         mock_adapter = AsyncMock()
-        self.executor._adapters = {'binance': mock_adapter}
+        self.executor._adapters = {"binance": mock_adapter}
         self.executor._running = True
         OrderExecutor._instance = self.executor
 
@@ -180,7 +191,7 @@ class TestOrderExecutorL2(unittest.TestCase):
         """shutdown() 应断开所有 adapter"""
         mock_adapter1 = AsyncMock()
         mock_adapter2 = AsyncMock()
-        self.executor._adapters = {'binance': mock_adapter1, 'okx': mock_adapter2}
+        self.executor._adapters = {"binance": mock_adapter1, "okx": mock_adapter2}
         self.executor._running = True
         OrderExecutor._instance = self.executor
 
