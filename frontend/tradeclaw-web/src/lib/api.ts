@@ -283,3 +283,85 @@ export const loggingApi = {
     return request<SystemLog[]>(`/api/logs/${qs ? `?${qs}` : ""}`);
   },
 };
+
+// ── Backtest API ──
+
+export interface BacktestResult {
+  id: string;
+  strategy: number;
+  symbol: string;
+  timeframe: string;
+  start_date: string;
+  end_date: string;
+  initial_capital: string;
+  final_capital: string;
+  total_return_pct: number;
+  sharpe_ratio: number | null;
+  max_drawdown_pct: number | null;
+  win_rate: number | null;
+  total_trades: number;
+  git_commit_hash: string;
+  parameters: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface EquityPoint {
+  timestamp: string;
+  equity: number;
+  drawdown: number;
+}
+
+export interface DrawdownPoint {
+  timestamp: string;
+  drawdown: number;
+}
+
+export interface BacktestDetail extends BacktestResult {
+  equity_curve: EquityPoint[];
+  drawdown_curve: DrawdownPoint[];
+}
+
+export interface BacktestTrade {
+  id: string;
+  entry_time: string;
+  exit_time: string | null;
+  symbol: string;
+  side: "long" | "short";
+  entry_price: string;
+  exit_price: string | null;
+  quantity: string;
+  pnl: string | null;
+  pnl_pct: number | null;
+  cumulative_pnl: string | null;
+  fees: string | null;
+  tags: string[];
+  created_at: string;
+}
+
+export interface PaginatedTrades {
+  count: number;
+  num_pages: number;
+  current_page: number;
+  results: BacktestTrade[];
+}
+
+export const backtestApi = {
+  getList: () => request<BacktestResult[]>("/api/backtest/results/"),
+  getDetail: (id: string) =>
+    request<BacktestResult>(`/api/backtest/results/${id}/`),
+  getFullDetail: (id: string) =>
+    request<BacktestDetail>(`/api/backtest/results/${id}/detail/`),
+  getTrades: (
+    id: string,
+    params?: { page?: number; page_size?: number; sort?: string }
+  ) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    if (params?.sort) query.set("sort", params.sort);
+    const qs = query.toString();
+    return request<PaginatedTrades>(
+      `/api/backtest/results/${id}/trades/${qs ? `?${qs}` : ""}`
+    );
+  },
+};
