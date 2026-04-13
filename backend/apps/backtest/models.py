@@ -32,6 +32,20 @@ class BacktestResult(models.Model):
         help_text='[{"timestamp": "...", "drawdown": -0.012}, ...]',
     )
 
+    # OHLCV market data used for backtest
+    ohlcv_data = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='[{"timestamp": "...", "open": x, "high": x, "low": x, "close": x, "volume": x}, ...]',
+    )
+
+    # Computed technical indicators
+    indicator_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='{"ma7": [...], "ma25": [...], "macd": {"dif": [...], "dea": [...], "hist": [...]}, "rsi": [...]}',
+    )
+
     class Meta:
         db_table = 'backtest_results'
 

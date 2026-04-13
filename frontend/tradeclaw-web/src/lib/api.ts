@@ -316,9 +316,29 @@ export interface DrawdownPoint {
   drawdown: number;
 }
 
+export interface OHLCVPoint {
+  timestamp: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface IndicatorData {
+  ma7?: number[];
+  ma25?: number[];
+  ma99?: number[];
+  boll?: { upper: number[]; mid: number[]; lower: number[] };
+  macd?: { dif: number[]; dea: number[]; hist: number[] };
+  rsi?: number[];
+}
+
 export interface BacktestDetail extends BacktestResult {
   equity_curve: EquityPoint[];
   drawdown_curve: DrawdownPoint[];
+  ohlcv_data: OHLCVPoint[];
+  indicator_data: IndicatorData;
 }
 
 export interface BacktestTrade {

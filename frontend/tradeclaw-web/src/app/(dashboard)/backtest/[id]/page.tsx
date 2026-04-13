@@ -4,20 +4,22 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import DashboardShell from "@/components/layout/DashboardShell";
-import { backtestApi, type BacktestDetail } from "@/lib/api";
+import { backtestApi, type BacktestDetail, type BacktestTrade } from "@/lib/api";
+import CandlestickChart from "@/components/backtest/CandlestickChart";
 import EquityChart from "@/components/backtest/EquityChart";
 import DrawdownChart from "@/components/backtest/DrawdownChart";
 import TradeLog from "@/components/backtest/TradeLog";
 
-type TabKey = "equity" | "drawdown" | "trades";
+type TabKey = "kline" | "equity" | "drawdown" | "trades";
 
 export default function BacktestDetailPage() {
   const params = useParams();
   const id = params.id as string;
 
   const [detail, setDetail] = useState<BacktestDetail | null>(null);
+  const [trades, setTrades] = useState<BacktestTrade[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<TabKey>("equity");
+  const [activeTab, setActiveTab] = useState<TabKey>("kline");
 
   useEffect(() => {
     backtestApi
@@ -26,6 +28,14 @@ export default function BacktestDetailPage() {
       .catch(() => setDetail(null))
       .finally(() => setLoading(false));
   }, [id]);
+
+  useEffect(() => {
+    if (!detail) return;
+    // Fetch all trades for markers (large page_size)
+    backtestApi.getTrades(id, { page: 1, page_size: 10000 }).then((res) => {
+      setTrades(res.results);
+    });
+  }, [detail, id]);
 
   if (loading) {
     return (
@@ -59,6 +69,7 @@ export default function BacktestDetailPage() {
     v !== null ? v.toFixed(decimals) : "—";
 
   const tabs: { key: TabKey; label: string }[] = [
+    { key: "kline", label: "K线图" },
     { key: "equity", label: "权益曲线" },
     { key: "drawdown", label: "回撤曲线" },
     { key: "trades", label: "交易日志" },
@@ -97,7 +108,7 @@ export default function BacktestDetailPage() {
           },
           {
             label: "胜率",
-            value: detail.win_rate ? `${(detail.win_rate * 100).toFixed(1)}%` : "—",
+            value: detail.win_rate ? `${detail.win_rate.toFixed(1)}%` : "—",
           },
         ].map((m, i) => (
           <div
@@ -133,6 +144,13 @@ export default function BacktestDetailPage() {
 
       {/* Chart / Log Area */}
       <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl px-4 py-4">
+        {activeTab === "kline" && detail && (
+          <CandlestickChart
+            ohlcv={detail.ohlcv_data}
+            indicators={detail.indicator_data}
+            trades={trades}
+          />
+        )}
         {activeTab === "equity" && (
           <EquityChart data={detail.equity_curve} showBenchmark />
         )}

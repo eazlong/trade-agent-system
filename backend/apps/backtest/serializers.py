@@ -15,7 +15,7 @@ class BacktestResultSerializer(serializers.ModelSerializer):
 
 
 class BacktestDetailSerializer(serializers.ModelSerializer):
-    """Extended serializer with equity_curve and drawdown_curve."""
+    """Extended serializer with equity/drawdown curves, OHLCV data, and indicators."""
 
     class Meta:
         model = BacktestResult
@@ -24,7 +24,7 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
             'initial_capital', 'final_capital', 'total_return_pct',
             'sharpe_ratio', 'max_drawdown_pct', 'win_rate', 'total_trades',
             'git_commit_hash', 'parameters', 'created_at',
-            'equity_curve', 'drawdown_curve',
+            'equity_curve', 'drawdown_curve', 'ohlcv_data', 'indicator_data',
         ]
         read_only_fields = ['id', 'created_at']
 
