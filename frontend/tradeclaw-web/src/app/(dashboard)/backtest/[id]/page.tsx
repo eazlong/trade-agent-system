@@ -149,6 +149,7 @@ export default function BacktestDetailPage() {
             ohlcv={detail.ohlcv_data}
             indicators={detail.indicator_data}
             trades={trades}
+            timeframe={detail.timeframe}
           />
         )}
         {activeTab === "equity" && (
