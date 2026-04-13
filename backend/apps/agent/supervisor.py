@@ -208,7 +208,7 @@ class SupervisorAgent(BaseAgent):
     name = 'supervisor'
     _agent_tools: list[str] = [
         'web_search', 'web_fetch', 'read_file', 'write_file',
-        'load_skill', 'get_system_status',
+        'load_skill', 'get_system_status', 'get_exchange_account',
     ]
 
     _instance: Optional['SupervisorAgent'] = None
@@ -358,6 +358,10 @@ class SupervisorAgent(BaseAgent):
 
             # 尝试用新意图路由
             new_intent = await self._parse_intent(message.payload.get('text', ''))
+            if isinstance(new_intent, dict) and new_intent.get('_free_chat'):
+                if new_intent.get('response'):
+                    return AgentResult(task_id=message.task_id, success=True, data=new_intent['response'])
+                return await self._free_chat(message)
             if new_intent and new_intent != 'free_chat':
                 new_agent = self._router.get_agent_for_intent(new_intent)
                 if new_agent and new_agent != agent_name:
@@ -410,6 +414,15 @@ class SupervisorAgent(BaseAgent):
             message.payload.get('text', ''),
             context=routing_history[-5:] if routing_history else None,
         )
+
+        # LLM 直接返回自由对话（节省一次 LLM 调用）
+        if isinstance(intent, dict) and intent.get('_free_chat'):
+            response_text = intent.get('response')
+            if response_text:
+                return AgentResult(task_id=message.task_id, success=True, data=response_text)
+            # response 为空（LLM 降级），用 _free_chat 处理
+            return await self._free_chat(message)
+
         message.intent = intent
 
         # 框架生命周期
@@ -471,6 +484,10 @@ class SupervisorAgent(BaseAgent):
                 message.payload.get('text', ''),
                 exclude_agents=exclude_agents,
             )
+            if isinstance(new_intent, dict) and new_intent.get('_free_chat'):
+                if new_intent.get('response'):
+                    return AgentResult(task_id=message.task_id, success=True, data=new_intent['response'])
+                return await self._free_chat(message)
             if new_intent and new_intent != 'free_chat':
                 new_agent = self._router.get_agent_for_intent(new_intent)
                 if new_agent and new_agent not in attempted:
@@ -525,12 +542,13 @@ class SupervisorAgent(BaseAgent):
 
     async def _parse_intent(self, text: str,
                            context: list | None = None,
-                           exclude_agents: list | None = None) -> str:
+                           exclude_agents: list | None = None) -> str | dict:
         """
         调用LLM解析意图，支持多意图。
 
         Returns:
-            str: 单个意图名，或 'free_chat'
+            str: 意图名（如 'analyze_market'）
+            dict: {'_free_chat': True, 'response': '...'} 未识别意图时 LLM 直接返回回复
         """
         if not text:
             return 'unknown'
@@ -556,7 +574,7 @@ class SupervisorAgent(BaseAgent):
             'Reply with a JSON object. '
             'If the user has one intent: {"intent": "<name>", "params": {}}\n'
             'If multiple independent intents: {"intents": [{"intent": "...", "params": {}}, ...]}\n'
-            'If none matches, use intent="free_chat".'
+            'If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
         )
         response = await self._llm.chat(
             system=self._system_prompt,
@@ -565,7 +583,11 @@ class SupervisorAgent(BaseAgent):
             temperature=0.1,
         )
         if is_fallback(response):
-            return self._rule_based_intent(text) or 'free_chat'
+            fallback_text = self._rule_based_intent(text)
+            if fallback_text:
+                return fallback_text
+            # LLM 完全不可用，返回 free_chat 标记让调用方处理
+            return {'_free_chat': True, 'response': None}
 
         try:
             text = response.strip()
@@ -579,16 +601,22 @@ class SupervisorAgent(BaseAgent):
             data = json.loads(text)
             logger.debug(f'Parsed intent data: {data}')
 
+            # 自由对话：LLM 直接返回回复内容
+            if data.get('_free_chat'):
+                return {'_free_chat': True, 'response': data.get('response', '')}
+
             # 多意图处理：取第一个意图，串行处理在调用方处理
             if 'intents' in data and isinstance(data['intents'], list) and len(data['intents']) > 0:
-                # 返回第一个，后续由 _handle_multi_intent 串行处理
-                return data['intents'][0].get('intent', 'free_chat')
+                return data['intents'][0].get('intent', 'unknown')
 
-            return data.get('intent', 'free_chat')
+            return data.get('intent', 'unknown')
         except Exception:
             logger.warning(f'Intent parse failed, raw: {response[:200]}')
             # 降级到规则引擎
-            return self._rule_based_intent(text) or 'free_chat'
+            fallback_text = self._rule_based_intent(text)
+            if fallback_text:
+                return fallback_text
+            return {'_free_chat': True, 'response': None}
 
     def _rule_based_intent(self, text: str) -> str | None:
         """规则引擎降级"""
@@ -617,7 +645,7 @@ class SupervisorAgent(BaseAgent):
             return AgentResult(
                 task_id=message.task_id,
                 success=True,
-                data={'frame': frame_type, 'action': action, 'status': 'ok'},
+                data=f'{frame_type} 已{"启动" if action == "start" else "停止"}',
             )
         except Exception as e:
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
