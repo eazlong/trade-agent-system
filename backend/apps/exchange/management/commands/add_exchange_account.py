@@ -8,15 +8,24 @@ from apps.exchange.models import ExchangeAccount
 
 
 class Command(BaseCommand):
-    help = 'Add a new exchange account with encrypted API keys'
+    help = "Add a new exchange account with encrypted API keys"
 
     def add_arguments(self, parser):
-        parser.add_argument('--exchange', type=str, required=True, help='Exchange name (e.g., binance, okx, bybit)')
-        parser.add_argument('--label', type=str, help='Account label/description')
+        parser.add_argument(
+            "--exchange",
+            type=str,
+            required=True,
+            help="Exchange name (e.g., binance, okx, bybit)",
+        )
+        parser.add_argument("--label", type=str, help="Account label/description")
 
     def handle(self, *args, **options):
-        exchange = options['exchange']
-        label = options['label'] or input(f'Enter account label (optional, default: {exchange}): ') or exchange
+        exchange = options["exchange"]
+        label = (
+            options["label"]
+            or input(f"Enter account label (optional, default: {exchange}): ")
+            or exchange
+        )
 
         # Securely get API key and secret without echoing
         api_key = getpass.getpass("Enter API Key: ")
@@ -36,5 +45,5 @@ class Command(BaseCommand):
         )
 
         self.stdout.write(
-            self.style.SUCCESS(f'Successfully added exchange account: {account}')
+            self.style.SUCCESS(f"Successfully added exchange account: {account}")
         )

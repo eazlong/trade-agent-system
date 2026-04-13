@@ -7,10 +7,11 @@
 - 数据缺失检测
 - 异常数据报警
 """
+
 import threading
 import time
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass, field
 import statistics
 
@@ -18,6 +19,7 @@ import statistics
 @dataclass
 class QualityReport:
     """数据质量报告"""
+
     source: str
     symbol: str
     data_type: str
@@ -25,19 +27,19 @@ class QualityReport:
 
     # 完整性指标
     completeness_rate: float = 0.0  # 数据完整率（0-1）
-    missing_count: int = 0           # 缺失数据数量
+    missing_count: int = 0  # 缺失数据数量
 
     # 准确性指标
-    accuracy_score: float = 0.0     # 准确性评分（0-100）
-    anomaly_count: int = 0          # 异常数据数量
+    accuracy_score: float = 0.0  # 准确性评分（0-100）
+    anomaly_count: int = 0  # 异常数据数量
 
     # 实时性指标
-    avg_latency_ms: float = 0.0     # 平均延迟（毫秒）
-    max_latency_ms: float = 0.0     # 最大延迟（毫秒）
-    latency_violations: int = 0     # 超过100ms的次数
+    avg_latency_ms: float = 0.0  # 平均延迟（毫秒）
+    max_latency_ms: float = 0.0  # 最大延迟（毫秒）
+    latency_violations: int = 0  # 超过100ms的次数
 
     # 状态
-    status: str = 'unknown'         # 'good' | 'warning' | 'critical' | 'unknown'
+    status: str = "unknown"  # 'good' | 'warning' | 'critical' | 'unknown'
     issues: List[str] = field(default_factory=list)
 
 
@@ -53,7 +55,7 @@ class DataQualityMonitor:
     - 提供报警机制
     """
 
-    _instance: Optional['DataQualityMonitor'] = None
+    _instance: Optional["DataQualityMonitor"] = None
     _lock = threading.Lock()
 
     # 检查间隔（秒）
@@ -68,7 +70,7 @@ class DataQualityMonitor:
     # 准确性阈值
     ACCURACY_THRESHOLD = 80
 
-    def __new__(cls) -> 'DataQualityMonitor':
+    def __new__(cls) -> "DataQualityMonitor":
         """单例模式"""
         if cls._instance is None:
             with cls._lock:
@@ -105,8 +107,7 @@ class DataQualityMonitor:
         if self._monitor_thread is None or not self._monitor_thread.is_alive():
             self._monitor_running = True
             self._monitor_thread = threading.Thread(
-                target=self._monitor_loop,
-                daemon=True
+                target=self._monitor_loop, daemon=True
             )
             self._monitor_thread.start()
 
@@ -128,7 +129,7 @@ class DataQualityMonitor:
         symbol: str,
         data_type: str,
         data_timestamp: datetime,
-        receive_time: Optional[datetime] = None
+        receive_time: Optional[datetime] = None,
     ) -> None:
         """
         记录数据接收
@@ -173,7 +174,7 @@ class DataQualityMonitor:
         symbol: str,
         data_type: str,
         anomaly_type: str,
-        description: str
+        description: str,
     ) -> None:
         """
         记录异常
@@ -203,6 +204,7 @@ class DataQualityMonitor:
 
         # 获取数据存储
         from .store import get_data_store
+
         store = get_data_store()
 
         # 获取所有数据类型
@@ -213,8 +215,8 @@ class DataQualityMonitor:
 
             for symbol in symbols:
                 # 解析 source（格式：source:symbol）
-                parts = symbol.split(':')
-                source = parts[0] if parts else 'unknown'
+                parts = symbol.split(":")
+                source = parts[0] if parts else "unknown"
                 sym = parts[1] if len(parts) > 1 else symbol
 
                 report = self.check(source, sym, data_type)
@@ -225,12 +227,7 @@ class DataQualityMonitor:
 
         return results
 
-    def check(
-        self,
-        source: str,
-        symbol: str,
-        data_type: str
-    ) -> QualityReport:
+    def check(self, source: str, symbol: str, data_type: str) -> QualityReport:
         """
         检查单个数据源的质量
 
@@ -260,11 +257,7 @@ class DataQualityMonitor:
         return report
 
     def _check_latency(
-        self,
-        report: QualityReport,
-        source: str,
-        symbol: str,
-        data_type: str
+        self, report: QualityReport, source: str, symbol: str, data_type: str
     ) -> None:
         """检查延迟"""
         with self._lock:
@@ -273,21 +266,22 @@ class DataQualityMonitor:
                 if latencies:
                     report.avg_latency_ms = statistics.mean(latencies)
                     report.max_latency_ms = max(latencies)
-                    report.latency_violations = sum(1 for l in latencies if l > self.LATENCY_THRESHOLD)
+                    report.latency_violations = sum(
+                        1 for l in latencies if l > self.LATENCY_THRESHOLD
+                    )
 
                     if report.avg_latency_ms > self.LATENCY_THRESHOLD:
-                        report.issues.append(f"平均延迟 {report.avg_latency_ms:.1f}ms 超过阈值 {self.LATENCY_THRESHOLD}ms")
+                        report.issues.append(
+                            f"平均延迟 {report.avg_latency_ms:.1f}ms 超过阈值 {self.LATENCY_THRESHOLD}ms"
+                        )
 
     def _check_completeness(
-        self,
-        report: QualityReport,
-        source: str,
-        symbol: str,
-        data_type: str
+        self, report: QualityReport, source: str, symbol: str, data_type: str
     ) -> None:
         """检查数据完整性"""
         # 获取数据存储
         from .store import get_data_store
+
         store = get_data_store()
 
         # 检查数据是否存在
@@ -302,7 +296,7 @@ class DataQualityMonitor:
         # 检查数据时间连续性
         timestamps = []
         for data in latest_data:
-            ts = data.get('timestamp')
+            ts = data.get("timestamp")
             if ts:
                 if isinstance(ts, datetime):
                     timestamps.append(ts)
@@ -316,7 +310,7 @@ class DataQualityMonitor:
 
             missing = 0
             for i in range(1, len(timestamps)):
-                gap = (timestamps[i] - timestamps[i-1]).total_seconds()
+                gap = (timestamps[i] - timestamps[i - 1]).total_seconds()
                 if gap > expected_interval * 2:  # 超过预期间隔 2 倍视为缺失
                     missing += int(gap / expected_interval) - 1
 
@@ -324,17 +318,19 @@ class DataQualityMonitor:
             report.missing_count = missing
 
             if report.completeness_rate < self.COMPLETENESS_THRESHOLD:
-                report.issues.append(f"数据完整率 {report.completeness_rate:.2%} 低于阈值 {self.COMPLETENESS_THRESHOLD:.2%}")
+                report.issues.append(
+                    f"数据完整率 {report.completeness_rate:.2%} 低于阈值 {self.COMPLETENESS_THRESHOLD:.2%}"
+                )
 
     def _get_expected_interval(self, data_type: str) -> float:
         """获取预期数据间隔（秒）"""
         # 根据数据类型返回预期间隔
         intervals = {
-            'kline_1m': 60,
-            'kline_5m': 300,
-            'trade': 1,  # 成交数据应该非常频繁
-            'ticker': 10,  # 行情快照
-            'depth': 5,   # 深度数据
+            "kline_1m": 60,
+            "kline_5m": 300,
+            "trade": 1,  # 成交数据应该非常频繁
+            "ticker": 10,  # 行情快照
+            "depth": 5,  # 深度数据
         }
         return intervals.get(data_type, 60)
 
@@ -344,14 +340,14 @@ class DataQualityMonitor:
 
         # 根据指标判断状态
         if issues_count == 0 and report.avg_latency_ms < self.LATENCY_THRESHOLD:
-            report.status = 'good'
+            report.status = "good"
         elif issues_count <= 2 and report.avg_latency_ms < self.LATENCY_THRESHOLD * 2:
-            report.status = 'warning'
+            report.status = "warning"
         else:
-            report.status = 'critical'
+            report.status = "critical"
 
         # 触发报警
-        if report.status != 'good':
+        if report.status != "good":
             self._trigger_alert(report)
 
     def _trigger_alert(self, report: QualityReport) -> None:
@@ -365,10 +361,7 @@ class DataQualityMonitor:
     # ==================== 报告存储 ====================
 
     def _get_or_create_report(
-        self,
-        source: str,
-        symbol: str,
-        data_type: str
+        self, source: str, symbol: str, data_type: str
     ) -> QualityReport:
         """获取或创建报告"""
         with self._lock:
@@ -383,7 +376,7 @@ class DataQualityMonitor:
                     source=source,
                     symbol=symbol,
                     data_type=data_type,
-                    check_time=datetime.now()
+                    check_time=datetime.now(),
                 )
                 self._reports[source][symbol][data_type] = report
 
@@ -403,10 +396,7 @@ class DataQualityMonitor:
             self._reports[report.source][report.symbol][report.data_type] = report
 
     def get_report(
-        self,
-        source: str,
-        symbol: str,
-        data_type: str
+        self, source: str, symbol: str, data_type: str
     ) -> Optional[QualityReport]:
         """获取质量报告"""
         with self._lock:
@@ -440,7 +430,7 @@ class DataQualityMonitor:
                 for source_reports in self._reports.values()
             )
 
-            status_counts = {'good': 0, 'warning': 0, 'critical': 0, 'unknown': 0}
+            status_counts = {"good": 0, "warning": 0, "critical": 0, "unknown": 0}
             avg_latencies: Dict[str, float] = {}
 
             for source, source_reports in self._reports.items():
@@ -455,12 +445,12 @@ class DataQualityMonitor:
                     avg_latencies[source] = statistics.mean(source_latencies)
 
             return {
-                'total_reports': total_reports,
-                'status_counts': status_counts,
-                'avg_latencies': avg_latencies,
-                'latency_threshold': self.LATENCY_THRESHOLD,
-                'completeness_threshold': self.COMPLETENESS_THRESHOLD,
-                'accuracy_threshold': self.ACCURACY_THRESHOLD,
+                "total_reports": total_reports,
+                "status_counts": status_counts,
+                "avg_latencies": avg_latencies,
+                "latency_threshold": self.LATENCY_THRESHOLD,
+                "completeness_threshold": self.COMPLETENESS_THRESHOLD,
+                "accuracy_threshold": self.ACCURACY_THRESHOLD,
             }
 
     # ==================== 清理 ====================

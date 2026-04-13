@@ -2,6 +2,7 @@
 Custom ASGI middleware that authenticates WebSocket connections
 using JWT token passed via query parameter (?token=xxx).
 """
+
 import logging
 from urllib.parse import parse_qs
 
@@ -51,12 +52,16 @@ class TokenAuthMiddleware(BaseMiddleware):
         user = None
         if token_list:
             token = token_list[0]
-            logger.debug(f"[TokenAuthMiddleware] Attempting auth with token: {token[:20]}...")
+            logger.debug(
+                f"[TokenAuthMiddleware] Attempting auth with token: {token[:20]}..."
+            )
             user = await sync_to_async(_get_user)(token)
             if user:
                 logger.info(f"[TokenAuthMiddleware] Authenticated user: {user.id}")
             else:
-                logger.warning(f"[TokenAuthMiddleware] Auth failed for token: {token[:20]}...")
+                logger.warning(
+                    f"[TokenAuthMiddleware] Auth failed for token: {token[:20]}..."
+                )
         else:
             logger.debug("[TokenAuthMiddleware] No token in query string")
 

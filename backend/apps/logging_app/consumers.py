@@ -6,6 +6,7 @@ with optional level/module/search filtering.
 Auth: JWT token passed via query parameter '?token=xxx',
 validated directly in the consumer.
 """
+
 import asyncio
 import json
 import logging
@@ -82,7 +83,9 @@ class LogConsumer(AsyncWebsocketConsumer):
         user = await sync_to_async(_get_user_by_token)(token)
 
         if not user:
-            logger.warning("[LogWebSocket] Auth failed: invalid token or user not found")
+            logger.warning(
+                "[LogWebSocket] Auth failed: invalid token or user not found"
+            )
             await self.close(code=4001)
             return
 

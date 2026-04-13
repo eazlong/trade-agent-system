@@ -9,4 +9,3 @@ urlpatterns = [
     path('positions/', views.position_list),
     path('accounts/', views.account_list),
 ]
-

@@ -35,7 +35,7 @@ class OrderExecutor:
     单例模式：通过 get_instance() 访问。
     """
 
-    _instance: 'OrderExecutor | None' = None
+    _instance: "OrderExecutor | None" = None
 
     def __init__(self):
         self._adapters: dict[str, BaseExchangeAdapter] = {}
@@ -43,7 +43,7 @@ class OrderExecutor:
         self._running = False
 
     @classmethod
-    def get_instance(cls) -> 'OrderExecutor | None':
+    def get_instance(cls) -> "OrderExecutor | None":
         """返回当前单例，未初始化时为 None"""
         return cls._instance
 
@@ -62,7 +62,7 @@ class OrderExecutor:
         await self._load_adapters()
         self._load_riskguard()
 
-        logger.info(f'OrderExecutor initialized with {len(self._adapters)} adapters')
+        logger.info(f"OrderExecutor initialized with {len(self._adapters)} adapters")
 
     async def shutdown(self) -> None:
         """
@@ -73,11 +73,11 @@ class OrderExecutor:
 
         for name, adapter in self._adapters.items():
             await adapter.disconnect()
-            logger.info(f'Adapter disconnected: {name}')
+            logger.info(f"Adapter disconnected: {name}")
 
         self._adapters.clear()
         OrderExecutor._instance = None
-        logger.info('OrderExecutor shutdown')
+        logger.info("OrderExecutor shutdown")
 
     # ─── 下单主流程 ───────────────────────────────────────────────────────────
 
@@ -115,11 +115,11 @@ class OrderExecutor:
         """
         uid = user_id  # 保留引用供 finally 使用
         if not self._running:
-            raise RuntimeError('OrderExecutor is not running')
+            raise RuntimeError("OrderExecutor is not running")
 
         adapter = self._adapters.get(exchange)
         if not adapter:
-            raise ValueError(f'Exchange adapter not found: {exchange}')
+            raise ValueError(f"Exchange adapter not found: {exchange}")
 
         # 1. RiskGuard 前置校验
         request = OrderRequest(
@@ -133,7 +133,7 @@ class OrderExecutor:
         if self._riskguard:
             approved, reason = await self._riskguard.pre_trade_check(request, user_id)
             if not approved:
-                raise PermissionError(f'RiskGuard拒绝下单: {reason}')
+                raise PermissionError(f"RiskGuard拒绝下单: {reason}")
 
         # 2. 持久化订单 (status=pending)
         order = await self._persist_order(
@@ -144,7 +144,7 @@ class OrderExecutor:
             order_type=order_type,
             quantity=quantity,
             price=price,
-            status='pending',
+            status="pending",
         )
 
         # 3. 发送到交易所
@@ -152,29 +152,29 @@ class OrderExecutor:
             response = await adapter.place_order(request)
             await self._update_order(
                 order_id=str(order.id),
-                status='submitted',
+                status="submitted",
                 exchange_order_id=response.exchange_order_id,
             )
             if self._riskguard:
                 await self._riskguard.record_order_success(uid)
             logger.info(
-                f'Order submitted: order_id={order.id} '
-                f'exchange_order_id={response.exchange_order_id}'
+                f"Order submitted: order_id={order.id} "
+                f"exchange_order_id={response.exchange_order_id}"
             )
             return {
-                'order_id': str(order.id),
-                'exchange_order_id': response.exchange_order_id,
-                'status': response.status,
+                "order_id": str(order.id),
+                "exchange_order_id": response.exchange_order_id,
+                "status": response.status,
             }
         except Exception as e:
             await self._update_order(
                 order_id=str(order.id),
-                status='failed',
+                status="failed",
                 error_message=str(e),
             )
             if self._riskguard:
                 await self._riskguard.record_order_failure(uid)
-            logger.error(f'Order failed: order_id={order.id} - {e}')
+            logger.error(f"Order failed: order_id={order.id} - {e}")
             raise
 
     async def cancel_order(
@@ -190,11 +190,11 @@ class OrderExecutor:
             True 撤销成功，False 失败
         """
         if not self._running:
-            raise RuntimeError('OrderExecutor is not running')
+            raise RuntimeError("OrderExecutor is not running")
 
         adapter = self._adapters.get(exchange)
         if not adapter:
-            raise ValueError(f'Exchange adapter not found: {exchange}')
+            raise ValueError(f"Exchange adapter not found: {exchange}")
 
         return await adapter.cancel_order(exchange_order_id, symbol)
 
@@ -203,22 +203,22 @@ class OrderExecutor:
     async def get_positions(self, exchange: str) -> list:
         """获取指定交易所的当前持仓"""
         if not self._running:
-            raise RuntimeError('OrderExecutor is not running')
+            raise RuntimeError("OrderExecutor is not running")
 
         adapter = self._adapters.get(exchange)
         if not adapter:
-            raise ValueError(f'Exchange adapter not found: {exchange}')
+            raise ValueError(f"Exchange adapter not found: {exchange}")
 
         return await adapter.get_positions()
 
     async def get_balance(self, exchange: str) -> dict:
         """获取指定交易所的账户余额"""
         if not self._running:
-            raise RuntimeError('OrderExecutor is not running')
+            raise RuntimeError("OrderExecutor is not running")
 
         adapter = self._adapters.get(exchange)
         if not adapter:
-            raise ValueError(f'Exchange adapter not found: {exchange}')
+            raise ValueError(f"Exchange adapter not found: {exchange}")
 
         return await adapter.get_balance()
 
@@ -238,39 +238,51 @@ class OrderExecutor:
             exchange = account.exchange.lower()
             adapter_cls = ADAPTER_MAP.get(exchange)
             if not adapter_cls:
-                logger.warning(f'No adapter for exchange: {exchange}, skipping')
+                logger.warning(f"No adapter for exchange: {exchange}, skipping")
                 continue
 
             try:
-                api_key_enc = bytes(account.api_key_enc) if hasattr(account.api_key_enc, '__bytes__') else account.api_key_enc
-                api_secret_enc = bytes(account.api_secret_enc) if hasattr(account.api_secret_enc, '__bytes__') else account.api_secret_enc
+                api_key_enc = (
+                    bytes(account.api_key_enc)
+                    if hasattr(account.api_key_enc, "__bytes__")
+                    else account.api_key_enc
+                )
+                api_secret_enc = (
+                    bytes(account.api_secret_enc)
+                    if hasattr(account.api_secret_enc, "__bytes__")
+                    else account.api_secret_enc
+                )
                 api_key = fernet.decrypt(api_key_enc).decode()
                 api_secret = fernet.decrypt(api_secret_enc).decode()
 
-                if exchange == 'okx':
+                if exchange == "okx":
                     # OKX 需要额外的 passphrase，从 label 字段临时存储
-                    passphrase = account.label or ''
+                    passphrase = account.label or ""
                     adapter = adapter_cls(api_key, api_secret, passphrase)
                 else:
                     adapter = adapter_cls(api_key, api_secret)
 
                 await adapter.connect()
                 self._adapters[exchange] = adapter
-                logger.info(f'Adapter loaded: {exchange} ({account.label or "default"})')
+                logger.info(
+                    f"Adapter loaded: {exchange} ({account.label or 'default'})"
+                )
             except Exception as e:
-                logger.error(f'Failed to load adapter for {exchange}: {e}')
+                logger.error(f"Failed to load adapter for {exchange}: {e}")
 
     def _load_riskguard(self) -> None:
         """获取 RiskGuard 单例引用"""
         from apps.riskguard.guard import RiskGuard
+
         self._riskguard = RiskGuard.get_instance()
 
     def _get_fernet(self):
         """创建 Fernet 解密器"""
         from cryptography.fernet import Fernet
-        key = getattr(settings, 'FERNET_KEY', '')
+
+        key = getattr(settings, "FERNET_KEY", "")
         if not key:
-            raise ValueError('FERNET_KEY not configured in settings')
+            raise ValueError("FERNET_KEY not configured in settings")
         return Fernet(key.encode())
 
     async def _persist_order(
@@ -283,24 +295,24 @@ class OrderExecutor:
         quantity: Decimal,
         price: Optional[Decimal],
         status: str,
-    ) -> 'Order':
+    ) -> "Order":
         """异步写入 orders 表"""
         from apps.trading.models import Order
 
         @sync_to_async
         def _create():
             kwargs_create = {
-                'exchange_account_id': exchange_account_id,
-                'symbol': symbol.upper(),
-                'side': side.lower(),
-                'order_type': order_type.lower(),
-                'quantity': quantity,
-                'price': price,
-                'status': status,
-                'request_id': uuid.uuid4(),
+                "exchange_account_id": exchange_account_id,
+                "symbol": symbol.upper(),
+                "side": side.lower(),
+                "order_type": order_type.lower(),
+                "quantity": quantity,
+                "price": price,
+                "status": status,
+                "request_id": uuid.uuid4(),
             }
             if user_id:
-                kwargs_create['user_id'] = user_id
+                kwargs_create["user_id"] = user_id
             return Order.objects.create(**kwargs_create)
 
         return await _create()

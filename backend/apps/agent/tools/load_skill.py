@@ -19,41 +19,41 @@ class LoadSkillTool(BaseTool):
     The tool returns the skill content for injection into the conversation.
     """
 
-    name = 'load_skill'
+    name = "load_skill"
     description = (
-        '加载指定技能的完整内容。当当前任务与某个可用技能的描述匹配时，'
-        '调用此工具获取技能的详细指导和代码模板。'
+        "加载指定技能的完整内容。当当前任务与某个可用技能的描述匹配时，"
+        "调用此工具获取技能的详细指导和代码模板。"
     )
 
-    def __init__(self, agent_name: str = ''):
+    def __init__(self, agent_name: str = ""):
         self._agent_name = agent_name
 
     @property
     def parameters_schema(self) -> dict:
         return {
-            'type': 'object',
-            'properties': {
-                'skill_name': {
-                    'type': 'string',
-                    'description': '要加载的技能名称',
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "要加载的技能名称",
                 },
             },
-            'required': ['skill_name'],
+            "required": ["skill_name"],
         }
 
-    async def execute(self, skill_name: str = '', **kwargs) -> ToolResult:
+    async def execute(self, skill_name: str = "", **kwargs) -> ToolResult:
         if not skill_name:
-            return ToolResult(success=False, error='skill_name 参数缺失')
+            return ToolResult(success=False, error="skill_name 参数缺失")
 
         loader = get_skills_loader(self._agent_name)
 
         # 先解析 references，确保依赖技能一并加载
         resolved = loader.resolve_references([skill_name])
         if not resolved:
-            available = [s['name'] for s in loader.list_skills()]
+            available = [s["name"] for s in loader.list_skills()]
             return ToolResult(
                 success=False,
-                error=f'技能 {skill_name!r} 不存在。可用技能: {", ".join(available)}',
+                error=f"技能 {skill_name!r} 不存在。可用技能: {', '.join(available)}",
             )
 
         content = loader.load_skills_content(resolved)

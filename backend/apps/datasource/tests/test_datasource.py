@@ -1,16 +1,21 @@
 """
 数据源模块测试
 """
+
 import pytest
-import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, AsyncMock
 
 from apps.datasource.registry import DataSourceRegistry
 from apps.datasource.store import MemoryDataStore
 from apps.datasource.subscription import DataSubscriptionManager
 from apps.datasource.monitor import DataQualityMonitor
-from apps.datasource.base import DataType, KlineInterval, MarketType, ConnectionStatus, BaseDataSource
+from apps.datasource.base import (
+    DataType,
+    KlineInterval,
+    MarketType,
+    ConnectionStatus,
+    BaseDataSource,
+)
 
 
 class TestDataSourceRegistry:
@@ -24,38 +29,41 @@ class TestDataSourceRegistry:
 
     def test_register_and_get(self):
         """测试注册和获取"""
-        @DataSourceRegistry.register('test_source')
-        class TestSource:
-            name = 'test_source'
 
-        assert 'test_source' in DataSourceRegistry.list_registered()
-        assert DataSourceRegistry.is_loaded('test_source') == False
+        @DataSourceRegistry.register("test_source")
+        class TestSource:
+            name = "test_source"
+
+        assert "test_source" in DataSourceRegistry.list_registered()
+        assert DataSourceRegistry.is_loaded("test_source") == False
 
         # 获取实例（懒加载）
-        source = DataSourceRegistry.get('test_source')
+        source = DataSourceRegistry.get("test_source")
         assert source is not None
-        assert DataSourceRegistry.is_loaded('test_source') == True
+        assert DataSourceRegistry.is_loaded("test_source") == True
 
     def test_unregister_nonexistent(self):
         """测试获取未注册的数据源"""
         with pytest.raises(KeyError):
-            DataSourceRegistry.get('nonexistent_source')
+            DataSourceRegistry.get("nonexistent_source")
 
     def test_unload(self):
         """测试卸载数据源"""
-        @DataSourceRegistry.register('test_unload')
+
+        @DataSourceRegistry.register("test_unload")
         class TestUnloadSource:
-            name = 'test_unload'
+            name = "test_unload"
+
             def cleanup(self):
                 pass
 
         # 先加载
-        DataSourceRegistry.get('test_unload')
-        assert DataSourceRegistry.is_loaded('test_unload') == True
+        DataSourceRegistry.get("test_unload")
+        assert DataSourceRegistry.is_loaded("test_unload") == True
 
         # 卸载
-        DataSourceRegistry.unload('test_unload')
-        assert DataSourceRegistry.is_loaded('test_unload') == False
+        DataSourceRegistry.unload("test_unload")
+        assert DataSourceRegistry.is_loaded("test_unload") == False
 
 
 class TestMemoryDataStore:
@@ -72,20 +80,16 @@ class TestMemoryDataStore:
         store = MemoryDataStore()
         store.clear_all()
 
-        data = {
-            'symbol': 'BTC/USDT',
-            'price': 50000.0,
-            'timestamp': datetime.now()
-        }
+        data = {"symbol": "BTC/USDT", "price": 50000.0, "timestamp": datetime.now()}
 
         # 存储
-        store.store('ticker', 'BTC/USDT', data, 'binance')
+        store.store("ticker", "BTC/USDT", data, "binance")
 
         # 获取
-        result = store.get_latest('ticker', 'BTC/USDT', 1)
+        result = store.get_latest("ticker", "BTC/USDT", 1)
         assert len(result) == 1
-        assert result[0]['symbol'] == 'BTC/USDT'
-        assert result[0]['price'] == 50000.0
+        assert result[0]["symbol"] == "BTC/USDT"
+        assert result[0]["price"] == 50000.0
 
     def test_store_batch(self):
         """测试批量存储"""
@@ -93,14 +97,14 @@ class TestMemoryDataStore:
         store.clear_all()
 
         data_list = [
-            {'symbol': 'BTC/USDT', 'price': 50000.0 + i, 'timestamp': datetime.now()}
+            {"symbol": "BTC/USDT", "price": 50000.0 + i, "timestamp": datetime.now()}
             for i in range(10)
         ]
 
-        count = store.store_batch('ticker', 'BTC/USDT', data_list, 'binance')
+        count = store.store_batch("ticker", "BTC/USDT", data_list, "binance")
         assert count == 10
 
-        result = store.get_latest('ticker', 'BTC/USDT', 100)
+        result = store.get_latest("ticker", "BTC/USDT", 100)
         assert len(result) == 10
 
     def test_get_range(self):
@@ -111,19 +115,19 @@ class TestMemoryDataStore:
         now = datetime.now()
         data_list = [
             {
-                'symbol': 'BTC/USDT',
-                'price': 50000.0 + i,
-                'timestamp': now - timedelta(hours=i)
+                "symbol": "BTC/USDT",
+                "price": 50000.0 + i,
+                "timestamp": now - timedelta(hours=i),
             }
             for i in range(5)
         ]
 
-        store.store_batch('kline', 'BTC/USDT', data_list, 'binance')
+        store.store_batch("kline", "BTC/USDT", data_list, "binance")
 
         start = now - timedelta(hours=3)
         end = now + timedelta(hours=1)
 
-        result = store.get_range('kline', 'BTC/USDT', start, end)
+        result = store.get_range("kline", "BTC/USDT", start, end)
         assert len(result) == 4  # 0, 1, 2, 3 小时前
 
     def test_delete(self):
@@ -131,15 +135,15 @@ class TestMemoryDataStore:
         store = MemoryDataStore()
         store.clear_all()
 
-        data = {'symbol': 'BTC/USDT', 'price': 50000.0}
-        store.store('ticker', 'BTC/USDT', data, 'binance', key='test_key')
+        data = {"symbol": "BTC/USDT", "price": 50000.0}
+        store.store("ticker", "BTC/USDT", data, "binance", key="test_key")
 
         # 删除
-        result = store.delete('ticker', 'BTC/USDT', 'test_key')
+        result = store.delete("ticker", "BTC/USDT", "test_key")
         assert result == True
 
         # 获取应该为空
-        result = store.get('ticker', 'BTC/USDT', 'test_key')
+        result = store.get("ticker", "BTC/USDT", "test_key")
         assert result is None
 
     def test_cleanup_expired(self):
@@ -148,11 +152,12 @@ class TestMemoryDataStore:
         store.clear_all()
 
         # 存储马上过期的数据
-        data = {'symbol': 'BTC/USDT', 'price': 50000.0}
-        store.store('ticker', 'BTC/USDT', data, 'binance', expire_seconds=0.1)
+        data = {"symbol": "BTC/USDT", "price": 50000.0}
+        store.store("ticker", "BTC/USDT", data, "binance", expire_seconds=0.1)
 
         # 等待过期
         import time
+
         time.sleep(0.2)
 
         # 清理
@@ -164,13 +169,13 @@ class TestMemoryDataStore:
         store = MemoryDataStore()
         store.clear_all()
 
-        store.store('ticker', 'BTC/USDT', {'price': 50000.0}, 'binance')
-        store.store('ticker', 'ETH/USDT', {'price': 3000.0}, 'binance')
-        store.store('kline', 'BTC/USDT', {'open': 50000.0}, 'binance')
+        store.store("ticker", "BTC/USDT", {"price": 50000.0}, "binance")
+        store.store("ticker", "ETH/USDT", {"price": 3000.0}, "binance")
+        store.store("kline", "BTC/USDT", {"open": 50000.0}, "binance")
 
         stats = store.get_stats()
-        assert stats['total_entries'] == 3
-        assert stats['data_types_count'] == 2
+        assert stats["total_entries"] == 3
+        assert stats["data_types_count"] == 2
 
 
 class TestDataSubscriptionManager:
@@ -187,45 +192,42 @@ class TestDataSubscriptionManager:
         sub = DataSubscriptionManager()
 
         sub_id = sub.subscribe(
-            user_id='user1',
-            source='binance',
-            symbol='BTC/USDT',
-            data_type='kline',
-            interval='1m'
+            user_id="user1",
+            source="binance",
+            symbol="BTC/USDT",
+            data_type="kline",
+            interval="1m",
         )
 
         assert sub_id is not None
-        assert sub.get_subscription_count(user_id='user1') == 1
+        assert sub.get_subscription_count(user_id="user1") == 1
 
         # 取消订阅
         result = sub.unsubscribe(sub_id)
         assert result == True
-        assert sub.get_subscription_count(user_id='user1') == 0
+        assert sub.get_subscription_count(user_id="user1") == 0
 
     def test_get_user_subscriptions(self):
         """测试获取用户订阅"""
         sub = DataSubscriptionManager()
 
         sub.subscribe(
-            user_id='user2',
-            source='binance',
-            symbol='BTC/USDT',
-            data_type='ticker'
+            user_id="user2", source="binance", symbol="BTC/USDT", data_type="ticker"
         )
         sub.subscribe(
-            user_id='user2',
-            source='okx',
-            symbol='ETH/USDT',
-            data_type='kline',
-            interval='5m'
+            user_id="user2",
+            source="okx",
+            symbol="ETH/USDT",
+            data_type="kline",
+            interval="5m",
         )
 
-        subs = sub.get_user_subscriptions('user2')
+        subs = sub.get_user_subscriptions("user2")
         assert len(subs) == 2
 
         # 清理
-        sub.unsubscribe_user('user2')
-        assert sub.get_subscription_count(user_id='user2') == 0
+        sub.unsubscribe_user("user2")
+        assert sub.get_subscription_count(user_id="user2") == 0
 
     def test_dispatch_data(self):
         """测试数据分发"""
@@ -236,16 +238,16 @@ class TestDataSubscriptionManager:
             callback_called.append(data)
 
         sub.subscribe(
-            user_id='user3',
-            source='binance',
-            symbol='BTC/USDT',
-            data_type='ticker',
-            callback=callback
+            user_id="user3",
+            source="binance",
+            symbol="BTC/USDT",
+            data_type="ticker",
+            callback=callback,
         )
 
         # 分发数据
-        test_data = {'symbol': 'BTC/USDT', 'price': 50000.0}
-        count = sub.dispatch_data('binance', 'BTC/USDT', 'ticker', test_data)
+        test_data = {"symbol": "BTC/USDT", "price": 50000.0}
+        count = sub.dispatch_data("binance", "BTC/USDT", "ticker", test_data)
 
         assert count == 1
         assert len(callback_called) == 1
@@ -266,30 +268,30 @@ class TestDataQualityMonitor:
         monitor = DataQualityMonitor()
 
         monitor.record_data(
-            source='binance',
-            symbol='BTC/USDT',
-            data_type='ticker',
-            data_timestamp=datetime.now() - timedelta(milliseconds=50)
+            source="binance",
+            symbol="BTC/USDT",
+            data_type="ticker",
+            data_timestamp=datetime.now() - timedelta(milliseconds=50),
         )
 
         # 检查延迟已记录
         stats = monitor.get_stats()
-        assert 'binance' in stats['avg_latencies']
+        assert "binance" in stats["avg_latencies"]
 
     def test_record_anomaly(self):
         """测试记录异常"""
         monitor = DataQualityMonitor()
 
         monitor.record_anomaly(
-            source='binance',
-            symbol='BTC/USDT',
-            data_type='ticker',
-            anomaly_type='missing_data',
-            description='Missing data for 5 minutes'
+            source="binance",
+            symbol="BTC/USDT",
+            data_type="ticker",
+            anomaly_type="missing_data",
+            description="Missing data for 5 minutes",
         )
 
         # 检查报告
-        report = monitor.get_report('binance', 'BTC/USDT', 'ticker')
+        report = monitor.get_report("binance", "BTC/USDT", "ticker")
         if report:
             assert report.anomaly_count > 0
 
@@ -297,12 +299,12 @@ class TestDataQualityMonitor:
         """测试质量检查"""
         monitor = DataQualityMonitor()
 
-        report = monitor.check('binance', 'BTC/USDT', 'ticker')
+        report = monitor.check("binance", "BTC/USDT", "ticker")
 
         assert report is not None
-        assert report.source == 'binance'
-        assert report.symbol == 'BTC/USDT'
-        assert report.data_type == 'ticker'
+        assert report.source == "binance"
+        assert report.symbol == "BTC/USDT"
+        assert report.data_type == "ticker"
 
     def test_alert_callback(self):
         """测试报警回调"""
@@ -316,14 +318,14 @@ class TestDataQualityMonitor:
 
         # 触发异常
         monitor.record_anomaly(
-            source='test',
-            symbol='TEST/USDT',
-            data_type='ticker',
-            anomaly_type='test',
-            description='test'
+            source="test",
+            symbol="TEST/USDT",
+            data_type="ticker",
+            anomaly_type="test",
+            description="test",
         )
 
-        monitor.check('test', 'TEST/USDT', 'ticker')
+        monitor.check("test", "TEST/USDT", "ticker")
 
         # 应该触发报警（如果状态不是 good）
         # 注：具体是否触发取决于报告状态
@@ -334,24 +336,46 @@ class TestMarketTypeConfig:
 
     def test_set_market_types(self):
         """测试设置市场类型"""
-        @DataSourceRegistry.register('test_mt_source')
+
+        @DataSourceRegistry.register("test_mt_source")
         class TestMTSource(BaseDataSource):
-            name = 'test_mt_source'
+            name = "test_mt_source"
             supported_market_types = [MarketType.SPOT, MarketType.FUTURES]
 
-            async def connect_websocket(self): return True
-            async def disconnect_websocket(self): return True
-            async def _handle_websocket_message(self, msg): pass
-            async def fetch_klines(self, *args, **kwargs): return []
-            async def fetch_trades(self, *args, **kwargs): return []
-            async def fetch_ticker(self, *args, **kwargs): return {}
-            async def subscribe(self, *args, **kwargs): return True
-            async def unsubscribe(self, *args, **kwargs): return True
-            def normalize_kline(self, raw): return {}
-            def normalize_trade(self, raw): return {}
-            def normalize_ticker(self, raw): return {}
+            async def connect_websocket(self):
+                return True
 
-        ds = DataSourceRegistry.get('test_mt_source')
+            async def disconnect_websocket(self):
+                return True
+
+            async def _handle_websocket_message(self, msg):
+                pass
+
+            async def fetch_klines(self, *args, **kwargs):
+                return []
+
+            async def fetch_trades(self, *args, **kwargs):
+                return []
+
+            async def fetch_ticker(self, *args, **kwargs):
+                return {}
+
+            async def subscribe(self, *args, **kwargs):
+                return True
+
+            async def unsubscribe(self, *args, **kwargs):
+                return True
+
+            def normalize_kline(self, raw):
+                return {}
+
+            def normalize_trade(self, raw):
+                return {}
+
+            def normalize_ticker(self, raw):
+                return {}
+
+        ds = DataSourceRegistry.get("test_mt_source")
 
         # 默认应返回所有支持类型
         assert ds._get_active_market_types() == [MarketType.SPOT, MarketType.FUTURES]
@@ -364,37 +388,61 @@ class TestMarketTypeConfig:
         ds.set_market_types(None)
         assert ds._get_active_market_types() == [MarketType.SPOT, MarketType.FUTURES]
 
-        DataSourceRegistry.unload('test_mt_source')
+        DataSourceRegistry.unload("test_mt_source")
 
     def test_registry_get_with_market_types(self):
         """测试 DataSourceRegistry.get 传入 market_types"""
-        @DataSourceRegistry.register('test_mt_source2')
+
+        @DataSourceRegistry.register("test_mt_source2")
         class TestMTSource2(BaseDataSource):
-            name = 'test_mt_source2'
+            name = "test_mt_source2"
             supported_market_types = [MarketType.SPOT, MarketType.FUTURES]
 
-            async def connect_websocket(self): return True
-            async def disconnect_websocket(self): return True
-            async def _handle_websocket_message(self, msg): pass
-            async def fetch_klines(self, *args, **kwargs): return []
-            async def fetch_trades(self, *args, **kwargs): return []
-            async def fetch_ticker(self, *args, **kwargs): return {}
-            async def subscribe(self, *args, **kwargs): return True
-            async def unsubscribe(self, *args, **kwargs): return True
-            def normalize_kline(self, raw): return {}
-            def normalize_trade(self, raw): return {}
-            def normalize_ticker(self, raw): return {}
+            async def connect_websocket(self):
+                return True
+
+            async def disconnect_websocket(self):
+                return True
+
+            async def _handle_websocket_message(self, msg):
+                pass
+
+            async def fetch_klines(self, *args, **kwargs):
+                return []
+
+            async def fetch_trades(self, *args, **kwargs):
+                return []
+
+            async def fetch_ticker(self, *args, **kwargs):
+                return {}
+
+            async def subscribe(self, *args, **kwargs):
+                return True
+
+            async def unsubscribe(self, *args, **kwargs):
+                return True
+
+            def normalize_kline(self, raw):
+                return {}
+
+            def normalize_trade(self, raw):
+                return {}
+
+            def normalize_ticker(self, raw):
+                return {}
 
         # 传入 market_types 应设置到实例
-        ds = DataSourceRegistry.get('test_mt_source2', market_types=[MarketType.FUTURES])
+        ds = DataSourceRegistry.get(
+            "test_mt_source2", market_types=[MarketType.FUTURES]
+        )
         assert ds._get_active_market_types() == [MarketType.FUTURES]
 
-        DataSourceRegistry.unload('test_mt_source2')
+        DataSourceRegistry.unload("test_mt_source2")
 
     def test_resolve_market_types_no_config(self):
         """测试 _resolve_market_types 无配置时返回 None"""
         sub = DataSubscriptionManager()
-        result = sub._resolve_market_types('nonexistent_source')
+        result = sub._resolve_market_types("nonexistent_source")
         assert result is None
 
 
@@ -403,27 +451,27 @@ class TestDataTypeEnums:
 
     def test_data_type(self):
         """测试数据类型枚举"""
-        assert DataType.KLINE.value == 'kline'
-        assert DataType.TICKER.value == 'ticker'
-        assert DataType.TRADE.value == 'trade'
+        assert DataType.KLINE.value == "kline"
+        assert DataType.TICKER.value == "ticker"
+        assert DataType.TRADE.value == "trade"
 
     def test_kline_interval(self):
         """测试K线周期枚举"""
-        assert KlineInterval.M1.value == '1m'
-        assert KlineInterval.H1.value == '1h'
-        assert KlineInterval.D1.value == '1d'
+        assert KlineInterval.M1.value == "1m"
+        assert KlineInterval.H1.value == "1h"
+        assert KlineInterval.D1.value == "1d"
 
     def test_market_type(self):
         """测试市场类型枚举"""
-        assert MarketType.SPOT.value == 'spot'
-        assert MarketType.FUTURES.value == 'futures'
+        assert MarketType.SPOT.value == "spot"
+        assert MarketType.FUTURES.value == "futures"
 
     def test_connection_status(self):
         """测试连接状态枚举"""
-        assert ConnectionStatus.DISCONNECTED.value == 'disconnected'
-        assert ConnectionStatus.CONNECTED.value == 'connected'
+        assert ConnectionStatus.DISCONNECTED.value == "disconnected"
+        assert ConnectionStatus.CONNECTED.value == "connected"
 
 
 # 运行测试的入口
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

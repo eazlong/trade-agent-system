@@ -5,29 +5,82 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
-    dependencies = [
-    ]
+    dependencies = []
 
     operations = [
         migrations.CreateModel(
-            name='SystemLog',
+            name="SystemLog",
             fields=[
-                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('level', models.CharField(choices=[('DEBUG', 'Debug'), ('INFO', 'Info'), ('WARNING', 'Warning'), ('ERROR', 'Error'), ('CRITICAL', 'Critical')], max_length=10)),
-                ('module', models.CharField(choices=[('agent', 'Agent'), ('trading', 'Trading'), ('riskguard', 'RiskGuard'), ('signal_monitor', 'SignalMonitor'), ('memory', 'Memory'), ('channel', 'Channel'), ('notify', 'Notify'), ('exchange', 'Exchange'), ('datasource', 'DataSource'), ('auth', 'Authentication'), ('backtest', 'Backtest'), ('skill', 'Skill'), ('core', 'Core'), ('unknown', 'Unknown')], default='unknown', max_length=32)),
-                ('logger_name', models.CharField(blank=True, max_length=256)),
-                ('message', models.TextField()),
-                ('trace_id', models.CharField(blank=True, db_index=True, max_length=64)),
-                ('extra_data', models.JSONField(blank=True, default=dict)),
-                ('created_at', models.DateTimeField(auto_now_add=True, db_index=True)),
+                (
+                    "id",
+                    models.UUIDField(
+                        default=uuid.uuid4,
+                        editable=False,
+                        primary_key=True,
+                        serialize=False,
+                    ),
+                ),
+                (
+                    "level",
+                    models.CharField(
+                        choices=[
+                            ("DEBUG", "Debug"),
+                            ("INFO", "Info"),
+                            ("WARNING", "Warning"),
+                            ("ERROR", "Error"),
+                            ("CRITICAL", "Critical"),
+                        ],
+                        max_length=10,
+                    ),
+                ),
+                (
+                    "module",
+                    models.CharField(
+                        choices=[
+                            ("agent", "Agent"),
+                            ("trading", "Trading"),
+                            ("riskguard", "RiskGuard"),
+                            ("signal_monitor", "SignalMonitor"),
+                            ("memory", "Memory"),
+                            ("channel", "Channel"),
+                            ("notify", "Notify"),
+                            ("exchange", "Exchange"),
+                            ("datasource", "DataSource"),
+                            ("auth", "Authentication"),
+                            ("backtest", "Backtest"),
+                            ("skill", "Skill"),
+                            ("core", "Core"),
+                            ("unknown", "Unknown"),
+                        ],
+                        default="unknown",
+                        max_length=32,
+                    ),
+                ),
+                ("logger_name", models.CharField(blank=True, max_length=256)),
+                ("message", models.TextField()),
+                (
+                    "trace_id",
+                    models.CharField(blank=True, db_index=True, max_length=64),
+                ),
+                ("extra_data", models.JSONField(blank=True, default=dict)),
+                ("created_at", models.DateTimeField(auto_now_add=True, db_index=True)),
             ],
             options={
-                'db_table': 'system_logs',
-                'ordering': ['-created_at'],
-                'indexes': [models.Index(fields=['level', '-created_at'], name='sys_log_level_created_idx'), models.Index(fields=['module', '-created_at'], name='sys_log_module_created_idx'), models.Index(fields=['-created_at'], name='sys_log_created_idx')],
+                "db_table": "system_logs",
+                "ordering": ["-created_at"],
+                "indexes": [
+                    models.Index(
+                        fields=["level", "-created_at"],
+                        name="sys_log_level_created_idx",
+                    ),
+                    models.Index(
+                        fields=["module", "-created_at"],
+                        name="sys_log_module_created_idx",
+                    ),
+                    models.Index(fields=["-created_at"], name="sys_log_created_idx"),
+                ],
             },
         ),
     ]

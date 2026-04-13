@@ -6,20 +6,20 @@ from .models import Notification
 from .serializers import NotificationSerializer
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_notifications(request):
-    qs = Notification.objects.filter(user=request.user).order_by('-created_at')[:50]
+    qs = Notification.objects.filter(user=request.user).order_by("-created_at")[:50]
     return Response(NotificationSerializer(qs, many=True).data)
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def mark_read(request, pk):
     try:
         n = Notification.objects.get(pk=pk, user=request.user)
     except Notification.DoesNotExist:
-        return Response({'detail': 'not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)
     n.is_read = True
-    n.save(update_fields=['is_read'])
-    return Response({'status': 'ok'})
+    n.save(update_fields=["is_read"])
+    return Response({"status": "ok"})
