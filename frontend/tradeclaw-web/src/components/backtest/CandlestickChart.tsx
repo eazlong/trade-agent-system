@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useMemo } from "react";
 import {
   createChart,
   ColorType,
@@ -21,6 +21,7 @@ interface CandlestickChartProps {
   indicators: IndicatorData;
   trades: BacktestTrade[];
   timeframe?: string;
+  availableTimeframes?: readonly string[];
   onTimeframeChange?: (tf: string) => void;
 }
 
@@ -76,10 +77,10 @@ export default function CandlestickChart({
   indicators,
   trades,
   timeframe,
+  availableTimeframes = TIMEFRAMES,
   onTimeframeChange,
 }: CandlestickChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [activeTf, setActiveTf] = useState(timeframe || "15m");
 
   // Build indicator legend
   const legendItems = useMemo<IndicatorLegend[]>(() => {
@@ -92,12 +93,6 @@ export default function CandlestickChart({
     items.push({ label: "VOL", color: "#6b7280" });
     return items;
   }, [indicators]);
-
-  useEffect(() => {
-    if (timeframe && timeframe !== activeTf) {
-      setActiveTf(timeframe);
-    }
-  }, [timeframe]);
 
   useEffect(() => {
     if (!containerRef.current || !ohlcv.length) return;
@@ -306,22 +301,22 @@ export default function CandlestickChart({
       <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-1 text-[10px]">
         {/* Timeframe switcher */}
         <div className="flex gap-1">
-          {TIMEFRAMES.map((tf) => (
-            <button
-              key={tf}
-              onClick={() => {
-                setActiveTf(tf);
-                onTimeframeChange?.(tf);
-              }}
-              className={`px-2 py-0.5 font-medium rounded cursor-pointer transition-all border ${
-                activeTf === tf
-                  ? "text-green bg-green-dim border-green/20"
-                  : "text-text3 border-transparent hover:text-text hover:bg-bg2"
-              }`}
-            >
-              {tf}
-            </button>
-          ))}
+          {availableTimeframes.map((tf) => {
+            const isActive = timeframe === tf;
+            return (
+              <button
+                key={tf}
+                onClick={() => onTimeframeChange?.(tf)}
+                className={`px-2 py-0.5 font-medium rounded cursor-pointer transition-all border ${
+                  isActive
+                    ? "text-green bg-green-dim border-green/20"
+                    : "text-text3 border-transparent hover:text-text hover:bg-bg2"
+                }`}
+              >
+                {tf}
+              </button>
+            );
+          })}
         </div>
 
         {/* Indicator legend */}
