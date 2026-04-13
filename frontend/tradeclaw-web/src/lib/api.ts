@@ -171,7 +171,54 @@ export const tradingApi = {
   getStrategies: () => request<Strategy[]>("/api/trading/strategies/"),
   createStrategy: (data: Partial<Strategy>) =>
     request<Strategy>("/api/trading/strategies/", "POST", data),
+  getSummary: () =>
+    request<TradingSummary>("/api/trading/summary/"),
+  getPositions: () =>
+    request<PositionResponse>("/api/trading/positions/"),
+  getAccounts: () =>
+    request<ExchangeAccountWithBalance[]>("/api/trading/accounts/"),
 };
+
+// ── Trading Page Types ──
+
+export interface PositionInfo {
+  exchange: string;
+  exchange_account_id?: string;
+  symbol: string;
+  side: "long" | "short";
+  quantity: string;
+  entry_price: string;
+  mark_price: string;
+  unrealized_pnl: string;
+}
+
+export interface PositionResponse {
+  positions: PositionInfo[];
+  executor_running: boolean;
+  message?: string;
+}
+
+export interface TradingSummary {
+  total_equity: string;
+  today_realized_pnl: string;
+  active_orders_count: number;
+  total_orders_today: number;
+  account_count: number;
+}
+
+export interface ExchangeAccountWithBalance {
+  id: string;
+  exchange: string;
+  label: string;
+  is_active: boolean;
+  testnet: boolean;
+  created_at: string;
+  balance?: {
+    total: string;
+    available: string;
+    used: string;
+  };
+}
 
 // ── Risk API ──
 
@@ -211,7 +258,13 @@ export interface ExchangeAccount {
   exchange: string;
   label: string;
   is_active: boolean;
+  testnet: boolean;
   created_at: string;
+  balance?: {
+    total: string;
+    available: string;
+    used: string;
+  };
 }
 
 export interface CreateExchangeAccountPayload {
