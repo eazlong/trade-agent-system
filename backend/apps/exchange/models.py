@@ -10,6 +10,7 @@ class ExchangeAccount(models.Model):
     api_key_enc = models.BinaryField()   # Fernet加密
     api_secret_enc = models.BinaryField()
     is_active = models.BooleanField(default=True)
+    testnet = models.BooleanField(default=False, help_text='是否为模拟账户')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
