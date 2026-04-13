@@ -7,4 +7,3 @@ urlpatterns = [
     path('results/<uuid:pk>/detail/', views.result_detail_full),
     path('results/<uuid:pk>/trades/', views.result_trades),
 ]
-

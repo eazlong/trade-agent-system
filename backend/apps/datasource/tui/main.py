@@ -5,10 +5,11 @@
 使用方法：
     python manage.py datasource_tui
 """
+
 import asyncio
 import time
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -17,7 +18,6 @@ from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
 from rich.prompt import Prompt
-from rich.style import Style
 
 console = Console()
 
@@ -44,13 +44,17 @@ class DataSourceTUI:
     def create_header(self) -> Panel:
         """创建头部面板"""
         title = Text("📊 数据源监控系统", style="bold cyan")
-        subtitle = Text(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
+        subtitle = Text(
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim"
+        )
         content = Text.assemble(title, "\n", subtitle)
         return Panel(content, style="bold blue")
 
     def create_sources_table(self) -> Table:
         """创建数据源状态表格"""
-        table = Table(title="📡 数据源状态", show_header=True, header_style="bold magenta")
+        table = Table(
+            title="📡 数据源状态", show_header=True, header_style="bold magenta"
+        )
         table.add_column("数据源", style="cyan", width=12)
         table.add_column("状态", width=12)
         table.add_column("订阅数", justify="right", width=8)
@@ -58,9 +62,8 @@ class DataSourceTUI:
 
         try:
             from apps.datasource.registry import DataSourceRegistry
+
             # 导入所有数据源以触发注册
-            from apps.datasource.sources.crypto import BinanceDataSource, OKXDataSource, BybitDataSource
-            from apps.datasource.sources.stock import USStockDataSource, CNStockDataSource, HKStockDataSource
 
             sources = DataSourceRegistry.list_registered()
 
@@ -72,7 +75,9 @@ class DataSourceTUI:
                     status = source.get_ws_status().value
                     sub_count = source.get_subscription_count()
                     last_data = source.get_last_data_time()
-                    last_data_str = f"{int(time.time() - last_data)}秒前" if last_data > 0 else "-"
+                    last_data_str = (
+                        f"{int(time.time() - last_data)}秒前" if last_data > 0 else "-"
+                    )
                 else:
                     status = "未加载"
                     sub_count = 0
@@ -80,18 +85,18 @@ class DataSourceTUI:
 
                 # 根据状态设置颜色
                 status_style = {
-                    'connected': 'green',
-                    'connecting': 'yellow',
-                    'disconnected': 'red',
-                    'error': 'bold red',
-                    '未加载': 'dim'
-                }.get(status, 'white')
+                    "connected": "green",
+                    "connecting": "yellow",
+                    "disconnected": "red",
+                    "error": "bold red",
+                    "未加载": "dim",
+                }.get(status, "white")
 
                 table.add_row(
                     name,
                     Text(status, style=status_style),
                     str(sub_count),
-                    last_data_str
+                    last_data_str,
                 )
 
         except Exception as e:
@@ -101,27 +106,26 @@ class DataSourceTUI:
 
     def create_storage_table(self) -> Table:
         """创建数据存储统计表格"""
-        table = Table(title="💾 数据存储统计", show_header=True, header_style="bold green")
+        table = Table(
+            title="💾 数据存储统计", show_header=True, header_style="bold green"
+        )
         table.add_column("数据类型", style="cyan", width=12)
         table.add_column("交易对数", justify="right", width=10)
         table.add_column("数据条数", justify="right", width=12)
 
         try:
             from apps.datasource.store import get_data_store
+
             store = get_data_store()
             stats = store.get_stats()
 
-            for data_type, count in stats.get('symbols_per_type', {}).items():
+            for data_type, count in stats.get("symbols_per_type", {}).items():
                 total = store.get_count(data_type)
                 table.add_row(data_type, str(count), str(total))
 
             # 总计
             table.add_section()
-            table.add_row(
-                "[bold]总计[/]",
-                "-",
-                f"[bold]{stats['total_entries']}[/]"
-            )
+            table.add_row("[bold]总计[/]", "-", f"[bold]{stats['total_entries']}[/]")
 
         except Exception as e:
             table.add_row("错误", str(e), "-")
@@ -130,7 +134,9 @@ class DataSourceTUI:
 
     def create_quality_table(self) -> Table:
         """创建数据质量表格"""
-        table = Table(title="📈 数据质量监控", show_header=True, header_style="bold yellow")
+        table = Table(
+            title="📈 数据质量监控", show_header=True, header_style="bold yellow"
+        )
         table.add_column("数据源", style="cyan", width=10)
         table.add_column("交易对", width=12)
         table.add_column("类型", width=8)
@@ -140,6 +146,7 @@ class DataSourceTUI:
 
         try:
             from apps.datasource.monitor import get_quality_monitor
+
             monitor = get_quality_monitor()
             reports = monitor.get_all_reports()
 
@@ -147,11 +154,11 @@ class DataSourceTUI:
                 for symbol, symbol_reports in source_reports.items():
                     for data_type, report in symbol_reports.items():
                         status_style = {
-                            'good': 'green',
-                            'warning': 'yellow',
-                            'critical': 'red',
-                            'unknown': 'dim'
-                        }.get(report.status, 'white')
+                            "good": "green",
+                            "warning": "yellow",
+                            "critical": "red",
+                            "unknown": "dim",
+                        }.get(report.status, "white")
 
                         table.add_row(
                             source,
@@ -159,7 +166,7 @@ class DataSourceTUI:
                             data_type,
                             f"{report.completeness_rate * 100:.1f}%",
                             f"{report.avg_latency_ms:.1f}",
-                            Text(report.status, style=status_style)
+                            Text(report.status, style=status_style),
                         )
 
             if not reports:
@@ -180,8 +187,7 @@ class DataSourceTUI:
         )
 
         layout["body"].split_row(
-            Layout(name="left", ratio=1),
-            Layout(name="right", ratio=1)
+            Layout(name="left", ratio=1), Layout(name="right", ratio=1)
         )
 
         layout["header"].update(self.create_header())
@@ -218,11 +224,11 @@ class DataSourceTUI:
             table.add_row("订阅数", str(source.get_subscription_count()))
             table.add_row(
                 "支持的数据类型",
-                ", ".join([dt.value for dt in source.supported_data_types])
+                ", ".join([dt.value for dt in source.supported_data_types]),
             )
             table.add_row(
                 "支持的市场类型",
-                ", ".join([mt.value for mt in source.supported_market_types])
+                ", ".join([mt.value for mt in source.supported_market_types]),
             )
 
             # 订阅列表
@@ -247,8 +253,6 @@ class DataSourceTUI:
         # 检查模块
         try:
             from apps.datasource.registry import DataSourceRegistry
-            from apps.datasource.store import get_data_store
-            from apps.datasource.monitor import get_quality_monitor
 
             console.print("[green]✓ 数据源模块加载成功[/]")
             sources = DataSourceRegistry.list_registered()

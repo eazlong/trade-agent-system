@@ -1,30 +1,37 @@
-from .base import BaseTool, ToolRegistry, ToolResult
-from .web_search import WebSearchTool
-from .web_fetch import WebFetchTool
-from .file_io import ReadFileTool, WriteFileTool
-from .market_data import FetchOHLCVTool, CalculateIndicatorsTool
-from .system_status import GetSystemStatusTool
-from .load_skill import LoadSkillTool
+from __future__ import annotations
 
-# Register default tools
-ToolRegistry.register(WebSearchTool())
-ToolRegistry.register(WebFetchTool())
-ToolRegistry.register(ReadFileTool())
-ToolRegistry.register(WriteFileTool())
-ToolRegistry.register(LoadSkillTool())
-ToolRegistry.register(FetchOHLCVTool())
-ToolRegistry.register(CalculateIndicatorsTool())
-ToolRegistry.register(GetSystemStatusTool())
+import importlib
+import logging
+from pathlib import Path
+
+from .base import BaseTool, ToolRegistry, ToolResult
+
+logger = logging.getLogger(__name__)
+
+# 自动发现 tools 目录下所有继承 BaseTool 的类并注册
+_tools_dir = Path(__file__).parent
+for _f in _tools_dir.glob("*.py"):
+    if _f.name.startswith(("_", "test")) or _f.name in ("base.py", "__init__.py"):
+        continue
+    module_name = _f.stem
+    try:
+        mod = importlib.import_module(f"apps.agent.tools.{module_name}")
+        for _attr in dir(mod):
+            cls = getattr(mod, _attr)
+            if (
+                isinstance(cls, type)
+                and issubclass(cls, BaseTool)
+                and cls is not BaseTool
+            ):
+                ToolRegistry.register(cls())
+                logger.debug(f"[ToolRegistry] auto-registered: {cls.__name__}")
+    except Exception as e:
+        logger.warning(
+            f"[ToolRegistry] failed to auto-register from {module_name}: {e}"
+        )
 
 __all__ = [
-    'BaseTool',
-    'ToolRegistry',
-    'ToolResult',
-    'ReadFileTool',
-    'WriteFileTool',
-    'WebSearchTool',
-    'WebFetchTool',
-    'FetchOHLCVTool',
-    'CalculateIndicatorsTool',
-    'GetSystemStatusTool'
+    "BaseTool",
+    "ToolRegistry",
+    "ToolResult",
 ]

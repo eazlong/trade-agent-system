@@ -8,12 +8,12 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = 'Start Telegram Bot channel'
+    help = "Start Telegram Bot channel"
 
     def handle(self, *args, **options):
         token = settings.TELEGRAM_BOT_TOKEN
         if not token:
-            self.stderr.write('TELEGRAM_BOT_TOKEN is not set in settings/env')
+            self.stderr.write("TELEGRAM_BOT_TOKEN is not set in settings/env")
             return
 
         from apps.channel.telegram import TelegramChannel
@@ -22,7 +22,7 @@ class Command(BaseCommand):
         supervisor = SupervisorAgent.get_instance()
         channel = TelegramChannel(token=token, supervisor_agent=supervisor)
 
-        self.stdout.write('Starting Telegram channel...')
+        self.stdout.write("Starting Telegram channel...")
         asyncio.run(self._run(channel))
 
     async def _run(self, channel):

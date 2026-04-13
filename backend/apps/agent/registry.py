@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 class AgentRegistry:
     """全局Agent注册中心（单例懒加载 + 动态发现）"""
 
-    _registry: dict[str, 'BaseAgent'] = {}   # 已实例化的Agent
-    _classes: dict[str, type] = {}           # 注册的Agent类
-    _discovered = False                       # 是否已从 Prompt 发现
+    _registry: dict[str, "BaseAgent"] = {}  # 已实例化的Agent
+    _classes: dict[str, type] = {}  # 注册的Agent类
+    _discovered = False  # 是否已从 Prompt 发现
 
     @classmethod
     def register_class(cls, agent_cls: type) -> type:
@@ -36,25 +36,26 @@ class AgentRegistry:
 
         agents = PromptLoader.list_agents()
         for meta in agents:
-            name = meta.get('name')
+            name = meta.get("name")
             if not name:
                 continue
             agent_cls = _build_dynamic_agent_class(meta)
             cls.register_dynamic(name, agent_cls)
             logging.getLogger(__name__).info(
-                '[AgentRegistry] discovered agent: %s (tools=%s)',
-                name, meta.get('tools', []),
+                "[AgentRegistry] discovered agent: %s (tools=%s)",
+                name,
+                meta.get("tools", []),
             )
         cls._discovered = True
 
     @classmethod
-    def get(cls, name: str) -> 'BaseAgent':
+    def get(cls, name: str) -> "BaseAgent":
         """获取Agent实例（懒加载 + 自动发现）"""
         cls.discover_from_prompts()  # 首次调用时自动发现
         if name not in cls._registry:
             agent_cls = cls._classes.get(name)
             if agent_cls is None:
-                raise KeyError(f'Agent not registered: {name!r}')
+                raise KeyError(f"Agent not registered: {name!r}")
             cls._registry[name] = agent_cls()
         return cls._registry[name]
 

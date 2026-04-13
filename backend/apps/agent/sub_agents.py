@@ -6,10 +6,9 @@ import re
 import time
 
 from .base import BaseAgent, AgentMessage, AgentResult
-from .llm_client import LLMClient, is_fallback
+from .llm_client import LLMClient
 from .prompt_loader import PromptLoader
 from .registry import AgentRegistry
-from ..skill.loader import get_skills_loader
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +16,9 @@ logger = logging.getLogger(__name__)
 class _LLMAgent(BaseAgent):
     """所有基于LLM的子Agent的公共基类，支持工具调用循环"""
 
-    prompt_name: str = ''
-    domain_description: str = ''  # 子类覆盖：领域边界描述
-    _agent_tools: list[str] = ['web_search', 'web_fetch', 'load_skill']  # 默认工具列表
+    prompt_name: str = ""
+    domain_description: str = ""  # 子类覆盖：领域边界描述
+    _agent_tools: list[str] = ["web_search", "web_fetch", "load_skill"]  # 默认工具列表
 
     def __init__(self):
         super().__init__()
@@ -31,7 +30,7 @@ class _LLMAgent(BaseAgent):
 
     def _build_system_prompt(self) -> str:
         """动态构建 system prompt，注入技能内容。"""
-        system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ''
+        system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ""
         return self._build_skills_section(system_prompt)
 
     def _get_tools_schema(self) -> list[dict]:
@@ -41,6 +40,7 @@ class _LLMAgent(BaseAgent):
         如果未声明，回退到全局所有工具。
         """
         from apps.agent.tools.base import ToolRegistry
+
         if self._agent_tools:
             schemas = []
             for tool_name in self._agent_tools:
@@ -48,7 +48,9 @@ class _LLMAgent(BaseAgent):
                 if tool:
                     schemas.append(tool.schema)
                 else:
-                    logger.warning('[%s] tool %s not found in registry', self.name, tool_name)
+                    logger.warning(
+                        "[%s] tool %s not found in registry", self.name, tool_name
+                    )
 
             return schemas
 
@@ -57,9 +59,12 @@ class _LLMAgent(BaseAgent):
 
     def _get_memory_manager(self, message: AgentMessage):
         from apps.memory.manager import MemoryManager
+
         return MemoryManager(agent_type=self.name, user_id=message.user_id)
 
-    async def _get_recent_conversation_context(self, message: AgentMessage, max_turns: int = 5) -> list[dict]:
+    async def _get_recent_conversation_context(
+        self, message: AgentMessage, max_turns: int = 5
+    ) -> list[dict]:
         """
         获取最近的对话上下文，用于多轮对话
         返回格式: [{'role': 'user', 'content': '...'}, {'role': 'assistant', 'content': '...'}]
@@ -67,39 +72,46 @@ class _LLMAgent(BaseAgent):
         mem = self._get_memory_manager(message)
 
         # 获取最近的对话记录
-        recent_conv = mem._l1.get('conv_history', [])[-max_turns*2:]  # 每轮对话包含用户和助手
+        recent_conv = mem._l1.get("conv_history", [])[
+            -max_turns * 2 :
+        ]  # 每轮对话包含用户和助手
 
-        logger.debug('[%s] Retrieved recent conversation from memory: %s', self.name, recent_conv)
+        logger.debug(
+            "[%s] Retrieved recent conversation from memory: %s", self.name, recent_conv
+        )
 
         context_messages = []
         for item in recent_conv:
             if isinstance(item, dict):
-                role = item.get('role', 'user')
-                text = item.get('text', '')
+                role = item.get("role", "user")
+                text = item.get("text", "")
                 if text:
-                    context_messages.append({
-                        'role': role,
-                        'content': text
-                    })
+                    context_messages.append({"role": role, "content": text})
 
         return context_messages
 
     async def handle(self, message: AgentMessage) -> AgentResult:
-        text = message.payload.get('text', '')
-        logger.info('[%s] Handling message with intent: %s, payload keys: %s， %s', self.name, message.intent, list(message.payload.keys()), text)
+        text = message.payload.get("text", "")
+        logger.info(
+            "[%s] Handling message with intent: %s, payload keys: %s， %s",
+            self.name,
+            message.intent,
+            list(message.payload.keys()),
+            text,
+        )
 
         extra = self._build_context(message)
-        user_prompt = f'{extra}\n\n{text}'.strip() if extra else text
+        user_prompt = f"{extra}\n\n{text}".strip() if extra else text
 
         # 检索相关记忆，注入system prompt
         mem = self._get_memory_manager(message)
         memories = await mem.retrieve(query=text, top_k=5)
         system = self._build_system_prompt()
         if memories:
-            mem_lines = '\n'.join(f'- [{m["source"]}] {m["content"]}' for m in memories)
-            system = f'{system}\n\n### 相关记忆\n{mem_lines}'
+            mem_lines = "\n".join(f"- [{m['source']}] {m['content']}" for m in memories)
+            system = f"{system}\n\n### 相关记忆\n{mem_lines}"
 
-        logger.debug('[%s] Final system prompt:\n%s', self.name, system)
+        logger.debug("[%s] Final system prompt:\n%s", self.name, system)
 
         # 获取最近的对话上下文
         recent_context = await self._get_recent_conversation_context(message)
@@ -107,13 +119,17 @@ class _LLMAgent(BaseAgent):
         tools = self._get_tools_schema()
 
         # 构建消息历史，先添加最近的对话记录，然后添加当前的用户消息
-        messages = recent_context + [{'role': 'user', 'content': user_prompt}]
-        logger.debug('[%s] Final user prompt:\n%s', self.name, user_prompt[:1000])
+        messages = recent_context + [{"role": "user", "content": user_prompt}]
+        logger.debug("[%s] Final user prompt:\n%s", self.name, user_prompt[:1000])
 
-        content, is_fb = await self._run_tool_loop(system, messages, tools, max_tokens=2048)
+        content, is_fb = await self._run_tool_loop(
+            system, messages, tools, max_tokens=2048
+        )
 
         if is_fb:
-            return AgentResult(task_id=message.task_id, success=False, error='LLM暂时不可用')
+            return AgentResult(
+                task_id=message.task_id, success=False, error="LLM暂时不可用"
+            )
 
         # 检查拒收信号
         rejection = self._check_rejection(content)
@@ -122,8 +138,8 @@ class _LLMAgent(BaseAgent):
                 task_id=message.task_id,
                 success=False,
                 need_reroute=True,
-                reroute_reason=rejection.get('reason', '不属于本Agent职责范围'),
-                reroute_suggestion=rejection.get('suggested_agent', ''),
+                reroute_reason=rejection.get("reason", "不属于本Agent职责范围"),
+                reroute_suggestion=rejection.get("suggested_agent", ""),
             )
 
         # 分析内容以确定是否需要继续多轮对话
@@ -131,48 +147,44 @@ class _LLMAgent(BaseAgent):
 
         # 准备返回数据，包含多轮对话控制信息
         response_data = {
-            'content': content,
-            'continue_conversation': continue_conversation,
-            'start_multi_turn': continue_conversation,  # 开始多轮对话模式
-            'agent_name': self.name
+            "content": content,
+            "continue_conversation": continue_conversation,
+            "start_multi_turn": continue_conversation,  # 开始多轮对话模式
+            "agent_name": self.name,
         }
 
         # 写入记忆
-        mem.write_l1(message.task_id, f'Q:{text[:200]}|A:{content[:200]}')
+        mem.write_l1(message.task_id, f"Q:{text[:200]}|A:{content[:200]}")
 
         # 更新对话历史到L1记忆
-        conv_history = mem._l1.get('conv_history', [])
+        conv_history = mem._l1.get("conv_history", [])
 
         # 添加用户消息
-        conv_history.append({
-            'role': 'user',
-            'text': text[:200],
-            'ts': int(time.time())
-        })
+        conv_history.append(
+            {"role": "user", "text": text[:200], "ts": int(time.time())}
+        )
         # 添加助手回复
-        conv_history.append({
-            'role': 'assistant',
-            'text': content[:200],
-            'ts': int(time.time())
-        })
+        conv_history.append(
+            {"role": "assistant", "text": content[:200], "ts": int(time.time())}
+        )
         # 限制对话历史长度
-        mem._l1['conv_history'] = conv_history[-20:]  # 保留最近10轮对话
+        mem._l1["conv_history"] = conv_history[-20:]  # 保留最近10轮对话
 
         await mem.write_l2(
-            content=f'user: {text}\nassistant: {content}',
-            memory_type='conversation',
+            content=f"user: {text}\nassistant: {content}",
+            memory_type="conversation",
         )
         return AgentResult(task_id=message.task_id, success=True, data=response_data)
 
     def _build_context(self, message: AgentMessage) -> str:
         """根据声明的 context_fields 从 payload 提取上下文"""
         if not self._context_fields:
-            return ''
+            return ""
         parts = []
         for field in self._context_fields:
             if value := message.payload.get(field):
-                parts.append(f'{field}: {value}')
-        return '\n'.join(parts)
+                parts.append(f"{field}: {value}")
+        return "\n".join(parts)
 
     def _should_continue_conversation(self, content: str) -> bool:
         """
@@ -183,22 +195,55 @@ class _LLMAgent(BaseAgent):
 
         # 检查是否有表示继续对话的词汇
         continuation_indicators = [
-            '是否需要进一步', '还需要什么', '继续', '接下来', '还有其他',
-            '是否还有', '还有什么', '下一步', '后续步骤', '想了解更多',
-            '继续帮你', '接下来我', '下一步是', '后续是', '然后呢',
-            '要不要', '是否想', '你想知道', '我可以帮你', '我可以继续',
-            '继续讨论', '深入探讨', '详细说明', '具体介绍', '请提供您的反馈'
+            "是否需要进一步",
+            "还需要什么",
+            "继续",
+            "接下来",
+            "还有其他",
+            "是否还有",
+            "还有什么",
+            "下一步",
+            "后续步骤",
+            "想了解更多",
+            "继续帮你",
+            "接下来我",
+            "下一步是",
+            "后续是",
+            "然后呢",
+            "要不要",
+            "是否想",
+            "你想知道",
+            "我可以帮你",
+            "我可以继续",
+            "继续讨论",
+            "深入探讨",
+            "详细说明",
+            "具体介绍",
+            "请提供您的反馈",
         ]
 
         # 检查是否有表示结束对话的词汇
         termination_indicators = [
-            '完成', '结束', '完毕', '搞定', '解决了', '任务完成',
-            '感谢使用', '再见', '如果有问题', '随时联系', '下次再说'
+            "完成",
+            "结束",
+            "完毕",
+            "搞定",
+            "解决了",
+            "任务完成",
+            "感谢使用",
+            "再见",
+            "如果有问题",
+            "随时联系",
+            "下次再说",
         ]
 
         # 计算延续和终止词汇的数量
-        continuation_count = sum(1 for indicator in continuation_indicators if indicator in content_lower)
-        termination_count = sum(1 for indicator in termination_indicators if indicator in content_lower)
+        continuation_count = sum(
+            1 for indicator in continuation_indicators if indicator in content_lower
+        )
+        termination_count = sum(
+            1 for indicator in termination_indicators if indicator in content_lower
+        )
 
         # 如果延续词汇数量多于终止词汇数量，则继续对话
         return continuation_count > termination_count
@@ -223,9 +268,9 @@ class _LLMAgent(BaseAgent):
 
 def _build_dynamic_agent_class(meta: dict) -> type:
     """根据 Prompt 元数据动态创建 Agent 类。"""
-    name = meta['name']
-    tools = meta.get('tools', [])
-    context_fields = meta.get('context_fields', [])
+    name = meta["name"]
+    tools = meta.get("tools", [])
+    context_fields = meta.get("context_fields", [])
 
     def make_init(self):
         _LLMAgent.__init__(self)
@@ -233,13 +278,13 @@ def _build_dynamic_agent_class(meta: dict) -> type:
         self._context_fields = context_fields
 
     agent_cls = type(
-        f'{name.capitalize()}Agent',
+        f"{name.capitalize()}Agent",
         (_LLMAgent,),
         {
-            'name': name,
-            'prompt_name': name,
-            'domain_description': '',
-            '__init__': make_init,
+            "name": name,
+            "prompt_name": name,
+            "domain_description": "",
+            "__init__": make_init,
         },
     )
     return agent_cls
@@ -249,60 +294,61 @@ def _build_dynamic_agent_class(meta: dict) -> type:
 class BacktestAgent(BaseAgent):
     """回测Agent：触发回测任务并返回结果摘要"""
 
-    name = 'backtest'
+    name = "backtest"
 
     async def handle(self, message: AgentMessage) -> AgentResult:
-        strategy_id = message.payload.get('strategy_id')
-        symbol = message.payload.get('symbol', 'BTCUSDT')
-        timeframe = message.payload.get('timeframe', '1h')
-        start_date = message.payload.get('start_date')
-        end_date = message.payload.get('end_date')
+        strategy_id = message.payload.get("strategy_id")
+        symbol = message.payload.get("symbol", "BTCUSDT")
+        timeframe = message.payload.get("timeframe", "1h")
+        start_date = message.payload.get("start_date")
+        end_date = message.payload.get("end_date")
 
         if not strategy_id:
             return AgentResult(
                 task_id=message.task_id,
                 success=False,
-                error='缺少 strategy_id 参数',
+                error="缺少 strategy_id 参数",
             )
 
         # 异步触发Celery任务（phase2）
         # from apps.backtest.tasks import run_backtest_task
         # task = run_backtest_task.delay(strategy_id, symbol, timeframe, start_date, end_date)
         logger.info(
-            f'[BacktestAgent] strategy={strategy_id} symbol={symbol} '
-            f'tf={timeframe} {start_date}~{end_date}'
+            f"[BacktestAgent] strategy={strategy_id} symbol={symbol} "
+            f"tf={timeframe} {start_date}~{end_date}"
         )
 
         # 准备响应数据，包含多轮对话控制信息
         response_data = {
-            'content': f'回测任务已提交：{symbol} {timeframe}',
-            'strategy_id': strategy_id,
-            'continue_conversation': False,  # 回测通常是单次操作
-            'start_multi_turn': False,
-            'agent_name': self.name
+            "content": f"回测任务已提交：{symbol} {timeframe}",
+            "strategy_id": strategy_id,
+            "continue_conversation": False,  # 回测通常是单次操作
+            "start_multi_turn": False,
+            "agent_name": self.name,
         }
 
         # 写入记忆
         from apps.memory.manager import MemoryManager
+
         mem = MemoryManager(agent_type=self.name, user_id=message.user_id)
 
         # 更新对话历史到L1记忆
-        conv_history = mem._l1.get('conv_history', [])
+        conv_history = mem._l1.get("conv_history", [])
         # 添加用户消息
-        text = message.payload.get('text', '')
-        conv_history.append({
-            'role': 'user',
-            'text': text[:200],
-            'ts': int(time.time())
-        })
+        text = message.payload.get("text", "")
+        conv_history.append(
+            {"role": "user", "text": text[:200], "ts": int(time.time())}
+        )
         # 添加助手回复
-        conv_history.append({
-            'role': 'assistant',
-            'text': f'回测任务已提交：{symbol} {timeframe}'[:200],
-            'ts': int(time.time())
-        })
+        conv_history.append(
+            {
+                "role": "assistant",
+                "text": f"回测任务已提交：{symbol} {timeframe}"[:200],
+                "ts": int(time.time()),
+            }
+        )
         # 限制对话历史长度
-        mem._l1['conv_history'] = conv_history[-20:]  # 保留最近10轮对话
+        mem._l1["conv_history"] = conv_history[-20:]  # 保留最近10轮对话
 
         return AgentResult(
             task_id=message.task_id,

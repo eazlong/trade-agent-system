@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = [
@@ -13,23 +12,34 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
-            name='Notification',
+            name="Notification",
             fields=[
-                ('id', models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, serialize=False)),
-                ('user', models.ForeignKey(
-                    to=settings.AUTH_USER_MODEL,
-                    on_delete=models.CASCADE,
-                    related_name='notifications',
-                )),
-                ('channel', models.CharField(max_length=16, default='telegram')),
-                ('message', models.TextField()),
-                ('is_read', models.BooleanField(default=False)),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
+                (
+                    "id",
+                    models.UUIDField(
+                        primary_key=True,
+                        default=uuid.uuid4,
+                        editable=False,
+                        serialize=False,
+                    ),
+                ),
+                (
+                    "user",
+                    models.ForeignKey(
+                        to=settings.AUTH_USER_MODEL,
+                        on_delete=models.CASCADE,
+                        related_name="notifications",
+                    ),
+                ),
+                ("channel", models.CharField(max_length=16, default="telegram")),
+                ("message", models.TextField()),
+                ("is_read", models.BooleanField(default=False)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
             ],
-            options={'db_table': 'notifications'},
+            options={"db_table": "notifications"},
         ),
         migrations.AddIndex(
-            model_name='notification',
-            index=models.Index(fields=['user', '-created_at'], name='notify_user_idx'),
+            model_name="notification",
+            index=models.Index(fields=["user", "-created_at"], name="notify_user_idx"),
         ),
     ]

@@ -4,15 +4,18 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('datasource', '0001_initial'),
+        ("datasource", "0001_initial"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='datasourceconfig',
-            name='market_types',
-            field=models.JSONField(blank=True, default=list, help_text='["spot"], ["futures"], 或同时配置。空列表=全部。'),
+            model_name="datasourceconfig",
+            name="market_types",
+            field=models.JSONField(
+                blank=True,
+                default=list,
+                help_text='["spot"], ["futures"], 或同时配置。空列表=全部。',
+            ),
         ),
     ]

@@ -12,26 +12,26 @@ logger = logging.getLogger(__name__)
 class ToolResult:
     success: bool
     data: Any = None
-    error: str = ''
+    error: str = ""
 
 
 class BaseTool(ABC):
     """所有工具的抽象基类"""
 
     # 工具名称（用于LLM function calling中的name字段）
-    name: str = ''
+    name: str = ""
     # 工具描述（用于LLM function calling中的description字段）
-    description: str = ''
+    description: str = ""
 
     @property
     def schema(self) -> dict:
         """返回OpenAI function calling格式的schema"""
         return {
-            'type': 'function',
-            'function': {
-                'name': self.name,
-                'description': self.description,
-                'parameters': self.parameters_schema,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters_schema,
             },
         }
 
@@ -53,7 +53,7 @@ class ToolRegistry:
     @classmethod
     def register(cls, tool: BaseTool) -> None:
         cls._tools[tool.name] = tool
-        logger.debug(f'[ToolRegistry] registered: {tool.name}')
+        logger.debug(f"[ToolRegistry] registered: {tool.name}")
 
     @classmethod
     def unregister(cls, name: str) -> None:

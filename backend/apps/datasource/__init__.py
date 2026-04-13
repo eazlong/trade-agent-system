@@ -9,4 +9,4 @@ DataSource Application
 交易所 → WebSocket/REST → 数据清洗标准化 → 内存存储 → API接口 → 过期删除(4h)
 """
 
-default_app_config = 'apps.datasource.apps.DataSourceConfig'
+default_app_config = "apps.datasource.apps.DataSourceConfig"

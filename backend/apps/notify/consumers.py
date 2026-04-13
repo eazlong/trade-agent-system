@@ -19,48 +19,44 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             await self.accept()
             # 加入用户特定组
             self.user_group = f"user_{self.scope['user'].id}"
-            await self.channel_layer.group_add(
-                self.user_group,
-                self.channel_name
-            )
+            await self.channel_layer.group_add(self.user_group, self.channel_name)
             logger.info(f"[WebSocket] User {self.scope['user'].id} connected")
 
     async def disconnect(self, close_code):
         # 从用户组中移除
-        if hasattr(self, 'user_group'):
-            await self.channel_layer.group_discard(
-                self.user_group,
-                self.channel_name
-            )
+        if hasattr(self, "user_group"):
+            await self.channel_layer.group_discard(self.user_group, self.channel_name)
         logger.info(f"[WebSocket] User {self.scope['user'].id} disconnected")
 
     async def receive(self, text_data):
         """接收来自客户端的消息"""
         try:
             data = json.loads(text_data)
-            message_type = data.get('type')
+            message_type = data.get("type")
 
-            if message_type == 'subscribe':
+            if message_type == "subscribe":
                 # 处理订阅请求
-                subscription_type = data.get('subscription_type')
+                subscription_type = data.get("subscription_type")
                 if subscription_type:
                     await self.channel_layer.group_add(
-                        f"{subscription_type}_updates",
-                        self.channel_name
+                        f"{subscription_type}_updates", self.channel_name
                     )
-                    await self.send(text_data=json.dumps({
-                        'type': 'subscription_ack',
-                        'subscription_type': subscription_type,
-                        'status': 'success'
-                    }))
+                    await self.send(
+                        text_data=json.dumps(
+                            {
+                                "type": "subscription_ack",
+                                "subscription_type": subscription_type,
+                                "status": "success",
+                            }
+                        )
+                    )
 
-            elif message_type == 'unsubscribe':
+            elif message_type == "unsubscribe":
                 # 处理取消订阅请求
-                subscription_type = data.get('subscription_type')
+                subscription_type = data.get("subscription_type")
                 if subscription_type:
                     await self.channel_layer.group_discard(
-                        f"{subscription_type}_updates",
-                        self.channel_name
+                        f"{subscription_type}_updates", self.channel_name
                     )
         except json.JSONDecodeError:
             logger.error("[WebSocket] Invalid JSON received")
@@ -69,4 +65,4 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def send_notification(self, event):
         """发送通知到 WebSocket 客户端"""
-        await self.send(text_data=json.dumps(event['message']))
+        await self.send(text_data=json.dumps(event["message"]))

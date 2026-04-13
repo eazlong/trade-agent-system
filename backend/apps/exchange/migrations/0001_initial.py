@@ -5,26 +5,32 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
-    dependencies = [
-    ]
+    dependencies = []
 
     operations = [
         migrations.CreateModel(
-            name='ExchangeAccount',
+            name="ExchangeAccount",
             fields=[
-                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('exchange', models.CharField(max_length=32)),
-                ('label', models.CharField(blank=True, max_length=64)),
-                ('api_key_enc', models.BinaryField()),
-                ('api_secret_enc', models.BinaryField()),
-                ('is_active', models.BooleanField(default=True)),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
+                (
+                    "id",
+                    models.UUIDField(
+                        default=uuid.uuid4,
+                        editable=False,
+                        primary_key=True,
+                        serialize=False,
+                    ),
+                ),
+                ("exchange", models.CharField(max_length=32)),
+                ("label", models.CharField(blank=True, max_length=64)),
+                ("api_key_enc", models.BinaryField()),
+                ("api_secret_enc", models.BinaryField()),
+                ("is_active", models.BooleanField(default=True)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
             ],
             options={
-                'db_table': 'exchange_accounts',
+                "db_table": "exchange_accounts",
             },
         ),
     ]
