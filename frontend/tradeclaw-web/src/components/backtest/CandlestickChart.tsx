@@ -301,38 +301,41 @@ export default function CandlestickChart({
   }
 
   return (
-    <div className="relative w-full">
-      {/* Timeframe switcher */}
-      <div className="absolute top-2 left-2 z-10 flex gap-1">
-        {TIMEFRAMES.map((tf) => (
-          <button
-            key={tf}
-            onClick={() => {
-              setActiveTf(tf);
-              onTimeframeChange?.(tf);
-            }}
-            className={`px-2 py-0.5 text-[10px] font-medium rounded cursor-pointer transition-all border ${
-              activeTf === tf
-                ? "text-green bg-green-dim border-green/20"
-                : "text-text3 border-transparent hover:text-text hover:bg-bg2"
-            }`}
-          >
-            {tf}
-          </button>
-        ))}
-      </div>
+    <div className="w-full">
+      {/* Control bar: timeframe + legend */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-1 text-[10px]">
+        {/* Timeframe switcher */}
+        <div className="flex gap-1">
+          {TIMEFRAMES.map((tf) => (
+            <button
+              key={tf}
+              onClick={() => {
+                setActiveTf(tf);
+                onTimeframeChange?.(tf);
+              }}
+              className={`px-2 py-0.5 font-medium rounded cursor-pointer transition-all border ${
+                activeTf === tf
+                  ? "text-green bg-green-dim border-green/20"
+                  : "text-text3 border-transparent hover:text-text hover:bg-bg2"
+              }`}
+            >
+              {tf}
+            </button>
+          ))}
+        </div>
 
-      {/* Indicator legend */}
-      <div className="flex flex-wrap gap-3 px-2 py-1 text-[10px] text-text3">
-        {legendItems.map((item) => (
-          <span key={item.label} className="flex items-center gap-1">
-            <span
-              className="inline-block h-2 w-2 rounded-full"
-              style={{ backgroundColor: item.color }}
-            />
-            {item.label}
-          </span>
-        ))}
+        {/* Indicator legend */}
+        <div className="flex flex-wrap gap-3 text-text3">
+          {legendItems.map((item) => (
+            <span key={item.label} className="flex items-center gap-1">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ backgroundColor: item.color }}
+              />
+              {item.label}
+            </span>
+          ))}
+        </div>
       </div>
 
       {/* Chart */}
