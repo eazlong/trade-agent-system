@@ -597,7 +597,7 @@ INTENT_TO_AGENT = {
     'generate_signal':    'AnalystAgent',
     # 量化/策略类
     'generate_strategy':  'QuantEngineerAgent',
-    'run_backtest':    'BacktestAgent',
+    'run_backtest':    'AnalystAgent',
     # 计划/复盘
     'create_plan':        'PlannerAgent',
     'review_trade':       'CoachAgent',

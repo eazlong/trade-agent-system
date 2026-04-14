@@ -168,20 +168,20 @@ def register_fallback_rule(pattern: str, intent: str):
 
 _router = IntentRouter.get_instance()
 
-# 默认意图映射
-_router.register_intents(
-    {
-        "analyze_market": "analyst",
-        "generate_signal": "analyst",
-        "generate_strategy": "quant",
-        "run_backtest": "backtest",
-        "create_plan": "coach",
-        "trading_system": "coach",
-        "review_trade": "coach",
-        "summarize_trades": "coach",
-        "assess_risk": "risk_advisor",
-    }
-)
+# # 默认意图映射
+# _router.register_intents(
+#     {
+#         "analyze_market": "analyst",
+#         "generate_signal": "analyst",
+#         "generate_strategy": "quant",
+#         "run_backtest": "quant",
+#         "create_plan": "coach",
+#         "trading_system": "coach",
+#         "review_trade": "coach",
+#         "summarize_trades": "coach",
+#         "assess_risk": "risk_advisor",
+#     }
+# )
 
 # 默认框架意图
 _router.register_frame_intent("start_trading", "trading", "start")
@@ -196,7 +196,7 @@ _router.register_fallback_rules(
         (r"(回测|测试策略|历史数据)", "run_backtest"),
         (r"(风险|止损|仓位|风控)", "assess_risk"),
         (r"(计划|复盘|总结|周报)", "create_plan"),
-        (r"(策略|代码|编写)", "generate_strategy"),
+        (r"(策略|代码|编写)", "generate_and_test_strategy"),
     ]
 )
 
@@ -388,11 +388,12 @@ class SupervisorAgent(BaseAgent):
                         data=new_intent["response"],
                     )
                 return await self._free_chat(message)
-            if new_intent and new_intent != "free_chat":
-                new_agent = self._router.get_agent_for_intent(new_intent)
+            new_intent_str = new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            if new_intent_str and new_intent_str != "free_chat":
+                new_agent = self._router.get_agent_for_intent(new_intent_str)
                 if new_agent and new_agent != agent_name:
                     return await self._route_with_fallback(
-                        message, new_intent, {agent_name}
+                        message, new_intent_str, {agent_name}
                     )
 
             # 无法路由，走 free_chat
@@ -448,14 +449,14 @@ class SupervisorAgent(BaseAgent):
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
             routing_history = mm._l1.get("routing_history", [])
 
-        intent = message.intent or await self._parse_intent(
+        parsed = message.intent or await self._parse_intent(
             message.payload.get("text", ""),
             context=routing_history[-5:] if routing_history else None,
         )
 
         # LLM 直接返回自由对话（节省一次 LLM 调用）
-        if isinstance(intent, dict) and intent.get("_free_chat"):
-            response_text = intent.get("response")
+        if isinstance(parsed, dict) and parsed.get("_free_chat"):
+            response_text = parsed.get("response")
             if response_text:
                 return AgentResult(
                     task_id=message.task_id, success=True, data=response_text
@@ -463,22 +464,32 @@ class SupervisorAgent(BaseAgent):
             # response 为空（LLM 降级），用 _free_chat 处理
             return await self._free_chat(message)
 
-        message.intent = intent
+        # 提取意图字符串和 LLM 返回的 params（若有）
+        intent_str: str
+        parsed_params: dict = {}
+        if isinstance(parsed, tuple):
+            intent_str, parsed_params = parsed
+        else:
+            intent_str = str(parsed)
+
+        message.intent = intent_str
+        if parsed_params:
+            message.payload = {**message.payload, **parsed_params}
 
         # 框架生命周期
-        if self._router.is_frame_intent(intent):
-            return await self._handle_frame(intent, message)
+        if self._router.is_frame_intent(intent_str):
+            return await self._handle_frame(intent_str, message)
 
         # 路由子Agent
-        agent_name = self._router.get_agent_for_intent(intent)
+        agent_name = self._router.get_agent_for_intent(intent_str)
         if agent_name:
-            result = await self._route_with_fallback(message, intent)
+            result = await self._route_with_fallback(message, intent_str)
 
             # 路由成功时写 L1
             if mm and result.success and not result.need_reroute:
                 updated = routing_history[-19:] + [
                     {
-                        "intent": intent,
+                        "intent": intent_str,
                         "agent": agent_name,
                         "q": message.payload.get("text", "")[:100],
                         "ts": int(time.time()),
@@ -542,11 +553,12 @@ class SupervisorAgent(BaseAgent):
                         data=new_intent["response"],
                     )
                 return await self._free_chat(message)
-            if new_intent and new_intent != "free_chat":
-                new_agent = self._router.get_agent_for_intent(new_intent)
+            new_intent_str = new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            if new_intent_str and new_intent_str != "free_chat":
+                new_agent = self._router.get_agent_for_intent(new_intent_str)
                 if new_agent and new_agent not in attempted:
                     return await self._route_with_fallback(
-                        message, new_intent, attempted
+                        message, new_intent_str, attempted
                     )
 
             # 都失败
@@ -638,8 +650,8 @@ class SupervisorAgent(BaseAgent):
             f"User message: {text}\n\n"
             f"Valid intents: {json.dumps(valid_intents)}\n\n"
             "Reply with a JSON object. "
-            'If the user has one intent: {"intent": "<name>", "params": {}}\n'
-            'If multiple independent intents: {"intents": [{"intent": "...", "params": {}}, ...]}\n'
+            'If the user has one intent: {"intent": "<name>", "text": "{text}"}\n'
+            'If multiple independent intents: {"intents": [{"intent": "...", "text": "{text}"}, ...]}\n'
             'If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
         )
         response = await self._llm.chat(
@@ -677,9 +689,12 @@ class SupervisorAgent(BaseAgent):
                 and isinstance(data["intents"], list)
                 and len(data["intents"]) > 0
             ):
-                return data["intents"][0].get("intent", "unknown")
+                first = data["intents"][0]
+                return first.get("intent", "unknown"), first.get("params", {})
 
-            return data.get("intent", "unknown")
+            intent = data.get("intent", "unknown")
+            params = data.get("params", {})
+            return intent, params
         except Exception:
             logger.warning(f"Intent parse failed, raw: {response[:200]}")
             # 降级到规则引擎

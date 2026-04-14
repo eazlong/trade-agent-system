@@ -183,10 +183,10 @@ class TUIChannel(BaseChannel):
             # 带超时调用 Agent
             result = await asyncio.wait_for(
                 self._stream_agent_response(text),
-                timeout=120.0,
+                timeout=360.0,
             )
         except asyncio.TimeoutError:
-            console.print("\n[yellow]⏱ Agent 处理超时（120s）[/]")
+            console.print("\n[yellow]⏱ Agent 处理超时（360s）[/]")
             result = None
         except Exception as e:
             console.print(f"\n[red]✗ Agent 错误: {e}[/]")
@@ -245,7 +245,7 @@ class TUIChannel(BaseChannel):
         msg = build_agent_task(user_id=self._user_id, payload={"text": text})
         await publish(AGENT_TASKS, msg)
 
-        reply = await wait_reply(msg["task_id"], timeout=120)
+        reply = await wait_reply(msg["task_id"], timeout=360)
         if reply is None:
             return None
 

@@ -1,0 +1,161 @@
+- generic [active] [ref=e1]:
+  - button "Open Next.js Dev Tools" [ref=e9] [cursor=pointer]:
+    - img [ref=e10]
+  - alert [ref=e13]
+  - generic [ref=e14]:
+    - generic [ref=e16]:
+      - generic [ref=e17]:
+        - img [ref=e19]
+        - generic [ref=e22]:
+          - generic [ref=e23]: TradeClaw
+          - generic [ref=e24]: Agent OS · v2.4.1
+      - generic [ref=e25]:
+        - link "总览" [ref=e26] [cursor=pointer]:
+          - /url: /overview
+        - link "智能体" [ref=e27] [cursor=pointer]:
+          - /url: /agents
+        - link "回测" [ref=e28] [cursor=pointer]:
+          - /url: /backtest
+        - link "交易" [ref=e29] [cursor=pointer]:
+          - /url: /trading
+        - link "日志" [ref=e30] [cursor=pointer]:
+          - /url: /logs
+        - link "配置" [ref=e31] [cursor=pointer]:
+          - /url: /settings
+      - generic [ref=e32]:
+        - generic [ref=e33]:
+          - generic [ref=e34]: BTC
+          - generic [ref=e35]: 67,828
+          - generic [ref=e36]: +1.23%
+        - generic [ref=e37]:
+          - generic [ref=e38]: ETH
+          - generic [ref=e39]: 3,423
+          - generic [ref=e40]: +0.90%
+        - generic [ref=e41]:
+          - generic [ref=e42]: SOL
+          - generic [ref=e43]: "182.4"
+          - generic [ref=e44]: "-0.41%"
+        - generic [ref=e47]: 实时运行中
+        - button "收起右侧面板" [ref=e48] [cursor=pointer]:
+          - img [ref=e49]
+    - generic [ref=e52]:
+      - generic [ref=e53]:
+        - generic [ref=e54]: 智能体集群
+        - generic [ref=e55] [cursor=pointer]:
+          - generic [ref=e57]: Orchestrator
+          - generic [ref=e58]: 主控
+        - generic [ref=e59] [cursor=pointer]:
+          - generic [ref=e61]: 市场分析
+          - generic [ref=e62]: 运行
+        - generic [ref=e63] [cursor=pointer]:
+          - generic [ref=e65]: 情绪分析
+          - generic [ref=e66]: 运行
+        - generic [ref=e67] [cursor=pointer]:
+          - generic [ref=e69]: 风险管理
+          - generic [ref=e70]: 告警
+        - generic [ref=e71] [cursor=pointer]:
+          - generic [ref=e73]: 策略优化
+          - generic [ref=e74]: 运行
+        - generic [ref=e75] [cursor=pointer]:
+          - generic [ref=e77]: 交易执行
+          - generic [ref=e78]: 就绪
+        - generic [ref=e79] [cursor=pointer]:
+          - generic [ref=e81]: 回测引擎
+          - generic [ref=e82]: 待机
+      - generic [ref=e84]:
+        - generic [ref=e85]: 账户概况
+        - generic [ref=e86]:
+          - generic [ref=e87]: 总资产
+          - generic [ref=e88]: $284,720
+        - generic [ref=e89]:
+          - generic [ref=e90]: 今日盈亏
+          - generic [ref=e91]: +$3,421
+        - generic [ref=e92]:
+          - generic [ref=e93]: 持仓数
+          - generic [ref=e94]: "4"
+        - generic [ref=e95]:
+          - generic [ref=e96]: 信号队列
+          - generic [ref=e97]: "7"
+        - generic [ref=e98]:
+          - generic [ref=e99]: 执行任务
+          - generic [ref=e100]: "12"
+      - generic [ref=e102]:
+        - generic [ref=e103]: 活跃策略
+        - generic [ref=e104]:
+          - generic [ref=e107] [cursor=pointer]:
+            - generic [ref=e108]: 动量突破
+            - generic [ref=e109]: BTC · 15m
+          - generic [ref=e114] [cursor=pointer]:
+            - generic [ref=e115]: 均值回归
+            - generic [ref=e116]: ETH · 1h
+          - generic [ref=e121] [cursor=pointer]:
+            - generic [ref=e122]: 套利对冲
+            - generic [ref=e123]: 多品种
+    - generic [ref=e126]:
+      - generic [ref=e127]:
+        - generic [ref=e128]:
+          - heading "交易中心" [level=1] [ref=e129]
+          - generic [ref=e130]: 1 个账户 · 0 个持仓 · 0 活跃订单
+          - generic [ref=e131]: "[running/stopped]"
+        - generic [ref=e132]:
+          - button "启动框架" [ref=e133] [cursor=pointer]
+          - generic [ref=e134]:
+            - button "全部" [ref=e135] [cursor=pointer]
+            - button "实盘" [ref=e136] [cursor=pointer]
+            - button "模拟" [ref=e137] [cursor=pointer]
+      - generic [ref=e139]:
+        - generic [ref=e141]:
+          - generic [ref=e143]: binance
+          - generic [ref=e144]: 实盘
+        - generic [ref=e147]:
+          - generic [ref=e148]: binance
+          - generic [ref=e149]:
+            - generic [ref=e150]:
+              - generic [ref=e151]: 总资产
+              - generic [ref=e152]: $0.00
+            - generic [ref=e153]:
+              - generic [ref=e154]: 可用余额
+              - generic [ref=e155]: $0.00
+            - generic [ref=e156]:
+              - generic [ref=e157]: 已用保证金
+              - generic [ref=e158]: $0.00
+            - generic [ref=e159]:
+              - generic [ref=e160]: 状态
+              - generic [ref=e161]: 未连接
+    - generic [ref=e163]:
+      - generic [ref=e164]:
+        - generic [ref=e165]: 当前持仓
+        - generic [ref=e166]: 暂无持仓
+      - generic [ref=e167]:
+        - generic [ref=e168]: 风险仪表盘
+        - generic [ref=e169]:
+          - generic [ref=e170]:
+            - generic [ref=e171]: P0 事件
+            - generic [ref=e172]: "0"
+          - generic [ref=e173]:
+            - generic [ref=e174]: P1 事件
+            - generic [ref=e175]: "0"
+          - generic [ref=e176]:
+            - generic [ref=e177]: 总事件
+            - generic [ref=e178]: "0"
+          - generic [ref=e179]:
+            - generic [ref=e180]: 已解决
+            - generic [ref=e181]: "0"
+      - generic [ref=e182]:
+        - generic [ref=e183]: 近期执行
+        - generic [ref=e184]: 暂无成交记录
+      - generic [ref=e185]:
+        - generic [ref=e186]: 模型调用统计
+        - generic [ref=e187]:
+          - generic [ref=e188]:
+            - generic [ref=e189]: 今日 API 调用
+            - generic [ref=e190]: "19"
+          - generic [ref=e191]:
+            - generic [ref=e192]: 平均响应时间
+            - generic [ref=e193]: 124ms
+          - generic [ref=e194]:
+            - generic [ref=e195]: Token 消耗
+            - generic [ref=e196]: 1.2M
+          - generic [ref=e197]:
+            - generic [ref=e198]: 推理成功率
+            - generic [ref=e199]: 99.7%

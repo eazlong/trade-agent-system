@@ -121,7 +121,7 @@ class TelegramChannel(BaseChannel):
             )
             await publish(AGENT_TASKS, msg)
 
-            reply = await wait_reply(msg["task_id"], timeout=120)
+            reply = await wait_reply(msg["task_id"], timeout=360)
             if reply:
                 # 如果返回的是字典格式，提取content部分
                 processed_reply = self._extract_content_from_response(reply)
@@ -136,7 +136,7 @@ class TelegramChannel(BaseChannel):
         msg = build_agent_task(user_id=user_id, payload={"text": text})
         await publish(AGENT_TASKS, msg)
 
-        reply = await wait_reply(msg["task_id"], timeout=120)
+        reply = await wait_reply(msg["task_id"], timeout=360)
         if reply:
             # 处理Agent返回的响应格式，只提取内容部分
             processed_reply = self._extract_content_from_response(reply)

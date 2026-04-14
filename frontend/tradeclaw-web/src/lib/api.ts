@@ -294,10 +294,11 @@ export const agentApi = {
     }),
   getFrameStatus: () =>
     request<Record<string, unknown>>("/api/agent/frame/status/"),
-  controlFrame: (action: string, frameId?: string) =>
+  controlFrame: (action: string, mode = "live") =>
     request<Record<string, unknown>>("/api/agent/frame/control/", "POST", {
+      frame: "trading",
       action,
-      frame_id: frameId,
+      mode,
     }),
 };
 
@@ -335,6 +336,71 @@ export const loggingApi = {
     const qs = query.toString();
     return request<SystemLog[]>(`/api/logs/${qs ? `?${qs}` : ""}`);
   },
+};
+
+// ── Live Session API ──
+
+export interface LiveSession {
+  id: string;
+  strategy: string;
+  strategy_name: string;
+  backtest_result: string | null;
+  backtest_result_id: string | null;
+  symbol: string;
+  mode: "live" | "paper";
+  status: "pending" | "running" | "paused" | "stopped" | "error";
+  exchange_account: string;
+  exchange_account_name: string | null;
+  initial_capital: string;
+  current_equity: string | null;
+  config: Record<string, unknown>;
+  started_at: string | null;
+  stopped_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSessionPayload {
+  backtest_result_id: string;
+  mode: "live" | "paper";
+  exchange_account_id: string;
+  config?: Record<string, unknown>;
+}
+
+export const liveSessionApi = {
+  list: () => request<LiveSession[]>("/api/trading/sessions/"),
+  get: (id: string) => request<LiveSession>(`/api/trading/sessions/${id}/`),
+  create: (data: CreateSessionPayload) =>
+    request<{ id: string; status: string; mode: string; message: string }>(
+      "/api/trading/sessions/create/",
+      "POST",
+      data
+    ),
+  start: (id: string) =>
+    request<{ status: string; message: string }>(
+      `/api/trading/sessions/${id}/start/`,
+      "POST"
+    ),
+  pause: (id: string) =>
+    request<{ status: string; message: string }>(
+      `/api/trading/sessions/${id}/pause/`,
+      "POST"
+    ),
+  resume: (id: string) =>
+    request<{ status: string; message: string }>(
+      `/api/trading/sessions/${id}/resume/`,
+      "POST"
+    ),
+  stop: (id: string) =>
+    request<{ status: string; message: string }>(
+      `/api/trading/sessions/${id}/stop/`,
+      "POST"
+    ),
+  promote: (id: string) =>
+    request<{ id: string; mode: string; status: string; message: string }>(
+      `/api/trading/sessions/${id}/promote/`,
+      "POST"
+    ),
 };
 
 // ── Backtest API ──
@@ -437,4 +503,11 @@ export const backtestApi = {
       `/api/backtest/results/${id}/trades/${qs ? `?${qs}` : ""}`
     );
   },
+  review: (id: string, data: { approved: boolean; notes?: string }) =>
+    request<{
+      id: string;
+      review_status: string;
+      review_notes: string;
+      reviewed_at: string;
+    }>(`/api/backtest/results/${id}/review/`, "POST", data),
 };
