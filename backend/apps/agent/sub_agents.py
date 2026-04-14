@@ -31,6 +31,7 @@ class _LLMAgent(BaseAgent):
     def _build_system_prompt(self) -> str:
         """动态构建 system prompt，注入技能内容。"""
         system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ""
+        system_prompt += '\n\n 收到用户消息后，先判断是否属于你的职责范围。如果不属于你的职责，必须只返回以下 JSON 格式，不加任何其他内容：\n {"rejected": true, "reason": "简短原因", "suggested_agent": "coach" 或 "risk_advisor"} \n 如果属于你的职责，正常回答，不要包含 rejected 字段。'
         return self._build_skills_section(system_prompt)
 
     def _get_tools_schema(self) -> list[dict]:
@@ -111,6 +112,7 @@ class _LLMAgent(BaseAgent):
             mem_lines = "\n".join(f"- [{m['source']}] {m['content']}" for m in memories)
             system = f"{system}\n\n### 相关记忆\n{mem_lines}"
 
+        
         logger.debug("[%s] Final system prompt:\n%s", self.name, system)
 
         # 获取最近的对话上下文
@@ -288,70 +290,3 @@ def _build_dynamic_agent_class(meta: dict) -> type:
         },
     )
     return agent_cls
-
-
-@AgentRegistry.register_class
-class BacktestAgent(BaseAgent):
-    """回测Agent：触发回测任务并返回结果摘要"""
-
-    name = "backtest"
-
-    async def handle(self, message: AgentMessage) -> AgentResult:
-        strategy_id = message.payload.get("strategy_id")
-        symbol = message.payload.get("symbol", "BTCUSDT")
-        timeframe = message.payload.get("timeframe", "1h")
-        start_date = message.payload.get("start_date")
-        end_date = message.payload.get("end_date")
-
-        if not strategy_id:
-            return AgentResult(
-                task_id=message.task_id,
-                success=False,
-                error="缺少 strategy_id 参数",
-            )
-
-        # 异步触发Celery任务（phase2）
-        # from apps.backtest.tasks import run_backtest_task
-        # task = run_backtest_task.delay(strategy_id, symbol, timeframe, start_date, end_date)
-        logger.info(
-            f"[BacktestAgent] strategy={strategy_id} symbol={symbol} "
-            f"tf={timeframe} {start_date}~{end_date}"
-        )
-
-        # 准备响应数据，包含多轮对话控制信息
-        response_data = {
-            "content": f"回测任务已提交：{symbol} {timeframe}",
-            "strategy_id": strategy_id,
-            "continue_conversation": False,  # 回测通常是单次操作
-            "start_multi_turn": False,
-            "agent_name": self.name,
-        }
-
-        # 写入记忆
-        from apps.memory.manager import MemoryManager
-
-        mem = MemoryManager(agent_type=self.name, user_id=message.user_id)
-
-        # 更新对话历史到L1记忆
-        conv_history = mem._l1.get("conv_history", [])
-        # 添加用户消息
-        text = message.payload.get("text", "")
-        conv_history.append(
-            {"role": "user", "text": text[:200], "ts": int(time.time())}
-        )
-        # 添加助手回复
-        conv_history.append(
-            {
-                "role": "assistant",
-                "text": f"回测任务已提交：{symbol} {timeframe}"[:200],
-                "ts": int(time.time()),
-            }
-        )
-        # 限制对话历史长度
-        mem._l1["conv_history"] = conv_history[-20:]  # 保留最近10轮对话
-
-        return AgentResult(
-            task_id=message.task_id,
-            success=True,
-            data=response_data,
-        )

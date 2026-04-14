@@ -4,7 +4,9 @@ import DashboardShell from "@/components/layout/DashboardShell";
 import { useOrders } from "@/hooks/useOrders";
 import { usePositions } from "@/hooks/usePositions";
 import { useAccounts } from "@/hooks/useAccounts";
-import type { Order, ExchangeAccountWithBalance } from "@/lib/api";
+import { useFrameControl } from "@/hooks/useFrameControl";
+import { useLiveSessions } from "@/hooks/useLiveSessions";
+import type { Order, ExchangeAccountWithBalance, LiveSession } from "@/lib/api";
 import { useState } from "react";
 
 function formatNumber(n: string | number, decimals = 2): string {
@@ -42,6 +44,44 @@ function statusBadge(status: Order["status"]): string {
     : status === "failed"
       ? "bg-red-dim text-red"
       : "bg-bg2 text-text3";
+}
+
+// ── Frame Control Button ──
+
+function FrameControlButton({
+  running,
+  loading,
+  onStart,
+  onStop,
+}: {
+  running: boolean;
+  loading: boolean;
+  onStart: () => void;
+  onStop: () => void;
+}) {
+  const disabled = loading;
+
+  if (running) {
+    return (
+      <button
+        onClick={onStop}
+        disabled={disabled}
+        className="px-3 py-1.5 rounded-md text-[10px] font-semibold cursor-pointer transition-all border bg-red-dim/50 border-red/20 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        {loading ? "停止中..." : "停止框架"}
+      </button>
+    );
+  }
+
+  return (
+    <button
+      onClick={onStart}
+      disabled={disabled}
+      className="px-3 py-1.5 rounded-md text-[10px] font-semibold cursor-pointer transition-all border border-green/20 bg-green-dim text-green hover:bg-green-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+    >
+      {loading ? "启动中..." : "启动框架"}
+    </button>
+  );
 }
 
 // ── Single Account Card ──
@@ -260,17 +300,152 @@ function AccountOrders({
   );
 }
 
+// ── Session Status Badge ──
+
+function sessionStatusBadge(sessionStatus: LiveSession["status"]): { text: string; color: string } {
+  const map: Record<LiveSession["status"], { text: string; color: string }> = {
+    pending: { text: "待启动", color: "bg-amber-dim text-amber" },
+    running: { text: "运行中", color: "bg-green-dim text-green" },
+    paused: { text: "已暂停", color: "bg-text3/20 text-text3" },
+    stopped: { text: "已停止", color: "bg-bg2 text-text3" },
+    error: { text: "异常", color: "bg-red-dim text-red" },
+  };
+  return map[sessionStatus] || { text: sessionStatus, color: "bg-bg2 text-text3" };
+}
+
+function sessionModeBadge(mode: LiveSession["mode"]): string {
+  return mode === "live" ? "实盘" : "模拟";
+}
+
+function sessionModeColor(mode: LiveSession["mode"]): string {
+  return mode === "live" ? "bg-green-dim text-green" : "bg-blue-dim text-blue";
+}
+
+// ── Live Session Mini Card ──
+
+function SessionMiniCard({
+  session,
+  onPause,
+  onResume,
+  onStop,
+  onPromote,
+  actionLoading,
+}: {
+  session: LiveSession;
+  onPause: () => void;
+  onResume: () => void;
+  onStop: () => void;
+  onPromote: () => void;
+  actionLoading: boolean;
+}) {
+  const statusInfo = sessionStatusBadge(session.status);
+  const equity = session.current_equity ? formatNumber(session.current_equity) : "—";
+  const initial = formatNumber(session.initial_capital);
+  const pnl =
+    session.current_equity && session.initial_capital
+      ? formatPnl(parseFloat(session.current_equity) - parseFloat(session.initial_capital))
+      : null;
+
+  return (
+    <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden">
+      <div className="px-3 py-2.5 border-b border-[rgba(255,255,255,0.07)] flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-text">{session.strategy_name}</span>
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider ${sessionModeColor(session.mode)}`}>
+            {sessionModeBadge(session.mode)}
+          </span>
+          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${statusInfo.color}`}>
+            {statusInfo.text}
+          </span>
+        </div>
+        <span className="text-[10px] font-mono text-text3">{session.symbol}</span>
+      </div>
+      <div className="p-3">
+        <div className="grid grid-cols-4 gap-3 mb-2.5">
+          <div>
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">初始资金</div>
+            <div className="font-mono text-xs font-bold text-text mt-0.5">${initial}</div>
+          </div>
+          <div>
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">当前权益</div>
+            <div className="font-mono text-xs font-bold text-text mt-0.5">${equity}</div>
+          </div>
+          <div>
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">盈亏</div>
+            <div className={`font-mono text-xs font-bold mt-0.5 ${pnl?.color ?? "text-text3"}`}>
+              {pnl ? pnl.text : "—"}
+            </div>
+          </div>
+          <div>
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">交易所</div>
+            <div className="text-[11px] font-semibold text-text2 mt-0.5 capitalize">
+              {session.exchange_account_name || "—"}
+            </div>
+          </div>
+        </div>
+        {session.status === "running" && (
+          <div className="flex gap-1.5">
+            <button onClick={onPause} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-amber-dim/50 text-amber hover:bg-amber-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              暂停
+            </button>
+            <button onClick={onStop} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-red-dim/50 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              停止
+            </button>
+            {session.mode === "paper" && (
+              <button onClick={onPromote} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed ml-auto">
+                升级为实盘
+              </button>
+            )}
+          </div>
+        )}
+        {session.status === "paused" && (
+          <div className="flex gap-1.5">
+            <button onClick={onResume} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              恢复
+            </button>
+            <button onClick={onStop} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-red-dim/50 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              停止
+            </button>
+          </div>
+        )}
+        {session.status === "pending" && (
+          <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+            启动
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Main Page ──
 
 export default function TradingPage() {
   const { accounts, loading: accLoading } = useAccounts();
   const { positions, loading: posLoading } = usePositions();
   const { orders, loading: ordersLoading } = useOrders();
+  const {
+    status: frameStatus,
+    loading: frameLoading,
+    actionLoading,
+    start: startFrame,
+    stop: stopFrame,
+  } = useFrameControl();
+  const {
+    sessions,
+    loading: sessionsLoading,
+    actionLoading: sessionActionLoading,
+    start: startSession,
+    pause: pauseSession,
+    resume: resumeSession,
+    stop: stopSession,
+    promote: promoteSession,
+  } = useLiveSessions();
 
   const [activeSection, setActiveSection] = useState<"all" | "live" | "paper">("all");
 
   const isLoading = accLoading || posLoading || ordersLoading;
-  const hasExecutor = positions.executor_running;
+  const hasExecutor = frameStatus.order_executor === "running";
 
   // Group accounts by testnet
   const liveAccounts = accounts.filter((a) => !a.testnet);
@@ -317,11 +492,22 @@ export default function TradingPage() {
               {accounts.length} 个账户 · {totalPositions} 个持仓 · {totalActiveOrders} 活跃订单
             </span>
           )}
+          {/* Debug: raw frame status */}
+          <span className="text-[10px] font-mono text-purple">
+            [{frameStatus.trading}/{frameStatus.order_executor}/{frameStatus.data_feed}]
+          </span>
         </div>
         <div className="flex items-center gap-2">
           {isLoading && (
             <div className="text-[10px] text-text3 animate-pulse">加载数据中...</div>
           )}
+          {/* Frame control */}
+          <FrameControlButton
+            running={hasExecutor}
+            loading={actionLoading}
+            onStart={startFrame}
+            onStop={stopFrame}
+          />
           {/* Section filter */}
           <div className="flex gap-1">
             {(["all", "live", "paper"] as const).map((key) => {
@@ -349,8 +535,43 @@ export default function TradingPage() {
         <div className="bg-amber-dim/20 border border-amber/30 rounded-lg px-4 py-3 flex items-center gap-3">
           <div className="w-2 h-2 rounded-full bg-amber" />
           <span className="text-xs text-amber">
-            交易框架未启动，持仓和余额数据暂不可用。请先启动交易框架。
+            交易框架未启动，持仓和余额数据暂不可用。请点击上方「启动框架」按钮。
           </span>
+        </div>
+      )}
+
+      {/* Live Sessions Section */}
+      {!sessionsLoading && sessions.length > 0 && (
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <svg width="12" height="12" viewBox="0 0 12 12">
+              <circle cx="6" cy="6" r="5" fill="none" stroke="var(--color-green)" strokeWidth="1.2" />
+              <path d="M4 6 L5.5 7.5 L8 4.5" fill="none" stroke="var(--color-green)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <span className="text-xs font-semibold text-text">交易会话</span>
+            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-green-dim text-green">
+              {sessions.filter((s) => s.status === "running").length} 运行中
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {sessions
+              .filter((s) => {
+                if (activeSection === "live") return s.mode === "live";
+                if (activeSection === "paper") return s.mode === "paper";
+                return true;
+              })
+              .map((session) => (
+                <SessionMiniCard
+                  key={session.id}
+                  session={session}
+                  onPause={() => pauseSession(session.id)}
+                  onResume={() => resumeSession(session.id)}
+                  onStop={() => stopSession(session.id)}
+                  onPromote={() => promoteSession(session.id)}
+                  actionLoading={sessionActionLoading}
+                />
+              ))}
+          </div>
         </div>
       )}
 

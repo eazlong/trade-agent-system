@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'apps.notify',
     'apps.datasource',
     'apps.signal_monitor',
+    'apps.strategy_engine',
     'apps.logging_app',
 ]
 

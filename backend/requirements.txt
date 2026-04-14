@@ -48,6 +48,7 @@ rich>=13.0.0
 # Env / Config
 python-dotenv==1.0.1
 uvicorn==0.42.0
+uvicorn[standard]==0.42.0
 
 # Monitoring
 prometheus-client==0.20.0

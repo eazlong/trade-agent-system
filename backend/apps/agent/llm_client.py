@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 FALLBACK_MARKER = "__FALLBACK__"
 
 
+class ToolCallTruncatedError(Exception):
+    """LLM 返回的 tool_call arguments JSON 被截断，需要重试"""
+
+
+TOOL_CALL_MAX_RETRIES = 2
+
+
 class LLMClient:
     """
     LLM调用客户端，带降级机制。
@@ -87,21 +94,31 @@ class LLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ) -> LLMToolResponse:
-        """支持工具调用的LLM接口（OpenAI function calling格式）"""
-        try:
-            return await self._call_openai_with_tools(
-                system, messages, tools, max_tokens, temperature
-            )
-        except Exception as e:
-            logger.warning(f"OpenAI tool call failed ({e}), falling back to plain chat")
-            # 降级：拼接工具描述到system prompt，让LLM输出JSON
-            tool_desc = json.dumps(tools, ensure_ascii=False)
-            fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
-            user_text = messages[-1].get("content", "") if messages else ""
-            result = await self.chat(
-                fallback_system, user_text, max_tokens, temperature
-            )
-            return LLMToolResponse(content=result)
+        """支持工具调用的LLM接口（OpenAI function calling格式），截断自动重试"""
+        last_exc: Exception | None = None
+        for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
+            try:
+                return await self._call_openai_with_tools(
+                    system, messages, tools, max_tokens, temperature
+                )
+            except ToolCallTruncatedError as e:
+                last_exc = e
+                logger.warning(
+                    "tool_call truncated, retry %d/%d: %s", attempt, TOOL_CALL_MAX_RETRIES, e
+                )
+            except Exception as e:
+                last_exc = e
+                break  # 非截断错误不重试，直接降级
+
+        logger.warning(f"OpenAI tool call failed ({last_exc}), falling back to plain chat")
+        # 降级：拼接工具描述到system prompt，让LLM输出JSON
+        tool_desc = json.dumps(tools, ensure_ascii=False)
+        fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
+        user_text = messages[-1].get("content", "") if messages else ""
+        result = await self.chat(
+            fallback_system, user_text, max_tokens, temperature
+        )
+        return LLMToolResponse(content=result)
 
     async def _call_openai_with_tools(
         self,
@@ -136,14 +153,21 @@ class LLMClient:
             resp.raise_for_status()
             msg = resp.json()["choices"][0]["message"]
             raw_calls = msg.get("tool_calls") or []
-            tool_calls = [
-                ToolCallRequest(
-                    call_id=tc["id"],
-                    name=tc["function"]["name"],
-                    arguments=json.loads(tc["function"]["arguments"]),
+            tool_calls = []
+            for tc in raw_calls:
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise ToolCallTruncatedError(
+                        f"tool_call '{tc['function']['name']}' arguments truncated: {exc}"
+                    ) from exc
+                tool_calls.append(
+                    ToolCallRequest(
+                        call_id=tc["id"],
+                        name=tc["function"]["name"],
+                        arguments=args,
+                    )
                 )
-                for tc in raw_calls
-            ]
             return LLMToolResponse(
                 content=msg.get("content") or "", tool_calls=tool_calls
             )
@@ -272,21 +296,32 @@ class LLMClient:
         temperature: float = 0.3,
     ) -> LLMToolResponse:
         """
-        支持工具调用的流式 LLM 接口。
+        支持工具调用的流式 LLM 接口，截断自动重试。
         注意：工具调用模式下流式只用于 content，
         tool_calls 在完全接收后返回。
         """
-        try:
-            return await self._call_openai_stream_with_tools(
-                system, messages, tools, on_chunk, max_tokens, temperature
-            )
-        except Exception as e:
-            logger.warning(
-                f"OpenAI tool stream failed ({e}), falling back to non-stream"
-            )
-            return await self.chat_with_tools(
-                system, messages, tools, max_tokens, temperature
-            )
+        last_exc: Exception | None = None
+        for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
+            try:
+                return await self._call_openai_stream_with_tools(
+                    system, messages, tools, on_chunk, max_tokens, temperature
+                )
+            except ToolCallTruncatedError as e:
+                last_exc = e
+                logger.warning(
+                    "stream tool_call truncated, retry %d/%d: %s",
+                    attempt, TOOL_CALL_MAX_RETRIES, e,
+                )
+            except Exception as e:
+                last_exc = e
+                break  # 非截断错误不重试
+
+        logger.warning(
+            f"OpenAI tool stream failed ({last_exc}), falling back to non-stream"
+        )
+        return await self.chat_with_tools(
+            system, messages, tools, max_tokens, temperature
+        )
 
     async def _call_openai_stream_with_tools(
         self,
@@ -358,16 +393,22 @@ class LLMClient:
                             if "arguments" in tc_delta["function"]:
                                 tc_map["arguments"] += tc_delta["function"]["arguments"]
 
-        tool_calls = [
-            ToolCallRequest(
-                call_id=f"tc_{i}",
-                name=tc_map["name"],
-                arguments=json.loads(tc_map["arguments"])
-                if tc_map["arguments"]
-                else {},
+        tool_calls = []
+        for i, tc_map in sorted(tool_calls_map.items()):
+            raw_args = tc_map.get("arguments", "")
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError as exc:
+                raise ToolCallTruncatedError(
+                    f"stream tool_call '{tc_map['name']}' arguments truncated: {exc}"
+                ) from exc
+            tool_calls.append(
+                ToolCallRequest(
+                    call_id=f"tc_{i}",
+                    name=tc_map["name"],
+                    arguments=args,
+                )
             )
-            for i, tc_map in sorted(tool_calls_map.items())
-        ]
         return LLMToolResponse(content="".join(chunks), tool_calls=tool_calls)
 
 

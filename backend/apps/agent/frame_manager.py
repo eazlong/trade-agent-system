@@ -89,8 +89,19 @@ class FrameManager:
                 self._data_feed_refs = int(data_feed_refs)
 
             if order_exec == "1":
-                # 标记需要恢复，但实际对象在 start 时重新初始化
-                pass  # _order_executor 保持 None，start 时会重建
+                # OrderExecutor 无法跨进程复用，标记需要重建
+                self._risk_guard_refs = 0
+                self._data_feed_refs = 0
+            elif order_exec == "0" and (
+                trading == FrameState.RUNNING.value
+                or assist == FrameState.RUNNING.value
+            ):
+                # 状态不一致：frame 标记为 running 但 executor 为 0
+                # 说明上次 shutdown 只保存了部分状态，需要完全重启
+                self._trading_state = FrameState.STOPPED
+                self._assist_state = FrameState.STOPPED
+                self._risk_guard_refs = 0
+                self._data_feed_refs = 0
 
             if (
                 trading == FrameState.RUNNING.value
@@ -141,13 +152,26 @@ class FrameManager:
     # ------------------------------------------------------------------ #
 
     def status(self) -> dict:
+        # 优先使用 Redis 持久化状态（进程重启后可恢复），
+        # 不依赖进程内对象引用（进程重启后对象丢失）。
+        try:
+            r = self._get_redis()
+            order_exec_persisted = r.get("frame:order_executor") == "1"
+            risk_refs_persisted = int(r.get("frame:risk_guard_refs") or 0)
+            data_feed_refs_persisted = int(r.get("frame:data_feed_refs") or 0)
+        except Exception:
+            order_exec_persisted = self._order_executor is not None
+            risk_refs_persisted = self._risk_guard_refs
+            data_feed_refs_persisted = self._data_feed_refs
+
         return {
-            "trading": self._trading_state,
-            "assist": self._assist_state,
-            "risk_guard": "running" if self._risk_guard_refs > 0 else "stopped",
+            "trading": self._trading_state.value if hasattr(self._trading_state, "value") else self._trading_state,
+            "assist": self._assist_state.value if hasattr(self._assist_state, "value") else self._assist_state,
+            "risk_guard": "running" if self._risk_guard_refs > 0 or risk_refs_persisted > 0 else "stopped",
             "order_executor": "running"
-            if self._order_executor is not None
+            if self._order_executor is not None or order_exec_persisted
             else "stopped",
+            "data_feed": "running" if self._data_feed_refs > 0 or data_feed_refs_persisted > 0 else "stopped",
         }
 
     # --- Trading Frame ---

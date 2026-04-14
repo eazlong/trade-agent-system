@@ -4,7 +4,16 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import DashboardShell from "@/components/layout/DashboardShell";
-import { backtestApi, type BacktestDetail, type BacktestTrade, type OHLCVPoint, type IndicatorData } from "@/lib/api";
+import {
+  backtestApi,
+  liveSessionApi,
+  exchangeApi,
+  type BacktestDetail,
+  type BacktestTrade,
+  type OHLCVPoint,
+  type IndicatorData,
+  type ExchangeAccount,
+} from "@/lib/api";
 import { resampleOHLCV, computeIndicators, timeframeToMinutes } from "@/lib/resample";
 import CandlestickChart from "@/components/backtest/CandlestickChart";
 import EquityChart from "@/components/backtest/EquityChart";
@@ -29,6 +38,19 @@ export default function BacktestDetailPage() {
   const [trades, setTrades] = useState<BacktestTrade[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<TabKey>("kline");
+
+  // ── Review ──
+  const [reviewNotes, setReviewNotes] = useState("");
+  const [reviewLoading, setReviewLoading] = useState(false);
+
+  // ── Deploy ──
+  const [deployOpen, setDeployOpen] = useState(false);
+  const [deployLoading, setDeployLoading] = useState(false);
+  const [deployMode, setDeployMode] = useState<"paper" | "live">("paper");
+  const [deployAccountId, setDeployAccountId] = useState("");
+  const [accounts, setAccounts] = useState<ExchangeAccount[]>([]);
+  const [deployError, setDeployError] = useState<string | null>(null);
+  const [deploySuccess, setDeploySuccess] = useState<string | null>(null);
 
   // ── Timeframe switching with cache ──
   const [activeTf, setActiveTf] = useState<string | null>(null);
@@ -108,6 +130,46 @@ export default function BacktestDetailPage() {
       setTrades(res.results);
     });
   }, [detail, id]);
+
+  // Fetch exchange accounts when deploy modal opens
+  useEffect(() => {
+    if (!deployOpen) return;
+    exchangeApi.getAccounts().then(setAccounts);
+  }, [deployOpen]);
+
+  const handleReview = async (approved: boolean) => {
+    setReviewLoading(true);
+    try {
+      await backtestApi.review(id, { approved, notes: reviewNotes });
+      setDetail(await backtestApi.getFullDetail(id));
+      setReviewNotes("");
+    } finally {
+      setReviewLoading(false);
+    }
+  };
+
+  const handleDeploy = async () => {
+    setDeployLoading(true);
+    setDeployError(null);
+    setDeploySuccess(null);
+    try {
+      if (!deployAccountId) {
+        setDeployError("请选择交易所账户");
+        return;
+      }
+      const result = await liveSessionApi.create({
+        backtest_result_id: id,
+        mode: deployMode,
+        exchange_account_id: deployAccountId,
+      });
+      setDeploySuccess(`会话已创建 (${deployMode === "paper" ? "模拟" : "实盘"} 模式)`);
+      setTimeout(() => setDeployOpen(false), 1500);
+    } catch (e) {
+      setDeployError(e instanceof Error ? e.message : "创建失败");
+    } finally {
+      setDeployLoading(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -197,7 +259,173 @@ export default function BacktestDetailPage() {
         ))}
       </div>
 
-      {/* Tab Switcher */}
+      {/* Review & Deploy Section */}
+      {detail && (
+        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl px-4 py-3 mb-4">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="text-[10px] text-text3 uppercase tracking-wider font-semibold">审核状态</span>
+            <span
+              className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                detail.review_status === "approved"
+                  ? "bg-green-dim text-green"
+                  : detail.review_status === "rejected"
+                    ? "bg-red-dim text-red"
+                    : "bg-amber-dim text-amber"
+              }`}
+            >
+              {detail.review_status === "approved" ? "已通过" : detail.review_status === "rejected" ? "已拒绝" : "待审核"}
+            </span>
+            {detail.reviewed_at && (
+              <span className="text-[10px] text-text3">{fmtDate(detail.reviewed_at)}</span>
+            )}
+          </div>
+
+          {/* Pending: show review form */}
+          {detail.review_status === "pending" && (
+            <div className="flex flex-col gap-2">
+              <textarea
+                value={reviewNotes}
+                onChange={(e) => setReviewNotes(e.target.value)}
+                placeholder="审核备注（可选）"
+                className="bg-bg2 border border-[rgba(255,255,255,0.1)] rounded-lg px-3 py-2 text-xs text-text placeholder:text-text3 focus:outline-none focus:border-green/30 resize-none"
+                rows={2}
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleReview(true)}
+                  disabled={reviewLoading}
+                  className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {reviewLoading ? "审核中..." : "通过审核"}
+                </button>
+                <button
+                  onClick={() => handleReview(false)}
+                  disabled={reviewLoading}
+                  className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-red/20 bg-red-dim text-red hover:bg-red-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {reviewLoading ? "审核中..." : "拒绝审核"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Approved: show deploy button */}
+          {detail.review_status === "approved" && (
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => {
+                  setDeployOpen(true);
+                  setDeployError(null);
+                  setDeploySuccess(null);
+                }}
+                className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80"
+              >
+                部署策略
+              </button>
+              {detail.review_notes && (
+                <span className="text-[10px] text-text3">备注：{detail.review_notes}</span>
+              )}
+            </div>
+          )}
+
+          {/* Rejected */}
+          {detail.review_status === "rejected" && (
+            <div className="text-[10px] text-text3">
+              {detail.review_notes && <span>备注：{detail.review_notes}</span>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Deploy Modal */}
+      {deployOpen && detail && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-bg1 border border-[rgba(255,255,255,0.1)] rounded-xl w-full max-w-md p-6">
+            <h3 className="text-sm font-bold mb-4">部署策略</h3>
+            <p className="text-xs text-text3 mb-4">
+              {detail.symbol} · {detail.timeframe} · {detail.strategy_name ?? "未命名策略"}
+            </p>
+
+            {/* Mode selection */}
+            <div className="mb-4">
+              <label className="text-[10px] text-text3 uppercase tracking-wider font-semibold block mb-2">
+                运行模式
+              </label>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setDeployMode("paper")}
+                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border cursor-pointer transition-all ${
+                    deployMode === "paper"
+                      ? "border-blue/30 bg-blue-dim text-blue"
+                      : "border-[rgba(255,255,255,0.07)] text-text3 hover:text-text"
+                  }`}
+                >
+                  模拟交易
+                </button>
+                <button
+                  onClick={() => setDeployMode("live")}
+                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border cursor-pointer transition-all ${
+                    deployMode === "live"
+                      ? "border-green/30 bg-green-dim text-green"
+                      : "border-[rgba(255,255,255,0.07)] text-text3 hover:text-text"
+                  }`}
+                >
+                  实盘交易
+                </button>
+              </div>
+            </div>
+
+            {/* Exchange account selection */}
+            <div className="mb-4">
+              <label className="text-[10px] text-text3 uppercase tracking-wider font-semibold block mb-2">
+                交易所账户
+              </label>
+              <select
+                value={deployAccountId}
+                onChange={(e) => setDeployAccountId(e.target.value)}
+                className="w-full bg-bg2 border border-[rgba(255,255,255,0.1)] rounded-lg px-3 py-2 text-xs text-text focus:outline-none focus:border-green/30"
+              >
+                <option value="">请选择...</option>
+                {accounts.map((acc) => (
+                  <option key={acc.id} value={acc.id}>
+                    {acc.exchange} · {acc.label || acc.id.slice(0, 8)} {acc.testnet ? "(模拟)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Error / Success */}
+            {deployError && (
+              <div className="bg-red-dim/20 border border-red/30 rounded-lg px-3 py-2 mb-4 text-xs text-red">
+                {deployError}
+              </div>
+            )}
+            {deploySuccess && (
+              <div className="bg-green-dim/20 border border-green/30 rounded-lg px-3 py-2 mb-4 text-xs text-green">
+                {deploySuccess}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setDeployOpen(false)}
+                disabled={deployLoading}
+                className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-[rgba(255,255,255,0.1)] text-text3 hover:text-text disabled:opacity-40"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleDeploy}
+                disabled={deployLoading}
+                className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {deployLoading ? "创建中..." : "确认部署"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="flex gap-1 mb-3">
         {tabs.map((tab) => (
           <button
