@@ -1,11 +1,13 @@
 import os
 import asyncio
+import json
 import logging
 
 # MUST be set before any Django-dependent imports
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.dev')
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings.dev")
 
 import django
+
 django.setup()
 
 from django.core.asgi import get_asgi_application
@@ -21,7 +23,58 @@ django_asgi_app = get_asgi_application()
 # 全局变量用于存储消费者和 Telegram Channel 实例
 _consumer = None
 _telegram_channel = None
+_progress_listener_task = None
 logger = logging.getLogger(__name__)
+
+
+async def _listen_progress_notifications():
+    """Background task: subscribe to Redis pubsub and forward to Telegram."""
+    import redis.asyncio as aioredis
+
+    from apps.channel.telegram import TelegramChannel
+
+    _PROGRESS_CHANNEL = "task:progress:notifications"
+    from django.conf import settings
+
+    url = settings.REDIS_URL
+    if url.rsplit("/", 1)[-1].isdigit():
+        url = url.rsplit("/", 1)[0] + "/3"
+
+    pubsub = None
+    try:
+        r = aioredis.from_url(url, decode_responses=True)
+        pubsub = r.pubsub()
+        await pubsub.subscribe(_PROGRESS_CHANNEL)
+        logger.info("[ASGI] Progress notification listener started")
+
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            try:
+                data = json.loads(message["data"])
+                text = data.get("text", "")
+                if _telegram_channel and _telegram_channel._app:
+                    await _telegram_channel.send_message(text)
+                else:
+                    logger.debug(
+                        "[ASGI] Telegram not ready, dropping notification: %s",
+                        text[:50],
+                    )
+            except Exception:
+                logger.warning(
+                    "[ASGI] failed to process progress notification", exc_info=True
+                )
+    except (asyncio.CancelledError, GeneratorExit, RuntimeError):
+        pass
+    except Exception:
+        logger.error("[ASGI] progress listener crashed", exc_info=True)
+    finally:
+        if pubsub:
+            try:
+                await pubsub.unsubscribe(_PROGRESS_CHANNEL)
+                await pubsub.aclose()
+            except Exception:
+                pass
 
 
 class LifespanHandler:
@@ -31,22 +84,23 @@ class LifespanHandler:
         pass
 
     async def __call__(self, scope, receive, send):
-        global _consumer, _telegram_channel
+        global _consumer, _telegram_channel, _progress_listener_task
 
         # 确保 scope 类型是 lifespan
-        assert scope['type'] == 'lifespan'
+        assert scope["type"] == "lifespan"
 
         try:
             while True:
                 event = await receive()
 
-                if event['type'] == 'lifespan.startup':
+                if event["type"] == "lifespan.startup":
                     try:
                         # 启动 AgentTaskConsumer
                         from apps.agent.consumer import AgentTaskConsumer
+
                         _consumer = AgentTaskConsumer(concurrency=4)
                         await _consumer.start()
-                        logger.info('[ASGI] AgentTaskConsumer started')
+                        logger.info("[ASGI] AgentTaskConsumer started")
 
                         # 恢复并自动重启之前运行的框架
                         await self._restore_frames()
@@ -54,33 +108,50 @@ class LifespanHandler:
                         # 启动 TelegramChannel
                         await self._start_telegram_channel()
 
-                        await send({'type': 'lifespan.startup.complete'})
-                        logger.info('[ASGI] Lifespan startup complete')
-                    except Exception as e:
-                        logger.error(f'[ASGI] Startup error: {e}')
-                        await send({'type': 'lifespan.startup.failed', 'reason': str(e)})
+                        # 启动进度通知监听器
+                        _progress_listener_task = asyncio.create_task(
+                            _listen_progress_notifications()
+                        )
 
-                elif event['type'] == 'lifespan.shutdown':
+                        await send({"type": "lifespan.startup.complete"})
+                        logger.info("[ASGI] Lifespan startup complete")
+                    except Exception as e:
+                        logger.error(f"[ASGI] Startup error: {e}")
+                        await send(
+                            {"type": "lifespan.startup.failed", "reason": str(e)}
+                        )
+
+                elif event["type"] == "lifespan.shutdown":
                     try:
+                        # 停止进度通知监听器
+                        if _progress_listener_task:
+                            _progress_listener_task.cancel()
+                            try:
+                                await _progress_listener_task
+                            except (asyncio.CancelledError, RuntimeError):
+                                pass
+
                         # 停止 TelegramChannel
                         if _telegram_channel:
                             await _telegram_channel.stop()
-                            logger.info('[ASGI] TelegramChannel stopped')
+                            logger.info("[ASGI] TelegramChannel stopped")
 
                         # 停止 AgentTaskConsumer
                         if _consumer:
                             await _consumer.stop()
-                            logger.info('[ASGI] AgentTaskConsumer stopped')
+                            logger.info("[ASGI] AgentTaskConsumer stopped")
 
-                        await send({'type': 'lifespan.shutdown.complete'})
-                        logger.info('[ASGI] Lifespan shutdown complete')
+                        await send({"type": "lifespan.shutdown.complete"})
+                        logger.info("[ASGI] Lifespan shutdown complete")
                     except Exception as e:
-                        logger.error(f'[ASGI] Shutdown error: {e}')
-                        await send({'type': 'lifespan.shutdown.failed', 'reason': str(e)})
+                        logger.error(f"[ASGI] Shutdown error: {e}")
+                        await send(
+                            {"type": "lifespan.shutdown.failed", "reason": str(e)}
+                        )
                     return
 
         except Exception as e:
-            logger.error(f'[ASGI] Lifespan handler error: {e}')
+            logger.error(f"[ASGI] Lifespan handler error: {e}")
 
     async def _start_telegram_channel(self):
         global _telegram_channel
@@ -88,39 +159,44 @@ class LifespanHandler:
         from apps.channel.telegram import TelegramChannel
         from apps.agent.supervisor import SupervisorAgent
 
-        token = getattr(settings, 'TELEGRAM_BOT_TOKEN', '')
+        token = getattr(settings, "TELEGRAM_BOT_TOKEN", "")
         if not token:
-            logger.warning('[ASGI] TELEGRAM_BOT_TOKEN not set, skipping TelegramChannel')
+            logger.warning(
+                "[ASGI] TELEGRAM_BOT_TOKEN not set, skipping TelegramChannel"
+            )
             return
 
         try:
             supervisor = SupervisorAgent.get_instance()
-            _telegram_channel = TelegramChannel(token=token, supervisor_agent=supervisor)
+            _telegram_channel = TelegramChannel(
+                token=token, supervisor_agent=supervisor
+            )
             await _telegram_channel.start()
-            logger.info('[ASGI] TelegramChannel started successfully')
+            logger.info("[ASGI] TelegramChannel started successfully")
         except Exception as e:
-            logger.error(f'[ASGI] Failed to start TelegramChannel: {e}')
+            logger.error(f"[ASGI] Failed to start TelegramChannel: {e}")
 
     async def _restore_frames(self):
         """恢复并自动重启之前运行的框架。"""
         try:
             from apps.agent.frame_manager import FrameManager
+
             fm = FrameManager.get_instance()
             await fm.restore_and_restart_frames()
         except Exception as e:
-            logger.warning('[ASGI] Frame restore failed: %s', e)
+            logger.warning("[ASGI] Frame restore failed: %s", e)
 
 
 # 创建 ASGI 应用程序，确保包含所有协议处理器
 # 创建 LifespanHandler 的实例
 lifespan_handler = LifespanHandler()
 
-application = ProtocolTypeRouter({
-    "http": django_asgi_app,
-    "websocket": TokenAuthMiddleware(
-        URLRouter(
-            notify_routing.websocket_urlpatterns
-        )
-    ),
-    "lifespan": lifespan_handler,
-})
+application = ProtocolTypeRouter(
+    {
+        "http": django_asgi_app,
+        "websocket": TokenAuthMiddleware(
+            URLRouter(notify_routing.websocket_urlpatterns)
+        ),
+        "lifespan": lifespan_handler,
+    }
+)

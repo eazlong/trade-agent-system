@@ -109,7 +109,10 @@ class StrategyRegistry:
                         ):
                             from .base import BaseStrategy
 
-                            if issubclass(attr, BaseStrategy) and attr is not BaseStrategy:
+                            if (
+                                issubclass(attr, BaseStrategy)
+                                and attr is not BaseStrategy
+                            ):
                                 cls.register(attr)
                                 discovered.append(attr.name)
                 except Exception as e:

@@ -13,10 +13,9 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from asgiref.sync import sync_to_async
-from django.utils import timezone
 
 if TYPE_CHECKING:
-    from .base import BaseStrategy, StrategyContext, OrderSignal
+    from .base import BaseStrategy, OrderSignal
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +163,9 @@ class BacktestEngine:
                 "exit_price": fill_price,
                 "quantity": sell_qty,
                 "pnl": pnl,
-                "pnl_pct": float(pnl / (avg_cost * sell_qty)) if avg_cost * sell_qty > 0 else 0,
+                "pnl_pct": float(pnl / (avg_cost * sell_qty))
+                if avg_cost * sell_qty > 0
+                else 0,
                 "commission": commission,
                 "signal": signal.signal_name,
                 "exit_reason": signal.metadata.get("reason", "signal"),
@@ -194,7 +195,9 @@ class BacktestEngine:
                 "exit_price": fill_price,
                 "quantity": self._position,
                 "pnl": pnl,
-                "pnl_pct": float(pnl / (avg_cost * self._position)) if avg_cost * self._position > 0 else 0,
+                "pnl_pct": float(pnl / (avg_cost * self._position))
+                if avg_cost * self._position > 0
+                else 0,
                 "commission": commission,
                 "signal": "close_position",
                 "exit_reason": reason,
@@ -235,9 +238,7 @@ class BacktestEngine:
         # 胜率
         winning_trades = [t for t in self._trades if t.get("pnl", 0) > 0]
         total_closed = len(self._trades)
-        win_rate = (
-            len(winning_trades) / total_closed if total_closed > 0 else None
-        )
+        win_rate = len(winning_trades) / total_closed if total_closed > 0 else None
 
         # 夏普比率（简化：用日收益率）
         sharpe = self._compute_sharpe()

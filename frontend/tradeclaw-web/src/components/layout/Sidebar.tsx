@@ -1,65 +1,72 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
+import { useDashboard } from "@/context/DashboardContext";
 
-interface AgentInfo {
-  id: string;
-  name: string;
-  status: string;
-  color: string;
-  isRunning: boolean;
+const AGENT_ROUTE_MAP: Record<string, string> = {
+  supervisor: "/agents",
+  analyst: "/agents",
+  coach: "/agents",
+  quant: "/backtest",
+  risk_advisor: "/overview",
+  trading_frame: "/trading",
+  assist_frame: "/logs",
+};
+
+function mapStatus(status: string): string {
+  switch (status) {
+    case "ready": return "就绪";
+    case "standby": return "待命";
+    case "running": return "运行中";
+    case "stopped": return "已停止";
+    default: return status;
+  }
 }
 
-const AGENTS: AgentInfo[] = [
-  { id: "orchestrator", name: "Orchestrator", status: "主控", color: "var(--color-purple)", isRunning: true },
-  { id: "market", name: "市场分析", status: "运行", color: "var(--color-teal)", isRunning: true },
-  { id: "sentiment", name: "情绪分析", status: "运行", color: "var(--color-blue)", isRunning: true },
-  { id: "risk", name: "风险管理", status: "告警", color: "var(--color-amber)", isRunning: true },
-  { id: "strategy", name: "策略优化", status: "运行", color: "var(--color-green)", isRunning: false },
-  { id: "execution", name: "交易执行", status: "就绪", color: "var(--color-green)", isRunning: true },
-  { id: "backtest", name: "回测引擎", status: "待机", color: "var(--color-text3)", isRunning: false },
-];
+function getStatusBg(status: string) {
+  switch (status) {
+    case "就绪": return "var(--color-purple-dim)";
+    case "运行中": case "就绪": return "var(--color-green-dim)";
+    case "告警": return "var(--color-amber-dim)";
+    case "待命": case "已停止": return "var(--color-bg2)";
+    default: return "var(--color-bg2)";
+  }
+}
 
-const STRATEGIES = [
-  { name: "动量突破", meta: "BTC · 15m", active: true, enabled: true, color: "var(--color-green)" },
-  { name: "均值回归", meta: "ETH · 1h", active: false, enabled: true, color: "var(--color-blue)" },
-  { name: "套利对冲", meta: "多品种", active: false, enabled: false, color: "var(--color-purple)" },
-];
+function getStatusColor(status: string) {
+  switch (status) {
+    case "就绪": return "var(--color-green)";
+    case "运行中": return "var(--color-teal)";
+    case "待命": return "var(--color-text3)";
+    case "已停止": return "var(--color-text3)";
+    default: return "var(--color-text3)";
+  }
+}
+
+function AgentSkeleton() {
+  return (
+    <div className="px-2.5 py-2 rounded-lg mb-0.5 animate-pulse">
+      <div className="flex items-center gap-2">
+        <div className="w-[7px] h-[7px] rounded-full bg-bg2 flex-shrink-0" />
+        <div className="h-3 w-16 rounded bg-bg2" />
+        <div className="h-3 w-8 rounded bg-bg2 ml-auto" />
+      </div>
+    </div>
+  );
+}
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const activeAgent = pathname.split("/").pop() === "agents" ? "market" : "orchestrator";
-  const [selectedAgent, setSelectedAgent] = useState(activeAgent);
-  const [strategies, setStrategies] = useState(STRATEGIES);
+  const router = useRouter();
+  const { agents, summary, loading, error } = useDashboard();
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
 
-  const toggleStrategy = (idx: number) => {
-    setStrategies((prev) =>
-      prev.map((s, i) => (i === idx ? { ...s, enabled: !s.enabled } : s))
-    );
-  };
-
-  const getStatusBg = (status: string) => {
-    switch (status) {
-      case "主控": return "var(--color-purple-dim)";
-      case "运行": return "var(--color-green-dim)";
-      case "告警": return "var(--color-amber-dim)";
-      case "就绪": return "var(--color-green-dim)";
-      case "待机": return "var(--color-bg2)";
-      default: return "var(--color-bg2)";
-    }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "主控": return "var(--color-purple)";
-      case "运行": return "var(--color-teal)";
-      case "告警": return "var(--color-amber)";
-      case "就绪": return "var(--color-green)";
-      case "待机": return "var(--color-text3)";
-      default: return "var(--color-text3)";
-    }
+  const handleAgentClick = (agentName: string) => {
+    setSelectedAgent(agentName);
+    const route = AGENT_ROUTE_MAP[agentName] ?? "/agents";
+    router.push(route);
   };
 
   return (
@@ -69,29 +76,46 @@ export default function Sidebar() {
         <div className="text-[9px] font-semibold text-text3 uppercase tracking-widest px-2 pt-1.5 pb-1">
           智能体集群
         </div>
-        {AGENTS.map((agent) => (
-          <div
-            key={agent.id}
-            onClick={() => setSelectedAgent(agent.id)}
-            className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-all border border-transparent mb-0.5 ${
-              agent.id === selectedAgent
-                ? "bg-bg3 border-[rgba(255,255,255,0.12)]"
-                : "hover:bg-bg2"
-            }`}
-          >
-            <div
-              className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${agent.isRunning ? "animate-pulse-slow" : ""}`}
-              style={{ background: agent.color, boxShadow: `0 0 6px ${agent.color}` }}
-            />
-            <span className="text-xs font-medium text-text flex-1">{agent.name}</span>
-            <span
-              className="font-mono text-[9px] px-1.5 py-0.5 rounded font-semibold"
-              style={{ background: getStatusBg(agent.status), color: getStatusColor(agent.status) }}
-            >
-              {agent.status}
-            </span>
+        {loading ? (
+          Array.from({ length: 7 }).map((_, i) => <AgentSkeleton key={i} />)
+        ) : error ? (
+          <div className="px-2.5 py-2 text-[10px] text-red">
+            加载失败: {error}
           </div>
-        ))}
+        ) : (
+          agents.map((agent) => {
+            const cnStatus = mapStatus(agent.status);
+            const tagColor = agent.tag_color;
+            const tagBg = agent.tag_bg;
+            const isRunning = agent.status === "running" || agent.status === "ready";
+
+            return (
+              <div
+                key={agent.name}
+                onClick={() => handleAgentClick(agent.name)}
+                className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-all border border-transparent mb-0.5 ${
+                  agent.name === selectedAgent
+                    ? "bg-bg3 border-[rgba(255,255,255,0.12)]"
+                    : "hover:bg-bg2"
+                }`}
+              >
+                <div
+                  className={`w-[7px] h-[7px] rounded-full flex-shrink-0 ${isRunning ? "animate-pulse-slow" : ""}`}
+                  style={{ background: tagColor, boxShadow: `0 0 6px ${tagColor}` }}
+                />
+                <span className="text-xs font-medium text-text flex-1 truncate" title={agent.display_name}>
+                  {agent.display_name}
+                </span>
+                <span
+                  className="font-mono text-[9px] px-1.5 py-0.5 rounded font-semibold whitespace-nowrap"
+                  style={{ background: tagBg, color: tagColor }}
+                >
+                  {cnStatus}
+                </span>
+              </div>
+            );
+          })
+        )}
       </div>
 
       <div className="h-px bg-[rgba(255,255,255,0.07)] my-2.5 mx-2" />
@@ -101,68 +125,47 @@ export default function Sidebar() {
         <div className="text-[9px] font-semibold text-text3 uppercase tracking-widest px-2 pt-1.5 pb-1">
           账户概况
         </div>
-        <div className="px-2.5 py-1.5 flex justify-between items-center">
-          <span className="text-xs text-text2">总资产</span>
-          <span className="font-mono text-xs font-semibold text-green">$284,720</span>
-        </div>
-        <div className="px-2.5 py-1.5 flex justify-between items-center">
-          <span className="text-xs text-text2">今日盈亏</span>
-          <span className="font-mono text-xs font-semibold text-green">+$3,421</span>
-        </div>
-        <div className="px-2.5 py-1.5 flex justify-between items-center">
-          <span className="text-xs text-text2">持仓数</span>
-          <span className="font-mono text-xs font-semibold">4</span>
-        </div>
-        <div className="px-2.5 py-1.5 flex justify-between items-center">
-          <span className="text-xs text-text2">信号队列</span>
-          <span className="font-mono text-xs font-semibold text-amber">7</span>
-        </div>
-        <div className="px-2.5 py-1.5 flex justify-between items-center">
-          <span className="text-xs text-text2">执行任务</span>
-          <span className="font-mono text-xs font-semibold">12</span>
-        </div>
+        {summary ? (
+          <>
+            <div className="px-2.5 py-1.5 flex justify-between items-center">
+              <span className="text-xs text-text2">总资产</span>
+              <span className="font-mono text-xs font-semibold text-green">${summary.total_equity}</span>
+            </div>
+            <div className="px-2.5 py-1.5 flex justify-between items-center">
+              <span className="text-xs text-text2">今日盈亏</span>
+              <span className={`font-mono text-xs font-semibold ${Number(summary.today_realized_pnl) >= 0 ? "text-green" : "text-red"}`}>
+                {Number(summary.today_realized_pnl) >= 0 ? "+" : ""}${summary.today_realized_pnl}
+              </span>
+            </div>
+            <div className="px-2.5 py-1.5 flex justify-between items-center">
+              <span className="text-xs text-text2">活跃订单</span>
+              <span className="font-mono text-xs font-semibold">{summary.active_orders_count}</span>
+            </div>
+            <div className="px-2.5 py-1.5 flex justify-between items-center">
+              <span className="text-xs text-text2">今日订单</span>
+              <span className="font-mono text-xs font-semibold">{summary.total_orders_today}</span>
+            </div>
+            <div className="px-2.5 py-1.5 flex justify-between items-center">
+              <span className="text-xs text-text2">账户数</span>
+              <span className="font-mono text-xs font-semibold">{summary.account_count}</span>
+            </div>
+          </>
+        ) : (
+          <div className="px-2.5 py-1.5 text-[10px] text-text3">暂无数据</div>
+        )}
       </div>
 
       <div className="h-px bg-[rgba(255,255,255,0.07)] my-2.5 mx-2" />
 
-      {/* Active strategies */}
+      {/* Active strategies - still hardcoded for now */}
       <div className="mb-1.5">
         <div className="text-[9px] font-semibold text-text3 uppercase tracking-widest px-2 pt-1.5 pb-1">
           活跃策略
         </div>
         <div className="px-0.5">
-          {strategies.map((strat, idx) => (
-            <div
-              key={idx}
-              className={`px-2.5 py-2 rounded-md border mb-1.5 cursor-pointer transition-all flex items-center gap-2.5 ${
-                strat.active
-                  ? "border-green/40 bg-green-dim"
-                  : "border-[rgba(255,255,255,0.07)] hover:border-[rgba(255,255,255,0.12)] hover:bg-bg2"
-              }`}
-            >
-              <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: strat.color }} />
-              <div className="flex-1 min-w-0">
-                <div className="text-xs font-semibold text-text">{strat.name}</div>
-                <div className="text-[10px] text-text3">{strat.meta}</div>
-              </div>
-              <label className="relative w-8 h-[18px] flex-shrink-0">
-                <input
-                  type="checkbox"
-                  className="hidden"
-                  checked={strat.enabled}
-                  onChange={() => toggleStrategy(idx)}
-                />
-                <div
-                  className={`absolute inset-0 rounded-[9px] cursor-pointer transition-all before:content-[''] before:absolute before:w-3 before:h-3 before:left-0.5 before:top-0.5 before:rounded-full before:bg-text3 before:transition-all before:duration-200 ${
-                    strat.enabled
-                      ? "!bg-green-dim !border-green before:!translate-x-[14px] before:!bg-green"
-                      : "bg-bg border border-[rgba(255,255,255,0.12)]"
-                  }`}
-                  style={strat.enabled ? { borderColor: "var(--color-green)" } : {}}
-                />
-              </label>
-            </div>
-          ))}
+          <div className="px-2.5 py-3 text-[10px] text-text3 text-center">
+            即将上线
+          </div>
         </div>
       </div>
     </div>

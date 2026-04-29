@@ -32,7 +32,7 @@ class Command(BaseCommand):
 
         # 确保事件循环
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             self.stderr.write(
                 self.style.WARNING("已在事件循环中运行，请使用 asyncio.run()")
             )

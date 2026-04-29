@@ -38,7 +38,7 @@ def strategy_list(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def trading_summary(request):
     """
@@ -49,37 +49,43 @@ def trading_summary(request):
     from apps.trading.models import DailySnapshot
 
     # 从最新快照获取总权益
-    latest_snapshot = DailySnapshot.objects.filter(user=request.user).order_by('-date').first()
-    total_equity = str(latest_snapshot.total_equity) if latest_snapshot else '0'
+    latest_snapshot = (
+        DailySnapshot.objects.filter(user=request.user).order_by("-date").first()
+    )
+    total_equity = str(latest_snapshot.total_equity) if latest_snapshot else "0"
 
     # 今日已实现盈亏
     today = timezone.now().date()
-    today_filled = list(Order.objects.filter(
-        created_at__date=today,
-        status='filled',
-        realized_pnl__isnull=False,
-    ))
+    today_filled = list(
+        Order.objects.filter(
+            created_at__date=today,
+            status="filled",
+            realized_pnl__isnull=False,
+        )
+    )
     today_pnl = sum(float(o.realized_pnl or 0) for o in today_filled)
     today_count = len(today_filled)
 
     # 活跃订单数
     active_count = Order.objects.filter(
-        status__in=['pending', 'submitted', 'partial']
+        status__in=["pending", "submitted", "partial"]
     ).count()
 
     # 交易所账户数
     account_count = ExchangeAccount.objects.filter(is_active=True).count()
 
-    return Response({
-        'total_equity': total_equity,
-        'today_realized_pnl': f'{today_pnl:.2f}',
-        'active_orders_count': active_count,
-        'total_orders_today': today_count,
-        'account_count': account_count,
-    })
+    return Response(
+        {
+            "total_equity": total_equity,
+            "today_realized_pnl": f"{today_pnl:.2f}",
+            "active_orders_count": active_count,
+            "total_orders_today": today_count,
+            "account_count": account_count,
+        }
+    )
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def position_list(request):
     """
@@ -91,11 +97,13 @@ def position_list(request):
 
     executor = OrderExecutor.get_instance()
     if not executor or not executor._running:
-        return Response({
-            'positions': [],
-            'executor_running': False,
-            'message': '交易框架未启动，持仓数据暂不可用',
-        })
+        return Response(
+            {
+                "positions": [],
+                "executor_running": False,
+                "message": "交易框架未启动，持仓数据暂不可用",
+            }
+        )
 
     # 构建 exchange -> account_id 映射
     exchange_to_account = {}
@@ -109,26 +117,32 @@ def position_list(request):
             positions = async_to_sync(adapter.get_positions)()
             for pos in positions:
                 # pos is a Position dataclass
-                all_positions.append({
-                    'exchange': exchange_name,
-                    'exchange_account_id': account_id,
-                    'symbol': pos.symbol,
-                    'side': pos.side,
-                    'quantity': str(pos.quantity),
-                    'entry_price': str(pos.entry_price),
-                    'mark_price': str(pos.entry_price),  # Position has no mark_price yet
-                    'unrealized_pnl': str(pos.unrealized_pnl),
-                })
+                all_positions.append(
+                    {
+                        "exchange": exchange_name,
+                        "exchange_account_id": account_id,
+                        "symbol": pos.symbol,
+                        "side": pos.side,
+                        "quantity": str(pos.quantity),
+                        "entry_price": str(pos.entry_price),
+                        "mark_price": str(
+                            pos.entry_price
+                        ),  # Position has no mark_price yet
+                        "unrealized_pnl": str(pos.unrealized_pnl),
+                    }
+                )
         except Exception:
             continue
 
-    return Response({
-        'positions': all_positions,
-        'executor_running': True,
-    })
+    return Response(
+        {
+            "positions": all_positions,
+            "executor_running": True,
+        }
+    )
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def account_list(request):
     """
@@ -152,17 +166,17 @@ def account_list(request):
                 # balance is dict[str, Decimal], e.g. {"USDT": Decimal("100.0")}
                 usdt_balance = balance.get("USDT", Decimal("0"))
                 balances[exchange_name] = {
-                    'total': str(usdt_balance),
-                    'available': str(usdt_balance),
-                    'used': '0',
+                    "total": str(usdt_balance),
+                    "available": str(usdt_balance),
+                    "used": "0",
                 }
             except Exception:
                 pass
 
     # 合并余额信息
     for acc in account_data:
-        exchange = acc['exchange'].lower()
-        acc['balance'] = balances.get(exchange)
+        exchange = acc["exchange"].lower()
+        acc["balance"] = balances.get(exchange)
 
     return Response(account_data)
 
@@ -171,7 +185,9 @@ def account_list(request):
 @permission_classes([IsAuthenticated])
 def live_session_list(request):
     """列出用户的实盘会话"""
-    sessions = LiveSession.objects.filter(user=request.user).order_by("-created_at")[:50]
+    sessions = LiveSession.objects.filter(user=request.user).order_by("-created_at")[
+        :50
+    ]
     return Response(LiveSessionSerializer(sessions, many=True).data)
 
 
@@ -200,7 +216,6 @@ def live_session_create(request):
     """
     from apps.backtest.models import BacktestResult
     from apps.exchange.models import ExchangeAccount
-    from apps.strategy_engine.runner import StrategyRunner
 
     backtest_id = request.data.get("backtest_result_id")
     mode = request.data.get("mode", "paper")
@@ -376,9 +391,7 @@ def live_session_promote(request, pk):
         return Response({"error": "Live session not found"}, status=404)
 
     if session.mode != "paper":
-        return Response(
-            {"error": "Only paper sessions can be promoted"}, status=400
-        )
+        return Response({"error": "Only paper sessions can be promoted"}, status=400)
 
     if session.status not in ("running", "stopped", "paused"):
         return Response(

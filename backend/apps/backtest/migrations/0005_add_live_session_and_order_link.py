@@ -6,31 +6,49 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('backtest', '0004_remove_backtesttrade_backtest_tr_backtes_29c5f0_idx_and_more'),
+        (
+            "backtest",
+            "0004_remove_backtesttrade_backtest_tr_backtes_29c5f0_idx_and_more",
+        ),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='backtestresult',
-            name='review_notes',
-            field=models.TextField(blank=True, help_text='审核备注'),
+            model_name="backtestresult",
+            name="review_notes",
+            field=models.TextField(blank=True, help_text="审核备注"),
         ),
         migrations.AddField(
-            model_name='backtestresult',
-            name='review_status',
-            field=models.CharField(choices=[('pending', '待审核'), ('approved', '审核通过'), ('rejected', '审核不通过')], default='pending', help_text='回测审核状态', max_length=12),
+            model_name="backtestresult",
+            name="review_status",
+            field=models.CharField(
+                choices=[
+                    ("pending", "待审核"),
+                    ("approved", "审核通过"),
+                    ("rejected", "审核不通过"),
+                ],
+                default="pending",
+                help_text="回测审核状态",
+                max_length=12,
+            ),
         ),
         migrations.AddField(
-            model_name='backtestresult',
-            name='reviewed_at',
-            field=models.DateTimeField(blank=True, help_text='审核时间', null=True),
+            model_name="backtestresult",
+            name="reviewed_at",
+            field=models.DateTimeField(blank=True, help_text="审核时间", null=True),
         ),
         migrations.AddField(
-            model_name='backtestresult',
-            name='user',
-            field=models.ForeignKey(blank=True, help_text='发起回测的用户', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='backtest_results', to=settings.AUTH_USER_MODEL),
+            model_name="backtestresult",
+            name="user",
+            field=models.ForeignKey(
+                blank=True,
+                help_text="发起回测的用户",
+                null=True,
+                on_delete=django.db.models.deletion.SET_NULL,
+                related_name="backtest_results",
+                to=settings.AUTH_USER_MODEL,
+            ),
         ),
     ]

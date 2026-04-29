@@ -236,7 +236,6 @@ class TestRiskGuardLifecycle(unittest.TestCase):
 
             guard._monitor_task = asyncio.create_task(fake_monitor())
             await asyncio.sleep(0)  # 让 task 开始执行
-            task_ref = guard._monitor_task  # 保存引用，stop() 后 _monitor_task 变 None
             await guard.stop()
             # stop() 将 _monitor_task 设为 None，将 _instance 清空
             self.assertIsNone(guard._monitor_task)

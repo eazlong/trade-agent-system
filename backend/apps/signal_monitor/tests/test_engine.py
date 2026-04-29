@@ -58,7 +58,7 @@ class TestParallelPerformance(unittest.TestCase):
         """单个指标计算时间"""
         klines = _make_klines(200)
         start = time.monotonic()
-        result = compute_indicator("sma", klines, {"period": 20})
+        compute_indicator("sma", klines, {"period": 20})
         duration = (time.monotonic() - start) * 1000
         self.assertLess(duration, 100, f"SMA took {duration:.1f}ms")
 
