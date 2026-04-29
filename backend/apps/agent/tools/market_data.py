@@ -317,7 +317,7 @@ class CalculateIndicatorsTool(BaseTool):
         params = params or {}
 
         try:
-            import pandas_ta as ta  # noqa: F811
+            import pandas_ta as ta  # noqa: F401
         except ImportError:
             return ToolResult(
                 success=False,
