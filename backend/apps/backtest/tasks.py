@@ -46,51 +46,69 @@ def run_backtest_task(
     Returns:
         回测统计结果
     """
+    from apps.agent.task_tracker import TaskTracker, tracker_context
     from apps.strategy_engine.runner import StrategyRunner
+
+    # Setup tracker for progress monitoring
+    tracker = TaskTracker(task_id=self.request.id, user_id=user_id or "", task_type="backtest")
+    token = tracker_context.set(tracker)
+    tracker.start(f"开始回测：{symbol} {timeframe}")
 
     logger.info(
         f"[BacktestTask] running: strategy={strategy_name} symbol={symbol} "
         f"tf={timeframe} exchange={exchange}"
     )
 
-    # 1. 获取历史 OHLCV 数据
-    self.update_state(state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol})
-    ohlcv_data = _fetch_ohlcv_sync(symbol, timeframe, exchange)
-    if not ohlcv_data:
-        raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
-
-    logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
-
-    # 2. 执行回测
-    self.update_state(
-        state="STARTED",
-        meta={"step": "running_backtest", "bars": len(ohlcv_data)},
-    )
-    runner = StrategyRunner()
-
-    loop = asyncio.new_event_loop()
     try:
-        stats = loop.run_until_complete(
-            runner.run_backtest(
-                strategy_name=strategy_name,
-                symbol=symbol,
-                timeframe=timeframe,
-                ohlcv_data=ohlcv_data,
-                initial_capital=Decimal(str(initial_capital)),
-                parameters=parameters,
-                strategy_id=strategy_id,
-                commission_rate=Decimal(str(commission_rate)),
-            )
+        # 1. 获取历史 OHLCV 数据
+        tracker.milestone("正在获取历史K线数据...", progress=0.1)
+        self.update_state(state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol})
+        ohlcv_data = _fetch_ohlcv_sync(symbol, timeframe, exchange)
+        if not ohlcv_data:
+            tracker.fail(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+            raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+
+        tracker.milestone(f"已获取 {len(ohlcv_data)} 条K线数据，开始回测", progress=0.3)
+        logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
+
+        # 2. 执行回测
+        tracker.milestone("正在执行策略回测...", progress=0.5)
+        self.update_state(
+            state="STARTED",
+            meta={"step": "running_backtest", "bars": len(ohlcv_data)},
         )
+        runner = StrategyRunner()
+
+        loop = asyncio.new_event_loop()
+        try:
+            stats = loop.run_until_complete(
+                runner.run_backtest(
+                    strategy_name=strategy_name,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    ohlcv_data=ohlcv_data,
+                    initial_capital=Decimal(str(initial_capital)),
+                    parameters=parameters,
+                    strategy_id=strategy_id,
+                    commission_rate=Decimal(str(commission_rate)),
+                )
+            )
+        finally:
+            loop.close()
+
+        total_trades = stats.get("total_trades", 0)
+        tracker.complete(f"回测完成：{total_trades} 笔交易")
+        logger.info(
+            f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
+            f"trades={total_trades}"
+        )
+        return stats
+    except Exception as e:
+        tracker.fail(str(e))
+        raise
     finally:
-        loop.close()
-
-    logger.info(
-        f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
-        f"trades={stats.get('total_trades')}"
-    )
-
-    return stats
+        tracker.stop()
+        tracker_context.reset(token)
 
 
 def _fetch_ohlcv_sync(
