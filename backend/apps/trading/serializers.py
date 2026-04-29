@@ -3,7 +3,9 @@ from .models import Order, Strategy, LiveSession
 
 
 class OrderSerializer(serializers.ModelSerializer):
-    live_session_id = serializers.UUIDField(source="live_session.id", read_only=True, allow_null=True)
+    live_session_id = serializers.UUIDField(
+        source="live_session.id", read_only=True, allow_null=True
+    )
 
     class Meta:
         model = Order
@@ -73,4 +75,10 @@ class LiveSessionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "started_at", "stopped_at"]
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "stopped_at",
+        ]

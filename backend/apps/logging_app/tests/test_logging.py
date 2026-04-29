@@ -60,7 +60,7 @@ class SystemLogHandlerTest(TestCase):
     @patch("apps.logging_app.handler._get_redis")
     def test_handler_emits_log(self, mock_redis):
         mock_redis.return_value = MagicMock()
-        handler = SystemLogHandler()
+        SystemLogHandler()
         record = logging.LogRecord(
             name="apps.agent.base",
             level=logging.INFO,

@@ -104,20 +104,23 @@ class LLMClient:
             except ToolCallTruncatedError as e:
                 last_exc = e
                 logger.warning(
-                    "tool_call truncated, retry %d/%d: %s", attempt, TOOL_CALL_MAX_RETRIES, e
+                    "tool_call truncated, retry %d/%d: %s",
+                    attempt,
+                    TOOL_CALL_MAX_RETRIES,
+                    e,
                 )
             except Exception as e:
                 last_exc = e
                 break  # 非截断错误不重试，直接降级
 
-        logger.warning(f"OpenAI tool call failed ({last_exc}), falling back to plain chat")
+        logger.warning(
+            f"OpenAI tool call failed ({last_exc}), falling back to plain chat"
+        )
         # 降级：拼接工具描述到system prompt，让LLM输出JSON
         tool_desc = json.dumps(tools, ensure_ascii=False)
         fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
         user_text = messages[-1].get("content", "") if messages else ""
-        result = await self.chat(
-            fallback_system, user_text, max_tokens, temperature
-        )
+        result = await self.chat(fallback_system, user_text, max_tokens, temperature)
         return LLMToolResponse(content=result)
 
     async def _call_openai_with_tools(
@@ -310,7 +313,9 @@ class LLMClient:
                 last_exc = e
                 logger.warning(
                     "stream tool_call truncated, retry %d/%d: %s",
-                    attempt, TOOL_CALL_MAX_RETRIES, e,
+                    attempt,
+                    TOOL_CALL_MAX_RETRIES,
+                    e,
                 )
             except Exception as e:
                 last_exc = e

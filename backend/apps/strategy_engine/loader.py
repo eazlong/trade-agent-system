@@ -24,9 +24,7 @@ class StrategyLoader:
     """策略加载器，从文件路径或模块名加载策略"""
 
     @staticmethod
-    def load_from_path(
-        file_path: str, context: "StrategyContext"
-    ) -> "BaseStrategy":
+    def load_from_path(file_path: str, context: "StrategyContext") -> "BaseStrategy":
         """
         从 Python 文件路径加载策略。
 
@@ -119,9 +117,7 @@ def _find_strategy_class(module) -> type["BaseStrategy"]:
             strategies.append(attr)
 
     if not strategies:
-        raise ValueError(
-            f"No valid strategy class found in module {module.__name__}"
-        )
+        raise ValueError(f"No valid strategy class found in module {module.__name__}")
 
     if len(strategies) > 1:
         names = [s.name for s in strategies]

@@ -15,8 +15,6 @@ from rich.table import Table
 from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from rich.prompt import Prompt, Confirm
 
 console = Console()
 
@@ -235,8 +233,6 @@ class DataSourceTUI:
         # 检查模块
         try:
             from apps.datasource.registry import DataSourceRegistry
-            from apps.datasource.store import get_data_store
-            from apps.datasource.monitor import get_quality_monitor
 
             console.print("[green]✓ 数据源模块加载成功[/]")
             console.print(

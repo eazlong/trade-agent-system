@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-from typing import Any
 
 import numpy as np
 
@@ -68,9 +67,7 @@ def macd(
     Returns:
         {"macd": ..., "signal": ..., "histogram": ...}
     """
-    return _compute_macd(
-        _extract_closes(history), fast, slow, signal_period
-    )
+    return _compute_macd(_extract_closes(history), fast, slow, signal_period)
 
 
 def bollinger(

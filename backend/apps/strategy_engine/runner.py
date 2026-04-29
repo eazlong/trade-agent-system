@@ -169,8 +169,7 @@ class StrategyRunner:
         # 实例化策略
         strategy = strategy_cls(context)
         logger.info(
-            f"[StrategyRunner] live starting: {strategy_name} "
-            f"{symbol} {timeframe}"
+            f"[StrategyRunner] live starting: {strategy_name} {symbol} {timeframe}"
         )
 
         # 创建实盘运行器

@@ -66,10 +66,8 @@ class TestNotificationModel(TestCase):
 
     def test_ordering_by_created_at(self):
         """测试通知按时间倒序"""
-        n1 = Notification.objects.create(
-            user=self.user, message="first", channel="telegram"
-        )
-        n2 = Notification.objects.create(
+        Notification.objects.create(user=self.user, message="first", channel="telegram")
+        Notification.objects.create(
             user=self.user, message="second", channel="telegram"
         )
         all_notifs = list(

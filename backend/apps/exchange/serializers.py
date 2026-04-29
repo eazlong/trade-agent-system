@@ -10,15 +10,24 @@ class ExchangeAccountSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ExchangeAccount
-        fields = ['id', 'exchange', 'label', 'is_active', 'testnet', 'created_at',
-                  'api_key', 'api_secret', 'leverage']
-        read_only_fields = ['id', 'created_at', 'testnet']
+        fields = [
+            "id",
+            "exchange",
+            "label",
+            "is_active",
+            "testnet",
+            "created_at",
+            "api_key",
+            "api_secret",
+            "leverage",
+        ]
+        read_only_fields = ["id", "created_at", "testnet"]
 
     def create(self, validated_data):
-        testnet = validated_data.pop('testnet', False)
-        validated_data.pop('leverage', None)
-        api_key = validated_data.pop('api_key')
-        api_secret = validated_data.pop('api_secret')
+        testnet = validated_data.pop("testnet", False)
+        validated_data.pop("leverage", None)
+        api_key = validated_data.pop("api_key")
+        api_secret = validated_data.pop("api_secret")
         account = ExchangeAccount(testnet=testnet, **validated_data)
         account.api_key_enc = account.encrypt_api_key(api_key)
         account.api_secret_enc = account.encrypt_api_secret(api_secret)
