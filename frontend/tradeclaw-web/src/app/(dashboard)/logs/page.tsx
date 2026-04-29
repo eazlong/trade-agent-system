@@ -1,7 +1,7 @@
 "use client";
 
 import DashboardShell from "@/components/layout/DashboardShell";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { useLogs } from "@/hooks/useLogs";
 import type { SystemLog } from "@/lib/api";
 
@@ -59,6 +59,7 @@ export default function LogsPage() {
   const [filter, setFilter] = useState<string>("ALL");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
   // Map frontend filter to backend level param
   const apiLevel = useMemo(() => {
@@ -68,10 +69,26 @@ export default function LogsPage() {
     return filter;
   }, [filter]);
 
-  const { logs, loading } = useLogs({
+  const { logs, loading, hasNext, loadingMore, loadMore, wsConnected, wsError } = useLogs({
     level: apiLevel,
     search: searchQuery || undefined,
   }, autoRefresh);
+
+  // Intersection observer for infinite scroll
+  const handleObserver = useCallback((entries: IntersectionObserverEntry[]) => {
+    const [entry] = entries;
+    if (entry.isIntersecting && hasNext && !loadingMore) {
+      loadMore();
+    }
+  }, [hasNext, loadingMore, loadMore]);
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(handleObserver, { root: sentinel.parentElement, rootMargin: "200px" });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [handleObserver]);
 
   // Count levels from current logs for badge display
   const levelCounts = useMemo(() => {
@@ -112,18 +129,40 @@ export default function LogsPage() {
           />
           <button
             onClick={() => setAutoRefresh(!autoRefresh)}
-            className={`px-3 py-1.5 rounded-md text-xs font-semibold border cursor-pointer transition-all ${
+            className={`px-3 py-1.5 rounded-md text-xs font-semibold border cursor-pointer transition-all flex items-center gap-1.5 ${
               autoRefresh
                 ? "bg-green-dim border-green/20 text-green"
                 : "bg-bg2 border-[rgba(255,255,255,0.07)] text-text3"
             }`}
           >
-            {autoRefresh ? "实时" : "已暂停"}
+            {autoRefresh ? (
+              <>
+                <span className={`inline-block w-1.5 h-1.5 rounded-full ${wsConnected ? "bg-green" : wsError ? "bg-red animate-pulse" : "bg-amber animate-pulse"}`} />
+                实时
+              </>
+            ) : (
+              "已暂停"
+            )}
           </button>
         </div>
       </div>
 
       {/* Filter tabs */}
+      {wsError && autoRefresh && (
+        <div className="px-3 py-2 bg-red-dim/30 border border-red/20 rounded-lg text-xs text-red flex items-center gap-2">
+          <span className="font-semibold">实时连接异常:</span>
+          <span className="text-text2">{wsError}</span>
+          <button
+            onClick={() => {
+              setAutoRefresh(false);
+              setTimeout(() => setAutoRefresh(true), 100);
+            }}
+            className="ml-auto px-2 py-0.5 bg-red/20 rounded hover:bg-red/30 transition-colors"
+          >
+            重连
+          </button>
+        </div>
+      )}
       <div className="flex gap-1.5">
         {(["ALL", "INFO", "WARN", "ERROR", "DEBUG"] as const).map((level) => (
           <button
@@ -161,21 +200,27 @@ export default function LogsPage() {
           ) : filteredLogs.length === 0 ? (
             <div className="px-4 py-8 text-center text-text3 text-xs">暂无日志</div>
           ) : (
-            filteredLogs.map((log) => (
-              <div
-                key={log.id}
-                className="px-4 py-1.5 border-b border-[rgba(255,255,255,0.03)] hover:bg-bg2/50 transition-colors flex items-center gap-4"
-              >
-                <span className="w-24 text-text3 flex-shrink-0">{log.displayTime}</span>
-                <span className={`w-14 flex-shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded text-center ${LEVEL_BG[log.displayLevel]} ${LEVEL_COLORS[log.displayLevel]}`}>
-                  {log.displayLevel}
-                </span>
-                <span className="w-24 flex-shrink-0" style={{ color: log.moduleInfo.color }}>
-                  {log.moduleInfo.label}
-                </span>
-                <span className="text-text2 flex-1">{log.message}</span>
+            <>
+              {filteredLogs.map((log) => (
+                <div
+                  key={log.id}
+                  className="px-4 py-1.5 border-b border-[rgba(255,255,255,0.03)] hover:bg-bg2/50 transition-colors flex items-center gap-4"
+                >
+                  <span className="w-24 text-text3 flex-shrink-0">{log.displayTime}</span>
+                  <span className={`w-14 flex-shrink-0 text-[10px] font-bold px-1.5 py-0.5 rounded text-center ${LEVEL_BG[log.displayLevel]} ${LEVEL_COLORS[log.displayLevel]}`}>
+                    {log.displayLevel}
+                  </span>
+                  <span className="w-24 flex-shrink-0" style={{ color: log.moduleInfo.color }}>
+                    {log.moduleInfo.label}
+                  </span>
+                  <span className="text-text2 flex-1">{log.message}</span>
+                </div>
+              ))}
+              {/* Sentinel for infinite scroll */}
+              <div ref={sentinelRef} className="py-4 text-center text-text3 text-xs">
+                {loadingMore ? "加载更多..." : hasNext ? "" : ""}
               </div>
-            ))
+            </>
           )}
         </div>
       </div>

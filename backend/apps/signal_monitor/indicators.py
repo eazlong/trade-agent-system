@@ -84,13 +84,26 @@ def compute_macd(
     ema_fast = compute_ema(closes, fast)
     ema_slow = compute_ema(closes, slow)
 
+    # 如果任一 EMA 数据不足返回空数组
+    if len(ema_fast) != len(ema_slow) or len(ema_fast) == 0:
+        empty = np.full(len(closes), np.nan) if len(closes) > 0 else np.array([])
+        return {
+            "macd": empty,
+            "signal": empty,
+            "histogram": empty,
+        }
+
     macd_line = ema_fast - ema_slow
-    valid = ~np.isnan(macd_line)
     signal_line = np.full_like(macd_line, np.nan)
-    if np.any(valid):
-        valid_values = macd_line[valid]
+
+    # 找到 MACD 第一个有效值的位置（即 slow EMA 有值的位置）
+    first_valid = slow - 1
+
+    if len(macd_line) >= first_valid + signal:
+        # 从第一个有效值开始计算 signal 线 EMA
+        valid_values = macd_line[first_valid:]
         sig = compute_ema(valid_values, signal)
-        signal_line[valid] = sig
+        signal_line[first_valid:] = sig
 
     histogram = macd_line - signal_line
     return {
@@ -181,6 +194,13 @@ def compute_stoch(
     return {"k": k_line, "d": d_line}
 
 
+def compute_price_watch(closes: np.ndarray, **kwargs) -> dict[str, float]:
+    """价格监控：返回当前最新价格，用于简单的价格比较条件。"""
+    if len(closes) == 0:
+        return {"price": 0.0}
+    return {"price": float(closes[-1])}
+
+
 # 指标注册表
 INDICATOR_REGISTRY: dict[str, Any] = {
     "sma": compute_sma,
@@ -190,6 +210,7 @@ INDICATOR_REGISTRY: dict[str, Any] = {
     "bollinger": compute_bollinger,
     "atr": compute_atr,
     "stoch": compute_stoch,
+    "price_watch": compute_price_watch,
 }
 
 
@@ -234,6 +255,9 @@ def compute_indicator(
         highs = np.array([k["high"] for k in klines], dtype=np.float64)
         lows = np.array([k["low"] for k in klines], dtype=np.float64)
         return func(highs, lows, closes, **params)
+
+    if indicator_type == "price_watch":
+        return func(closes)
 
     return func(closes, **params)
 

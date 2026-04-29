@@ -41,7 +41,6 @@ class OKXAdapter(BaseExchangeAdapter):
             self.BASE_URL = "https://www.okx.com"
             # OKX testnet uses different endpoints
         self._client: Optional[httpx.AsyncClient] = None
-        self._timestamp = ""
 
     async def connect(self) -> None:
         proxy = getattr(settings, "WEB_PROXY", "") or None

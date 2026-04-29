@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 async def _listen_progress_notifications():
     """Background task: subscribe to Redis pubsub and forward to Telegram."""
+import json
+
     import redis.asyncio as aioredis
 
     from apps.channel.telegram import TelegramChannel
@@ -45,7 +47,7 @@ async def _listen_progress_notifications():
         r = aioredis.from_url(url, decode_responses=True)
         pubsub = r.pubsub()
         await pubsub.subscribe(_PROGRESS_CHANNEL)
-        logger.info("[ASGI] Progress notification listener started")
+logger.info('[ASGI] Progress notification listener started')
 
         async for message in pubsub.listen():
             if message["type"] != "message":
@@ -56,14 +58,9 @@ async def _listen_progress_notifications():
                 if _telegram_channel and _telegram_channel._app:
                     await _telegram_channel.send_message(text)
                 else:
-                    logger.debug(
-                        "[ASGI] Telegram not ready, dropping notification: %s",
-                        text[:50],
-                    )
+logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
             except Exception:
-                logger.warning(
-                    "[ASGI] failed to process progress notification", exc_info=True
-                )
+                logger.warning("[ASGI] failed to process progress notification", exc_info=True)
     except (asyncio.CancelledError, GeneratorExit, RuntimeError):
         pass
     except Exception:

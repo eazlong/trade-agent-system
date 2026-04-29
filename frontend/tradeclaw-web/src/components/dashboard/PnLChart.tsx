@@ -13,6 +13,7 @@ import {
   Filler,
 } from "chart.js";
 import { Line } from "react-chartjs-2";
+import { backtestApi, EquityPoint } from "@/lib/api";
 
 ChartJS.register(
   CategoryScale,
@@ -24,28 +25,61 @@ ChartJS.register(
 );
 
 export default function PnLChart() {
-  const [chartReady, setChartReady] = useState(false);
-  const [chartData, setChartData] = useState<{ labels: string[]; data: number[]; benchmark: number[] } | null>(null);
+  const [chartData, setChartData] = useState<{
+    labels: string[];
+    data: number[];
+    benchmark: number[];
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setChartReady(true);
-    const days = 30;
-    const labels = Array.from({ length: days }, (_, i) => {
-      const d = new Date();
-      d.setDate(d.getDate() - (days - i));
-      return `${d.getMonth() + 1}/${d.getDate()}`;
-    });
-    let v = 1.0;
-    const data = [v];
-    for (let i = 1; i < days; i++) {
-      v += (Math.random() - 0.45) * 0.015;
-      data.push(parseFloat(v.toFixed(4)));
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const listRes = await backtestApi.getList({ page_size: 1 });
+        if (!cancelled) {
+          if (listRes.results.length === 0) {
+            setChartData(null);
+            return;
+          }
+          const latest = listRes.results[0];
+          const detail = await backtestApi.getFullDetail(latest.id);
+          if (!cancelled && detail.equity_curve?.length > 0) {
+            const curve = detail.equity_curve;
+            const labels = curve.map((p: EquityPoint) => {
+              const d = new Date(p.timestamp);
+              return `${d.getMonth() + 1}/${d.getDate()}`;
+            });
+            const data = curve.map((p: EquityPoint) => p.equity);
+            const initial = data[0];
+            const benchmark = data.map((_, i) => {
+              const pct = i / (data.length - 1);
+              return parseFloat((initial + (data[data.length - 1] - initial) * pct).toFixed(4));
+            });
+            setChartData({ labels, data, benchmark });
+          } else if (!cancelled) {
+            setChartData(null);
+          }
+        }
+      } catch (e: unknown) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "加载失败");
+        }
+      }
     }
-    const benchmark = data.map((_, i) => parseFloat((1 + i * 0.001).toFixed(4)));
-    setChartData({ labels, data, benchmark });
+
+    load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  if (!chartReady || !chartData) {
+  if (error) {
+    return <div className="h-40 flex items-center justify-center text-red text-xs">加载失败: {error}</div>;
+  }
+
+  if (!chartData) {
     return <div className="h-40 bg-bg2 rounded-lg animate-pulse" />;
   }
 

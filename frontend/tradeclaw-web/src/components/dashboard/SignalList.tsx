@@ -1,61 +1,104 @@
 "use client";
 
-interface SignalData {
-  type: "buy" | "sell" | "watch";
-  symbol: string;
-  desc: string;
-  conf: number;
-  time: string;
-  symColor: string;
+import { useState, useEffect } from "react";
+import { signalMonitorApi, SignalMonitor } from "@/lib/api";
+
+function formatTime(isoStr: string | null): string {
+  if (!isoStr) return "--:--";
+  const d = new Date(isoStr);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-const INITIAL_SIGNALS: SignalData[] = [
-  { type: "buy", symbol: "BTC/USDT", desc: "突破关键阻力 68,000 · RSI 背离确认", conf: 91, time: "09:42", symColor: "var(--color-green)" },
-  { type: "buy", symbol: "SOL/USDT", desc: "均线多头排列 · 量能放大 2.3x", conf: 78, time: "09:38", symColor: "var(--color-green)" },
-  { type: "sell", symbol: "ETH/USDT", desc: "触及目标价 3,450 · 止盈条件满足", conf: 85, time: "09:35", symColor: "var(--color-red)" },
-  { type: "watch", symbol: "BNB/USDT", desc: "情绪急剧下滑 · 关注风险敞口", conf: 62, time: "09:31", symColor: "var(--color-amber)" },
-  { type: "buy", symbol: "AVAX/USDT", desc: "链上活跃度突增 · 机构流入信号", conf: 74, time: "09:28", symColor: "var(--color-green)" },
-  { type: "sell", symbol: "MATIC/USDT", desc: "跌破支撑 · 空头主导 · 回避风险", conf: 69, time: "09:22", symColor: "var(--color-red)" },
-  { type: "watch", symbol: "ARB/USDT", desc: "等待成交量确认 · 突破未验证", conf: 55, time: "09:15", symColor: "var(--color-amber)" },
-];
+function getSignalType(signal: SignalMonitor): "buy" | "sell" | "watch" {
+  if (signal.status === "triggered") return "buy";
+  if (signal.status === "disabled" || signal.status === "expired") return "watch";
+  const condStr = JSON.stringify(signal.condition).toLowerCase();
+  if (condStr.includes("sell") || condStr.includes("short")) return "sell";
+  if (condStr.includes("buy") || condStr.includes("long") || condStr.includes("cross_over")) return "buy";
+  return "watch";
+}
+
+function getBorderColor(type: string): string {
+  if (type === "buy") return "!border-l-green";
+  if (type === "sell") return "!border-l-red";
+  return "!border-l-amber";
+}
+
+function getBadgeClasses(type: string): string {
+  if (type === "buy") return "bg-green-dim text-green";
+  if (type === "sell") return "bg-red-dim text-red";
+  return "bg-amber-dim text-amber";
+}
+
+function getSymbolColor(type: string): string {
+  if (type === "buy") return "var(--color-green)";
+  if (type === "sell") return "var(--color-red)";
+  return "var(--color-amber)";
+}
+
+function typeLabel(type: string): string {
+  if (type === "buy") return "BUY";
+  if (type === "sell") return "SELL";
+  return "WATCH";
+}
 
 export default function SignalList() {
-  const typeLabel = (type: string) => {
-    if (type === "buy") return "BUY";
-    if (type === "sell") return "SELL";
-    return "⚠";
-  };
+  const [signals, setSignals] = useState<SignalMonitor[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    signalMonitorApi
+      .list()
+      .then((res) => setSignals(res.data.filter((s) => s.status === "active" || s.status === "triggered")))
+      .catch((e) => setError(e.message));
+  }, []);
+
+  if (error) {
+    return <div className="p-4 text-red text-xs">加载失败: {error}</div>;
+  }
+
+  if (signals.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-6 text-text3 text-xs">
+        暂无活跃信号
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-px py-1">
-      {INITIAL_SIGNALS.map((sig, i) => (
-        <div
-          key={i}
-          className={`flex items-center gap-2.5 px-3 py-1.5 text-xs rounded-md transition-colors cursor-default hover:bg-bg2 border-l-[2px] border-transparent ${
-            sig.type === "buy" ? "!border-l-green" : sig.type === "sell" ? "!border-l-red" : "!border-l-amber"
-          }`}
-        >
-          <span
-            className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded min-w-[36px] text-center ${
-              sig.type === "buy"
-                ? "bg-green-dim text-green"
-                : sig.type === "sell"
-                ? "bg-red-dim text-red"
-                : "bg-amber-dim text-amber"
-            }`}
+      {signals.map((sig, i) => {
+        const type = getSignalType(sig);
+        const desc = `${sig.indicator_type} · ${sig.name}`;
+        const time = formatTime(sig.last_triggered_at);
+        const triggerCount = sig.trigger_count;
+
+        return (
+          <div
+            key={sig.id}
+            className={`flex items-center gap-2.5 px-3 py-1.5 text-xs rounded-md transition-colors cursor-default hover:bg-bg2 border-l-[2px] border-transparent ${getBorderColor(type)}`}
           >
-            {typeLabel(sig.type)}
-          </span>
-          <span className="font-mono text-xs font-semibold min-w-[60px]" style={{ color: sig.symColor }}>
-            {sig.symbol}
-          </span>
-          <span className="flex-1 text-text2">{sig.desc}</span>
-          <span className={`font-mono text-xs font-semibold ${sig.conf >= 80 ? "text-green" : sig.conf >= 60 ? "text-amber" : "text-red"}`}>
-            {sig.conf}%
-          </span>
-          <span className="font-mono text-xs text-text3 min-w-[45px] text-right">{sig.time}</span>
-        </div>
-      ))}
+            <span
+              className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded min-w-[36px] text-center ${getBadgeClasses(type)}`}
+            >
+              {typeLabel(type)}
+            </span>
+            <span
+              className="font-mono text-xs font-semibold min-w-[60px]"
+              style={{ color: getSymbolColor(type) }}
+            >
+              {sig.symbol}
+            </span>
+            <span className="flex-1 text-text2">{desc}</span>
+            <span className="font-mono text-xs text-text3" title={`触发 ${triggerCount} 次`}>
+              #{triggerCount}
+            </span>
+            <span className="font-mono text-xs text-text3 min-w-[45px] text-right">
+              {time}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -98,11 +98,11 @@ function AccountMiniCard({
   const available = bal?.available ?? "—";
   const used = bal?.used ?? "—";
 
-  const indicatorColor = account.testnet
+  const indicatorColor = account.testnet_status
     ? "var(--color-blue)"
     : "var(--color-green)";
-  const badgeText = account.testnet ? "模拟" : "实盘";
-  const badgeColor = account.testnet
+  const badgeText = account.testnet_status ? "模拟" : "实盘";
+  const badgeColor = account.testnet_status
     ? "bg-blue-dim text-blue"
     : "bg-green-dim text-green";
 
@@ -180,7 +180,7 @@ function AccountPositions({
             <line x1="4" y1="3" x2="4" y2="9" stroke="var(--color-teal)" strokeWidth="1" />
             <line x1="8" y1="3" x2="8" y2="9" stroke="var(--color-teal)" strokeWidth="1" />
           </svg>
-          {account.exchange} · {account.label || (account.testnet ? "模拟" : "实盘")}
+          {account.exchange} · {account.label || (account.testnet_status ? "模拟" : "实盘")}
           <span className="text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider bg-teal-dim text-teal">
             {positions.length} 个持仓
           </span>
@@ -247,7 +247,7 @@ function AccountOrders({
             <line x1="6" y1="3" x2="6" y2="6.5" stroke="var(--color-amber)" strokeWidth="1.2" strokeLinecap="round" />
             <line x1="6" y1="6.5" x2="8.5" y2="8" stroke="var(--color-amber)" strokeWidth="1.2" strokeLinecap="round" />
           </svg>
-          {account.exchange} · {account.label || (account.testnet ? "模拟" : "实盘")}
+          {account.exchange} · {account.label || (account.testnet_status ? "模拟" : "实盘")}
           <span className="text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider bg-amber-dim text-amber">
             {orders.length} 个活跃订单
           </span>
@@ -325,6 +325,7 @@ function sessionModeColor(mode: LiveSession["mode"]): string {
 
 function SessionMiniCard({
   session,
+  onStart,
   onPause,
   onResume,
   onStop,
@@ -332,6 +333,7 @@ function SessionMiniCard({
   actionLoading,
 }: {
   session: LiveSession;
+  onStart: () => void;
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
@@ -413,6 +415,11 @@ function SessionMiniCard({
             启动
           </button>
         )}
+        {session.status === "stopped" && (
+          <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+            重新启动
+          </button>
+        )}
       </div>
     </div>
   );
@@ -447,9 +454,8 @@ export default function TradingPage() {
   const isLoading = accLoading || posLoading || ordersLoading;
   const hasExecutor = frameStatus.order_executor === "running";
 
-  // Group accounts by testnet
-  const liveAccounts = accounts.filter((a) => !a.testnet);
-  const paperAccounts = accounts.filter((a) => a.testnet);
+  const liveAccounts = accounts.filter((a) => !a.testnet_status);
+  const paperAccounts = accounts.filter((a) => a.testnet_status);
 
   // Group positions by exchange_account_id (using exchange name as fallback)
   const positionsByAccount = new Map<string, typeof positions.positions>();
@@ -564,6 +570,7 @@ export default function TradingPage() {
                 <SessionMiniCard
                   key={session.id}
                   session={session}
+                  onStart={() => startSession(session.id)}
                   onPause={() => pauseSession(session.id)}
                   onResume={() => resumeSession(session.id)}
                   onStop={() => stopSession(session.id)}

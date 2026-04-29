@@ -73,6 +73,13 @@ class TelegramChannel(BaseChannel):
     # --- command handlers ---
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._chat_id = update.effective_chat.id
+        telegram_id = str(update.effective_user.id) if update.effective_user else None
+        username = update.effective_user.username if update.effective_user else None
+
+        # 保存 telegram_id 和 telegram_chat_id 到数据库
+        if telegram_id:
+            self._save_telegram_user(telegram_id, self._chat_id, username)
+
         await update.message.reply_text(
             "TradeAgent已就绪。发送任何消息开始交互，或使用 /help 查看指令。"
         )
@@ -101,10 +108,45 @@ class TelegramChannel(BaseChannel):
         )
         await update.message.reply_text(help_text)
 
+    def _save_telegram_user(self, telegram_id: str, chat_id: int, username: str | None) -> None:
+        """保存或更新 Telegram 用户信息到数据库"""
+        try:
+            from apps.authentication.models import User
+
+            user = User.objects.filter(telegram_id=telegram_id).first()
+            if not user:
+                user = User.objects.filter(username=telegram_id).first()
+            if user:
+                changed = False
+                if user.telegram_id != telegram_id:
+                    user.telegram_id = telegram_id
+                    changed = True
+                if user.telegram_chat_id != chat_id:
+                    user.telegram_chat_id = chat_id
+                    changed = True
+                if changed:
+                    user.save(update_fields=["telegram_id", "telegram_chat_id"])
+                    logger.info(
+                        "Saved telegram info for user %s: telegram_id=%s, chat_id=%s",
+                        user.username, telegram_id, chat_id,
+                    )
+            else:
+                logger.debug(
+                    "No Django user found for telegram_id %s, chat_id still tracked in memory",
+                    telegram_id,
+                )
+        except Exception as e:
+            logger.warning("Failed to save telegram user info: %s", e)
+
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._chat_id = update.effective_chat.id
         text = update.message.text
         user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+        username = update.effective_user.username if update.effective_user else None
+
+        # 保存用户的 telegram_chat_id 到数据库（用于信号通知）
+        if user_id != "unknown":
+            self._save_telegram_user(user_id, self._chat_id, username)
 
         # 检查是否是特殊命令来结束多轮对话
         if text.lower() in ["/end", "/stop", "/quit", "/exit", "结束", "停止", "退出"]:

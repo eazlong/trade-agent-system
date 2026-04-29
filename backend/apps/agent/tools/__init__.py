@@ -24,7 +24,6 @@ for _f in _tools_dir.glob("*.py"):
                 and cls is not BaseTool
             ):
                 ToolRegistry.register(cls())
-                logger.debug(f"[ToolRegistry] auto-registered: {cls.__name__}")
     except Exception as e:
         logger.warning(
             f"[ToolRegistry] failed to auto-register from {module_name}: {e}"

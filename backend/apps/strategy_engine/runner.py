@@ -38,6 +38,7 @@ class StrategyRunner:
         strategy_id: str | None = None,
         git_commit_hash: str = "",
         commission_rate: Decimal = Decimal("0.001"),
+        result_id: str | None = None,
     ) -> dict:
         """
         用历史数据回放策略。
@@ -57,13 +58,18 @@ class StrategyRunner:
             回测统计结果
         """
         from .registry import StrategyRegistry
-        from .backtest_mode import BacktestEngine, save_backtest_result
+        from .base import StrategyContext
+        from .backtest_mode import BacktestEngine, save_backtest_result, _resolve_strategy_id, _get_strategy_id_from_result
 
         # 加载策略类
         strategy_cls = StrategyRegistry.get_class(strategy_name)
 
-        # 合并参数
-        params = {**getattr(strategy_cls, "params_schema", {})}
+        # 合并参数：先从 params_schema 提取默认值，再覆盖用户传入的参数
+        schema: dict = getattr(strategy_cls, "params_schema", {})
+        params = {
+            key: val.get("default") if isinstance(val, dict) else val
+            for key, val in schema.items()
+        }
         if parameters:
             params.update(parameters)
 
@@ -95,12 +101,23 @@ class StrategyRunner:
         )
         stats = await engine.run()
 
-        # 存入数据库
-        if strategy_id:
+        # 存入数据库：优先使用已有的 result_id（BacktestResult），否则根据 strategy_id 查找/创建
+        if result_id:
+            # result_id 是 BacktestResult UUID，需要从中获取 strategy_id
+            resolved_strategy_id = await _get_strategy_id_from_result(result_id)
+            existing_result_id = result_id
+        elif strategy_id:
+            resolved_strategy_id = strategy_id
+            existing_result_id = None
+        else:
+            resolved_strategy_id = await _resolve_strategy_id(strategy_name)
+            existing_result_id = None
+
+        if resolved_strategy_id:
             start_date = ohlcv_data[0].get("timestamp", "")[:10]
             end_date = ohlcv_data[-1].get("timestamp", "")[:10]
             result = await save_backtest_result(
-                strategy_id=strategy_id,
+                strategy_id=resolved_strategy_id,
                 symbol=symbol,
                 timeframe=timeframe,
                 start_date=start_date,
@@ -110,11 +127,17 @@ class StrategyRunner:
                 stats=stats,
                 ohlcv_data=ohlcv_data[:500],
                 git_commit_hash=git_commit_hash,
+                existing_result_id=existing_result_id,
             )
             stats["result_id"] = result["result_id"]
             logger.info(
                 f"[StrategyRunner] backtest result saved: {result['result_id']} "
                 f"trades={result['trade_count']}"
+            )
+        else:
+            logger.warning(
+                f"[StrategyRunner] backtest completed but no Strategy model found "
+                f"for '{strategy_name}', result not persisted"
             )
 
         return stats
@@ -146,6 +169,7 @@ class StrategyRunner:
             initial_balance: 初始余额
         """
         from .registry import StrategyRegistry
+        from .base import StrategyContext
         from .live_mode import LiveStrategyRunner
 
         # 加载策略类

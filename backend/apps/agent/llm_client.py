@@ -69,7 +69,7 @@ class LLMClient:
             raise ValueError("OPENAI_API_KEY not configured")
         model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
         proxy = getattr(settings, "OPENAI_PROXY", "") or None
-        async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -94,7 +94,7 @@ class LLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ) -> LLMToolResponse:
-        """支持工具调用的LLM接口（OpenAI function calling格式），截断自动重试"""
+        """支持工具调用的LLM接口（OpenAI function calling格式），截断/网络错误自动重试"""
         last_exc: Exception | None = None
         for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
             try:
@@ -109,9 +109,21 @@ class LLMClient:
                     TOOL_CALL_MAX_RETRIES,
                     e,
                 )
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                # 5xx / 429 可重试，其他直接降级
+                if e.response.status_code in (429, 500, 502, 503, 504):
+                    logger.warning(
+                        "HTTP %d, retry %d/%d", e.response.status_code, attempt, TOOL_CALL_MAX_RETRIES
+                    )
+                else:
+                    break
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                last_exc = e
+                logger.warning("Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES)
             except Exception as e:
                 last_exc = e
-                break  # 非截断错误不重试，直接降级
+                break  # 配置错误等非可重试异常，直接降级
 
         logger.warning(
             f"OpenAI tool call failed ({last_exc}), falling back to plain chat"
@@ -140,7 +152,7 @@ class LLMClient:
         model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
         proxy = getattr(settings, "OPENAI_PROXY", "") or None
         full_messages = [{"role": "system", "content": system}] + messages
-        async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -183,7 +195,7 @@ class LLMClient:
             raise ValueError("ANTHROPIC_API_KEY not configured")
         model = getattr(settings, "ANTHROPIC_MODEL_FALLBACK", "claude-opus-4-6")
         proxy = getattr(settings, "ANTHROPIC_PROXY", "") or None
-        async with httpx.AsyncClient(timeout=60.0, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -317,9 +329,20 @@ class LLMClient:
                     TOOL_CALL_MAX_RETRIES,
                     e,
                 )
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                if e.response.status_code in (429, 500, 502, 503, 504):
+                    logger.warning(
+                        "HTTP %d, retry %d/%d", e.response.status_code, attempt, TOOL_CALL_MAX_RETRIES
+                    )
+                else:
+                    break
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                last_exc = e
+                logger.warning("Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES)
             except Exception as e:
                 last_exc = e
-                break  # 非截断错误不重试
+                break  # 配置错误等非可重试异常，直接降级
 
         logger.warning(
             f"OpenAI tool stream failed ({last_exc}), falling back to non-stream"
@@ -351,7 +374,7 @@ class LLMClient:
         tool_calls_map: dict[int, dict] = {}  # index → {name, arguments}
         full_messages = [{"role": "system", "content": system}] + messages
 
-        async with httpx.AsyncClient(timeout=120.0, proxy=proxy) as client:
+        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             async with client.stream(
                 "POST",
                 f"{base_url}/chat/completions",

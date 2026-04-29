@@ -64,11 +64,19 @@ async function request<T>(
     if (!retryRes.ok) {
       throw new Error(`API error: ${retryRes.status}`);
     }
+    if (retryRes.status === 204) {
+      return undefined as T;
+    }
     return retryRes.json() as Promise<T>;
   }
 
   if (!res.ok) {
     throw new Error(`API error: ${res.status}`);
+  }
+
+  // 204 No Content has no body
+  if (res.status === 204) {
+    return undefined as T;
   }
 
   return res.json() as Promise<T>;
@@ -211,7 +219,7 @@ export interface ExchangeAccountWithBalance {
   exchange: string;
   label: string;
   is_active: boolean;
-  testnet: boolean;
+  testnet_status: boolean;
   created_at: string;
   balance?: {
     total: string;
@@ -258,7 +266,7 @@ export interface ExchangeAccount {
   exchange: string;
   label: string;
   is_active: boolean;
-  testnet: boolean;
+  testnet_status: boolean;
   created_at: string;
   balance?: {
     total: string;
@@ -280,11 +288,30 @@ export const exchangeApi = {
   getAccounts: () => request<ExchangeAccount[]>("/api/exchange/accounts/"),
   createAccount: (data: CreateExchangeAccountPayload) =>
     request<ExchangeAccount>("/api/exchange/accounts/", "POST", data),
-  deleteAccount: (id: string) =>
-    request<void>(`/api/exchange/accounts/${id}/`, "DELETE"),
+  deleteAccount: (id: string) => {
+    // 204 No Content has no body, so we skip JSON parsing
+    return request<void>(`/api/exchange/accounts/${id}/`, "DELETE");
+  },
 };
 
 // ── Agent API ──
+
+export interface AgentInfo {
+  name: string;
+  display_name: string;
+  role: string;
+  description: string;
+  status: "ready" | "standby" | "running" | "stopped";
+  tools: string[];
+  intent: string;
+  tag_color: string;
+  tag_bg: string;
+  frame_state?: string;
+}
+
+export interface AgentListResponse {
+  agents: AgentInfo[];
+}
 
 export const agentApi = {
   chat: (message: string, frameId?: string) =>
@@ -300,6 +327,7 @@ export const agentApi = {
       action,
       mode,
     }),
+  listAgents: () => request<AgentListResponse>("/api/agent/list/"),
 };
 
 // ── Logging API ──
@@ -322,6 +350,16 @@ export interface LogQueryParams {
   trace_id?: string;
   since?: string;
   before?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface PaginatedLogs {
+  count: number;
+  page: number;
+  page_size: number;
+  has_next: boolean;
+  results: SystemLog[];
 }
 
 export const loggingApi = {
@@ -333,8 +371,10 @@ export const loggingApi = {
     if (params?.trace_id) query.set("trace_id", params.trace_id);
     if (params?.since) query.set("since", params.since);
     if (params?.before) query.set("before", params.before);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
     const qs = query.toString();
-    return request<SystemLog[]>(`/api/logs/${qs ? `?${qs}` : ""}`);
+    return request<PaginatedLogs>(`/api/logs/${qs ? `?${qs}` : ""}`);
   },
 };
 
@@ -408,6 +448,7 @@ export const liveSessionApi = {
 export interface BacktestResult {
   id: string;
   strategy: number;
+  strategy_name: string;
   symbol: string;
   timeframe: string;
   start_date: string;
@@ -421,6 +462,9 @@ export interface BacktestResult {
   total_trades: number;
   git_commit_hash: string;
   parameters: Record<string, unknown>;
+  review_status: "pending" | "approved" | "rejected";
+  review_notes: string;
+  reviewed_at: string | null;
   created_at: string;
 }
 
@@ -445,36 +489,44 @@ export interface OHLCVPoint {
 }
 
 export interface IndicatorData {
-  ma7?: number[];
-  ma25?: number[];
-  ma99?: number[];
-  boll?: { upper: number[]; mid: number[]; lower: number[] };
-  macd?: { dif: number[]; dea: number[]; hist: number[] };
-  rsi?: number[];
+  ma7?: (number | null)[];
+  ma25?: (number | null)[];
+  ma99?: (number | null)[];
+  boll?: { upper: (number | null)[]; mid: (number | null)[]; lower: (number | null)[] };
+  macd?: { dif: (number | null)[]; dea: (number | null)[]; hist: (number | null)[] };
+  rsi?: (number | null)[];
 }
 
 export interface BacktestDetail extends BacktestResult {
   equity_curve: EquityPoint[];
   drawdown_curve: DrawdownPoint[];
   ohlcv_data: OHLCVPoint[];
+  ohlcv_total?: number;  // total bars count when truncated for initial load
   indicator_data: IndicatorData;
+}
+
+export interface OHLCVRangeResponse {
+  ohlcv_data: OHLCVPoint[];
+  indicator_data: IndicatorData;
+  start: number;
+  end: number;
+  total: number;
 }
 
 export interface BacktestTrade {
   id: string;
   entry_time: string;
   exit_time: string | null;
-  symbol: string;
   side: "long" | "short";
-  entry_price: string;
+  entry_price: string | null;
   exit_price: string | null;
   quantity: string;
   pnl: string | null;
   pnl_pct: number | null;
-  cumulative_pnl: string | null;
-  fees: string | null;
-  tags: string[];
-  created_at: string;
+  commission: string | null;
+  signal: string;
+  exit_reason: string | null;
+  trade_type: "open" | "add" | "close";
 }
 
 export interface PaginatedTrades {
@@ -484,12 +536,53 @@ export interface PaginatedTrades {
   results: BacktestTrade[];
 }
 
+export interface CreateBacktestPayload {
+  strategy_name: string;
+  symbol: string;
+  timeframe: string;
+  start_date?: string;
+  end_date?: string;
+  initial_capital?: number;
+  commission_rate?: number;
+  parameters?: Record<string, unknown>;
+  exchange?: string;
+}
+
+export interface BacktestSubmitResponse {
+  task_id: string;
+  message: string;
+}
+
+export interface PaginatedBacktestResults {
+  count: number;
+  num_pages: number;
+  current_page: number;
+  results: BacktestResult[];
+}
+
+export interface BacktestListParams {
+  page?: number;
+  page_size?: number;
+}
+
 export const backtestApi = {
-  getList: () => request<BacktestResult[]>("/api/backtest/results/"),
+  getList: (params?: BacktestListParams) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    const qs = query.toString();
+    return request<PaginatedBacktestResults>(
+      `/api/backtest/results/${qs ? `?${qs}` : ""}`
+    );
+  },
   getDetail: (id: string) =>
     request<BacktestResult>(`/api/backtest/results/${id}/`),
   getFullDetail: (id: string) =>
     request<BacktestDetail>(`/api/backtest/results/${id}/detail/`),
+  getOHLCVRange: (id: string, start: number, end: number) =>
+    request<OHLCVRangeResponse>(
+      `/api/backtest/results/${id}/ohlcv/?start=${start}&end=${end}`
+    ),
   getTrades: (
     id: string,
     params?: { page?: number; page_size?: number; sort?: string }
@@ -503,6 +596,8 @@ export const backtestApi = {
       `/api/backtest/results/${id}/trades/${qs ? `?${qs}` : ""}`
     );
   },
+  create: (data: CreateBacktestPayload) =>
+    request<BacktestSubmitResponse>("/api/backtest/results/create/", "POST", data),
   review: (id: string, data: { approved: boolean; notes?: string }) =>
     request<{
       id: string;
@@ -510,4 +605,77 @@ export const backtestApi = {
       review_notes: string;
       reviewed_at: string;
     }>(`/api/backtest/results/${id}/review/`, "POST", data),
+  rerun: (id: string) =>
+    request<{
+      task_id: string;
+      message: string;
+    }>(`/api/backtest/results/${id}/rerun/`, "POST", {}),
+};
+
+// ── Scheduled Task API ──
+
+export interface ScheduledTask {
+  id: number | null;
+  name: string;
+  agent_name: string;
+  message: string;
+  schedule: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  total_run_count: number;
+  expires: string | null;
+  start_time: string | null;
+  source: "static" | "database";
+}
+
+export interface ScheduledTaskListResponse {
+  tasks: ScheduledTask[];
+}
+
+export const scheduledTaskApi = {
+  list: () => request<ScheduledTaskListResponse>("/api/agent/tasks/scheduled/"),
+};
+
+// ── Signal Monitor API ──
+
+export interface SignalMonitor {
+  id: string;
+  name: string;
+  symbol: string;
+  interval: string;
+  source: string;
+  indicator_type: string;
+  indicator_params: Record<string, unknown>;
+  condition: Record<string, unknown>;
+  trigger_type: "once" | "continuous";
+  action_type: "notify" | "trade" | "notify_and_trade";
+  action_params: Record<string, unknown>;
+  status: "active" | "triggered" | "disabled" | "expired";
+  last_triggered_at: string | null;
+  trigger_count: number;
+  expires_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSignalMonitorPayload {
+  name: string;
+  symbol: string;
+  indicator_type: string;
+  indicator_params?: Record<string, unknown>;
+  condition: Record<string, unknown>;
+}
+
+export const signalMonitorApi = {
+  list: () => request<{ success: boolean; data: SignalMonitor[] }>("/api/signal-monitor/"),
+  create: (data: CreateSignalMonitorPayload) =>
+    request<{ success: boolean; data: SignalMonitor }>("/api/signal-monitor/", "POST", data),
+  delete: (id: string) =>
+    request<void>(`/api/signal-monitor/${id}/`, "DELETE"),
+  toggle: (id: string, enabled: boolean) =>
+    request<{ success: boolean; data: SignalMonitor }>(
+      `/api/signal-monitor/${id}/`,
+      "PATCH",
+      { status: enabled ? "active" : "disabled" }
+    ),
 };

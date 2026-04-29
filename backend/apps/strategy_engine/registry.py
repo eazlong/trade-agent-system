@@ -77,9 +77,17 @@ class StrategyRegistry:
     @classmethod
     def discover(cls) -> list[str]:
         """自动发现并注册策略模块"""
-        import os
-
         path = cls._strategy_path
+        if not path:
+            return cls.list_registered()
+        return cls.discover_path(path)
+
+    @classmethod
+    def discover_path(cls, path: str) -> list[str]:
+        """扫描指定目录，发现并注册策略模块"""
+        import os
+        import sys
+
         if not path:
             return cls.list_registered()
 
@@ -92,11 +100,13 @@ class StrategyRegistry:
             if filename.endswith(".py") and not filename.startswith("_"):
                 module_name = filename[:-3]
                 try:
-                    import sys
-
                     # 确保路径在 sys.path 中
                     if path not in sys.path:
                         sys.path.insert(0, path)
+
+                    # 避免缓存：如果模块已加载，先删除以便重新加载
+                    if module_name in sys.modules:
+                        del sys.modules[module_name]
 
                     mod = importlib.import_module(module_name)
                     # 触发装饰器注册

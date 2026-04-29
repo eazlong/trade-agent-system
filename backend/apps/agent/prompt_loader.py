@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-PROMPT_BASE = Path(__file__).parent.parent.parent / "prompts"
+PROMPT_BASE = Path.home() / ".tradelogx" / "agents"
 
 _cache: dict[str, str] = {}
 _meta_cache: dict[str, dict[str, Any]] = {}
@@ -74,31 +74,12 @@ class PromptLoader:
         return prompt
 
     @classmethod
-    def load_with_meta(
-        cls, name: str, version: str = "v1"
-    ) -> tuple[str, dict[str, Any]]:
-        """加载 Prompt 内容和元数据，返回 (content, metadata)。"""
-        cache_key = f"{version}/{name}"
-        meta_key = f"{version}/{name}/meta"
-
-        if meta_key not in _meta_cache:
-            text = cls.load(name, version)
-            meta, body = _parse_frontmatter(text)
-            _meta_cache[meta_key] = meta
-            _cache[cache_key] = body
-            return body, meta
-
-        # 确保 content cache 已更新（不含 frontmatter）
-        if cache_key not in _cache:
-            text = cls.load(name, version)
-            _, body = _parse_frontmatter(text)
-            _cache[cache_key] = body
-
-        return _cache[cache_key], _meta_cache[meta_key]
-
-    @classmethod
     def list_agents(cls, version: str = "v1") -> list[dict[str, Any]]:
-        """扫描 Prompt 目录，返回所有带 frontmatter 的 Agent 配置。"""
+        """扫描 Prompt 目录，返回所有带 frontmatter 的 Agent 配置。
+
+        每个 Agent 字典额外包含 overview 字段（prompt body 前 5 行），
+        供 Supervisor 的 LLM 意图识别使用。
+        """
         version_dir = PROMPT_BASE / version
         if not version_dir.exists():
             return []
@@ -108,13 +89,12 @@ class PromptLoader:
             if f.name == "supervisor.txt":
                 continue  # supervisor 不是子 Agent
             text = f.read_text(encoding="utf-8")
-            meta, _ = _parse_frontmatter(text)
+            meta, body = _parse_frontmatter(text)
             if meta and "name" in meta:
+                # 提取 body 前 5 行作为概述
+                overview_lines = [
+                    line for line in body.splitlines() if line.strip()
+                ][:5]
+                meta["overview"] = "\n".join(overview_lines)
                 agents.append(meta)
         return agents
-
-    @classmethod
-    def clear_cache(cls) -> None:
-        """测试或热更新时使用"""
-        _cache.clear()
-        _meta_cache.clear()

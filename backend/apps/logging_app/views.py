@@ -24,10 +24,39 @@ LOG_STREAM_KEY = "system:logs"
 
 
 class LogListView(generics.ListAPIView):
-    """Query logs with filters: level, module, search, time range, pagination."""
+    """Query logs with filters: level, module, search, time range, pagination.
+
+    Supports cursor-based pagination via `page_size` query param (default 200, max 500).
+    Returns {count, next_page, results}.
+    """
 
     serializer_class = SystemLogSerializer
     permission_classes = [AllowAny]
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page_size = int(request.query_params.get("page_size", 200))
+        page_size = min(page_size, 500)
+
+        page = int(request.query_params.get("page", 1))
+        if page < 1:
+            page = 1
+
+        total = queryset.count()
+        offset = (page - 1) * page_size
+        page_qs = queryset[offset: offset + page_size]
+
+        serializer = self.get_serializer(page_qs, many=True)
+        has_next = offset + page_size < total
+
+        return Response({
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "has_next": has_next,
+            "results": serializer.data,
+        })
 
     def get_queryset(self):
         qs = SystemLog.objects.all()

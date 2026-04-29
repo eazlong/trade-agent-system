@@ -50,15 +50,16 @@ def _resolve_operand(
     """
     解析操作数的值。
 
-    支持两种格式：
+    支持三种格式：
     - {"value": 50000} — 固定值
     - {"field": "rsi"} — 指标结果中的字段
+    - {"field": "price"} — 当前价格（用于 price_watch 场景）
     """
     if "value" in op:
         return float(op["value"])
 
     field = op.get("field", "")
-    # 从指标结果中提取最新有效值
+    # 从指标结果或价格字段中提取最新有效值
     val = _extract_latest(indicator_result, field)
     return val
 
@@ -69,10 +70,13 @@ def _extract_latest(result: Any, field: str) -> float | None:
         return None
 
     if isinstance(result, dict):
-        # 复合指标（如 macd, bollinger）
+        # 复合指标（如 macd, bollinger）或 price_watch
         arr = result.get(field)
         if arr is None:
             return None
+        # price_watch 返回的是标量 float
+        if isinstance(arr, (int, float)):
+            return float(arr)
         return _last_valid(arr)
 
     if isinstance(result, np.ndarray):
@@ -92,17 +96,6 @@ def _last_valid(arr: Any) -> float | None:
     if len(valid) == 0:
         return None
     return float(valid[-1])
-
-
-def _second_last_valid(arr: Any) -> float | None:
-    """获取数组中倒数第二个非 NaN 值（用于交叉检测）"""
-    if arr is None:
-        return None
-    arr = np.asarray(arr)
-    valid = arr[~np.isnan(arr)]
-    if len(valid) < 2:
-        return None
-    return float(valid[-2])
 
 
 def evaluate_condition(

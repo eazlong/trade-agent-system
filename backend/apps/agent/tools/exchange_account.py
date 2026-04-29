@@ -41,19 +41,26 @@ class GetExchangeAccountTool(BaseTool):
             "required": [],
         }
 
+    def _execute_query(self, exchange: str, label: str) -> list:
+        """Synchronous DB query."""
+        from apps.exchange.models import ExchangeAccount
+
+        qs = ExchangeAccount.objects.filter(is_active=True)
+        if exchange:
+            qs = qs.filter(exchange__iexact=exchange)
+        if label:
+            qs = qs.filter(label__icontains=label)
+        return list(qs.order_by("-created_at"))
+
     async def execute(
         self, exchange: str = "", label: str = "", **kwargs
     ) -> ToolResult:
         try:
-            from apps.exchange.models import ExchangeAccount
+            from asgiref.sync import sync_to_async
 
-            qs = ExchangeAccount.objects.filter(is_active=True)
-            if exchange:
-                qs = qs.filter(exchange__iexact=exchange)
-            if label:
-                qs = qs.filter(label__icontains=label)
-
-            accounts = list(qs.order_by("-created_at"))
+            accounts = await sync_to_async(
+                self._execute_query, thread_sensitive=True
+            )(exchange, label)
             if not accounts:
                 parts = []
                 if exchange:

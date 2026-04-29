@@ -1,0 +1,332 @@
+- generic [active] [ref=e1]:
+  - button "Open Next.js Dev Tools" [ref=e28] [cursor=pointer]:
+    - img [ref=e29]
+  - alert [ref=e32]
+  - generic [ref=e33]:
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - img [ref=e38]
+        - generic [ref=e41]:
+          - generic [ref=e42]: TradeClaw
+          - generic [ref=e43]: Agent OS · v2.4.1
+      - generic [ref=e44]:
+        - link "总览" [ref=e45] [cursor=pointer]:
+          - /url: /overview
+        - link "智能体" [ref=e46] [cursor=pointer]:
+          - /url: /agents
+        - link "回测" [ref=e47] [cursor=pointer]:
+          - /url: /backtest
+        - link "交易" [ref=e48] [cursor=pointer]:
+          - /url: /trading
+        - link "日志" [ref=e49] [cursor=pointer]:
+          - /url: /logs
+        - link "配置" [ref=e50] [cursor=pointer]:
+          - /url: /settings
+      - generic [ref=e51]:
+        - generic [ref=e52]:
+          - generic [ref=e53]: BTC
+          - generic [ref=e54]: 67,842
+          - generic [ref=e55]: +1.24%
+        - generic [ref=e56]:
+          - generic [ref=e57]: ETH
+          - generic [ref=e58]: 3,421
+          - generic [ref=e59]: +0.87%
+        - generic [ref=e60]:
+          - generic [ref=e61]: SOL
+          - generic [ref=e62]: "182.4"
+          - generic [ref=e63]: "-0.43%"
+        - generic [ref=e66]: 实时运行中
+        - button "收起右侧面板" [ref=e67] [cursor=pointer]:
+          - img [ref=e68]
+    - generic [ref=e71]:
+      - generic [ref=e72]:
+        - generic [ref=e73]: 智能体集群
+        - generic [ref=e74] [cursor=pointer]:
+          - generic [ref=e76]: Orchestrator
+          - generic [ref=e77]: 主控
+        - generic [ref=e78] [cursor=pointer]:
+          - generic [ref=e80]: 市场分析
+          - generic [ref=e81]: 运行
+        - generic [ref=e82] [cursor=pointer]:
+          - generic [ref=e84]: 情绪分析
+          - generic [ref=e85]: 运行
+        - generic [ref=e86] [cursor=pointer]:
+          - generic [ref=e88]: 风险管理
+          - generic [ref=e89]: 告警
+        - generic [ref=e90] [cursor=pointer]:
+          - generic [ref=e92]: 策略优化
+          - generic [ref=e93]: 运行
+        - generic [ref=e94] [cursor=pointer]:
+          - generic [ref=e96]: 交易执行
+          - generic [ref=e97]: 就绪
+        - generic [ref=e98] [cursor=pointer]:
+          - generic [ref=e100]: 回测引擎
+          - generic [ref=e101]: 待机
+      - generic [ref=e103]:
+        - generic [ref=e104]: 账户概况
+        - generic [ref=e105]:
+          - generic [ref=e106]: 总资产
+          - generic [ref=e107]: $284,720
+        - generic [ref=e108]:
+          - generic [ref=e109]: 今日盈亏
+          - generic [ref=e110]: +$3,421
+        - generic [ref=e111]:
+          - generic [ref=e112]: 持仓数
+          - generic [ref=e113]: "4"
+        - generic [ref=e114]:
+          - generic [ref=e115]: 信号队列
+          - generic [ref=e116]: "7"
+        - generic [ref=e117]:
+          - generic [ref=e118]: 执行任务
+          - generic [ref=e119]: "12"
+      - generic [ref=e121]:
+        - generic [ref=e122]: 活跃策略
+        - generic [ref=e123]:
+          - generic [ref=e126] [cursor=pointer]:
+            - generic [ref=e127]: 动量突破
+            - generic [ref=e128]: BTC · 15m
+          - generic [ref=e133] [cursor=pointer]:
+            - generic [ref=e134]: 均值回归
+            - generic [ref=e135]: ETH · 1h
+          - generic [ref=e140] [cursor=pointer]:
+            - generic [ref=e141]: 套利对冲
+            - generic [ref=e142]: 多品种
+    - generic [ref=e145]:
+      - generic [ref=e146]:
+        - generic [ref=e147]:
+          - generic [ref=e148]: 净值
+          - generic [ref=e149]: "0.0000"
+          - generic [ref=e150]: ↑ +0.00 今日
+        - generic [ref=e151]:
+          - generic [ref=e152]: 今日盈亏
+          - generic [ref=e153]: ↑ +0.00
+          - generic [ref=e154]: 已实现
+        - generic [ref=e155]:
+          - generic [ref=e156]: 活跃订单
+          - generic [ref=e157]: "0"
+          - generic [ref=e158]: 今日 0 单
+      - generic [ref=e159]:
+        - generic [ref=e160]:
+          - generic [ref=e161]:
+            - generic [ref=e162]:
+              - img [ref=e163]
+              - text: 策略净值曲线
+            - generic [ref=e165]:
+              - generic [ref=e166]: 实盘
+              - combobox [ref=e167] [cursor=pointer]:
+                - option "近30天" [selected]
+                - option "近90天"
+                - option "今年"
+          - img [ref=e170]
+        - generic [ref=e171]:
+          - generic [ref=e172]:
+            - generic [ref=e173]:
+              - img [ref=e174]
+              - text: 智能体实时状态
+            - generic [ref=e177]:
+              - generic [ref=e178]: Orchestrator 规划中
+              - generic [ref=e179]: .
+              - generic [ref=e180]: .
+              - generic [ref=e181]: .
+          - generic [ref=e182]:
+            - generic [ref=e183]:
+              - generic [ref=e184]:
+                - generic [ref=e185]:
+                  - generic [ref=e186]: 主控编排
+                  - generic [ref=e187]: 任务调度 · 信号聚合
+                - generic [ref=e188]: 就绪
+              - generic "核心编排器，负责任务分配、信号汇总和跨 Agent 通信协调。使用 LLM 进行意图理解和决策规划。" [ref=e189]
+            - generic [ref=e190]:
+              - generic [ref=e191]:
+                - generic [ref=e192]:
+                  - generic [ref=e193]: 市场分析
+                  - generic [ref=e194]: 技术指标 · 形态识别
+                - generic [ref=e195]: 待机
+              - 'generic "# AnalystAgent System Prompt v1 # Current Date: {{CURRENT_DATETIME}} You are a professional quantitative market analyst. Your role: analyze market data, interpret technical indicators, identify signals. Always provide clear, actionable insights with specific examples where possible." [ref=e196]'
+            - generic [ref=e197]:
+              - generic [ref=e198]:
+                - generic [ref=e199]:
+                  - generic [ref=e200]: 交易教练
+                  - generic [ref=e201]: 交易计划 · 复盘
+                - generic [ref=e202]: 待机
+              - 'generic "# CoachAgent System Prompt v1 # Current Date: {{CURRENT_DATETIME}} You are a professional trading coach and psychologist. Your role: manage user''s trading system, help the trader draft trading plans, review entry timing, and conduct post-trade reviews." [ref=e203]'
+            - generic [ref=e204]:
+              - generic [ref=e205]:
+                - generic [ref=e206]:
+                  - generic [ref=e207]: 策略优化
+                  - generic [ref=e208]: 参数调优 · 回测
+                - generic [ref=e209]: 待机
+              - 'generic "# QuantEngineerAgent System Prompt v1 # Current Date: {{CURRENT_DATETIME}} You are a professional quantitative engineer specializing in algorithmic trading. Your role: design, code, and optimize trading strategies in Python. When generating code, use clean, well-structured Python with type hints." [ref=e210]'
+            - generic [ref=e211]:
+              - generic [ref=e212]:
+                - generic [ref=e214]: researcher
+                - generic [ref=e215]: 待机
+              - 'generic "# ResearcherAgent System Prompt v1 # Current Date: {{CURRENT_DATETIME}} You are a professional content researcher and knowledge curator. Your role: collect, synthesize, and organize information from the web based on user requests. ## Core Responsibilities" [ref=e216]'
+            - generic [ref=e217]:
+              - generic [ref=e218]:
+                - generic [ref=e219]:
+                  - generic [ref=e220]: 风险管理
+                  - generic [ref=e221]: VaR · 仓位控制
+                - generic [ref=e222]: 待机
+              - 'generic "# RiskAdvisorAgent System Prompt v1 # Current Date: {{CURRENT_DATETIME}} You are a professional trading risk advisor. Your role: assess position sizing, drawdown risk, and provide actionable risk management advice. Always emphasize capital preservation. Flag excessive risk clearly." [ref=e223]'
+            - generic [ref=e224]:
+              - generic [ref=e225]:
+                - generic [ref=e226]:
+                  - generic [ref=e227]: 交易执行
+                  - generic [ref=e228]: 订单路由 · 滑点控制
+                - generic [ref=e229]: 运行
+              - 'generic "框架状态: running" [ref=e230]'
+            - generic [ref=e231]:
+              - generic [ref=e232]:
+                - generic [ref=e233]:
+                  - generic [ref=e234]: 辅助监控
+                  - generic [ref=e235]: 信号监控 · 风险预警
+                - generic [ref=e236]: 运行
+              - 'generic "框架状态: running" [ref=e237]'
+      - generic [ref=e238]:
+        - generic [ref=e239]:
+          - generic [ref=e240]:
+            - generic [ref=e241]:
+              - img [ref=e242]
+              - text: 实时信号队列
+            - generic [ref=e244]: 7 待处理
+          - generic [ref=e245]:
+            - generic [ref=e246]:
+              - generic [ref=e247]: BUY
+              - generic [ref=e248]: BTC/USDT
+              - generic [ref=e249]: price_watch · BTC跌破75000
+              - generic "触发 1 次" [ref=e250]: "#1"
+              - generic [ref=e251]: 03:42
+            - generic [ref=e252]:
+              - generic [ref=e253]: BUY
+              - generic [ref=e254]: BTC/USDT
+              - generic [ref=e255]: price_watch · BTC突破76000
+              - generic "触发 2 次" [ref=e256]: "#2"
+              - generic [ref=e257]: 15:15
+        - generic [ref=e258]:
+          - generic [ref=e259]:
+            - generic [ref=e260]:
+              - img [ref=e261]
+              - text: 智能体通信日志
+            - generic [ref=e263]: 实时
+          - generic [ref=e265]:
+            - generic [ref=e266]:
+              - generic [ref=e267]: 16:18:01
+              - generic [ref=e268]: unknown
+              - generic [ref=e269]: 2026-04-28 08:18:01 INFO [apps.logging_app.consumers] [LogWebSocket] User f00b3db3-97bb-43de-b8e6-2bf94ad9feb3 disconnected
+            - generic [ref=e270]:
+              - generic [ref=e271]: 16:17:12
+              - generic [ref=e272]: unknown
+              - generic [ref=e273]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: bollinger_rsi_strategy (BollingerRsiStrategy)"
+            - generic [ref=e274]:
+              - generic [ref=e275]: 16:17:12
+              - generic [ref=e276]: unknown
+              - generic [ref=e277]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: atr_breakout_strategy (AtrBreakoutStrategy)"
+            - generic [ref=e278]:
+              - generic [ref=e279]: 16:17:12
+              - generic [ref=e280]: unknown
+              - generic [ref=e281]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: rule123_reversal_strategy (Rule123ReversalStrategy)"
+            - generic [ref=e282]:
+              - generic [ref=e283]: 16:17:12
+              - generic [ref=e284]: unknown
+              - generic [ref=e285]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: ema_rsi_atr_strategy (EmaRsiAtrStrategy)"
+            - generic [ref=e286]:
+              - generic [ref=e287]: 16:17:12
+              - generic [ref=e288]: unknown
+              - generic [ref=e289]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: support_rsi_strategy (SupportRsiStrategy)"
+            - generic [ref=e290]:
+              - generic [ref=e291]: 16:17:12
+              - generic [ref=e292]: unknown
+              - generic [ref=e293]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: reversal_123_strategy (Reversal123Strategy)"
+            - generic [ref=e294]:
+              - generic [ref=e295]: 16:17:12
+              - generic [ref=e296]: unknown
+              - generic [ref=e297]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: volatility_breakout_strategy (VolatilityBreakoutStrategy)"
+            - generic [ref=e298]:
+              - generic [ref=e299]: 16:17:12
+              - generic [ref=e300]: unknown
+              - generic [ref=e301]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: turtle_trend_strategy (TurtleTrendStrategy)"
+            - generic [ref=e302]:
+              - generic [ref=e303]: 16:17:12
+              - generic [ref=e304]: unknown
+              - generic [ref=e305]: "2026-04-28 08:17:11 INFO [apps.strategy_engine.registry] Strategy registered: turtle_strategy (TurtleStrategy)"
+            - generic [ref=e306]:
+              - generic [ref=e307]: 16:05:14
+              - generic [ref=e308]: unknown
+              - generic [ref=e309]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: atr_breakout_strategy (AtrBreakoutStrategy)"
+            - generic [ref=e310]:
+              - generic [ref=e311]: 16:05:14
+              - generic [ref=e312]: unknown
+              - generic [ref=e313]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: support_rsi_strategy (SupportRsiStrategy)"
+            - generic [ref=e314]:
+              - generic [ref=e315]: 16:05:14
+              - generic [ref=e316]: unknown
+              - generic [ref=e317]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: rule123_reversal_strategy (Rule123ReversalStrategy)"
+            - generic [ref=e318]:
+              - generic [ref=e319]: 16:05:14
+              - generic [ref=e320]: unknown
+              - generic [ref=e321]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: bollinger_rsi_strategy (BollingerRsiStrategy)"
+            - generic [ref=e322]:
+              - generic [ref=e323]: 16:05:14
+              - generic [ref=e324]: unknown
+              - generic [ref=e325]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: reversal_123_strategy (Reversal123Strategy)"
+            - generic [ref=e326]:
+              - generic [ref=e327]: 16:05:14
+              - generic [ref=e328]: unknown
+              - generic [ref=e329]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: turtle_trend_strategy (TurtleTrendStrategy)"
+            - generic [ref=e330]:
+              - generic [ref=e331]: 16:05:14
+              - generic [ref=e332]: unknown
+              - generic [ref=e333]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: volatility_breakout_strategy (VolatilityBreakoutStrategy)"
+            - generic [ref=e334]:
+              - generic [ref=e335]: 16:05:14
+              - generic [ref=e336]: unknown
+              - generic [ref=e337]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: turtle_strategy (TurtleStrategy)"
+            - generic [ref=e338]:
+              - generic [ref=e339]: 16:05:14
+              - generic [ref=e340]: unknown
+              - generic [ref=e341]: "2026-04-28 08:05:14 INFO [apps.strategy_engine.registry] Strategy registered: ema_rsi_atr_strategy (EmaRsiAtrStrategy)"
+            - generic [ref=e342]:
+              - generic [ref=e343]: 16:04:54
+              - generic [ref=e344]: unknown
+              - generic [ref=e345]: "2026-04-28 08:04:54 INFO [apps.strategy_engine.registry] Strategy registered: atr_breakout_strategy (AtrBreakoutStrategy)"
+      - button "+ 新建策略" [ref=e346] [cursor=pointer]
+    - generic [ref=e348]:
+      - generic [ref=e349]:
+        - generic [ref=e350]: 当前持仓
+        - generic [ref=e351]: 暂无持仓
+      - generic [ref=e352]:
+        - generic [ref=e353]: 风险仪表盘
+        - generic [ref=e354]:
+          - generic [ref=e355]:
+            - generic [ref=e356]: P0 事件
+            - generic [ref=e357]: "0"
+          - generic [ref=e358]:
+            - generic [ref=e359]: P1 事件
+            - generic [ref=e360]: "0"
+          - generic [ref=e361]:
+            - generic [ref=e362]: 总事件
+            - generic [ref=e363]: "0"
+          - generic [ref=e364]:
+            - generic [ref=e365]: 已解决
+            - generic [ref=e366]: "0"
+      - generic [ref=e367]:
+        - generic [ref=e368]: 近期执行
+        - generic [ref=e369]: 暂无成交记录
+      - generic [ref=e370]:
+        - generic [ref=e371]: 模型调用统计
+        - generic [ref=e372]:
+          - generic [ref=e373]:
+            - generic [ref=e374]: 今日 API 调用
+            - generic [ref=e375]: "3"
+          - generic [ref=e376]:
+            - generic [ref=e377]: 平均响应时间
+            - generic [ref=e378]: 124ms
+          - generic [ref=e379]:
+            - generic [ref=e380]: Token 消耗
+            - generic [ref=e381]: 1.2M
+          - generic [ref=e382]:
+            - generic [ref=e383]: 推理成功率
+            - generic [ref=e384]: 99.7%
+    - button "打开 Supervisor 对话" [ref=e385] [cursor=pointer]:
+      - img [ref=e386]

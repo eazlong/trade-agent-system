@@ -18,6 +18,7 @@ if not settings.configured:
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings.test")
     django.setup()
 
+from django.test import TransactionTestCase
 from rest_framework.test import APITestCase
 
 from apps.authentication.models import User
@@ -26,10 +27,8 @@ from apps.exchange.models import ExchangeAccount
 
 def _run(coro):
     """兼容 Python 3.10+ 的异步执行辅助函数"""
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        return asyncio.get_event_loop().run_until_complete(coro)
+    # Use asyncio.run for normal async execution
+    return asyncio.run(coro)
 
 
 def _get_tokens(user: User) -> dict:
@@ -146,7 +145,7 @@ class TestToolAutoRegistration(APITestCase):
                     )
 
 
-class TestExchangeAccountToolE2E(APITestCase):
+class TestExchangeAccountToolE2E(TransactionTestCase):
     """E2E: 交易所账号查询工具的完整链路测试"""
 
     def setUp(self):
@@ -348,20 +347,20 @@ class TestIntentFreeChatInlineResponse(APITestCase):
         self.assertIn("我不太明白", result.get("response", ""))
 
     def test_parse_intent_returns_intent_string_when_match(self):
-        """_parse_intent 在识别意图时应返回意图名字符串"""
+        """_parse_intent 在识别意图时应返回 agent name 字符串"""
         from apps.agent.supervisor import SupervisorAgent
         from unittest.mock import patch
 
         supervisor = SupervisorAgent.get_instance()
 
         async def mock_chat(*args, **kwargs):
-            return '{"intent": "analyze_market", "params": {"symbol": "BTC"}}'
+            return '{"agent": "analyst"}'
 
         with patch.object(supervisor._llm, "chat", new=mock_chat):
             result = _run(supervisor._parse_intent("分析一下BTC的走势"))
 
         self.assertIsInstance(result, str)
-        self.assertEqual(result, "analyze_market")
+        self.assertEqual(result, "analyst")
 
     def test_normal_route_handles_free_chat_inline(self):
         """_normal_route 对 free-chat dict 直接返回，不调用 _free_chat"""

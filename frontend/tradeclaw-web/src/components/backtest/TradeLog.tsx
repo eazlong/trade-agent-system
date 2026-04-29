@@ -69,7 +69,40 @@ export default function TradeLog({ backtestId }: TradeLogProps) {
   const fmtPnl = (v: string | null) =>
     v ? Number(v).toFixed(2) : "—";
   const fmtTime = (v: string | null) =>
-    v ? new Date(v).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—";
+    v
+      ? new Date(v).toLocaleDateString("zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : "—";
+
+  const tradeTypeLabel = (t: string) => {
+    switch (t) {
+      case "open":
+        return "开仓";
+      case "add":
+        return "加仓";
+      case "close":
+        return "出场";
+      default:
+        return t;
+    }
+  };
+
+  const tradeTypeClass = (t: string) => {
+    switch (t) {
+      case "open":
+        return "bg-blue-dim text-blue";
+      case "add":
+        return "bg-amber-dim text-amber";
+      case "close":
+        return "bg-purple-dim text-purple";
+      default:
+        return "bg-bg2 text-text3";
+    }
+  };
 
   return (
     <div>
@@ -97,6 +130,7 @@ export default function TradeLog({ backtestId }: TradeLogProps) {
           <thead>
             <tr className="text-text3 border-b border-[rgba(255,255,255,0.07)]">
               <th className="text-left py-1.5 pr-2 font-semibold">#</th>
+              <th className="text-left py-1.5 pr-2 font-semibold">类型</th>
               <th className="text-left py-1.5 pr-2 font-semibold">入场时间</th>
               <th className="text-left py-1.5 pr-2 font-semibold">出场时间</th>
               <th className="text-left py-1.5 pr-2 font-semibold">方向</th>
@@ -108,12 +142,24 @@ export default function TradeLog({ backtestId }: TradeLogProps) {
             </tr>
           </thead>
           <tbody>
-            {trades.map((t, i) => (
+            {trades.map((t, i) => {
+              const isClose = t.trade_type === "close";
+              const pnlValue = t.pnl ? Number(t.pnl) : null;
+              return (
               <tr
                 key={t.id}
-                className="border-b border-[rgba(255,255,255,0.04)] hover:bg-bg2/50 transition-colors"
+                className={`border-b border-[rgba(255,255,255,0.04)] hover:bg-bg2/50 transition-colors ${
+                  !isClose ? "opacity-70" : ""
+                }`}
               >
                 <td className="py-1.5 pr-2 text-text3">{i + 1}</td>
+                <td className="py-1.5 pr-2">
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${tradeTypeClass(t.trade_type)}`}
+                  >
+                    {tradeTypeLabel(t.trade_type)}
+                  </span>
+                </td>
                 <td className="py-1.5 pr-2 text-text">{fmtTime(t.entry_time)}</td>
                 <td className="py-1.5 pr-2 text-text">{fmtTime(t.exit_time)}</td>
                 <td className="py-1.5 pr-2">
@@ -127,30 +173,37 @@ export default function TradeLog({ backtestId }: TradeLogProps) {
                     {t.side === "long" ? "多" : "空"}
                   </span>
                 </td>
-                <td className="py-1.5 pr-2 text-right text-text">{fmtPrice(t.entry_price)}</td>
-                <td className="py-1.5 pr-2 text-right text-text">{fmtPrice(t.exit_price)}</td>
+                <td className="py-1.5 pr-2 text-right text-text">
+                  {t.entry_price ? fmtPrice(t.entry_price) : "—"}
+                </td>
+                <td className="py-1.5 pr-2 text-right text-text">
+                  {t.exit_price ? fmtPrice(t.exit_price) : "—"}
+                </td>
                 <td className="py-1.5 pr-2 text-right text-text2">{t.quantity}</td>
                 <td
                   className={`py-1.5 pr-2 text-right font-semibold ${
-                    t.pnl && Number(t.pnl) >= 0 ? "text-green" : "text-red"
+                    pnlValue !== null && pnlValue >= 0 ? "text-green" : pnlValue !== null ? "text-red" : "text-text3"
                   }`}
                 >
-                  {fmtPnl(t.pnl)}
+                  {pnlValue !== null ? pnlValue.toFixed(2) : "—"}
                 </td>
                 <td className="py-1.5 pr-2">
                   <div className="flex gap-1 flex-wrap">
-                    {t.tags.map((tag, j) => (
-                      <span
-                        key={j}
-                        className="text-[9px] px-1.5 py-0.5 rounded bg-bg2 text-text3"
-                      >
-                        {tag}
+                    {t.signal && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg2 text-text3">
+                        {t.signal}
                       </span>
-                    ))}
+                    )}
+                    {t.exit_reason && (
+                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-bg2 text-text3">
+                        {t.exit_reason}
+                      </span>
+                    )}
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

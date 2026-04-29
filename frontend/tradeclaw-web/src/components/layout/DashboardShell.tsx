@@ -5,6 +5,7 @@ import { useAuth } from "@/context/AuthContext";
 import Topbar from "@/components/layout/Topbar";
 import Sidebar from "@/components/layout/Sidebar";
 import RightPanel from "@/components/layout/RightPanel";
+import ChatWindow from "@/components/chat/ChatWindow";
 
 interface RightPanelContextType {
   show: boolean;
@@ -51,7 +52,7 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
         </div>
 
         {/* Main content */}
-        <div className="overflow-y-auto py-3 px-4 flex flex-col gap-3" style={{ gridRow: "2", gridColumn: "2" }}>
+        <div className="overflow-y-auto pt-3 pb-16 px-4 flex flex-col gap-3" style={{ gridRow: "2", gridColumn: "2" }}>
           {children}
         </div>
 
@@ -59,6 +60,9 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
         <div className="overflow-hidden" style={{ gridRow: "2", gridColumn: "3" }}>
           {showRightPanel && <RightPanel />}
         </div>
+
+        {/* Chat floating window */}
+        <ChatWindow />
       </div>
     </RightPanelContext.Provider>
   );

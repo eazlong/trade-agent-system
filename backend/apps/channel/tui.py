@@ -8,7 +8,6 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
-from rich.prompt import Prompt
 from rich.live import Live
 
 from .base import BaseChannel
@@ -96,7 +95,8 @@ class TUIChannel(BaseChannel):
     async def start(self) -> None:
         console.clear()
         self._print_banner()
-        console.print("[dim]输入 /help 查看命令，/quit 退出\n[/]")
+        console.print("[dim]输入 /help 查看命令，/quit 退出\n")
+        console.print("[dim]行尾输入 \\ 可换行写多行内容\n[/]")
         self._running = True
         self._task = asyncio.create_task(self._input_loop())
         await self._task
@@ -123,6 +123,35 @@ class TUIChannel(BaseChannel):
         console.print(Panel(banner, style="cyan"))
 
     # ------------------------------------------------------------------ #
+    #  输入读取（支持多行）                                                 #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _read_input() -> str | None:
+        """
+        读取用户输入，支持多行。
+
+        规则：
+        - 行尾加 `\\` 继续输入（换行）
+        - 直接回车发送当前单行消息
+        - Ctrl+D (EOF) 或 Ctrl+C 触发退出
+        """
+        lines: list[str] = []
+        try:
+            while True:
+                prompt_text = "» " if not lines else "… "
+                line = input(prompt_text)
+                if line.endswith("\\"):
+                    lines.append(line[:-1])
+                    continue
+                lines.append(line)
+                break
+        except (EOFError, KeyboardInterrupt):
+            if not lines:
+                return None
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
     #  主循环                                                            #
     # ------------------------------------------------------------------ #
 
@@ -130,9 +159,9 @@ class TUIChannel(BaseChannel):
         loop = asyncio.get_event_loop()
         while self._running:
             try:
-                raw = await loop.run_in_executor(
-                    None, lambda: Prompt.ask("[bold green]»[/] ")
-                )
+                raw = await loop.run_in_executor(None, self._read_input)
+                if raw is None:
+                    continue
                 text = raw.strip()
                 if not text:
                     continue
@@ -333,7 +362,9 @@ class TUIChannel(BaseChannel):
 | `/clear` | 清屏 |
 | `/history` | 查看本次会话历史 |
 
-直接输入消息即可与 Agent 对话，支持流式输出。"""
+直接输入消息即可与 Agent 对话，支持流式输出。
+
+**多行输入**：行尾输入 `\\` 后回车可换行，继续输入下一行。直接回车发送消息。"""
         console.print(Markdown(help_md))
 
     def _print_status(self) -> None:

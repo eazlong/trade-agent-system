@@ -5,4 +5,6 @@ urlpatterns = [
     path("chat/", views.chat, name="agent-chat"),
     path("frame/status/", views.frame_status, name="agent-frame-status"),
     path("frame/control/", views.frame_control, name="agent-frame-control"),
+    path("list/", views.list_agents, name="agent-list"),
+    path("tasks/scheduled/", views.list_scheduled_tasks, name="agent-tasks-scheduled"),
 ]

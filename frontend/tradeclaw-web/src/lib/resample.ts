@@ -86,14 +86,14 @@ export function computeIndicators(
     });
   }
 
+  // Keep nulls so arrays stay same length as OHLCV — TView.tsx maps by index
   const result: IndicatorData = {
-    ma7: sma(closes, 7).filter((v): v is number => v !== null),
-    ma25: sma(closes, 25).filter((v): v is number => v !== null),
+    ma7: sma(closes, 7),
+    ma25: sma(closes, 25),
   };
 
-  // Only compute ma99 if we have enough data points
   if (closes.length >= 99) {
-    result.ma99 = sma(closes, 99).filter((v): v is number => v !== null);
+    result.ma99 = sma(closes, 99);
   }
 
   return result;

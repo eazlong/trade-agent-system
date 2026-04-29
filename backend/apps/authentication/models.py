@@ -24,6 +24,12 @@ class User(AbstractBaseUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
     username = models.CharField(max_length=64, unique=True)
+    telegram_id = models.CharField(
+        max_length=64, null=True, blank=True, verbose_name="Telegram User ID"
+    )
+    telegram_chat_id = models.BigIntegerField(
+        null=True, blank=True, verbose_name="Telegram Chat ID"
+    )
     is_active = models.BooleanField(default=True)
     is_frozen = models.BooleanField(default=False)  # 风控冻结
     is_admin = models.BooleanField(default=False)

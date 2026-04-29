@@ -1,0 +1,20 @@
+- generic [active] [ref=e1]:
+  - button "Open Next.js Dev Tools" [ref=e7] [cursor=pointer]:
+    - img [ref=e8]
+  - alert [ref=e11]
+  - generic [ref=e14]:
+    - generic [ref=e15]:
+      - img [ref=e17]
+      - generic [ref=e20]:
+        - generic [ref=e21]: TradeClaw
+        - generic [ref=e22]: Agent OS · v2.4.1
+    - heading "登录系统" [level=2] [ref=e23]
+    - generic [ref=e24]:
+      - generic [ref=e25]:
+        - generic [ref=e26]: 邮箱
+        - textbox "输入邮箱" [ref=e27]
+      - generic [ref=e28]:
+        - generic [ref=e29]: 密码
+        - textbox "输入密码" [ref=e30]
+      - button "登录" [ref=e31] [cursor=pointer]
+    - generic [ref=e32]: 需要账号？请联系管理员注册

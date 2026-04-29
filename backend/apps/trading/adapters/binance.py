@@ -36,7 +36,7 @@ class BinanceAdapter(BaseExchangeAdapter):
     def __init__(self, api_key: str, secret: str, testnet: bool = False):
         super().__init__(api_key, secret)
         if testnet:
-            self.BASE_URL = "https://testnet.binancefuture.com"
+            self.BASE_URL = "https://demo-fapi.binance.com"
         self._client: Optional[httpx.AsyncClient] = None
 
     async def connect(self) -> None:
@@ -54,8 +54,12 @@ class BinanceAdapter(BaseExchangeAdapter):
             await self._client.aclose()
             self._client = None
 
-    def _sign(self, params: dict) -> dict:
-        """HMAC SHA256 签名"""
+    def _sign(self, params: dict) -> str:
+        """HMAC SHA256 签名，返回完整查询字符串。
+
+        返回已签名的 query string，可直接拼接在 URL 后。
+        避免 httpx 重排 params 导致签名失效。
+        """
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 5000
@@ -65,8 +69,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             query.encode(),
             hashlib.sha256,
         ).hexdigest()
-        params["signature"] = signature
-        return params
+        return f"{query}&signature={signature}"
 
     def _ensure_connected(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -91,8 +94,8 @@ class BinanceAdapter(BaseExchangeAdapter):
             params["stopPrice"] = str(request.stop_loss)
             params["workType"] = "STOP"
 
-        params = self._sign(params)
-        resp = await client.post("/fapi/v1/order", data=params)
+        query = self._sign(params)
+        resp = await client.post(f"/fapi/v1/order?{query}")
         resp.raise_for_status()
         data = resp.json()
 
@@ -108,20 +111,20 @@ class BinanceAdapter(BaseExchangeAdapter):
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
         client = self._ensure_connected()
 
-        params = self._sign(
+        query = self._sign(
             {
                 "symbol": symbol.upper(),
                 "orderId": exchange_order_id,
             }
         )
-        resp = await client.delete("/fapi/v1/order", data=params)
+        resp = await client.delete(f"/fapi/v1/order?{query}")
         return resp.status_code == 200
 
     async def get_positions(self) -> list[Position]:
         client = self._ensure_connected()
 
-        params = self._sign({})
-        resp = await client.get("/fapi/v2/positionRisk", params=params)
+        query = self._sign({})
+        resp = await client.get(f"/fapi/v2/positionRisk?{query}")
         resp.raise_for_status()
 
         positions = []
@@ -141,10 +144,34 @@ class BinanceAdapter(BaseExchangeAdapter):
         return positions
 
     async def get_balance(self) -> dict[str, Decimal]:
+        """获取账户余额（USDS-M Futures）。
+
+        /fapi/v2/balance 返回格式: [{asset, balance, walletBalance, ...}]
+        Demo 环境使用 v2 端点。
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
         client = self._ensure_connected()
 
-        params = self._sign({"accountType": "UMFUTURE"})
-        resp = await client.get("/fapi/v2/balance", params=params)
-        resp.raise_for_status()
+        query = self._sign({})
+        resp = await client.get(f"/fapi/v2/balance?{query}")
 
-        return {b["asset"]: Decimal(b["balance"]) for b in resp.json()}
+        if resp.status_code != 200:
+            logger.error(f"Binance balance API error: {resp.status_code} - {resp.text}")
+            resp.raise_for_status()
+
+        data = resp.json()
+
+        # v2 返回数组格式: [{asset, balance, walletBalance, ...}]
+        if isinstance(data, list):
+            result = {}
+            for b in data:
+                asset = b.get("asset", "USDT")
+                balance_val = b.get("balance") or b.get("walletBalance") or "0"
+                result[asset] = Decimal(balance_val)
+            return result
+
+        # 兼容对象格式
+        balance_info = data.get("balance", {})
+        return {"USDT": Decimal(balance_info.get("walletBalance", "0"))}

@@ -11,6 +11,9 @@ class DataSourceConfig(AppConfig):
     verbose_name = "数据源管理"
 
     def ready(self):
-        # 懒加载初始化 - 不在此处主动加载任何数据源
-        # 数据源按需加载，首次调用 DataSourceRegistry.get() 时才实例化
-        pass
+        # 导入所有数据源模块，触发 @DataSourceRegistry.register 装饰器注册
+        # 数据源实例仍然懒加载，首次调用 DataSourceRegistry.get() 时才实例化
+        from apps.datasource.sources import (  # noqa: F401
+            BinanceDataSource,
+            CNStockDataSource,
+        )

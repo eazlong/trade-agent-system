@@ -3,11 +3,14 @@ from .models import BacktestResult, BacktestTrade
 
 
 class BacktestResultSerializer(serializers.ModelSerializer):
+    strategy_name = serializers.CharField(source="strategy.name", read_only=True)
+
     class Meta:
         model = BacktestResult
         fields = [
             "id",
             "strategy",
+            "strategy_name",
             "symbol",
             "timeframe",
             "start_date",
@@ -52,21 +55,26 @@ class BacktestTradeSerializer(serializers.ModelSerializer):
             "commission",
             "signal",
             "exit_reason",
+            "trade_type",
         ]
         read_only_fields = ["id"]
 
 
 class BacktestDetailSerializer(serializers.ModelSerializer):
-    """Full detail serializer: summary + equity_curve + drawdown_curve."""
+    """Full detail serializer: summary + equity_curve + drawdown_curve + ohlcv + indicators."""
 
     equity_curve = serializers.JSONField(read_only=True)
     drawdown_curve = serializers.JSONField(read_only=True)
+    ohlcv_data = serializers.JSONField(read_only=True)
+    indicator_data = serializers.JSONField(read_only=True)
+    strategy_name = serializers.CharField(source="strategy.name", read_only=True)
 
     class Meta:
         model = BacktestResult
         fields = [
             "id",
             "strategy",
+            "strategy_name",
             "symbol",
             "timeframe",
             "start_date",
@@ -82,6 +90,11 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
             "parameters",
             "equity_curve",
             "drawdown_curve",
+            "ohlcv_data",
+            "indicator_data",
+            "review_status",
+            "review_notes",
+            "reviewed_at",
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]

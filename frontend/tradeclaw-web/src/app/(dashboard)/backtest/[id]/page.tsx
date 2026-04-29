@@ -15,7 +15,7 @@ import {
   type ExchangeAccount,
 } from "@/lib/api";
 import { resampleOHLCV, computeIndicators, timeframeToMinutes } from "@/lib/resample";
-import CandlestickChart from "@/components/backtest/CandlestickChart";
+import TView from "@/components/backtest/TView";
 import EquityChart from "@/components/backtest/EquityChart";
 import DrawdownChart from "@/components/backtest/DrawdownChart";
 import TradeLog from "@/components/backtest/TradeLog";
@@ -43,6 +43,10 @@ export default function BacktestDetailPage() {
   const [reviewNotes, setReviewNotes] = useState("");
   const [reviewLoading, setReviewLoading] = useState(false);
 
+  // ── Rerun ──
+  const [rerunLoading, setRerunLoading] = useState(false);
+  const [rerunMessage, setRerunMessage] = useState<string | null>(null);
+
   // ── Deploy ──
   const [deployOpen, setDeployOpen] = useState(false);
   const [deployLoading, setDeployLoading] = useState(false);
@@ -56,6 +60,59 @@ export default function BacktestDetailPage() {
   const [activeTf, setActiveTf] = useState<string | null>(null);
   const [tfCache, setTfCache] = useState<Record<string, CachedTimeframeData>>({});
   const [tfLoading, setTfLoading] = useState(false);
+
+  // ── Lazy-loaded full OHLCV data ──
+  const [fullOhlcv, setFullOhlcv] = useState<OHLCVPoint[]>([]);
+  const [fullIndicators, setFullIndicators] = useState<IndicatorData>({});
+
+  /** Load more OHLCV bars from server (lazy loading)
+   * Backend stores oldest-first (index 0 = oldest, index n = newest).
+   * Initial data is slice [:200] = oldest 200 bars.
+   * Lazy load slice [loadedCount:nextEnd] = newer bars.
+   * Both are oldest-first, so we append (not prepend/reverse).
+   */
+  const loadMoreOhlcv = useCallback(
+    (start: number, end: number) => {
+      backtestApi.getOHLCVRange(id, start, end).then((res) => {
+        setFullOhlcv((prev) => {
+          // Initialize empty if needed
+          if (prev.length === 0) {
+            // Start with initial detail data, will be merged in currentData
+            return res.ohlcv_data;
+          }
+          // Backend returns oldest-first slice, append to existing oldest-first data
+          if (res.start >= prev.length) {
+            return [...prev, ...res.ohlcv_data];
+          }
+          return prev;
+        });
+        setFullIndicators((prev) => {
+          if (Object.keys(prev).length === 0) {
+            return res.indicator_data;
+          }
+          const merged: Record<string, unknown> = { ...prev };
+          for (const [key, value] of Object.entries(res.indicator_data)) {
+            const existing = merged[key];
+            if (Array.isArray(value)) {
+              merged[key] = Array.isArray(existing) ? [...existing, ...value] : value;
+            } else if (typeof value === "object" && value !== null) {
+              const obj: Record<string, unknown> = (existing as Record<string, unknown>) ?? {};
+              for (const [k2, v2] of Object.entries(value)) {
+                const arr = v2 as unknown[];
+                const existingArr = obj[k2] as unknown[];
+                obj[k2] = Array.isArray(arr)
+                  ? Array.isArray(existingArr) ? [...existingArr, ...arr] : arr
+                  : v2;
+              }
+              merged[key] = obj;
+            }
+          }
+          return merged as IndicatorData;
+        });
+      });
+    },
+    [id]
+  );
 
   /** Resample data for target timeframe, using cache if available */
   const switchTimeframe = useCallback(
@@ -97,16 +154,101 @@ export default function BacktestDetailPage() {
     }
   }, [detail, activeTf]);
 
+  /** Merge two indicator data objects */
+  const mergeIndicators = useCallback((a: IndicatorData, b: IndicatorData): IndicatorData => {
+    const merged: Record<string, unknown> = { ...a };
+    for (const [key, value] of Object.entries(b)) {
+      if (Array.isArray(value)) {
+        const existing = merged[key];
+        merged[key] = Array.isArray(existing) ? [...existing, ...value] : value;
+      } else if (typeof value === "object" && value !== null) {
+        const existingObj: Record<string, unknown> = (merged[key] as Record<string, unknown>) ?? {};
+        for (const [k2, v2] of Object.entries(value)) {
+          if (Array.isArray(v2)) {
+            const existing2 = existingObj[k2];
+            existingObj[k2] = Array.isArray(existing2) ? [...existing2, ...v2] : v2;
+          }
+        }
+        merged[key] = existingObj;
+      }
+    }
+    return merged as IndicatorData;
+  }, []);
+
+  /** Sort indicator arrays to match sorted OHLCV order */
+  const sortIndicators = useCallback((indicators: IndicatorData, sortIndices: number[]): IndicatorData => {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(indicators)) {
+      if (Array.isArray(value)) {
+        result[key] = sortIndices.map(i => value[i]);
+      } else if (typeof value === "object" && value !== null) {
+        const obj: Record<string, unknown> = {};
+        for (const [k2, v2] of Object.entries(value)) {
+          if (Array.isArray(v2)) {
+            obj[k2] = sortIndices.map(i => v2[i]);
+          } else {
+            obj[k2] = v2;
+          }
+        }
+        result[key] = obj;
+      } else {
+        result[key] = value;
+      }
+    }
+    return result as IndicatorData;
+  }, []);
+
   /** Current OHLCV + indicators for the active timeframe */
   const currentData = useMemo((): { ohlcv: OHLCVPoint[]; indicators: IndicatorData } => {
     if (!activeTf || !detail) return { ohlcv: [], indicators: {} };
-    // Base timeframe: use original data
+    // Base timeframe: merge initial data with lazy-loaded data
     if (activeTf === detail.timeframe) {
-      return { ohlcv: detail.ohlcv_data, indicators: detail.indicator_data };
+      const initialBars = detail.ohlcv_data ?? [];
+      let ohlcv = fullOhlcv.length > 0
+        ? [...initialBars, ...fullOhlcv]
+        : initialBars;
+      let indicators = detail.indicator_data;
+
+      // Merge indicators if lazy-loaded
+      if (Object.keys(fullIndicators).length > 0) {
+        indicators = mergeIndicators(detail.indicator_data, fullIndicators);
+      }
+
+      // Sort by timestamp to ensure ascending order (oldest-first)
+      // Create sort indices to sync indicators with sorted OHLCV
+      const indexed = ohlcv.map((p, i) => ({
+        ts: new Date(p.timestamp).getTime(),
+        idx: i,
+      }));
+      indexed.sort((a, b) => a.ts - b.ts);
+      const sortIndices = indexed.map(x => x.idx);
+      ohlcv = sortIndices.map(i => ohlcv[i]);
+
+      // Sync indicators to sorted order
+      indicators = sortIndicators(indicators, sortIndices);
+
+      // Deduplicate by timestamp to keep OHLCV and indicators in sync
+      const seenTs = new Set<number>();
+      const keepIndices: number[] = [];
+      const dedupedOhlcv: OHLCVPoint[] = [];
+      for (let i = 0; i < ohlcv.length; i++) {
+        const ts = new Date(ohlcv[i].timestamp).getTime();
+        if (!seenTs.has(ts)) {
+          seenTs.add(ts);
+          keepIndices.push(i);
+          dedupedOhlcv.push(ohlcv[i]);
+        }
+      }
+      if (keepIndices.length < ohlcv.length) {
+        ohlcv = dedupedOhlcv;
+        indicators = sortIndicators(indicators, keepIndices);
+      }
+
+      return { ohlcv, indicators };
     }
     // Resampled timeframe: use cache
     return tfCache[activeTf] ?? { ohlcv: [], indicators: {} };
-  }, [activeTf, detail, tfCache]);
+  }, [activeTf, detail, tfCache, fullOhlcv, fullIndicators, mergeIndicators, sortIndicators]);
 
   // Determine which timeframes to show (only >= base timeframe)
   const availableTimeframes = useMemo(() => {
@@ -145,6 +287,23 @@ export default function BacktestDetailPage() {
       setReviewNotes("");
     } finally {
       setReviewLoading(false);
+    }
+  };
+
+  const handleRerun = async () => {
+    setRerunLoading(true);
+    setRerunMessage(null);
+    try {
+      const result = await backtestApi.rerun(id);
+      setRerunMessage(result.message);
+      // Refresh detail after a short delay to allow Celery to process
+      setTimeout(async () => {
+        setDetail(await backtestApi.getFullDetail(id));
+      }, 3000);
+    } catch (e) {
+      setRerunMessage(e instanceof Error ? e.message : "重新回测失败");
+    } finally {
+      setRerunLoading(false);
     }
   };
 
@@ -242,7 +401,7 @@ export default function BacktestDetailPage() {
           },
           {
             label: "胜率",
-            value: detail.win_rate ? `${detail.win_rate.toFixed(1)}%` : "—",
+            value: detail.win_rate != null ? `${(detail.win_rate * 100).toFixed(1)}%` : "—",
           },
         ].map((m, i) => (
           <div
@@ -262,77 +421,92 @@ export default function BacktestDetailPage() {
       {/* Review & Deploy Section */}
       {detail && (
         <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl px-4 py-3 mb-4">
-          <div className="flex items-center gap-3 mb-3">
-            <span className="text-[10px] text-text3 uppercase tracking-wider font-semibold">审核状态</span>
-            <span
-              className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                detail.review_status === "approved"
-                  ? "bg-green-dim text-green"
-                  : detail.review_status === "rejected"
-                    ? "bg-red-dim text-red"
-                    : "bg-amber-dim text-amber"
-              }`}
-            >
-              {detail.review_status === "approved" ? "已通过" : detail.review_status === "rejected" ? "已拒绝" : "待审核"}
-            </span>
-            {detail.reviewed_at && (
-              <span className="text-[10px] text-text3">{fmtDate(detail.reviewed_at)}</span>
-            )}
-          </div>
-
-          {/* Pending: show review form */}
-          {detail.review_status === "pending" && (
-            <div className="flex flex-col gap-2">
-              <textarea
-                value={reviewNotes}
-                onChange={(e) => setReviewNotes(e.target.value)}
-                placeholder="审核备注（可选）"
-                className="bg-bg2 border border-[rgba(255,255,255,0.1)] rounded-lg px-3 py-2 text-xs text-text placeholder:text-text3 focus:outline-none focus:border-green/30 resize-none"
-                rows={2}
-              />
-              <div className="flex gap-2">
-                <button
-                  onClick={() => handleReview(true)}
-                  disabled={reviewLoading}
-                  className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {reviewLoading ? "审核中..." : "通过审核"}
-                </button>
-                <button
-                  onClick={() => handleReview(false)}
-                  disabled={reviewLoading}
-                  className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-red/20 bg-red-dim text-red hover:bg-red-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {reviewLoading ? "审核中..." : "拒绝审核"}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Approved: show deploy button */}
-          {detail.review_status === "approved" && (
+          {/* Top row: status badge left, buttons right */}
+          <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">
-              <button
-                onClick={() => {
-                  setDeployOpen(true);
-                  setDeployError(null);
-                  setDeploySuccess(null);
-                }}
-                className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80"
+              <span className="text-[10px] text-text3 uppercase tracking-wider font-semibold">审核状态</span>
+              <span
+                className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                  detail.review_status === "approved"
+                    ? "bg-green-dim text-green"
+                    : detail.review_status === "rejected"
+                      ? "bg-red-dim text-red"
+                      : "bg-amber-dim text-amber"
+                }`}
               >
-                部署策略
-              </button>
-              {detail.review_notes && (
-                <span className="text-[10px] text-text3">备注：{detail.review_notes}</span>
+                {detail.review_status === "approved" ? "已通过" : detail.review_status === "rejected" ? "已拒绝" : "待审核"}
+              </span>
+              {detail.reviewed_at && (
+                <span className="text-[10px] text-text3">{fmtDate(detail.reviewed_at)}</span>
               )}
             </div>
+
+            {/* Right side: action buttons */}
+            <div className="flex items-center gap-2">
+              {/* Rerun button: always visible */}
+              <button
+                onClick={handleRerun}
+                disabled={rerunLoading}
+                className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-[rgba(255,255,255,0.1)] text-text3 hover:text-text hover:border-[rgba(255,255,255,0.2)] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {rerunLoading ? "回测中..." : "重新回测"}
+              </button>
+
+              {/* Pending: review buttons */}
+              {detail.review_status === "pending" && (
+                <>
+                  <button
+                    onClick={() => handleReview(true)}
+                    disabled={reviewLoading}
+                    className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {reviewLoading ? "审核中..." : "通过审核"}
+                  </button>
+                  <button
+                    onClick={() => handleReview(false)}
+                    disabled={reviewLoading}
+                    className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-red/20 bg-red-dim text-red hover:bg-red-dim/80 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {reviewLoading ? "审核中..." : "拒绝审核"}
+                  </button>
+                </>
+              )}
+
+              {/* Approved: deploy button */}
+              {detail.review_status === "approved" && (
+                <button
+                  onClick={() => {
+                    setDeployOpen(true);
+                    setDeployError(null);
+                    setDeploySuccess(null);
+                  }}
+                  className="px-4 py-1.5 rounded-md text-xs font-semibold cursor-pointer border border-green/20 bg-green-dim text-green hover:bg-green-dim/80"
+                >
+                  部署策略
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Notes display for rejected/approved */}
+          {detail.review_notes && detail.review_status !== "pending" && (
+            <div className="text-[10px] text-text3 mb-2">备注：{detail.review_notes}</div>
           )}
 
-          {/* Rejected */}
-          {detail.review_status === "rejected" && (
-            <div className="text-[10px] text-text3">
-              {detail.review_notes && <span>备注：{detail.review_notes}</span>}
-            </div>
+          {/* Pending: show review notes textarea */}
+          {detail.review_status === "pending" && (
+            <textarea
+              value={reviewNotes}
+              onChange={(e) => setReviewNotes(e.target.value)}
+              placeholder="审核备注（可选）"
+              className="bg-bg2 border border-[rgba(255,255,255,0.1)] rounded-lg px-3 py-2 text-xs text-text placeholder:text-text3 focus:outline-none focus:border-green/30 resize-none"
+              rows={2}
+            />
+          )}
+
+          {/* Rerun message */}
+          {rerunMessage && (
+            <div className="mt-2 text-[10px] text-green">{rerunMessage}</div>
           )}
         </div>
       )}
@@ -388,7 +562,7 @@ export default function BacktestDetailPage() {
                 <option value="">请选择...</option>
                 {accounts.map((acc) => (
                   <option key={acc.id} value={acc.id}>
-                    {acc.exchange} · {acc.label || acc.id.slice(0, 8)} {acc.testnet ? "(模拟)" : ""}
+                    {acc.exchange} · {acc.label || acc.id.slice(0, 8)} {acc.testnet_status ? "(模拟)" : ""}
                   </option>
                 ))}
               </select>
@@ -452,13 +626,15 @@ export default function BacktestDetailPage() {
               </div>
             )}
             {!tfLoading && (
-              <CandlestickChart
+              <TView
                 ohlcv={currentData.ohlcv}
                 indicators={currentData.indicators}
                 trades={trades}
-                timeframe={activeTf}
-                availableTimeframes={availableTimeframes}
+                timeframe={activeTf ?? undefined}
+                availableTimeframes={[...availableTimeframes]}
                 onTimeframeChange={switchTimeframe}
+                totalBars={detail.ohlcv_total ?? currentData.ohlcv.length}
+                onLoadMore={activeTf === detail.timeframe ? loadMoreOhlcv : undefined}
               />
             )}
           </>

@@ -6,11 +6,8 @@ import PnLChart from "@/components/dashboard/PnLChart";
 import AgentCards from "@/components/dashboard/AgentCards";
 import SignalList from "@/components/dashboard/SignalList";
 import LogList from "@/components/dashboard/LogList";
-import CreateStrategyModal from "@/components/dashboard/CreateStrategyModal";
-import { useState } from "react";
 
 export default function OverviewPage() {
-  const [modalOpen, setModalOpen] = useState(false);
 
   return (
     <DashboardShell>
@@ -63,10 +60,10 @@ export default function OverviewPage() {
         </div>
       </div>
 
-      {/* Signals + Logs */}
-      <div className="grid grid-cols-2 gap-3">
+      {/* Signals + Logs — stretches to fill remaining height */}
+      <div className="grid grid-cols-2 gap-3 flex-1 min-h-0">
         {/* Signal Queue */}
-        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden">
+        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden flex flex-col">
           <div className="px-4 py-3 border-b border-[rgba(255,255,255,0.07)] flex items-center justify-between">
             <div className="text-xs font-semibold flex items-center gap-2">
               <svg width="12" height="12" viewBox="0 0 12 12">
@@ -78,11 +75,13 @@ export default function OverviewPage() {
               7 待处理
             </span>
           </div>
-          <SignalList />
+          <div className="flex-1 min-h-0 overflow-y-auto">
+            <SignalList />
+          </div>
         </div>
 
         {/* Log */}
-        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden">
+        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden flex flex-col">
           <div className="px-4 py-3 border-b border-[rgba(255,255,255,0.07)] flex items-center justify-between">
             <div className="text-xs font-semibold flex items-center gap-2">
               <svg width="12" height="12" viewBox="0 0 12 12">
@@ -96,21 +95,11 @@ export default function OverviewPage() {
               实时
             </span>
           </div>
-          <div className="px-3 py-2.5 max-h-40 overflow-y-auto">
+          <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2.5">
             <LogList />
           </div>
         </div>
       </div>
-
-      <CreateStrategyModal open={modalOpen} onClose={() => setModalOpen(false)} />
-
-      {/* Floating action button */}
-      <button
-        onClick={() => setModalOpen(true)}
-        className="fixed bottom-6 right-[310px] bg-green text-black text-xs font-semibold px-4 py-2 rounded-lg shadow-lg hover:opacity-85 transition-all cursor-pointer z-40"
-      >
-        + 新建策略
-      </button>
     </DashboardShell>
   );
 }

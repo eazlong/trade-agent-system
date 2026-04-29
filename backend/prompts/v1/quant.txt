@@ -1,6 +1,6 @@
 ---
 name: quant
-intent: generate_and_test_strategy
+intent: [generate_and_test_strategy, manage_backtest_task]
 tools: [fetch_ohlcv, calculate_indicators, read_file, write_file, web_search, submit_backtest, get_task_result, load_skill]
 context_fields: []
 ---

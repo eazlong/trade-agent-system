@@ -21,13 +21,24 @@ from apps.signal_monitor.indicators import (
 )
 
 
-def _extract_closes(history: list[dict]) -> np.ndarray:
-    """从 K 线历史中提取收盘价数组"""
+def _extract_closes(history: list[dict] | np.ndarray | list[float]) -> np.ndarray:
+    """从 K 线历史中提取收盘价数组，兼容多种输入格式"""
+    if isinstance(history, np.ndarray):
+        return history.astype(np.float64)
+    if isinstance(history, list) and len(history) > 0:
+        # 如果已经是数字列表（如 [42345.67, 42400.12, ...]），直接转数组
+        if isinstance(history[0], (int, float)):
+            return np.array(history, dtype=np.float64)
     return np.array([k["close"] for k in history], dtype=np.float64)
 
 
 def _extract_hl(history: list[dict]):
     """从 K 线历史中提取 high/low 数组"""
+    if isinstance(history, np.ndarray):
+        raise TypeError(
+            "此指标函数需要 K 线 dict 列表（含 high/low 字段），"
+            "不能直接传 np.ndarray。如需传入收盘价数组，请使用对应独立函数。"
+        )
     highs = np.array([k["high"] for k in history], dtype=np.float64)
     lows = np.array([k["low"] for k in history], dtype=np.float64)
     return highs, lows
@@ -83,10 +94,49 @@ def bollinger(
     return _compute_bollinger(_extract_closes(history), period, std_dev)
 
 
-def atr(history: list[dict], period: int = 14) -> np.ndarray:
-    """平均真实波幅"""
-    highs, lows = _extract_hl(history)
-    return _compute_atr(highs, lows, _extract_closes(history), period)
+def atr(
+    highs_or_history: list[dict] | np.ndarray,
+    period_or_lows: int | np.ndarray = 14,
+    closes: np.ndarray | None = None,
+    period: int = 14,
+) -> np.ndarray:
+    """平均真实波幅
+
+    支持两种调用方式：
+    1. atr(history, period) — history 为 K 线 dict 列表
+    2. atr(highs, lows, closes, period=N) — 直接传入 high/low/close 数组
+    """
+    # 判断是 K 线 dict 列表还是数组形式
+    # 如果是 np.ndarray，或 list 且元素为数字（非 dict），则为数组/三数组形式
+    is_array_form = isinstance(highs_or_history, np.ndarray) or (
+        isinstance(highs_or_history, list)
+        and len(highs_or_history) > 0
+        and isinstance(highs_or_history[0], (int, float))
+    )
+
+    if is_array_form:
+        if closes is not None:
+            # 三数组形式：atr(highs, lows, closes, period=N)
+            # period 始终来自 keyword 参数
+            h = highs_or_history if isinstance(highs_or_history, np.ndarray) else np.array(highs_or_history, dtype=np.float64)
+            lo = period_or_lows if isinstance(period_or_lows, np.ndarray) else np.array(period_or_lows, dtype=np.float64)
+            c = closes if isinstance(closes, np.ndarray) else np.array(closes, dtype=np.float64)
+            return _compute_atr(h, lo, c, period)
+        # 两数组形式：atr(highs_array, lows_array)
+        p = period_or_lows if isinstance(period_or_lows, int) else period
+        empty = np.array([])
+        h = highs_or_history if isinstance(highs_or_history, np.ndarray) else np.array(highs_or_history, dtype=np.float64)
+        lo = period_or_lows if isinstance(period_or_lows, np.ndarray) else empty
+        return _compute_atr(h, lo, empty, p)
+
+    # 默认 atr(history, period)
+    if closes is not None:
+        raise TypeError(
+            "当第一个参数为 K 线 dict 列表时，不能传入 closes 作为位置参数"
+        )
+    h, lo = _extract_hl(highs_or_history)
+    p = period_or_lows if isinstance(period_or_lows, int) else period
+    return _compute_atr(h, lo, _extract_closes(highs_or_history), p)
 
 
 def stoch(

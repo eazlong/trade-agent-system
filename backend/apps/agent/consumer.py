@@ -38,8 +38,8 @@ class AgentTaskConsumer:
             self._poll_task.cancel()
             try:
                 await self._poll_task
-            except asyncio.CancelledError:
-                logger.info("[AgentTaskConsumer] Polling task cancelled")
+            except (asyncio.CancelledError, RuntimeError):
+                pass
         if self._handle_tasks:
             for t in list(self._handle_tasks):
                 t.cancel()
@@ -61,11 +61,17 @@ class AgentTaskConsumer:
                     self._handle_tasks.add(task)
                     task.add_done_callback(self._handle_tasks.discard)
             except asyncio.CancelledError:
-                logger.info("[AgentTaskConsumer] Poll loop cancelled")
+                break
+            except GeneratorExit:
+                break
+            except RuntimeError:
                 break
             except Exception as e:
                 logger.error("[AgentTaskConsumer] poll error: %s", e)
-                await asyncio.sleep(1)
+                try:
+                    await asyncio.sleep(1)
+                except (asyncio.CancelledError, RuntimeError):
+                    break
 
     async def _handle(self, msg_id: str, fields: dict) -> None:
         async with self._semaphore:
