@@ -95,7 +95,6 @@ class SignalDispatcher:
         riskguard = RiskGuard.get_instance()
         if riskguard:
             from apps.trading.adapters.base import OrderRequest
-            from decimal import Decimal
 
             request = OrderRequest(
                 exchange=signal.exchange,

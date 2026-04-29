@@ -384,12 +384,6 @@ class BinanceDataSource(BaseDataSource):
             # 初始化 CCXT 客户端
             await self._init_ccxt(market_type)
 
-            client = (
-                self._ccxt_spot
-                if market_type == MarketType.SPOT
-                else self._ccxt_futures
-            )
-
             # 参数
             params = {
                 "symbol": symbol.replace("/", ""),  # Binance 格式

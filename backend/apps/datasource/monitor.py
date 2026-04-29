@@ -267,7 +267,7 @@ class DataQualityMonitor:
                     report.avg_latency_ms = statistics.mean(latencies)
                     report.max_latency_ms = max(latencies)
                     report.latency_violations = sum(
-                        1 for l in latencies if l > self.LATENCY_THRESHOLD
+                        1 for lat in latencies if lat > self.LATENCY_THRESHOLD
                     )
 
                     if report.avg_latency_ms > self.LATENCY_THRESHOLD:

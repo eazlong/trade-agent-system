@@ -8,7 +8,6 @@ import time
 from .base import BaseAgent, AgentMessage, AgentResult
 from .llm_client import LLMClient
 from .prompt_loader import PromptLoader
-from .registry import AgentRegistry
 
 logger = logging.getLogger(__name__)
 

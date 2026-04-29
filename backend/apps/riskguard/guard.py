@@ -196,6 +196,8 @@ class RiskGuard:
 
         @sync_to_async
         def get_today_pnl():
+            from apps.trading.models import Order
+
             result = Order.objects.filter(
                 user_id=user_id,
                 status="filled",

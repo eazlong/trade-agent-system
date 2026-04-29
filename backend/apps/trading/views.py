@@ -216,7 +216,6 @@ def live_session_create(request):
     """
     from apps.backtest.models import BacktestResult
     from apps.exchange.models import ExchangeAccount
-    from apps.strategy_engine.runner import StrategyRunner
 
     backtest_id = request.data.get("backtest_result_id")
     mode = request.data.get("mode", "paper")

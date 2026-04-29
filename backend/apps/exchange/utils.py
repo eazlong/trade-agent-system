@@ -68,7 +68,7 @@ def verify_exchange_connection(account_id: str) -> bool:
         exchange_class.secret = account.decrypt_api_secret()
 
         # 尝试获取账户信息验证连接
-        balance = exchange_class.fetch_balance()
+        exchange_class.fetch_balance()
         return True
     except Exception:
         return False
