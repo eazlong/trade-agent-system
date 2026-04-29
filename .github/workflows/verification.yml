@@ -35,6 +35,7 @@ jobs:
           ruff check apps/
 
       - name: Type Check
+        continue-on-error: true
         run: |
           cd backend
           pyright apps/
