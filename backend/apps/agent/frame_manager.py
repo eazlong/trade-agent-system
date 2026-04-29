@@ -165,13 +165,21 @@ class FrameManager:
             data_feed_refs_persisted = self._data_feed_refs
 
         return {
-            "trading": self._trading_state.value if hasattr(self._trading_state, "value") else self._trading_state,
-            "assist": self._assist_state.value if hasattr(self._assist_state, "value") else self._assist_state,
-            "risk_guard": "running" if self._risk_guard_refs > 0 or risk_refs_persisted > 0 else "stopped",
+            "trading": self._trading_state.value
+            if hasattr(self._trading_state, "value")
+            else self._trading_state,
+            "assist": self._assist_state.value
+            if hasattr(self._assist_state, "value")
+            else self._assist_state,
+            "risk_guard": "running"
+            if self._risk_guard_refs > 0 or risk_refs_persisted > 0
+            else "stopped",
             "order_executor": "running"
             if self._order_executor is not None or order_exec_persisted
             else "stopped",
-            "data_feed": "running" if self._data_feed_refs > 0 or data_feed_refs_persisted > 0 else "stopped",
+            "data_feed": "running"
+            if self._data_feed_refs > 0 or data_feed_refs_persisted > 0
+            else "stopped",
         }
 
     # --- Trading Frame ---

@@ -4,68 +4,81 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('backtest', '0003_add_ohlcv_and_indicators'),
+        ("backtest", "0003_add_ohlcv_and_indicators"),
     ]
 
     operations = [
         migrations.RemoveIndex(
-            model_name='backtesttrade',
-            name='backtest_tr_backtes_29c5f0_idx',
+            model_name="backtesttrade",
+            name="backtest_tr_backtes_29c5f0_idx",
         ),
         migrations.RemoveIndex(
-            model_name='backtesttrade',
-            name='backtest_tr_backtes_27cd7e_idx',
+            model_name="backtesttrade",
+            name="backtest_tr_backtes_27cd7e_idx",
         ),
         migrations.RemoveField(
-            model_name='backtesttrade',
-            name='created_at',
+            model_name="backtesttrade",
+            name="created_at",
         ),
         migrations.RemoveField(
-            model_name='backtesttrade',
-            name='cumulative_pnl',
+            model_name="backtesttrade",
+            name="cumulative_pnl",
         ),
         migrations.RemoveField(
-            model_name='backtesttrade',
-            name='fees',
+            model_name="backtesttrade",
+            name="fees",
         ),
         migrations.RemoveField(
-            model_name='backtesttrade',
-            name='symbol',
+            model_name="backtesttrade",
+            name="symbol",
         ),
         migrations.RemoveField(
-            model_name='backtesttrade',
-            name='tags',
+            model_name="backtesttrade",
+            name="tags",
         ),
         migrations.AddField(
-            model_name='backtesttrade',
-            name='commission',
-            field=models.DecimalField(blank=True, decimal_places=8, default=0, max_digits=20),
+            model_name="backtesttrade",
+            name="commission",
+            field=models.DecimalField(
+                blank=True, decimal_places=8, default=0, max_digits=20
+            ),
         ),
         migrations.AddField(
-            model_name='backtesttrade',
-            name='exit_reason',
-            field=models.CharField(blank=True, help_text='Why this trade was closed (stop_loss, take_profit, signal, etc.)', max_length=64),
+            model_name="backtesttrade",
+            name="exit_reason",
+            field=models.CharField(
+                blank=True,
+                help_text="Why this trade was closed (stop_loss, take_profit, signal, etc.)",
+                max_length=64,
+            ),
         ),
         migrations.AddField(
-            model_name='backtesttrade',
-            name='signal',
-            field=models.CharField(blank=True, help_text='What signal triggered this trade', max_length=64),
+            model_name="backtesttrade",
+            name="signal",
+            field=models.CharField(
+                blank=True, help_text="What signal triggered this trade", max_length=64
+            ),
         ),
         migrations.AlterField(
-            model_name='backtesttrade',
-            name='id',
-            field=models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID'),
+            model_name="backtesttrade",
+            name="id",
+            field=models.BigAutoField(
+                auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
+            ),
         ),
         migrations.AlterField(
-            model_name='backtesttrade',
-            name='pnl',
-            field=models.DecimalField(blank=True, decimal_places=2, max_digits=20, null=True),
+            model_name="backtesttrade",
+            name="pnl",
+            field=models.DecimalField(
+                blank=True, decimal_places=2, max_digits=20, null=True
+            ),
         ),
         migrations.AlterField(
-            model_name='backtesttrade',
-            name='side',
-            field=models.CharField(choices=[('long', 'Long'), ('short', 'Short')], max_length=5),
+            model_name="backtesttrade",
+            name="side",
+            field=models.CharField(
+                choices=[("long", "Long"), ("short", "Short")], max_length=5
+            ),
         ),
     ]

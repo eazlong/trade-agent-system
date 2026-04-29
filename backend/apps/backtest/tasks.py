@@ -50,7 +50,9 @@ def run_backtest_task(
     from apps.strategy_engine.runner import StrategyRunner
 
     # Setup tracker for progress monitoring
-    tracker = TaskTracker(task_id=self.request.id, user_id=user_id or "", task_type="backtest")
+    tracker = TaskTracker(
+        task_id=self.request.id, user_id=user_id or "", task_type="backtest"
+    )
     token = tracker_context.set(tracker)
     tracker.start(f"开始回测：{symbol} {timeframe}")
 
@@ -62,7 +64,9 @@ def run_backtest_task(
     try:
         # 1. 获取历史 OHLCV 数据
         tracker.milestone("正在获取历史K线数据...", progress=0.1)
-        self.update_state(state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol})
+        self.update_state(
+            state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
+        )
         ohlcv_data = _fetch_ohlcv_sync(symbol, timeframe, exchange)
         if not ohlcv_data:
             tracker.fail(f"未能获取 {symbol} {timeframe} 的历史K线数据")
@@ -148,14 +152,16 @@ def _fetch_ohlcv_sync(
 
         result = []
         for candle in ohlcv:
-            result.append({
-                "timestamp": datetime.fromtimestamp(candle[0] / 1000).isoformat(),
-                "open": float(candle[1]),
-                "high": float(candle[2]),
-                "low": float(candle[3]),
-                "close": float(candle[4]),
-                "volume": float(candle[5]),
-            })
+            result.append(
+                {
+                    "timestamp": datetime.fromtimestamp(candle[0] / 1000).isoformat(),
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": float(candle[5]),
+                }
+            )
 
         return result
 

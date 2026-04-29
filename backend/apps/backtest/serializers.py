@@ -26,7 +26,13 @@ class BacktestResultSerializer(serializers.ModelSerializer):
             "reviewed_at",
             "created_at",
         ]
-        read_only_fields = ["id", "created_at", "review_status", "review_notes", "reviewed_at"]
+        read_only_fields = [
+            "id",
+            "created_at",
+            "review_status",
+            "review_notes",
+            "reviewed_at",
+        ]
 
 
 class BacktestTradeSerializer(serializers.ModelSerializer):

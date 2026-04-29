@@ -6,39 +6,47 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('agent', '0001_initial'),
+        ("agent", "0001_initial"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='TaskProgress',
+            name="TaskProgress",
             fields=[
-                ('id', models.UUIDField(
-                    default=uuid.uuid4,
-                    editable=False,
-                    primary_key=True,
-                    serialize=False,
-                )),
-                ('task_id', models.CharField(
-                    db_index=True,
-                    max_length=128,
-                    unique=True,
-                    verbose_name='Task ID',
-                )),
-                ('task_type', models.CharField(max_length=64)),
-                ('status', models.CharField(max_length=32)),
-                ('progress', models.FloatField(default=0.0)),
-                ('milestones', models.JSONField(default=list, verbose_name='里程碑记录')),
-                ('result', models.TextField(blank=True, default='')),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('completed_at', models.DateTimeField(blank=True, null=True)),
+                (
+                    "id",
+                    models.UUIDField(
+                        default=uuid.uuid4,
+                        editable=False,
+                        primary_key=True,
+                        serialize=False,
+                    ),
+                ),
+                (
+                    "task_id",
+                    models.CharField(
+                        db_index=True,
+                        max_length=128,
+                        unique=True,
+                        verbose_name="Task ID",
+                    ),
+                ),
+                ("task_type", models.CharField(max_length=64)),
+                ("status", models.CharField(max_length=32)),
+                ("progress", models.FloatField(default=0.0)),
+                (
+                    "milestones",
+                    models.JSONField(default=list, verbose_name="里程碑记录"),
+                ),
+                ("result", models.TextField(blank=True, default="")),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("completed_at", models.DateTimeField(blank=True, null=True)),
             ],
             options={
-                'db_table': 'task_progress',
-                'ordering': ['-created_at'],
+                "db_table": "task_progress",
+                "ordering": ["-created_at"],
             },
         ),
     ]

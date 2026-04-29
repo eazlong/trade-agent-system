@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('exchange', '0001_initial'),
+        ("exchange", "0001_initial"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='exchangeaccount',
-            name='testnet',
-            field=models.BooleanField(default=False, help_text='是否为模拟账户'),
+            model_name="exchangeaccount",
+            name="testnet",
+            field=models.BooleanField(default=False, help_text="是否为模拟账户"),
         ),
     ]

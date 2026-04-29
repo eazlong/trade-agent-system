@@ -388,7 +388,9 @@ class SupervisorAgent(BaseAgent):
                         data=new_intent["response"],
                     )
                 return await self._free_chat(message)
-            new_intent_str = new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            new_intent_str = (
+                new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            )
             if new_intent_str and new_intent_str != "free_chat":
                 new_agent = self._router.get_agent_for_intent(new_intent_str)
                 if new_agent and new_agent != agent_name:
@@ -553,7 +555,9 @@ class SupervisorAgent(BaseAgent):
                         data=new_intent["response"],
                     )
                 return await self._free_chat(message)
-            new_intent_str = new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            new_intent_str = (
+                new_intent[0] if isinstance(new_intent, tuple) else new_intent
+            )
             if new_intent_str and new_intent_str != "free_chat":
                 new_agent = self._router.get_agent_for_intent(new_intent_str)
                 if new_agent and new_agent not in attempted:
