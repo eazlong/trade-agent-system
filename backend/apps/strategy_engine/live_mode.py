@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from asgiref.sync import sync_to_async
 
 if TYPE_CHECKING:
     from .base import BaseStrategy, OrderSignal

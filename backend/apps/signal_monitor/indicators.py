@@ -163,9 +163,9 @@ def compute_stoch(
     k_line = np.full_like(closes, np.nan)
     for i in range(k_period - 1, len(closes)):
         h = highs[i - k_period + 1 : i + 1]
-        l = lows[i - k_period + 1 : i + 1]
+        lo = lows[i - k_period + 1 : i + 1]
         highest = np.max(h)
-        lowest = np.min(l)
+        lowest = np.min(lo)
         if highest == lowest:
             k_line[i] = 50.0
         else:

@@ -35,12 +35,12 @@ class TestDataSourceRegistry:
             name = "test_source"
 
         assert "test_source" in DataSourceRegistry.list_registered()
-        assert DataSourceRegistry.is_loaded("test_source") == False
+        assert not DataSourceRegistry.is_loaded("test_source")
 
         # 获取实例（懒加载）
         source = DataSourceRegistry.get("test_source")
         assert source is not None
-        assert DataSourceRegistry.is_loaded("test_source") == True
+        assert DataSourceRegistry.is_loaded("test_source")
 
     def test_unregister_nonexistent(self):
         """测试获取未注册的数据源"""
@@ -59,11 +59,11 @@ class TestDataSourceRegistry:
 
         # 先加载
         DataSourceRegistry.get("test_unload")
-        assert DataSourceRegistry.is_loaded("test_unload") == True
+        assert DataSourceRegistry.is_loaded("test_unload")
 
         # 卸载
         DataSourceRegistry.unload("test_unload")
-        assert DataSourceRegistry.is_loaded("test_unload") == False
+        assert not DataSourceRegistry.is_loaded("test_unload")
 
 
 class TestMemoryDataStore:
@@ -140,7 +140,7 @@ class TestMemoryDataStore:
 
         # 删除
         result = store.delete("ticker", "BTC/USDT", "test_key")
-        assert result == True
+        assert result
 
         # 获取应该为空
         result = store.get("ticker", "BTC/USDT", "test_key")
@@ -204,7 +204,7 @@ class TestDataSubscriptionManager:
 
         # 取消订阅
         result = sub.unsubscribe(sub_id)
-        assert result == True
+        assert result
         assert sub.get_subscription_count(user_id="user1") == 0
 
     def test_get_user_subscriptions(self):

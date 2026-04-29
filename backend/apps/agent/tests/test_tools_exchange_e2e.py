@@ -264,7 +264,7 @@ class TestFrameControlNaturalLanguage(APITestCase):
 
         # 初始化 supervisor 和 frame manager
         supervisor = SupervisorAgent.get_instance()
-        frame = FrameManager.get_instance()
+        FrameManager.get_instance()
 
         # 创建测试消息
         message = AgentMessage(
