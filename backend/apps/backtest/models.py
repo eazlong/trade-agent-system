@@ -95,7 +95,9 @@ class BacktestTrade(models.Model):
         choices=[("long", "Long"), ("short", "Short")],
     )
     entry_price = models.DecimalField(max_digits=20, decimal_places=8)
-    exit_price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
+    exit_price = models.DecimalField(
+        max_digits=20, decimal_places=8, null=True, blank=True
+    )
     quantity = models.DecimalField(max_digits=20, decimal_places=8)
     pnl = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
     pnl_pct = models.FloatField(null=True, blank=True)

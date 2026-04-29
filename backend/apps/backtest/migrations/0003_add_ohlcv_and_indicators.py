@@ -5,38 +5,49 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('backtest', '0002_backtest_detail_data'),
+        ("backtest", "0002_backtest_detail_data"),
     ]
 
     operations = [
         migrations.RemoveIndex(
-            model_name='backtesttrade',
-            name='backtest_tr_bt_id_9f2b4c_idx',
+            model_name="backtesttrade",
+            name="backtest_tr_bt_id_9f2b4c_idx",
         ),
         migrations.RenameIndex(
-            model_name='backtesttrade',
-            new_name='backtest_tr_backtes_29c5f0_idx',
-            old_name='backtest_tr_bt_id_e7a3c1_idx',
+            model_name="backtesttrade",
+            new_name="backtest_tr_backtes_29c5f0_idx",
+            old_name="backtest_tr_bt_id_e7a3c1_idx",
         ),
         migrations.AddField(
-            model_name='backtestresult',
-            name='indicator_data',
-            field=models.JSONField(blank=True, default=dict, help_text='{"ma7": [...], "ma25": [...], "macd": {"dif": [...], "dea": [...], "hist": [...]}, "rsi": [...]}'),
+            model_name="backtestresult",
+            name="indicator_data",
+            field=models.JSONField(
+                blank=True,
+                default=dict,
+                help_text='{"ma7": [...], "ma25": [...], "macd": {"dif": [...], "dea": [...], "hist": [...]}, "rsi": [...]}',
+            ),
         ),
         migrations.AddField(
-            model_name='backtestresult',
-            name='ohlcv_data',
-            field=models.JSONField(blank=True, default=list, help_text='[{"timestamp": "...", "open": x, "high": x, "low": x, "close": x, "volume": x}, ...]'),
+            model_name="backtestresult",
+            name="ohlcv_data",
+            field=models.JSONField(
+                blank=True,
+                default=list,
+                help_text='[{"timestamp": "...", "open": x, "high": x, "low": x, "close": x, "volume": x}, ...]',
+            ),
         ),
         migrations.AlterField(
-            model_name='backtesttrade',
-            name='id',
-            field=models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False),
+            model_name="backtesttrade",
+            name="id",
+            field=models.UUIDField(
+                default=uuid.uuid4, editable=False, primary_key=True, serialize=False
+            ),
         ),
         migrations.AddIndex(
-            model_name='backtesttrade',
-            index=models.Index(fields=['backtest', '-pnl'], name='backtest_tr_backtes_27cd7e_idx'),
+            model_name="backtesttrade",
+            index=models.Index(
+                fields=["backtest", "-pnl"], name="backtest_tr_backtes_27cd7e_idx"
+            ),
         ),
     ]

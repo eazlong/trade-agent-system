@@ -139,9 +139,7 @@ class BaseStrategy(ABC):
         self.ctx = context
 
     @abstractmethod
-    def on_bar(
-        self, kline: dict, history: list[dict]
-    ) -> OrderSignal | None:
+    def on_bar(self, kline: dict, history: list[dict]) -> OrderSignal | None:
         """
         每根 K 线完成时调用。
 

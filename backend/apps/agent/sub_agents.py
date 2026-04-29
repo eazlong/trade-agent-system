@@ -112,7 +112,6 @@ class _LLMAgent(BaseAgent):
             mem_lines = "\n".join(f"- [{m['source']}] {m['content']}" for m in memories)
             system = f"{system}\n\n### 相关记忆\n{mem_lines}"
 
-        
         logger.debug("[%s] Final system prompt:\n%s", self.name, system)
 
         # 获取最近的对话上下文
