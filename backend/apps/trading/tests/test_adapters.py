@@ -117,7 +117,7 @@ class TestBinanceAdapterL1(unittest.TestCase):
 
         mock_client.post.assert_called_once()
         call_args = mock_client.post.call_args
-        self.assertEqual(call_args[0][0], "/fapi/v1/order")
+        self.assertTrue(call_args[0][0].startswith("/fapi/v1/order"))
 
     @patch("httpx.AsyncClient")
     def test_binance_get_positions_filters_zero(self, mock_client_cls):

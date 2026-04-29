@@ -36,6 +36,8 @@ INSTALLED_APPS = [
     'apps.signal_monitor',
     'apps.strategy_engine',
     'apps.logging_app',
+    # Celery beat
+    'django_celery_beat',
 ]
 
 MIDDLEWARE = [
@@ -150,11 +152,11 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get('TELEGRAM_ADMIN_CHAT_ID', '')
 
 # Proxies (each can be set independently; fall back to HTTPS_PROXY / HTTP_PROXY)
-_default_proxy = os.environ.get('HTTPS_PROXY', '') or os.environ.get('HTTP_PROXY', '')
+_default_proxy  = os.environ.get('HTTPS_PROXY', '') or os.environ.get('HTTP_PROXY', '')
 TELEGRAM_PROXY  = os.environ.get('TELEGRAM_PROXY', '') or _default_proxy
 OPENAI_PROXY    = os.environ.get('OPENAI_PROXY', '')   or _default_proxy
 ANTHROPIC_PROXY = os.environ.get('ANTHROPIC_PROXY', '') or _default_proxy
-WEB_PROXY            = os.environ.get('WEB_PROXY', '')           or _default_proxy
+WEB_PROXY       = os.environ.get('WEB_PROXY', '') or _default_proxy
 
 # Web tools
 WEB_SEARCH_PROVIDER  = os.environ.get('WEB_SEARCH_PROVIDER', 'duckduckgo')  # brave|tavily|searxng|jina|duckduckgo
@@ -196,9 +198,14 @@ LOGGING = {
         'level': 'INFO',
     },
     'loggers': {
-        'httpx':    {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-        'httpcore': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-        'telegram': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
-        'markdown_it': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        "uvicorn.access": {
+            "handlers": ["console"],
+            "level": "WARNING",  # 设为 WARNING 即可屏蔽正常请求日志
+        },
+        'rest_framework': {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'httpx':          {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'httpcore':       {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'telegram':       {'level': 'WARNING', 'handlers': ['console'], 'propagate': False},
+        'markdown_it':    {'level': 'WARNING', 'handlers': ['console'], 'propagate': False}
     },
 }

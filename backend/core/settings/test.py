@@ -1,16 +1,28 @@
 """Test settings — uses in-memory SQLite for fast, isolated tests."""
 from .base import *  # noqa: F401, F403
+import tempfile
+import os
 
+# Use a temp file for SQLite so multiple connections (from sync_to_async) can share data
+_temp_db = os.path.join(tempfile.gettempdir(), f"tradeclaw_test_{os.getpid()}.db")
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+        'NAME': _temp_db,
         'TEST': {
             'SERIALIZE': False,
             'DEPENDENCIES': [],
         },
+        # Allow multiple threads to access the same connection
+        'OPTIONS': {
+            'timeout': 20,
+        },
     }
 }
+
+# Enable thread-sharing for SQLite
+import sqlite3
+sqlite3.threadsafety = 1  # Serialized mode
 
 # Speed up tests
 PASSWORD_HASHERS = [

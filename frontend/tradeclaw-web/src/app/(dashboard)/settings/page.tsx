@@ -6,6 +6,10 @@ import { useAuth } from "@/context/AuthContext";
 import {
   exchangeApi,
   riskApi,
+  scheduledTaskApi,
+  signalMonitorApi,
+  SignalMonitor,
+  ScheduledTask,
   RiskConfig as RiskConfigType,
 } from "@/lib/api";
 
@@ -45,6 +49,15 @@ export default function SettingsPage() {
   const [stopLoss, setStopLoss] = useState("2.0");
   const [autoStop, setAutoStop] = useState(true);
 
+  // Scheduled tasks - from backend
+  const [scheduledTasks, setScheduledTasks] = useState<ScheduledTask[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+
+  // Signal monitors - from backend
+  const [signalMonitors, setSignalMonitors] = useState<SignalMonitor[]>([]);
+  const [monitorsLoading, setMonitorsLoading] = useState(false);
+  const [showAddMonitor, setShowAddMonitor] = useState(false);
+
   // Load existing exchange accounts and risk config
   const loadInitialData = useCallback(async () => {
     try {
@@ -63,6 +76,44 @@ export default function SettingsPage() {
       // API not available or error - use defaults
     }
   }, []);
+
+  const loadScheduledTasks = useCallback(async () => {
+    setTasksLoading(true);
+    try {
+      const res = await scheduledTaskApi.list();
+      setScheduledTasks(res.tasks);
+    } catch {
+      // API not available
+    } finally {
+      setTasksLoading(false);
+    }
+  }, []);
+
+  const loadSignalMonitors = useCallback(async () => {
+    setMonitorsLoading(true);
+    try {
+      const res = await signalMonitorApi.list();
+      setSignalMonitors(res.data);
+    } catch {
+      // API not available
+    } finally {
+      setMonitorsLoading(false);
+    }
+  }, []);
+
+  // Load scheduled tasks when tab is activated
+  useEffect(() => {
+    if (activeTab === "scheduled") {
+      loadScheduledTasks();
+    }
+  }, [activeTab, loadScheduledTasks]);
+
+  // Load signal monitors when tab is activated
+  useEffect(() => {
+    if (activeTab === "signals") {
+      loadSignalMonitors();
+    }
+  }, [activeTab, loadSignalMonitors]);
 
   useEffect(() => {
     loadInitialData();
@@ -117,9 +168,33 @@ export default function SettingsPage() {
   };
 
   const handleDeleteAccount = async (id: string) => {
+    if (!confirm("确定要删除该交易所账户吗？此操作不可撤销。")) {
+      return;
+    }
     try {
       await exchangeApi.deleteAccount(id);
       loadInitialData();
+    } catch (err) {
+      alert(`删除失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  };
+
+  const handleToggleMonitor = async (id: string, currentlyActive: boolean) => {
+    try {
+      await signalMonitorApi.toggle(id, !currentlyActive);
+      loadSignalMonitors();
+    } catch (err) {
+      alert(`操作失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  };
+
+  const handleDeleteMonitor = async (id: string) => {
+    if (!confirm("确定要删除该信号监控吗？此操作不可撤销。")) {
+      return;
+    }
+    try {
+      await signalMonitorApi.delete(id);
+      loadSignalMonitors();
     } catch (err) {
       alert(`删除失败: ${err instanceof Error ? err.message : "未知错误"}`);
     }
@@ -129,6 +204,8 @@ export default function SettingsPage() {
     { key: "general", label: "通用" },
     { key: "exchange", label: "交易所" },
     { key: "risk", label: "风控" },
+    { key: "scheduled", label: "定时任务" },
+    { key: "signals", label: "信号监控" },
     { key: "account", label: "账户" },
   ];
 
@@ -577,6 +654,189 @@ export default function SettingsPage() {
           </div>
         )}
 
+        {activeTab === "scheduled" && (
+          <div className="p-5 flex flex-col gap-4">
+            <div className="text-xs font-semibold text-text mb-1">
+              定时任务
+            </div>
+
+            {tasksLoading ? (
+              <div className="flex items-center justify-center py-12 text-text3 text-xs">
+                正在加载...
+              </div>
+            ) : scheduledTasks.length === 0 ? (
+              <div className="text-center py-12 text-[11px] text-text3 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg">
+                暂无定时任务
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {scheduledTasks.map((task) => (
+                  <div
+                    key={task.source === "database" ? task.id : task.name}
+                    className="bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg px-4 py-3"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-text">
+                          {task.name}
+                        </span>
+                        <span
+                          className={`text-[9px] px-1.5 py-0.5 rounded-sm font-semibold ${
+                            task.source === "database"
+                              ? task.enabled
+                                ? "bg-green-dim text-green"
+                                : "bg-text3/20 text-text3"
+                              : "bg-blue-dim text-blue"
+                          }`}
+                        >
+                          {task.source === "database" ? (task.enabled ? "动态·启用" : "动态·禁用") : "静态"}
+                        </span>
+                      </div>
+                      <div className="text-[9px] text-text3 font-mono">
+                        {task.schedule}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-4 gap-3 text-[9px]">
+                      <div>
+                        <div className="text-text3">目标 Agent</div>
+                        <div className="font-mono text-xs text-text2">
+                          {task.agent_name}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-text3">已执行次数</div>
+                        <div className="font-mono text-xs text-text2">
+                          {task.total_run_count}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-text3">上次执行</div>
+                        <div className="font-mono text-xs text-text2">
+                          {task.last_run_at
+                            ? new Date(task.last_run_at).toLocaleString("zh-CN")
+                            : "未执行"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-text3">开始时间</div>
+                        <div className="font-mono text-xs text-text2">
+                          {task.start_time
+                            ? new Date(task.start_time).toLocaleString("zh-CN")
+                            : "—"}
+                        </div>
+                      </div>
+                    </div>
+                    {task.message && (
+                      <div className="mt-2 pt-2 border-t border-[rgba(255,255,255,0.05)]">
+                        <div className="text-[9px] text-text3 mb-0.5">任务内容</div>
+                        <div className="text-[10px] text-text2 line-clamp-2">
+                          {task.message}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Signal Monitor Tab */}
+        {activeTab === "signals" && (
+          <div className="p-5 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <div className="text-xs font-semibold text-text">信号监控</div>
+              <button
+                onClick={() => setShowAddMonitor(true)}
+                className="bg-green text-black text-xs font-semibold px-3 py-1.5 rounded-md hover:opacity-85 transition-all cursor-pointer"
+              >
+                + 添加监控
+              </button>
+            </div>
+
+            {/* Add Monitor Form */}
+            {showAddMonitor && <AddMonitorForm onClose={() => setShowAddMonitor(false)} onAdded={loadSignalMonitors} />}
+
+            {/* Monitor List */}
+            {monitorsLoading ? (
+              <div className="flex items-center justify-center py-12 text-text3 text-xs">
+                正在加载...
+              </div>
+            ) : signalMonitors.length === 0 ? (
+              <div className="text-center py-12 text-[11px] text-text3 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg">
+                暂无信号监控
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {signalMonitors.map((monitor) => (
+                  <div
+                    key={monitor.id}
+                    className="bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg px-4 py-3"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-text">{monitor.name}</span>
+                        <span
+                          className={`text-[9px] px-1.5 py-0.5 rounded-sm font-semibold ${
+                            monitor.status === "active"
+                              ? "bg-green-dim text-green"
+                              : monitor.status === "disabled"
+                              ? "bg-text3/20 text-text3"
+                              : "bg-amber-dim text-amber"
+                          }`}
+                        >
+                          {monitor.status === "active" ? "活跃" : monitor.status === "disabled" ? "已禁用" : monitor.status}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-[9px] text-text3 font-mono">
+                          {monitor.symbol} {monitor.interval}
+                        </span>
+                        <button
+                          onClick={() => handleToggleMonitor(monitor.id, monitor.status === "active")}
+                          className="text-[10px] text-blue hover:opacity-80 cursor-pointer"
+                        >
+                          {monitor.status === "active" ? "禁用" : "启用"}
+                        </button>
+                        <button
+                          onClick={() => handleDeleteMonitor(monitor.id)}
+                          className="text-[10px] text-red hover:opacity-80 cursor-pointer"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-4 gap-3 text-[9px]">
+                      <div>
+                        <div className="text-text3">指标类型</div>
+                        <div className="font-mono text-xs text-text2 uppercase">{monitor.indicator_type}</div>
+                      </div>
+                      <div>
+                        <div className="text-text3">触发类型</div>
+                        <div className="font-mono text-xs text-text2">
+                          {monitor.trigger_type === "once" ? "单次" : "持续"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-text3">触发次数</div>
+                        <div className="font-mono text-xs text-text2">{monitor.trigger_count}</div>
+                      </div>
+                      <div>
+                        <div className="text-text3">最后触发</div>
+                        <div className="font-mono text-xs text-text2">
+                          {monitor.last_triggered_at
+                            ? new Date(monitor.last_triggered_at).toLocaleString("zh-CN")
+                            : "—"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Save button for general tab only */}
         {activeTab === "general" && (
           <div className="px-5 py-3 border-t border-[rgba(255,255,255,0.07)] flex justify-end">
@@ -590,5 +850,158 @@ export default function SettingsPage() {
         )}
       </div>
     </DashboardShell>
+  );
+}
+
+interface AddMonitorFormProps {
+  onClose: () => void;
+  onAdded: () => void;
+}
+
+function AddMonitorForm({ onClose, onAdded }: AddMonitorFormProps) {
+  const [name, setName] = useState("");
+  const [symbol, setSymbol] = useState("");
+  const [indicatorType, setIndicatorType] = useState("rsi");
+  const [condition, setCondition] = useState("");
+  const [threshold, setThreshold] = useState("30");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name || !symbol || !condition) return;
+
+    setLoading(true);
+    try {
+      const operatorMap: Record<string, string> = {
+        below: "lt",
+        above: "gt",
+        cross_up: "gte_cross",
+        cross_down: "lte_cross",
+      };
+
+      await signalMonitorApi.create({
+        name,
+        symbol: symbol.toUpperCase(),
+        indicator_type: indicatorType,
+        indicator_params: {},
+        condition: {
+          operator: operatorMap[condition] || "lt",
+          left: { field: "" },
+          right: { value: parseFloat(threshold) },
+        },
+      });
+      onAdded();
+      onClose();
+    } catch (err) {
+      alert(`创建失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const inputClass =
+    "w-full bg-bg border border-[rgba(255,255,255,0.12)] rounded-md px-3 py-2 text-xs text-text outline-none focus:border-green transition-colors";
+  const labelClass =
+    "text-[10px] text-text3 uppercase tracking-wider font-semibold mb-1 block";
+
+  return (
+    <div className="bg-bg2 border border-[rgba(255,255,255,0.1)] rounded-lg p-4">
+      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-semibold text-text">添加信号监控</div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-[10px] text-text3 hover:text-text cursor-pointer"
+          >
+            取消
+          </button>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={labelClass}>名称</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="如: BTC RSI 超卖"
+              className={inputClass}
+              required
+            />
+          </div>
+          <div>
+            <label className={labelClass}>交易对</label>
+            <input
+              type="text"
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value)}
+              placeholder="BTCUSDT"
+              className={inputClass}
+              required
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className={labelClass}>指标</label>
+            <select
+              value={indicatorType}
+              onChange={(e) => setIndicatorType(e.target.value)}
+              className={inputClass}
+            >
+              <option value="rsi">RSI</option>
+              <option value="macd">MACD</option>
+              <option value="ema">EMA</option>
+              <option value="ma">MA</option>
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>条件</label>
+            <select
+              value={condition}
+              onChange={(e) => setCondition(e.target.value)}
+              className={inputClass}
+              required
+            >
+              <option value="">选择条件</option>
+              <option value="below">低于</option>
+              <option value="above">高于</option>
+              <option value="cross_up">向上突破</option>
+              <option value="cross_down">向下突破</option>
+            </select>
+          </div>
+          <div>
+            <label className={labelClass}>阈值</label>
+            <input
+              type="number"
+              step="0.1"
+              value={threshold}
+              onChange={(e) => setThreshold(e.target.value)}
+              className={inputClass}
+              required
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-xs text-text hover:text-text2 cursor-pointer"
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            disabled={loading || !name || !symbol || !condition}
+            className="bg-green text-black text-xs font-semibold px-4 py-2 rounded-md hover:opacity-85 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loading ? "创建中..." : "创建监控"}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }

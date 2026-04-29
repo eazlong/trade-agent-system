@@ -27,6 +27,7 @@ from .adapters import ADAPTER_MAP, BaseExchangeAdapter, OrderRequest
 
 if TYPE_CHECKING:
     from apps.riskguard.guard import RiskGuard
+    from apps.trading.models import Order
 
 logger = logging.getLogger(__name__)
 
@@ -261,9 +262,9 @@ class OrderExecutor:
                 if exchange == "okx":
                     # OKX 需要额外的 passphrase，从 label 字段临时存储
                     passphrase = account.label or ""
-                    adapter = adapter_cls(api_key, api_secret, passphrase)
+                    adapter = adapter_cls(api_key, api_secret, passphrase, account.testnet)
                 else:
-                    adapter = adapter_cls(api_key, api_secret)
+                    adapter = adapter_cls(api_key, api_secret, account.testnet)
 
                 await adapter.connect()
                 self._adapters[exchange] = adapter

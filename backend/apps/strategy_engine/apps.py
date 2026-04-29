@@ -9,11 +9,12 @@ class StrategyEngineConfig(AppConfig):
     def ready(self):
         """应用启动时自动发现并注册策略"""
         import os
+        from pathlib import Path
+
         from .registry import StrategyRegistry
 
-        strategy_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "strategies",
-        )
-        StrategyRegistry.set_strategy_path(strategy_path)
-        StrategyRegistry.discover()
+        # 扫描动态生成的策略目录: ~/.tradelogx/strategies/
+        dynamic_path = str(Path.home() / ".tradelogx" / "strategies")
+        StrategyRegistry.set_strategy_path(dynamic_path)
+        if os.path.isdir(dynamic_path):
+            StrategyRegistry.discover()

@@ -1,0 +1,21 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - img [ref=e7]
+      - generic [ref=e10]:
+        - generic [ref=e11]: TradeClaw
+        - generic [ref=e12]: Agent OS · v2.4.1
+    - heading "登录系统" [level=2] [ref=e13]
+    - generic [ref=e33]: 邮箱或密码错误
+    - generic [ref=e14]:
+      - generic [ref=e15]:
+        - generic [ref=e16]: 邮箱
+        - textbox "输入邮箱" [ref=e17]: admin@admin.com
+      - generic [ref=e18]:
+        - generic [ref=e19]: 密码
+        - textbox "输入密码" [ref=e20]: admin123
+      - button "登录" [ref=e21] [cursor=pointer]
+    - generic [ref=e22]: 需要账号？请联系管理员注册
+  - button "Open Next.js Dev Tools" [ref=e28] [cursor=pointer]:
+    - img [ref=e29]
+  - alert [ref=e32]

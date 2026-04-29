@@ -30,7 +30,7 @@ class _LLMAgent(BaseAgent):
     def _build_system_prompt(self) -> str:
         """动态构建 system prompt，注入技能内容。"""
         system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ""
-        system_prompt += '\n\n 收到用户消息后，先判断是否属于你的职责范围。如果不属于你的职责，必须只返回以下 JSON 格式，不加任何其他内容：\n {"rejected": true, "reason": "简短原因", "suggested_agent": "coach" 或 "risk_advisor"} \n 如果属于你的职责，正常回答，不要包含 rejected 字段。'
+        system_prompt += '\n\n 收到用户消息后，先判断是否属于你的职责范围。如果不属于你的职责，必须**只**返回以下 JSON 格式，不加任何其他内容：\n {"rejected": true, "reason": "简短原因", "suggested_agent": "coach" 或 "risk_advisor"} \n 如果属于你的职责，正常回答，不要包含 rejected 字段。'
         return self._build_skills_section(system_prompt)
 
     def _get_tools_schema(self) -> list[dict]:
@@ -143,13 +143,13 @@ class _LLMAgent(BaseAgent):
             )
 
         # 分析内容以确定是否需要继续多轮对话
-        continue_conversation = self._should_continue_conversation(content)
+        # continue_conversation = self._should_continue_conversation(content)
 
         # 准备返回数据，包含多轮对话控制信息
         response_data = {
             "content": content,
-            "continue_conversation": continue_conversation,
-            "start_multi_turn": continue_conversation,  # 开始多轮对话模式
+            "continue_conversation": True,
+            "start_multi_turn": True,  # 开始多轮对话模式
             "agent_name": self.name,
         }
 
@@ -220,6 +220,8 @@ class _LLMAgent(BaseAgent):
             "详细说明",
             "具体介绍",
             "请提供您的反馈",
+            "建议",
+            "是否需要"
         ]
 
         # 检查是否有表示结束对话的词汇

@@ -8,22 +8,30 @@ app = Celery('trade_agent')
 app.config_from_object('django.conf:settings', namespace='CELERY')
 app.autodiscover_tasks()
 
+# 显式导入 task 模块（autodiscover_tasks 在某些环境下不生效）
+import apps.agent.tasks  # noqa: F401
+import apps.backtest.tasks  # noqa: F401
+import apps.signal_monitor.tasks  # noqa: F401
+
 app.conf.beat_schedule = {
     # Sync positions from exchange every 5 minutes
-    'sync-positions': {
-        'task': 'apps.trading.tasks.sync_positions',
-        'schedule': 300.0,
-    },
+    # TODO: apps.trading.tasks.sync_positions 尚未实现，启用后需补上
+    # 'sync-positions': {
+    #     'task': 'apps.trading.tasks.sync_positions',
+    #     'schedule': 300.0,
+    # },
     # Clean expired agent memory (L2) every hour
-    'clean-agent-memory': {
-        'task': 'apps.memory.tasks.clean_expired_memory',
-        'schedule': crontab(minute=0),
-    },
+    # TODO: apps.memory.tasks.clean_expired_memory 尚未实现
+    # 'clean-agent-memory': {
+    #     'task': 'apps.memory.tasks.clean_expired_memory',
+    #     'schedule': crontab(minute=0),
+    # },
     # Clean old audit logs every day at 02:00 UTC
-    'clean-audit-logs': {
-        'task': 'apps.agent.tasks.clean_old_audit_logs',
-        'schedule': crontab(hour=2, minute=0),
-    },
+    # TODO: apps.agent.tasks.clean_old_audit_logs 尚未实现
+    # 'clean-audit-logs': {
+    #     'task': 'apps.agent.tasks.clean_old_audit_logs',
+    #     'schedule': crontab(hour=2, minute=0),
+    # },
     # Check signal monitors every 30 seconds
     'check-signals': {
         'task': 'apps.signal_monitor.tasks.check_signals',
@@ -35,3 +43,6 @@ app.conf.beat_schedule = {
         'schedule': crontab(minute=15),
     },
 }
+
+# 使用数据库调度器，支持动态添加/删除定时任务
+app.conf.beat_scheduler = 'django_celery_beat.schedulers:DatabaseScheduler'

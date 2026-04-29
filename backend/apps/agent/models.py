@@ -47,3 +47,25 @@ class AgentAuditLog(models.Model):
         indexes = [
             models.Index(fields=["-created_at"], name="agent_audit_created_89d8b0_idx")
         ]
+
+
+class TaskProgress(models.Model):
+    """Completed/failed task history — running state lives in Redis, archived here."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task_id = models.CharField(max_length=128, unique=True, db_index=True, verbose_name="Task ID")
+    user = models.ForeignKey("authentication.User", on_delete=models.SET_NULL, null=True, related_name="task_progress")
+    task_type = models.CharField(max_length=64)  # backtest, agent, data_fetch
+    status = models.CharField(max_length=32)  # completed / failed
+    progress = models.FloatField(default=0.0)
+    milestones = models.JSONField(default=list, verbose_name="里程碑记录")
+    result = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "task_progress"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"TaskProgress({self.task_id[:8]}) {self.status}"

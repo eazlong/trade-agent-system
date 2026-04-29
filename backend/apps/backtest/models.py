@@ -114,6 +114,12 @@ class BacktestTrade(models.Model):
         blank=True,
         help_text="Why this trade was closed (stop_loss, take_profit, signal, etc.)",
     )
+    trade_type = models.CharField(
+        max_length=8,
+        choices=[("open", "Open"), ("add", "Add"), ("close", "Close")],
+        default="open",
+        help_text="Type of trade: open (initial position), add (add to position), close (exit position)",
+    )
 
     class Meta:
         db_table = "backtest_trades"

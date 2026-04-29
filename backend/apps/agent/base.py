@@ -51,19 +51,9 @@ class BaseAgent(ABC):
     _max_tool_rounds: int = 5
 
     def __init__(self):
-        self._skills: dict[str, Any] = {}
         self._running = False
         self._skills_loader = None
 
-    def register_skill(self, skill) -> None:
-        self._skills[skill.name] = skill
-        logger.debug("[%s] skill registered: %s", self.name, skill.name)
-
-    def get_skill(self, name: str):
-        skill = self._skills.get(name)
-        if not skill:
-            raise ValueError(f"Skill {name!r} not registered on {self.name}")
-        return skill
 
     # ------------------------------------------------------------------ #
     #  工具 & 技能（公共逻辑）                                              #
@@ -113,7 +103,7 @@ class BaseAgent(ABC):
             base_prompt = (
                 f"{base_prompt}\n\n"
                 f"### Skills\n"
-                f"以下技能扩展了你的能力。使用 load_skill 工具加载完整内容。\n"
+                f"以下技能扩展了你的能力, **能用则必须要使用**。使用 load_skill 工具加载完整内容。\n"
                 f"如果用户的需求与以下技能描述相关，**一定要**使用 load_skill 工具。\n"
                 f"{skill_summary}"
             )
@@ -131,6 +121,12 @@ class BaseAgent(ABC):
 
                 skill_name = tc.arguments.get("skill_name", "")
                 tool = LoadSkillTool(agent_name=self.name)
+                logger.info(
+                    "[%s] executing tool: %s with args: %s",
+                    self.name,
+                    tc.name,
+                    tc.arguments,
+                )
                 result = await tool.execute(skill_name=skill_name)
             else:
                 result = await self.run_tool(tc.name, **tc.arguments)

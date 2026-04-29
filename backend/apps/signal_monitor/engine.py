@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class SignalMonitorEngine:
-    """信��监控引擎"""
+    """信号监控引擎"""
 
     _instance: SignalMonitorEngine | None = None
 
@@ -55,7 +55,7 @@ class SignalMonitorEngine:
 
         # 加载活跃监控
         monitors = list(
-            SignalMonitor.objects.filter(status="active").select_related("user")
+            SignalMonitor.objects.filter(status="active")
         )
         if not monitors:
             return []
@@ -82,8 +82,15 @@ class SignalMonitorEngine:
         for monitor in active_monitors:
             symbol = monitor.symbol
             klines = klines_map.get(symbol, [])
-            if len(klines) < 2:
+            if len(klines) < 1:
                 continue
+
+            logger.info(
+                "Prepared monitor %s for symbol %s with %d klines",
+                monitor.id,
+                symbol,
+                len(klines),
+            )
             tasks.append(
                 {
                     "monitor": monitor,
@@ -298,8 +305,79 @@ class SignalMonitorEngine:
                 message=message,
             )
             logger.info("Notification sent for monitor %s", monitor.id)
+
+            # 2. 立即通过 Telegram 发送
+            self._send_telegram_message(monitor.user, message)
+
         except Exception as e:
-            logger.error("Failed to send notification: %s", e)
+            import traceback
+
+            logger.error("Failed to send notification: %s\n%s", e, traceback.format_exc())
+
+    def _send_telegram_message(self, user, message: str) -> None:
+        """通过 Telegram 发送消息（同步 HTTP，支持代理）"""
+        chat_id = getattr(user, "telegram_chat_id", None)
+        if not chat_id:
+            logger.warning(
+                "User %s has no telegram_chat_id set. "
+                "They need to send /start to the Telegram bot first.",
+                user,
+            )
+            return
+
+        try:
+            import json
+            import urllib.error
+            import urllib.request
+
+            from django.conf import settings
+
+            token = getattr(settings, "TELEGRAM_BOT_TOKEN", "")
+            if not token:
+                logger.warning("TELEGRAM_BOT_TOKEN not configured in settings")
+                return
+
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = json.dumps({
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            # 配置代理（如果有）
+            proxy_url = getattr(settings, "TELEGRAM_PROXY", "") or ""
+            if proxy_url:
+                proxy_handler = urllib.request.ProxyHandler({
+                    "http": proxy_url,
+                    "https": proxy_url,
+                })
+                opener = urllib.request.build_opener(proxy_handler)
+                opener.addheaders = [("Content-Type", "application/json")]
+                with opener.open(req, timeout=15) as resp:
+                    result = json.loads(resp.read().decode())
+            else:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    result = json.loads(resp.read().decode())
+
+            if result.get("ok"):
+                logger.info("Telegram message sent to chat_id %s", chat_id)
+            else:
+                logger.error(
+                    "Telegram API error: %s",
+                    result.get("description", result),
+                )
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else str(e)
+            logger.error("Telegram HTTP %d error: %s", e.code, body)
+        except Exception as e:
+            logger.error("Failed to send Telegram message to chat_id %s: %s", chat_id, e)
 
     def _execute_trade(self, monitor: SignalMonitor, trigger_value: dict) -> None:
         """执行交易"""
@@ -334,15 +412,84 @@ class SignalMonitorEngine:
     def _load_klines_for_monitors(
         self, monitors: list[SignalMonitor]
     ) -> dict[str, list[dict]]:
-        """从 MemoryDataStore 加载 K 线数据"""
+        """从 MemoryDataStore 加载 K 线数据，如果缓存为空则从交易所获取"""
         from apps.datasource.store import get_data_store
 
         store = get_data_store()
         klines_map: dict[str, list[dict]] = {}
 
         for monitor in monitors:
-            if monitor.symbol not in klines_map:
-                klines = store.get_latest("kline", monitor.symbol, limit=200)
+            if monitor.symbol in klines_map:
+                continue
+
+            # 尝试从缓存加载
+            klines = store.get_latest("kline", monitor.symbol, limit=200)
+            if klines and len(klines) >= 2:
+                klines_map[monitor.symbol] = klines
+                continue
+
+            # 缓存为空或不完整，从交易所获取历史 K 线
+            klines = self._fetch_recent_klines(
+                monitor.symbol,
+                interval=monitor.interval,
+                limit=10
+            )
+            if klines:
                 klines_map[monitor.symbol] = klines
 
         return klines_map
+
+    def _fetch_realtime_price(self, symbol: str) -> float | None:
+        """从交易所获取实时价格"""
+        try:
+            import ccxt
+
+            # 解析交易对
+            base, quote = symbol.split("/")
+            ccxt_symbol = f"{base}/{quote}"
+
+            # 创建交易所实例（使用公开接口，不需要认证）
+            exchange = ccxt.binance({"enableRateLimit": True})
+            ticker = exchange.fetch_ticker(ccxt_symbol)
+            price = ticker.get("last")
+            if price:
+                logger.debug("Fetched realtime price for %s: %s", symbol, price)
+            return price
+        except Exception as e:
+            logger.warning("Failed to fetch realtime price for %s: %s", symbol, e)
+            return None
+
+    def _fetch_recent_klines(self, symbol: str, interval: str = "1h", limit: int = 5) -> list[dict]:
+        """从交易所获取最近的 K 线数据"""
+        try:
+            import ccxt
+
+            base, quote = symbol.split("/")
+            ccxt_symbol = f"{base}/{quote}"
+
+            exchange = ccxt.binance({"enableRateLimit": True})
+
+            # ccxt 时间框架映射
+            tf_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                     "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h",
+                     "12h": "12h", "1d": "1d", "1w": "1w"}
+            ccxt_tf = tf_map.get(interval, "1h")
+
+            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe=ccxt_tf, limit=limit)
+
+            klines = []
+            for candle in ohlcv:
+                klines.append({
+                    "timestamp": candle[0],
+                    "open": candle[1],
+                    "high": candle[2],
+                    "low": candle[3],
+                    "close": candle[4],
+                    "volume": candle[5],
+                })
+
+            logger.debug("Fetched %d klines for %s", len(klines), symbol)
+            return klines
+        except Exception as e:
+            logger.warning("Failed to fetch klines for %s: %s", symbol, e)
+            return []

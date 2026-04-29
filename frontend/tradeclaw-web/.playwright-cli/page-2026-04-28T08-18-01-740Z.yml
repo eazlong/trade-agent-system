@@ -1,0 +1,167 @@
+- generic [active] [ref=e1]:
+  - button "Open Next.js Dev Tools" [ref=e7] [cursor=pointer]:
+    - img [ref=e8]
+  - alert [ref=e11]
+  - generic [ref=e12]:
+    - generic [ref=e14]:
+      - generic [ref=e15]:
+        - img [ref=e17]
+        - generic [ref=e20]:
+          - generic [ref=e21]: TradeClaw
+          - generic [ref=e22]: Agent OS · v2.4.1
+      - generic [ref=e23]:
+        - link "总览" [ref=e24] [cursor=pointer]:
+          - /url: /overview
+        - link "智能体" [ref=e25] [cursor=pointer]:
+          - /url: /agents
+        - link "回测" [ref=e26] [cursor=pointer]:
+          - /url: /backtest
+        - link "交易" [ref=e27] [cursor=pointer]:
+          - /url: /trading
+        - link "日志" [ref=e28] [cursor=pointer]:
+          - /url: /logs
+        - link "配置" [ref=e29] [cursor=pointer]:
+          - /url: /settings
+      - generic [ref=e30]:
+        - generic [ref=e31]:
+          - generic [ref=e32]: BTC
+          - generic [ref=e33]: 67,842
+          - generic [ref=e34]: +1.24%
+        - generic [ref=e35]:
+          - generic [ref=e36]: ETH
+          - generic [ref=e37]: 3,421
+          - generic [ref=e38]: +0.87%
+        - generic [ref=e39]:
+          - generic [ref=e40]: SOL
+          - generic [ref=e41]: "182.4"
+          - generic [ref=e42]: "-0.43%"
+        - generic [ref=e45]: 实时运行中
+        - button "收起右侧面板" [ref=e46] [cursor=pointer]:
+          - img [ref=e47]
+    - generic [ref=e50]:
+      - generic [ref=e51]:
+        - generic [ref=e52]: 智能体集群
+        - generic [ref=e53] [cursor=pointer]:
+          - generic [ref=e55]: Orchestrator
+          - generic [ref=e56]: 主控
+        - generic [ref=e57] [cursor=pointer]:
+          - generic [ref=e59]: 市场分析
+          - generic [ref=e60]: 运行
+        - generic [ref=e61] [cursor=pointer]:
+          - generic [ref=e63]: 情绪分析
+          - generic [ref=e64]: 运行
+        - generic [ref=e65] [cursor=pointer]:
+          - generic [ref=e67]: 风险管理
+          - generic [ref=e68]: 告警
+        - generic [ref=e69] [cursor=pointer]:
+          - generic [ref=e71]: 策略优化
+          - generic [ref=e72]: 运行
+        - generic [ref=e73] [cursor=pointer]:
+          - generic [ref=e75]: 交易执行
+          - generic [ref=e76]: 就绪
+        - generic [ref=e77] [cursor=pointer]:
+          - generic [ref=e79]: 回测引擎
+          - generic [ref=e80]: 待机
+      - generic [ref=e82]:
+        - generic [ref=e83]: 账户概况
+        - generic [ref=e84]:
+          - generic [ref=e85]: 总资产
+          - generic [ref=e86]: $284,720
+        - generic [ref=e87]:
+          - generic [ref=e88]: 今日盈亏
+          - generic [ref=e89]: +$3,421
+        - generic [ref=e90]:
+          - generic [ref=e91]: 持仓数
+          - generic [ref=e92]: "4"
+        - generic [ref=e93]:
+          - generic [ref=e94]: 信号队列
+          - generic [ref=e95]: "7"
+        - generic [ref=e96]:
+          - generic [ref=e97]: 执行任务
+          - generic [ref=e98]: "12"
+      - generic [ref=e100]:
+        - generic [ref=e101]: 活跃策略
+        - generic [ref=e102]:
+          - generic [ref=e105] [cursor=pointer]:
+            - generic [ref=e106]: 动量突破
+            - generic [ref=e107]: BTC · 15m
+          - generic [ref=e112] [cursor=pointer]:
+            - generic [ref=e113]: 均值回归
+            - generic [ref=e114]: ETH · 1h
+          - generic [ref=e119] [cursor=pointer]:
+            - generic [ref=e120]: 套利对冲
+            - generic [ref=e121]: 多品种
+    - generic [ref=e124]:
+      - generic [ref=e135]:
+        - generic [ref=e137]:
+          - generic [ref=e138]:
+            - img [ref=e139]
+            - text: 策略净值曲线
+          - generic [ref=e141]:
+            - generic [ref=e142]: 实盘
+            - combobox [ref=e143] [cursor=pointer]:
+              - option "近30天" [selected]
+              - option "近90天"
+              - option "今年"
+        - generic [ref=e147]:
+          - generic [ref=e148]:
+            - img [ref=e149]
+            - text: 智能体实时状态
+          - generic [ref=e152]:
+            - generic [ref=e153]: Orchestrator 规划中
+            - generic [ref=e154]: .
+            - generic [ref=e155]: .
+            - generic [ref=e156]: .
+      - generic [ref=e182]:
+        - generic [ref=e183]:
+          - generic [ref=e184]:
+            - generic [ref=e185]:
+              - img [ref=e186]
+              - text: 实时信号队列
+            - generic [ref=e188]: 7 待处理
+          - generic [ref=e189]: 暂无活跃信号
+        - generic [ref=e191]:
+          - generic [ref=e192]:
+            - img [ref=e193]
+            - text: 智能体通信日志
+          - generic [ref=e195]: 实时
+      - button "+ 新建策略" [ref=e214] [cursor=pointer]
+    - generic [ref=e216]:
+      - generic [ref=e217]:
+        - generic [ref=e218]: 当前持仓
+        - generic [ref=e219]: 暂无持仓
+      - generic [ref=e220]:
+        - generic [ref=e221]: 风险仪表盘
+        - generic [ref=e222]:
+          - generic [ref=e223]:
+            - generic [ref=e224]: P0 事件
+            - generic [ref=e225]: "0"
+          - generic [ref=e226]:
+            - generic [ref=e227]: P1 事件
+            - generic [ref=e228]: "0"
+          - generic [ref=e229]:
+            - generic [ref=e230]: 总事件
+            - generic [ref=e231]: "0"
+          - generic [ref=e232]:
+            - generic [ref=e233]: 已解决
+            - generic [ref=e234]: "0"
+      - generic [ref=e235]:
+        - generic [ref=e236]: 近期执行
+        - generic [ref=e237]: 暂无成交记录
+      - generic [ref=e238]:
+        - generic [ref=e239]: 模型调用统计
+        - generic [ref=e240]:
+          - generic [ref=e241]:
+            - generic [ref=e242]: 今日 API 调用
+            - generic [ref=e243]: "0"
+          - generic [ref=e244]:
+            - generic [ref=e245]: 平均响应时间
+            - generic [ref=e246]: 124ms
+          - generic [ref=e247]:
+            - generic [ref=e248]: Token 消耗
+            - generic [ref=e249]: 1.2M
+          - generic [ref=e250]:
+            - generic [ref=e251]: 推理成功率
+            - generic [ref=e252]: 99.7%
+    - button "打开 Supervisor 对话" [ref=e253] [cursor=pointer]:
+      - img [ref=e254]

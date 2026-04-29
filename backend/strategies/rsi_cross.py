@@ -56,7 +56,7 @@ class RsiCrossStrategy(BaseStrategy):
         # 超卖区金叉 → 买入（无持仓时）
         if prev_rsi < self.oversold and curr_rsi >= self.oversold:
             if self.ctx.position == 0:
-                return self.buy(
+                return self.ctx.buy(
                     quantity=self.quantity,
                     signal_name="rsi_oversold_cross",
                 )
@@ -64,7 +64,7 @@ class RsiCrossStrategy(BaseStrategy):
         # 超买区死叉 → 卖出（有持仓时）
         if prev_rsi > self.overbought and curr_rsi <= self.overbought:
             if self.ctx.position > 0:
-                return self.sell(
+                return self.ctx.sell(
                     quantity=self.ctx.position,
                     signal_name="rsi_overbought_cross",
                 )

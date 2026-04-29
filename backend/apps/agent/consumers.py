@@ -1,0 +1,147 @@
+from channels.generic.websocket import AsyncWebsocketConsumer
+import json
+import logging
+import traceback
+from urllib.parse import parse_qs
+
+from apps.agent.base import AgentMessage, AgentResult
+from apps.agent.supervisor import SupervisorAgent
+
+logger = logging.getLogger(__name__)
+
+
+class ChatConsumer(AsyncWebsocketConsumer):
+    """SupervisorAgent WebSocket 聊天消费者
+
+    客户端通过 WebSocket 发送聊天消息，SupervisorAgent 处理后返回响应。
+    协议格式:
+    - 发送: {"type": "chat", "text": "用户消息"}
+    - 接收: {"type": "chat_response", "data": "回复内容", "task_id": "...", "status": "done|error"}
+    - 接收: {"type": "status", "status": "connected|processing"}
+    """
+
+    async def connect(self):
+        # 从 query string 解析 JWT token
+        query_string = self.scope.get("query_string", b"").decode()
+        query_params = parse_qs(query_string)
+        token_list = query_params.get("token", [])
+
+        if not token_list:
+            await self.close(code=4001)
+            return
+
+        from rest_framework_simplejwt.tokens import AccessToken
+        from asgiref.sync import sync_to_async
+
+        def _get_user(token_string):
+            try:
+                access_token = AccessToken(token_string)
+                user_id = access_token["user_id"]
+            except Exception:
+                return None
+            from django.contrib.auth import get_user_model
+
+            User = get_user_model()
+            try:
+                return User.objects.get(id=user_id, is_active=True)
+            except Exception:
+                return None
+
+        user = await sync_to_async(_get_user)(token_list[0])
+        if not user:
+            await self.close(code=4001)
+            return
+
+        await self.accept()
+        self.user_id = str(user.id)
+        logger.info("[ChatWS] User %s connected", self.user_id)
+
+        await self.send(
+            text_data=json.dumps({"type": "status", "status": "connected"})
+        )
+
+    async def disconnect(self, close_code):
+        user_id = getattr(self, 'user_id', 'unknown')
+        logger.info("[ChatWS] User %s disconnected (code=%s)", user_id, close_code)
+
+    async def receive(self, text_data):
+        try:
+            data = json.loads(text_data)
+            message_type = data.get("type")
+
+            if message_type == "chat":
+                await self._handle_chat(data)
+            elif message_type == "ping":
+                await self.send(text_data=json.dumps({"type": "pong"}))
+            else:
+                await self.send(
+                    text_data=json.dumps(
+                        {"type": "error", "error": f"Unknown message type: {message_type}"}
+                    )
+                )
+
+        except json.JSONDecodeError:
+            logger.error("[ChatWS] Invalid JSON received")
+            await self.send(
+                text_data=json.dumps({"type": "error", "error": "Invalid JSON"})
+            )
+        except Exception as e:
+            logger.error("[ChatWS] Error processing message: %s", e)
+            await self.send(
+                text_data=json.dumps({"type": "error", "error": str(e)})
+            )
+
+    async def _handle_chat(self, data):
+        text = data.get("text", "").strip()
+        if not text:
+            await self.send(
+                text_data=json.dumps({"type": "error", "error": "text is required"})
+            )
+            return
+
+        logger.info("[ChatWS] User %s chat: %s", self.user_id, text[:100])
+
+        # 发送处理中状态
+        await self.send(
+            text_data=json.dumps({"type": "status", "status": "processing"})
+        )
+
+        try:
+            supervisor = SupervisorAgent.get_instance()
+            result: AgentResult = await supervisor.handle(
+                AgentMessage(
+                    sender="user",
+                    recipient="supervisor",
+                    payload={"text": text},
+                    user_id=self.user_id,
+                )
+            )
+
+            if result.success:
+                await self.send(
+                    text_data=json.dumps({
+                        "type": "chat_response",
+                        "data": result.data,
+                        "task_id": result.task_id,
+                        "status": "done",
+                    })
+                )
+            else:
+                await self.send(
+                    text_data=json.dumps({
+                        "type": "chat_response",
+                        "error": result.error,
+                        "task_id": result.task_id,
+                        "status": "error",
+                    })
+                )
+
+        except Exception as e:
+            logger.error("[ChatWS] Supervisor handle error: %s\n%s", e, traceback.format_exc())
+            await self.send(
+                text_data=json.dumps({
+                    "type": "chat_response",
+                    "error": str(e),
+                    "status": "error",
+                })
+            )

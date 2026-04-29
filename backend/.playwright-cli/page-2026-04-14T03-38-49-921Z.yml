@@ -1,0 +1,344 @@
+- generic [active] [ref=e1]:
+  - button "Open Next.js Dev Tools" [ref=e28] [cursor=pointer]:
+    - img [ref=e29]
+  - alert [ref=e32]
+  - generic [ref=e33]:
+    - generic [ref=e35]:
+      - generic [ref=e36]:
+        - img [ref=e38]
+        - generic [ref=e41]:
+          - generic [ref=e42]: TradeClaw
+          - generic [ref=e43]: Agent OS · v2.4.1
+      - generic [ref=e44]:
+        - link "总览" [ref=e45] [cursor=pointer]:
+          - /url: /overview
+        - link "智能体" [ref=e46] [cursor=pointer]:
+          - /url: /agents
+        - link "回测" [ref=e47] [cursor=pointer]:
+          - /url: /backtest
+        - link "交易" [ref=e48] [cursor=pointer]:
+          - /url: /trading
+        - link "日志" [ref=e49] [cursor=pointer]:
+          - /url: /logs
+        - link "配置" [ref=e50] [cursor=pointer]:
+          - /url: /settings
+      - generic [ref=e51]:
+        - generic [ref=e52]:
+          - generic [ref=e53]: BTC
+          - generic [ref=e54]: 67,842
+          - generic [ref=e55]: +1.24%
+        - generic [ref=e56]:
+          - generic [ref=e57]: ETH
+          - generic [ref=e58]: 3,421
+          - generic [ref=e59]: +0.87%
+        - generic [ref=e60]:
+          - generic [ref=e61]: SOL
+          - generic [ref=e62]: "182.4"
+          - generic [ref=e63]: "-0.43%"
+        - generic [ref=e66]: 实时运行中
+        - button "收起右侧面板" [ref=e67] [cursor=pointer]:
+          - img [ref=e68]
+    - generic [ref=e71]:
+      - generic [ref=e72]:
+        - generic [ref=e73]: 智能体集群
+        - generic [ref=e74] [cursor=pointer]:
+          - generic [ref=e76]: Orchestrator
+          - generic [ref=e77]: 主控
+        - generic [ref=e78] [cursor=pointer]:
+          - generic [ref=e80]: 市场分析
+          - generic [ref=e81]: 运行
+        - generic [ref=e82] [cursor=pointer]:
+          - generic [ref=e84]: 情绪分析
+          - generic [ref=e85]: 运行
+        - generic [ref=e86] [cursor=pointer]:
+          - generic [ref=e88]: 风险管理
+          - generic [ref=e89]: 告警
+        - generic [ref=e90] [cursor=pointer]:
+          - generic [ref=e92]: 策略优化
+          - generic [ref=e93]: 运行
+        - generic [ref=e94] [cursor=pointer]:
+          - generic [ref=e96]: 交易执行
+          - generic [ref=e97]: 就绪
+        - generic [ref=e98] [cursor=pointer]:
+          - generic [ref=e100]: 回测引擎
+          - generic [ref=e101]: 待机
+      - generic [ref=e103]:
+        - generic [ref=e104]: 账户概况
+        - generic [ref=e105]:
+          - generic [ref=e106]: 总资产
+          - generic [ref=e107]: $284,720
+        - generic [ref=e108]:
+          - generic [ref=e109]: 今日盈亏
+          - generic [ref=e110]: +$3,421
+        - generic [ref=e111]:
+          - generic [ref=e112]: 持仓数
+          - generic [ref=e113]: "4"
+        - generic [ref=e114]:
+          - generic [ref=e115]: 信号队列
+          - generic [ref=e116]: "7"
+        - generic [ref=e117]:
+          - generic [ref=e118]: 执行任务
+          - generic [ref=e119]: "12"
+      - generic [ref=e121]:
+        - generic [ref=e122]: 活跃策略
+        - generic [ref=e123]:
+          - generic [ref=e126] [cursor=pointer]:
+            - generic [ref=e127]: 动量突破
+            - generic [ref=e128]: BTC · 15m
+          - generic [ref=e133] [cursor=pointer]:
+            - generic [ref=e134]: 均值回归
+            - generic [ref=e135]: ETH · 1h
+          - generic [ref=e140] [cursor=pointer]:
+            - generic [ref=e141]: 套利对冲
+            - generic [ref=e142]: 多品种
+    - generic [ref=e145]:
+      - generic [ref=e146]:
+        - generic [ref=e147]:
+          - generic [ref=e148]: 净值
+          - generic [ref=e149]: "1.2847"
+          - generic [ref=e150]: ↑ +0.34% 今日
+        - generic [ref=e151]:
+          - generic [ref=e152]: 夏普比率
+          - generic [ref=e153]: "2.41"
+          - generic [ref=e154]: 年化 · 滚动30天
+        - generic [ref=e155]:
+          - generic [ref=e156]: 最大回撤
+          - generic [ref=e157]: "-4.2%"
+          - generic [ref=e158]: 本月 · 限额 -8%
+      - generic [ref=e159]:
+        - generic [ref=e160]:
+          - generic [ref=e161]:
+            - generic [ref=e162]:
+              - img [ref=e163]
+              - text: 策略净值曲线
+            - generic [ref=e165]:
+              - generic [ref=e166]: 实盘
+              - combobox [ref=e167] [cursor=pointer]:
+                - option "近30天" [selected]
+                - option "近90天"
+                - option "今年"
+          - img [ref=e170]
+        - generic [ref=e171]:
+          - generic [ref=e172]:
+            - generic [ref=e173]:
+              - img [ref=e174]
+              - text: 智能体实时状态
+            - generic [ref=e177]:
+              - generic [ref=e178]: Orchestrator 规划中
+              - generic [ref=e179]: .
+              - generic [ref=e180]: .
+              - generic [ref=e181]: .
+          - generic [ref=e182]:
+            - generic [ref=e183]:
+              - generic [ref=e184]:
+                - generic [ref=e185]:
+                  - generic [ref=e186]: Orchestrator
+                  - generic [ref=e187]: 任务调度 · 信号聚合
+                - generic [ref=e188]: 主控
+              - generic [ref=e189]:
+                - generic [ref=e190]: 调度效率
+                - generic [ref=e191]: 98.2%
+            - generic [ref=e194]:
+              - generic [ref=e195]:
+                - generic [ref=e196]:
+                  - generic [ref=e197]: 市场分析
+                  - generic [ref=e198]: 技术指标 · 形态识别
+                - generic [ref=e199]: 运行
+              - generic [ref=e200]:
+                - generic [ref=e201]: 信号置信度
+                - generic [ref=e202]: 84.7%
+            - generic [ref=e205]:
+              - generic [ref=e206]:
+                - generic [ref=e207]:
+                  - generic [ref=e208]: 情绪分析
+                  - generic [ref=e209]: NLP · 社交媒体
+                - generic [ref=e210]: 运行
+              - generic [ref=e211]:
+                - generic [ref=e212]: 情绪评分
+                - generic [ref=e213]: 72.3%
+            - generic [ref=e216]:
+              - generic [ref=e217]:
+                - generic [ref=e218]:
+                  - generic [ref=e219]: 风险管理
+                  - generic [ref=e220]: VaR · 仓位控制
+                - generic [ref=e221]: 告警
+              - generic [ref=e222]:
+                - generic [ref=e223]: 风险水位
+                - generic [ref=e224]: 63.1%
+            - generic [ref=e227]:
+              - generic [ref=e228]:
+                - generic [ref=e229]:
+                  - generic [ref=e230]: 策略优化
+                  - generic [ref=e231]: 参数调优 · 回测
+                - generic [ref=e232]: 运行
+              - generic [ref=e233]:
+                - generic [ref=e234]: 优化进度
+                - generic [ref=e235]: 91.5%
+            - generic [ref=e238]:
+              - generic [ref=e239]:
+                - generic [ref=e240]:
+                  - generic [ref=e241]: 交易执行
+                  - generic [ref=e242]: 订单路由 · 滑点
+                - generic [ref=e243]: 就绪
+              - generic [ref=e244]:
+                - generic [ref=e245]: 执行质量
+                - generic [ref=e246]: 96.8%
+      - generic [ref=e249]:
+        - generic [ref=e250]:
+          - generic [ref=e251]:
+            - generic [ref=e252]:
+              - img [ref=e253]
+              - text: 实时信号队列
+            - generic [ref=e255]: 7 待处理
+          - generic [ref=e256]:
+            - generic [ref=e257]:
+              - generic [ref=e258]: BUY
+              - generic [ref=e259]: BTC/USDT
+              - generic [ref=e260]: 突破关键阻力 68,000 · RSI 背离确认
+              - generic [ref=e261]: 91%
+              - generic [ref=e262]: 09:42
+            - generic [ref=e263]:
+              - generic [ref=e264]: BUY
+              - generic [ref=e265]: SOL/USDT
+              - generic [ref=e266]: 均线多头排列 · 量能放大 2.3x
+              - generic [ref=e267]: 78%
+              - generic [ref=e268]: 09:38
+            - generic [ref=e269]:
+              - generic [ref=e270]: SELL
+              - generic [ref=e271]: ETH/USDT
+              - generic [ref=e272]: 触及目标价 3,450 · 止盈条件满足
+              - generic [ref=e273]: 85%
+              - generic [ref=e274]: 09:35
+            - generic [ref=e275]:
+              - generic [ref=e276]: ⚠
+              - generic [ref=e277]: BNB/USDT
+              - generic [ref=e278]: 情绪急剧下滑 · 关注风险敞口
+              - generic [ref=e279]: 62%
+              - generic [ref=e280]: 09:31
+            - generic [ref=e281]:
+              - generic [ref=e282]: BUY
+              - generic [ref=e283]: AVAX/USDT
+              - generic [ref=e284]: 链上活跃度突增 · 机构流入信号
+              - generic [ref=e285]: 74%
+              - generic [ref=e286]: 09:28
+            - generic [ref=e287]:
+              - generic [ref=e288]: SELL
+              - generic [ref=e289]: MATIC/USDT
+              - generic [ref=e290]: 跌破支撑 · 空头主导 · 回避风险
+              - generic [ref=e291]: 69%
+              - generic [ref=e292]: 09:22
+            - generic [ref=e293]:
+              - generic [ref=e294]: ⚠
+              - generic [ref=e295]: ARB/USDT
+              - generic [ref=e296]: 等待成交量确认 · 突破未验证
+              - generic [ref=e297]: 55%
+              - generic [ref=e298]: 09:15
+        - generic [ref=e299]:
+          - generic [ref=e300]:
+            - generic [ref=e301]:
+              - img [ref=e302]
+              - text: 智能体通信日志
+            - generic [ref=e304]: 实时
+          - generic [ref=e306]:
+            - generic [ref=e307]:
+              - generic [ref=e308]: 11:38:24
+              - generic [ref=e309]: Orchestrator
+              - generic [ref=e310]: → 市场分析 · 触发扫描任务 · BTC 信号强度 HIGH
+            - generic [ref=e311]:
+              - generic [ref=e312]: 11:38:27
+              - generic [ref=e313]: 市场分析
+              - generic [ref=e314]: → 风险管理 · RSI 超买预警 · 建议减仓 10%
+            - generic [ref=e315]:
+              - generic [ref=e316]: 11:38:30
+              - generic [ref=e317]: 情绪分析
+              - generic [ref=e318]: → Orchestrator · Twitter 情绪分 +72 · 多头偏强
+            - generic [ref=e319]:
+              - generic [ref=e320]: 11:38:33
+              - generic [ref=e321]: 风险管理
+              - generic [ref=e322]: → 执行 · 仓位上限预警 · BTC 敞口 38%
+            - generic [ref=e323]:
+              - generic [ref=e324]: 11:38:36
+              - generic [ref=e325]: 策略优化
+              - generic [ref=e326]: → Orchestrator · 参数更新完成 · 预期收益 +2.1%
+            - generic [ref=e327]:
+              - generic [ref=e328]: 11:38:39
+              - generic [ref=e329]: 执行
+              - generic [ref=e330]: → Orchestrator · 订单成交 BTC 0.15 · 滑点 0.02%
+            - generic [ref=e331]:
+              - generic [ref=e332]: 11:38:42
+              - generic [ref=e333]: Orchestrator
+              - generic [ref=e334]: → 情绪分析 · 请求新闻快速扫描 · 优先级 HIGH
+            - generic [ref=e335]:
+              - generic [ref=e336]: 11:38:45
+              - generic [ref=e337]: 市场分析
+              - generic [ref=e338]: → 策略优化 · SOL 突破确认 · 信号置信 84%
+            - generic [ref=e339]:
+              - generic [ref=e340]: 11:38:24
+              - generic [ref=e341]: Orchestrator
+              - generic [ref=e342]: → 市场分析 · 触发扫描任务 · BTC 信号强度 HIGH
+            - generic [ref=e343]:
+              - generic [ref=e344]: 11:38:27
+              - generic [ref=e345]: 市场分析
+              - generic [ref=e346]: → 风险管理 · RSI 超买预警 · 建议减仓 10%
+            - generic [ref=e347]:
+              - generic [ref=e348]: 11:38:30
+              - generic [ref=e349]: 情绪分析
+              - generic [ref=e350]: → Orchestrator · Twitter 情绪分 +72 · 多头偏强
+            - generic [ref=e351]:
+              - generic [ref=e352]: 11:38:33
+              - generic [ref=e353]: 风险管理
+              - generic [ref=e354]: → 执行 · 仓位上限预警 · BTC 敞口 38%
+            - generic [ref=e355]:
+              - generic [ref=e356]: 11:38:36
+              - generic [ref=e357]: 策略优化
+              - generic [ref=e358]: → Orchestrator · 参数更新完成 · 预期收益 +2.1%
+            - generic [ref=e359]:
+              - generic [ref=e360]: 11:38:39
+              - generic [ref=e361]: 执行
+              - generic [ref=e362]: → Orchestrator · 订单成交 BTC 0.15 · 滑点 0.02%
+            - generic [ref=e363]:
+              - generic [ref=e364]: 11:38:42
+              - generic [ref=e365]: Orchestrator
+              - generic [ref=e366]: → 情绪分析 · 请求新闻快速扫描 · 优先级 HIGH
+            - generic [ref=e367]:
+              - generic [ref=e368]: 11:38:45
+              - generic [ref=e369]: 市场分析
+              - generic [ref=e370]: → 策略优化 · SOL 突破确认 · 信号置信 84%
+      - button "+ 新建策略" [ref=e371] [cursor=pointer]
+    - generic [ref=e373]:
+      - generic [ref=e374]:
+        - generic [ref=e375]: 当前持仓
+        - generic [ref=e376]: 暂无持仓
+      - generic [ref=e377]:
+        - generic [ref=e378]: 风险仪表盘
+        - generic [ref=e379]:
+          - generic [ref=e380]:
+            - generic [ref=e381]: P0 事件
+            - generic [ref=e382]: "0"
+          - generic [ref=e383]:
+            - generic [ref=e384]: P1 事件
+            - generic [ref=e385]: "0"
+          - generic [ref=e386]:
+            - generic [ref=e387]: 总事件
+            - generic [ref=e388]: "0"
+          - generic [ref=e389]:
+            - generic [ref=e390]: 已解决
+            - generic [ref=e391]: "0"
+      - generic [ref=e392]:
+        - generic [ref=e393]: 近期执行
+        - generic [ref=e394]: 暂无成交记录
+      - generic [ref=e395]:
+        - generic [ref=e396]: 模型调用统计
+        - generic [ref=e397]:
+          - generic [ref=e398]:
+            - generic [ref=e399]: 今日 API 调用
+            - generic [ref=e400]: "3"
+          - generic [ref=e401]:
+            - generic [ref=e402]: 平均响应时间
+            - generic [ref=e403]: 124ms
+          - generic [ref=e404]:
+            - generic [ref=e405]: Token 消耗
+            - generic [ref=e406]: 1.2M
+          - generic [ref=e407]:
+            - generic [ref=e408]: 推理成功率
+            - generic [ref=e409]: 99.7%

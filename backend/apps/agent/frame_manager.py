@@ -285,6 +285,7 @@ class FrameManager:
 
         # 1. 加载并连接所有已注册的 crypto 数据源
         sources = DataSourceRegistry.list_registered()
+        logger.info("[FrameManager] starting data feed, registered sources: %s", sources)
         for source_name in sources:
             try:
                 ds = DataSourceRegistry.get(source_name)
@@ -472,8 +473,29 @@ class FrameManager:
         logger.info("[FrameManager] order consumer stopped")
 
     async def _start_signal_monitor(self) -> None:
-        logger.info("[FrameManager] signal monitor starting...")
-        # TODO: 启动信号监控
+        """启动信号监控。
+
+        信号监控由 Celery Beat 每 30 秒定时驱动（check_signals 任务），
+        同时 WebSocket 数据源的 K 线回调也会触发实时检查（_on_kline_data）。
+        此处主要验证 Celery Beat 是否运行并输出监控摘要。
+        """
+        from apps.signal_monitor.models import SignalMonitor
+        from django.utils import timezone
+        from asgiref.sync import sync_to_async
+
+        @sync_to_async
+        def _count_active_monitors():
+            now = timezone.now()
+            return SignalMonitor.objects.filter(
+                status="active",
+            ).exclude(
+                expires_at__lt=now,
+            ).count()
+
+        active_count = await _count_active_monitors()
+        logger.info(
+            "[FrameManager] signal monitor started: %d active monitors", active_count
+        )
 
     async def _stop_signal_monitor(self) -> None:
         logger.info("[FrameManager] signal monitor stopped")

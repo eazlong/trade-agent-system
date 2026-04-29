@@ -77,7 +77,7 @@ class MySkill(BaseSkill):
 ```
 只需在 `apps/skill/skills/__init__.py` 中 import，装饰器自动注册。
 
-**意图路由** — `apps/agent/supervisor.py` 中 `INTENT_TO_AGENT` 字典映射意图到 Agent 名称，新增 Agent 需同时更新此映射。
+**意图路由** — `apps/agent/supervisor.py` 中 SupervisorAgent 通过 LLM 动态识别：将各 Agent prompt body 中的概述描述传给 LLM，由 LLM 根据用户消息内容判断应路由到哪个 Agent，不再依赖 prompt frontmatter 的 `intent` 字段。新增 Agent 只需在 prompts 目录下添加 prompt 文件即可。
 
 ### 2. 分层记忆架构
 
@@ -126,7 +126,7 @@ OpenAI GPT-4o → (超时/429/错误) → Anthropic Claude Opus → (失败) →
 ### 新增 Agent
 1. 在 `apps/agent/sub_agents.py` 中继承 `_LLMAgent`
 2. 用 `@AgentRegistry.register_class` 装饰
-3. 在 `INTENT_TO_AGENT` 映射中添加路由规则
+3. 在 `backend/prompts/v1/` 下创建 prompt 文件，frontmatter 中设置 `name`，body 中描述 Agent 的职责概述（LLM 会基于此自动路由）
 
 ### 新增 Celery 定时任务
 在 `backend/celery_app.py` 的 `beat_schedule` 中添加条目。

@@ -49,6 +49,9 @@ class LogWebSocket {
     return url.toString();
   }
 
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+
   connect() {
     if (
       this.ws &&
@@ -61,6 +64,7 @@ class LogWebSocket {
     this.ws = new WebSocket(this.getWsUrl());
 
     this.ws.onopen = () => {
+      this.reconnectAttempts = 0;
       if (this.currentParams) {
         this.subscribe(this.currentParams);
       }
@@ -76,6 +80,11 @@ class LogWebSocket {
     };
 
     this.ws.onclose = () => {
+      this.reconnectAttempts++;
+      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+        console.warn("[LogWebSocket] Max reconnect attempts reached");
+        return;
+      }
       this.reconnectTimer = setTimeout(() => this.connect(), 3000);
     };
 
@@ -110,6 +119,10 @@ class LogWebSocket {
 
   get readyState(): number {
     return this.ws?.readyState ?? WebSocket.CLOSED;
+  }
+
+  get isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
   }
 }
 

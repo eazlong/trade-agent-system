@@ -190,28 +190,6 @@ async def nack_and_retry(
         await publish(stream, retry_payload)
 
 
-async def scan_dlq(stream: str, count: int = 100) -> list[dict]:
-    """
-    扫描 DLQ（供监控/告警调用）。
-    返回待处理的 DLQ 消息列表（不消费，仅读取）。
-    """
-    dlq = f"{stream}:dlq"
-    r = await _get_redis(stream)  # DLQ 与原 stream 同 DB
-    try:
-        entries = await r.xrange(dlq, count=count)
-        result = []
-        for msg_id, fields in entries:
-            decoded = {"_msg_id": msg_id}
-            for k, v in fields.items():
-                try:
-                    decoded[k] = json.loads(v)
-                except (json.JSONDecodeError, TypeError):
-                    decoded[k] = v
-            result.append(decoded)
-        return result
-    finally:
-        await r.aclose()
-
 
 async def publish_reply(task_id: str, result: str, ttl: int = 60) -> None:
     """

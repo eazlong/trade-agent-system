@@ -197,16 +197,12 @@ _router.register_fallback_rules(
         (r"(风险|止损|仓位|风控)", "assess_risk"),
         (r"(计划|复盘|总结|周报)", "create_plan"),
         (r"(策略|代码|编写)", "generate_and_test_strategy"),
+        (r"(研究|调研|收集.*资料|查找.*知识|搜索.*信息|内容研究)", "research_topic"),
+        (r"(价格|突破|跌破|高于|低于|提醒|通知|监控).*(BTC|ETH|币|\d{4,})", "supervisor"),
     ]
 )
 
 
-# 保持旧模块级变量的向后兼容（指向 router 的数据）
-# 新代码应直接使用 IntentRouter.get_instance()
-INTENT_TO_AGENT = _router._intent_to_agent
-AGENT_TO_INTENT = _router._agent_to_intent
-FRAME_INTENTS = _router._frame_intents
-FALLBACK_RULES = _router._fallback_rules
 
 MAX_REROUTE = 2
 PAUSE_TTL = 300  # 5 minutes
@@ -216,15 +212,7 @@ class SupervisorAgent(BaseAgent):
     """主管Agent：LLM解析用户意图、路由子Agent、管理框架生命周期"""
 
     name = "supervisor"
-    _agent_tools: list[str] = [
-        "web_search",
-        "web_fetch",
-        "read_file",
-        "write_file",
-        "load_skill",
-        "get_system_status",
-        "get_exchange_account",
-    ]
+    _agent_tools: list[str] = []
 
     _instance: Optional["SupervisorAgent"] = None
 
@@ -232,33 +220,52 @@ class SupervisorAgent(BaseAgent):
         super().__init__()
         self._llm = LLMClient.get_instance()
         self._frame = FrameManager.get_instance()
-        self._prompt_loader = PromptLoader
         self._router = IntentRouter.get_instance()
+        self._current_user_id: str = ""
 
-        # 动态发现并注册所有 Agent（从 Prompt 文件）
+        # 动态发现所有 Agent（从 Prompt 文件）
         from .registry import AgentRegistry
 
         AgentRegistry.discover_from_prompts()
 
-        # 从 Prompt 元数据动态注册意图映射
-        self._register_intents_from_prompts()
+        # 从 prompt 元数据加载工具声明
+        from .prompt_loader import _parse_frontmatter
+        from pathlib import Path
+        prompt_file = Path(__file__).parent.parent.parent / "prompts" / "v1" / "supervisor.txt"
+        raw = prompt_file.read_text(encoding="utf-8")
+        meta, _ = _parse_frontmatter(raw)
+
+        # 用 prompt 中声明的工具覆盖硬编码列表
+        if "tools" in meta:
+            self._agent_tools = meta["tools"]
 
         self._system_prompt = PromptLoader.load("supervisor")
+
+    async def _execute_tool_call(self, tc) -> str:
+        """执行工具调用，自动注入 user_id 上下文。"""
+        try:
+            if tc.name == "load_skill":
+                from apps.agent.tools.load_skill import LoadSkillTool
+
+                skill_name = tc.arguments.get("skill_name", "")
+                tool = LoadSkillTool(agent_name=self.name)
+                result = await tool.execute(skill_name=skill_name)
+            else:
+                # 注入 user_id（如果工具支持）
+                if self._current_user_id and "user_id" not in tc.arguments:
+                    tc.arguments["user_id"] = self._current_user_id
+                result = await self.run_tool(tc.name, **tc.arguments)
+
+            if result.success:
+                return str(result.data)
+            return f"Error: {result.error}"
+        except Exception as e:
+            logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
+            return f"Error: {e}"
 
     def _build_system_prompt_with_skills(self) -> str:
         """动态构建 system prompt，注入 always 技能内容。"""
         return self._build_skills_section(self._system_prompt)
-
-    def _register_intents_from_prompts(self) -> None:
-        """从 Prompt 元数据注册意图映射。"""
-        from .prompt_loader import PromptLoader
-
-        agents = PromptLoader.list_agents()
-        for meta in agents:
-            name = meta.get("name")
-            intent = meta.get("intent")
-            if name and intent:
-                self._router.register_intent(intent, name)
 
     @classmethod
     def get_instance(cls) -> "SupervisorAgent":
@@ -367,7 +374,34 @@ class SupervisorAgent(BaseAgent):
             await session_mgr.clear_session_context(message.user_id)
             return await self._normal_route(message)
 
+        # 初始化 MemoryManager
+        mm = None
+        if message.user_id:
+            from apps.memory.manager import MemoryManager
+            mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
+
         result = await self._route_to_agent(agent_name, message)
+
+        # 写入统一对话历史
+        if mm and result.success and not result.need_reroute:
+            user_text = message.payload.get("text", "")[:500]
+            agent_text = str(result.data)[:500] if result.data else ""
+            conversation_history = mm._l1.get("conversation_history", [])
+            updated = conversation_history[-4:] + [
+                {
+                    "role": "user",
+                    "agent": agent_name,
+                    "text": user_text,
+                    "ts": int(time.time()),
+                },
+                {
+                    "role": "agent",
+                    "agent": agent_name,
+                    "text": agent_text,
+                    "ts": int(time.time()),
+                },
+            ]
+            mm.write_l1("conversation_history", updated[-5:])
 
         # SubAgent 拒收
         if result.need_reroute:
@@ -379,24 +413,19 @@ class SupervisorAgent(BaseAgent):
             await self._pause_session(message, session_mgr, agent_name, result)
 
             # 尝试用新意图路由
-            new_intent = await self._parse_intent(message.payload.get("text", ""))
-            if isinstance(new_intent, dict) and new_intent.get("_free_chat"):
-                if new_intent.get("response"):
+            new_parsed = await self._parse_intent(message.payload.get("text", ""))
+            if isinstance(new_parsed, dict) and new_parsed.get("_free_chat"):
+                if new_parsed.get("response"):
                     return AgentResult(
                         task_id=message.task_id,
                         success=True,
-                        data=new_intent["response"],
+                        data=new_parsed["response"],
                     )
                 return await self._free_chat(message)
-            new_intent_str = (
-                new_intent[0] if isinstance(new_intent, tuple) else new_intent
-            )
-            if new_intent_str and new_intent_str != "free_chat":
-                new_agent = self._router.get_agent_for_intent(new_intent_str)
-                if new_agent and new_agent != agent_name:
-                    return await self._route_with_fallback(
-                        message, new_intent_str, {agent_name}
-                    )
+# 新流程：parsed 直接是 agent name 或 frame intent
+            new_agent = str(new_parsed)
+            if new_agent and new_agent != "free_chat" and new_agent != agent_name:
+                return await self._route_to_agent(new_agent, message)
 
             # 无法路由，走 free_chat
             return await self._free_chat(message)
@@ -411,6 +440,7 @@ class SupervisorAgent(BaseAgent):
                 agent_name,
             )
         else:
+            logger.info("[%s] Ending multi-turn session for user %s", self.name, message.user_id)
             await session_mgr.clear_session_context(message.user_id)
 
         return result
@@ -444,16 +474,16 @@ class SupervisorAgent(BaseAgent):
 
         session_mgr = get_session_manager()
         mm = None
-        routing_history: list = []
+        conversation_history: list = []
         if message.user_id:
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            routing_history = mm._l1.get("routing_history", [])
+            conversation_history = mm._l1.get("conversation_history", [])
 
         parsed = message.intent or await self._parse_intent(
             message.payload.get("text", ""),
-            context=routing_history[-5:] if routing_history else None,
+            context=conversation_history[-5:] if conversation_history else None,
         )
 
         # LLM 直接返回自由对话（节省一次 LLM 调用）
@@ -466,38 +496,41 @@ class SupervisorAgent(BaseAgent):
             # response 为空（LLM 降级），用 _free_chat 处理
             return await self._free_chat(message)
 
-        # 提取意图字符串和 LLM 返回的 params（若有）
-        intent_str: str
-        parsed_params: dict = {}
-        if isinstance(parsed, tuple):
-            intent_str, parsed_params = parsed
-        else:
-            intent_str = str(parsed)
-
-        message.intent = intent_str
-        if parsed_params:
-            message.payload = {**message.payload, **parsed_params}
+        # 新流程：parsed 直接是 agent name 或 frame intent
+        resolved: str = str(parsed)
 
         # 框架生命周期
-        if self._router.is_frame_intent(intent_str):
-            return await self._handle_frame(intent_str, message)
+        if self._router.is_frame_intent(resolved):
+            return await self._handle_frame(resolved, message)
 
-        # 路由子Agent
-        agent_name = self._router.get_agent_for_intent(intent_str)
-        if agent_name:
-            result = await self._route_with_fallback(message, intent_str)
+        # Supervisor 自己处理（使用自身工具）
+        if resolved == "supervisor":
+            return await self._self_execute(message)
 
-            # 路由成功时写 L1
+        # 路由子Agent（parsed 直接是 agent name）
+        agent_name = resolved
+        if agent_name and agent_name != "unknown":
+            result = await self._route_to_agent(agent_name, message)
+
+            # 路由成功时写入统一对话历史
             if mm and result.success and not result.need_reroute:
-                updated = routing_history[-19:] + [
+                user_text = message.payload.get("text", "")[:500]
+                agent_text = str(result.data)[:500] if result.data else ""
+                updated = conversation_history[-4:] + [
                     {
-                        "intent": intent_str,
+                        "role": "user",
                         "agent": agent_name,
-                        "q": message.payload.get("text", "")[:100],
+                        "text": user_text,
                         "ts": int(time.time()),
-                    }
+                    },
+                    {
+                        "role": "agent",
+                        "agent": agent_name,
+                        "text": agent_text,
+                        "ts": int(time.time()),
+                    },
                 ]
-                mm.write_l1("routing_history", updated)
+                mm.write_l1("conversation_history", updated[-5:])
 
                 # 检查响应是否要求开始多轮对话
                 if hasattr(result.data, "get") and result.data.get(
@@ -517,9 +550,13 @@ class SupervisorAgent(BaseAgent):
     async def _route_with_fallback(
         self, message: AgentMessage, intent: str, attempted: set | None = None
     ) -> AgentResult:
-        """带拒收重路由的 Agent 调用"""
+        """带拒收重路由的 Agent 调用。
+
+        兼容旧调用方式：intent 参数可能是 agent name 或旧式 intent。
+        """
         attempted = attempted or set()
-        agent_name = self._router.get_agent_for_intent(intent)
+        # 兼容：intent 可能是 agent name 或旧式 intent
+        agent_name = self._router.get_agent_for_intent(intent) or intent
 
         if not agent_name or agent_name in attempted or len(attempted) >= MAX_REROUTE:
             return await self._free_chat(message)
@@ -533,37 +570,29 @@ class SupervisorAgent(BaseAgent):
 
             # 优先用 SubAgent 建议的目标
             if result.reroute_suggestion and result.reroute_suggestion not in attempted:
-                suggested_intent = self._router.get_intent_for_agent(
-                    result.reroute_suggestion
+                return await self._route_with_fallback(
+                    message, result.reroute_suggestion, attempted
                 )
-                if suggested_intent:
-                    return await self._route_with_fallback(
-                        message, suggested_intent, attempted
-                    )
 
             # 重新解析意图（排除已尝试的 Agent）
             exclude_agents = list(attempted)
-            new_intent = await self._parse_intent(
+            new_parsed = await self._parse_intent(
                 message.payload.get("text", ""),
                 exclude_agents=exclude_agents,
             )
-            if isinstance(new_intent, dict) and new_intent.get("_free_chat"):
-                if new_intent.get("response"):
+            if isinstance(new_parsed, dict) and new_parsed.get("_free_chat"):
+                if new_parsed.get("response"):
                     return AgentResult(
                         task_id=message.task_id,
                         success=True,
-                        data=new_intent["response"],
+                        data=new_parsed["response"],
                     )
                 return await self._free_chat(message)
-            new_intent_str = (
-                new_intent[0] if isinstance(new_intent, tuple) else new_intent
-            )
-            if new_intent_str and new_intent_str != "free_chat":
-                new_agent = self._router.get_agent_for_intent(new_intent_str)
-                if new_agent and new_agent not in attempted:
-                    return await self._route_with_fallback(
-                        message, new_intent_str, attempted
-                    )
+new_agent = str(new_parsed)
+            if new_agent and new_agent != "free_chat" and new_agent not in attempted:
+                return await self._route_with_fallback(
+                    message, new_agent, attempted
+                )
 
             # 都失败
             return await self._free_chat(message)
@@ -620,16 +649,30 @@ class SupervisorAgent(BaseAgent):
         self, text: str, context: list | None = None, exclude_agents: list | None = None
     ) -> str | dict:
         """
-        调用LLM解析意图，支持多意图。
+        调用LLM解析意图，基于 Agent 概述动态识别。
 
         Returns:
-            str: 意图名（如 'analyze_market'）
+            str: Agent 名称（如 'quant'）或框架意图（如 'start_trading'）
             dict: {'_free_chat': True, 'response': '...'} 未识别意图时 LLM 直接返回回复
         """
         if not text:
             return "unknown"
 
-        valid_intents = self._router.valid_intents_for_prompt()
+        # 构建 Agent 概述列表（排除已尝试的）
+        agents = PromptLoader.list_agents()
+        if exclude_agents:
+            agents = [a for a in agents if a.get("name") not in exclude_agents]
+
+        agent_descriptions = "\n".join(
+            f"- {a['name']}: {a.get('overview', '').replace(chr(10), chr(10) + '  ')}" for a in agents if a.get("name")
+        )
+
+        # 框架意图列表（仍然需要检查）
+        frame_intents = self._router.all_frame_intents()
+        frame_block = ""
+        if frame_intents:
+            frame_block = f"Framework intents (system actions): {json.dumps(frame_intents)}\n"
+
         context_block = ""
         if context:
             context_block = (
@@ -638,26 +681,38 @@ class SupervisorAgent(BaseAgent):
 
         exclude_block = ""
         if exclude_agents:
-            exclude_block = (
-                f"Exclude these agents (already tried): {exclude_agents}\n\n"
-            )
+            exclude_block = f"Exclude these agents (already tried): {exclude_agents}\n\n"
 
         skills_summary = self._get_skills_summary()
         skills_block = (
             f"Available agent skills:\n{skills_summary}\n\n" if skills_summary else ""
         )
 
+        # Supervisor 自身能力（工具声明）
+        supervisor_tools = self._agent_tools if hasattr(self, '_agent_tools') and self._agent_tools else []
+        supervisor_block = ""
+        if supervisor_tools:
+            supervisor_block = (
+                f"Your own tools (handle these yourself): {json.dumps(supervisor_tools)}\n"
+                f"If the user request matches these tools, reply: {{\"agent\": \"supervisor\"}}\n\n"
+            )
+
         user_prompt = (
             f"{context_block}"
             f"{exclude_block}"
             f"{skills_block}"
+            f"{frame_block}"
+            f"{supervisor_block}"
+            f"Available agents:\n{agent_descriptions}\n\n"
             f"User message: {text}\n\n"
-            f"Valid intents: {json.dumps(valid_intents)}\n\n"
-            "Reply with a JSON object. "
-            'If the user has one intent: {"intent": "<name>", "text": "{text}"}\n'
-            'If multiple independent intents: {"intents": [{"intent": "...", "text": "{text}"}, ...]}\n'
-            'If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
+            "Analyze the user's intent and determine which agent should handle it "
+            "based on each agent's overview/role description.\n\n"
+            "Reply with a JSON object:\n"
+            '- If one agent matches: {"agent": "<agent_name>"} (can be "supervisor" for your own tools)\n'
+            '- If it matches a framework intent: {"intent": "<frame_intent>"}\n'
+            '- If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
         )
+        logger.debug("Supervisor intent parsing prompt: %s", user_prompt[:500])
         response = await self._llm.chat(
             system=self._system_prompt,
             user=user_prompt,
@@ -668,7 +723,6 @@ class SupervisorAgent(BaseAgent):
             fallback_text = self._rule_based_intent(text)
             if fallback_text:
                 return fallback_text
-            # LLM 完全不可用，返回 free_chat 标记让调用方处理
             return {"_free_chat": True, "response": None}
 
         try:
@@ -687,21 +741,18 @@ class SupervisorAgent(BaseAgent):
             if data.get("_free_chat"):
                 return {"_free_chat": True, "response": data.get("response", "")}
 
-            # 多意图处理：取第一个意图，串行处理在调用方处理
-            if (
-                "intents" in data
-                and isinstance(data["intents"], list)
-                and len(data["intents"]) > 0
-            ):
-                first = data["intents"][0]
-                return first.get("intent", "unknown"), first.get("params", {})
+            # 框架意图
+            if data.get("intent") and data["intent"] in frame_intents:
+                return data["intent"]
 
-            intent = data.get("intent", "unknown")
-            params = data.get("params", {})
-            return intent, params
+            # Agent 路由：返回 agent name
+            agent_name = data.get("agent")
+            if agent_name:
+                return agent_name
+
+            return "unknown"
         except Exception:
             logger.warning(f"Intent parse failed, raw: {response[:200]}")
-            # 降级到规则引擎
             fallback_text = self._rule_based_intent(text)
             if fallback_text:
                 return fallback_text
@@ -744,20 +795,42 @@ class SupervisorAgent(BaseAgent):
         except Exception as e:
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
 
+    async def _self_execute(self, message: AgentMessage) -> AgentResult:
+        """Supervisor 使用自身工具执行任务。"""
+        self._current_user_id = message.user_id or ""
+        text = message.payload.get("text", "")
+        tools = self._get_tools_schema()
+        system = self._build_system_prompt_with_skills()
+        messages = [{"role": "user", "content": text}]
+
+        content, is_fb = await self._run_tool_loop(
+            system, messages, tools, max_tokens=2048
+        )
+
+        if is_fb:
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                error="LLM暂时不可用，请稍后再试",
+            )
+
+        return AgentResult(task_id=message.task_id, success=True, data=content)
+
     async def _free_chat(self, message: AgentMessage) -> AgentResult:
         """未识别意图，LLM自由对话，支持工具调用"""
+        self._current_user_id = message.user_id or ""
         text = message.payload.get("text", "")
 
         mm = None
-        conv_history: list = []
+        conversation_history: list = []
         if message.user_id:
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            conv_history = mm._l1.get("conv_history", [])[-20:]
+            conversation_history = mm._l1.get("conversation_history", [])[-5:]
 
-        if conv_history:
-            history_block = "\n".join(f"{t['role']}: {t['text']}" for t in conv_history)
+        if conversation_history:
+            history_block = "\n".join(f"{t['role']}({t.get('agent','supervisor')}): {t['text']}" for t in conversation_history)
             user_prompt = f"[对话历史]\n{history_block}\n\n[当前消息]\n{text}"
         else:
             user_prompt = text
@@ -778,11 +851,11 @@ class SupervisorAgent(BaseAgent):
             )
 
         if mm:
-            updated = conv_history[-18:] + [
-                {"role": "user", "text": text[:200], "ts": int(time.time())},
-                {"role": "assistant", "text": content[:200], "ts": int(time.time())},
+            updated = conversation_history[-4:] + [
+                {"role": "user", "agent": "supervisor", "text": text[:500], "ts": int(time.time())},
+                {"role": "agent", "agent": "supervisor", "text": content[:500], "ts": int(time.time())},
             ]
-            mm.write_l1("conv_history", updated)
+            mm.write_l1("conversation_history", updated[-5:])
             await mm.write_l2(
                 content=f"user: {text}\nassistant: {content}",
                 memory_type="conversation",

@@ -72,6 +72,14 @@ class SubmitBacktestTool(BaseTool):
                     "description": "交易所名称，默认 binance",
                     "default": "binance",
                 },
+                "start_date": {
+                    "type": "string",
+                    "description": "回测开始日期（ISO 格式，如 2024-01-01），默认最近 30 天",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "回测结束日期（ISO 格式，如 2024-12-31），默认今天",
+                },
             },
             "required": ["strategy_name", "symbol", "timeframe"],
         }
@@ -100,6 +108,8 @@ class SubmitBacktestTool(BaseTool):
                     "parameters": kwargs.get("parameters"),
                     "strategy_id": kwargs.get("strategy_id"),
                     "exchange": kwargs.get("exchange", "binance"),
+                    "start_date": kwargs.get("start_date", ""),
+                    "end_date": kwargs.get("end_date", ""),
                 }
             )
             logger.info(
@@ -166,22 +176,58 @@ class GetTaskResultTool(BaseTool):
             state = result.state
 
             if state == "SUCCESS":
+                res_data = result.result
+                # 检测结构化 FAILURE 结果（任务内捕获异常并返回错误详情）
+                if isinstance(res_data, dict) and res_data.get("status") == "FAILURE":
+                    error_msg = res_data.get("error_message", "未知错误")
+                    error_type = res_data.get("error_type", "Exception")
+                    task_params = res_data.get("task_params", {})
+
+                    # 构建可操作的错误信息，方便 Agent 自动修复
+                    error_detail = (
+                        f"回测任务失败 [{error_type}]: {error_msg}\n"
+                        f"原始任务参数:\n"
+                        f"  - strategy_name: {task_params.get('strategy_name', 'N/A')}\n"
+                        f"  - symbol: {task_params.get('symbol', 'N/A')}\n"
+                        f"  - timeframe: {task_params.get('timeframe', 'N/A')}\n"
+                        f"  - exchange: {task_params.get('exchange', 'N/A')}\n"
+                        f"  - start_date: {task_params.get('start_date', 'N/A')}\n"
+                        f"  - end_date: {task_params.get('end_date', 'N/A')}\n"
+                        f"  - initial_capital: {task_params.get('initial_capital', 'N/A')}\n"
+                        f"  - commission_rate: {task_params.get('commission_rate', 'N/A')}\n"
+                        f"  - parameters: {task_params.get('parameters', 'N/A')}\n\n"
+                        f"请分析上述错误原因，修复问题后重新提交回测任务。"
+                    )
+                    return ToolResult(
+                        success=True,
+                        data={
+                            "task_id": task_id,
+                            "status": "FAILURE",
+                            "error_type": error_type,
+                            "error": error_msg,
+                            "task_params": task_params,
+                            "actionable_error": error_detail,
+                        },
+                    )
+
                 return ToolResult(
                     success=True,
                     data={
                         "task_id": task_id,
                         "status": "SUCCESS",
-                        "result": result.result,
+                        "result": res_data,
                     },
                 )
             elif state == "FAILURE":
+                # Celery 层面未捕获的异常（非任务内 return 的 FAILURE）
                 error_info = str(result.result) if result.result else "未知错误"
                 return ToolResult(
-                    success=True,  # 工具本身成功，只是任务失败
+                    success=True,
                     data={
                         "task_id": task_id,
                         "status": "FAILURE",
                         "error": error_info,
+                        "note": "此错误为 Celery 层面异常，请检查日志以获取详细信息。",
                     },
                 )
             else:

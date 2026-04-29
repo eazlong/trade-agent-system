@@ -14,12 +14,29 @@
 
 ### 核心模块
 - `apps/agent/` - SupervisorAgent + 子 Agent（分析、策略、风控、教练）
-- `apps/skill/` - 技能注册中心（分析、策略、风控、教练技能）
+- `apps/skill/` - 技能注册中心
 - `apps/trading/` - 交易执行框架（懒加载）
 - `apps/risk/` - 风控引擎
+- `apps/riskguard/` - 风控守卫
 - `apps/backtest/` - 回测框架
+- `apps/strategy_engine/` - 策略引擎（独立运行，支持回测/实盘双模式）
+- `apps/signal_monitor/` - 信号监控（技术指标计算）
+- `apps/channel/` - 通道管理（TUI 交互）
+- `apps/notify/` - 通知系统（WebSocket 路由）
+- `apps/logging_app/` - 日志应用
+- `apps/datasource/` - 数据源管理
+- `apps/exchange/` - 交易所连接（ccxt 封装）
+- `apps/authentication/` - 用户认证
 - `apps/memory/` - 分层记忆（L1/L2/L3）
-- `apps/exchange/` - 交易所连接
+
+### Frontend (tradeclaw-web)
+- **框架**: Next.js (App Router)
+- **位置**: `frontend/tradeclaw-web/`
+- **入口**: `src/app/layout.tsx`
+- **组件**: `src/components/`
+- **API 层**: `src/lib/api.ts`
+- **自定义 Hooks**: `src/hooks/`
+- **状态上下文**: `src/context/`
 
 ### 架构约束
 - **依赖层级**: Types → Config → Repo → Service → API → UI（单向依赖）
@@ -55,6 +72,15 @@ DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app worker -l i
 
 # Celery Beat
 DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app beat -l info
+```
+
+### Docker 完整栈
+```bash
+# 启动全部服务
+docker-compose up --build
+
+# 仅启动特定服务
+docker-compose up backend celery redis
 ```
 
 ### 测试（强制执行）
@@ -156,4 +182,5 @@ cd backend && python scripts/check_invariants.py
 ### 新增 Agent
 1. 在 `apps/agent/sub_agents.py` 中继承 `_LLMAgent`
 2. 用 `@AgentRegistry.register_class` 装饰
-3. 在 `INTENT_TO_AGENT` 映射中添加路由规则
+3. 在 `backend/prompts/v1/` 下创建 prompt 文件，body 中描述 Agent 职责概述
+   （LLM 会基于 supervisor.py 中的动态识别自动路由）
