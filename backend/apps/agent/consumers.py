@@ -56,12 +56,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.user_id = str(user.id)
         logger.info("[ChatWS] User %s connected", self.user_id)
 
-        await self.send(
-            text_data=json.dumps({"type": "status", "status": "connected"})
-        )
+        await self.send(text_data=json.dumps({"type": "status", "status": "connected"}))
 
     async def disconnect(self, close_code):
-        user_id = getattr(self, 'user_id', 'unknown')
+        user_id = getattr(self, "user_id", "unknown")
         logger.info("[ChatWS] User %s disconnected (code=%s)", user_id, close_code)
 
     async def receive(self, text_data):
@@ -76,7 +74,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
             else:
                 await self.send(
                     text_data=json.dumps(
-                        {"type": "error", "error": f"Unknown message type: {message_type}"}
+                        {
+                            "type": "error",
+                            "error": f"Unknown message type: {message_type}",
+                        }
                     )
                 )
 
@@ -87,9 +88,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
         except Exception as e:
             logger.error("[ChatWS] Error processing message: %s", e)
-            await self.send(
-                text_data=json.dumps({"type": "error", "error": str(e)})
-            )
+            await self.send(text_data=json.dumps({"type": "error", "error": str(e)}))
 
     async def _handle_chat(self, data):
         text = data.get("text", "").strip()
@@ -119,29 +118,37 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             if result.success:
                 await self.send(
-                    text_data=json.dumps({
-                        "type": "chat_response",
-                        "data": result.data,
-                        "task_id": result.task_id,
-                        "status": "done",
-                    })
+                    text_data=json.dumps(
+                        {
+                            "type": "chat_response",
+                            "data": result.data,
+                            "task_id": result.task_id,
+                            "status": "done",
+                        }
+                    )
                 )
             else:
                 await self.send(
-                    text_data=json.dumps({
-                        "type": "chat_response",
-                        "error": result.error,
-                        "task_id": result.task_id,
-                        "status": "error",
-                    })
+                    text_data=json.dumps(
+                        {
+                            "type": "chat_response",
+                            "error": result.error,
+                            "task_id": result.task_id,
+                            "status": "error",
+                        }
+                    )
                 )
 
         except Exception as e:
-            logger.error("[ChatWS] Supervisor handle error: %s\n%s", e, traceback.format_exc())
+            logger.error(
+                "[ChatWS] Supervisor handle error: %s\n%s", e, traceback.format_exc()
+            )
             await self.send(
-                text_data=json.dumps({
-                    "type": "chat_response",
-                    "error": str(e),
-                    "status": "error",
-                })
+                text_data=json.dumps(
+                    {
+                        "type": "chat_response",
+                        "error": str(e),
+                        "status": "error",
+                    }
+                )
             )

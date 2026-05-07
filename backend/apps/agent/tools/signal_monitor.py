@@ -82,7 +82,8 @@ class ListSignalMonitorTool(BaseTool):
             def _get_user(uid: str):
                 try:
                     import uuid
-                    return User.objects.get(id=uuid.UUID(uid))
+
+                    return User.objects.get(id=uuid.UUID(str(uid)))
                 except (ValueError, User.DoesNotExist):
                     return User.objects.filter(username=uid).first()
 
@@ -118,27 +119,29 @@ class ListSignalMonitorTool(BaseTool):
                 op_label = _CONDITION_MAP.get(op, {}).get("label", op)
                 right_val = cond.get("right", {}).get("value", "")
 
-                items.append({
-                    "id": str(m.id),
-                    "name": m.name,
-                    "symbol": m.symbol,
-                    "indicator_type": m.indicator_type,
-                    "condition": f"{op_label} {right_val}",
-                    "status": _STATUS_LABELS.get(m.status, m.status),
-                    "trigger_type": "单次" if m.trigger_type == "once" else "持续",
-                    "trigger_count": m.trigger_count,
-                    "last_triggered_at": (
-                        m.last_triggered_at.strftime("%Y-%m-%d %H:%M")
-                        if m.last_triggered_at
-                        else "未触发"
-                    ),
-                    "expires_at": (
-                        m.expires_at.strftime("%Y-%m-%d %H:%M")
-                        if m.expires_at
-                        else "永不过期"
-                    ),
-                    "created_at": m.created_at.strftime("%Y-%m-%d %H:%M"),
-                })
+                items.append(
+                    {
+                        "id": str(m.id),
+                        "name": m.name,
+                        "symbol": m.symbol,
+                        "indicator_type": m.indicator_type,
+                        "condition": f"{op_label} {right_val}",
+                        "status": _STATUS_LABELS.get(m.status, m.status),
+                        "trigger_type": "单次" if m.trigger_type == "once" else "持续",
+                        "trigger_count": m.trigger_count,
+                        "last_triggered_at": (
+                            m.last_triggered_at.strftime("%Y-%m-%d %H:%M")
+                            if m.last_triggered_at
+                            else "未触发"
+                        ),
+                        "expires_at": (
+                            m.expires_at.strftime("%Y-%m-%d %H:%M")
+                            if m.expires_at
+                            else "永不过期"
+                        ),
+                        "created_at": m.created_at.strftime("%Y-%m-%d %H:%M"),
+                    }
+                )
 
             lines = [f"共 {len(items)} 个监控任务：\n"]
             for i, item in enumerate(items, 1):
@@ -220,7 +223,8 @@ class DeleteSignalMonitorTool(BaseTool):
             def _get_user(uid: str):
                 try:
                     import uuid
-                    return User.objects.get(id=uuid.UUID(uid))
+
+                    return User.objects.get(id=uuid.UUID(str(uid)))
                 except (ValueError, User.DoesNotExist):
                     return User.objects.filter(username=uid).first()
 
@@ -230,6 +234,7 @@ class DeleteSignalMonitorTool(BaseTool):
 
             # 按单个 ID 删除
             if monitor_id:
+
                 @sync_to_async
                 def _delete_one():
                     try:
@@ -421,7 +426,8 @@ class AddSignalMonitorTool(BaseTool):
             def _get_user(uid: str):
                 try:
                     import uuid
-                    return User.objects.get(id=uuid.UUID(uid))
+
+                    return User.objects.get(id=uuid.UUID(str(uid)))
                 except (ValueError, User.DoesNotExist):
                     return User.objects.filter(username=uid).first()
 
@@ -446,17 +452,25 @@ class AddSignalMonitorTool(BaseTool):
                 status = await _get_frame_status()
                 frame_status = status.get("assist", "unknown")
                 if frame_status != "running":
-                    logger.info("[AddSignalMonitorTool] assist frame not running, starting...")
+                    logger.info(
+                        "[AddSignalMonitorTool] assist frame not running, starting..."
+                    )
                     await frame.start_assist_frame()
                     status = await _get_frame_status()
                     frame_status = status.get("assist", "unknown")
             except Exception as e:
-                logger.warning("[AddSignalMonitorTool] assist frame check/start failed: %s", e)
+                logger.warning(
+                    "[AddSignalMonitorTool] assist frame check/start failed: %s", e
+                )
 
             # 构建条件
             condition = {
                 "operator": condition_operator,
-                "left": {"field": "price" if indicator_type == "price_watch" else indicator_type},
+                "left": {
+                    "field": "price"
+                    if indicator_type == "price_watch"
+                    else indicator_type
+                },
                 "right": {"value": target_value},
             }
 
@@ -470,9 +484,7 @@ class AddSignalMonitorTool(BaseTool):
             # 计算过期时间
             expires_at = None
             if expires_hours and expires_hours > 0:
-                expires_at = datetime.now(timezone.utc) + timedelta(
-                    hours=expires_hours
-                )
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
 
             # 创建 SignalMonitor（需要同步包装）
             from apps.signal_monitor.models import SignalMonitor
@@ -499,7 +511,11 @@ class AddSignalMonitorTool(BaseTool):
             cond_label = _CONDITION_MAP.get(condition_operator, {}).get(
                 "label", condition_operator
             )
-            target_str = f"{target_value:,.2f}" if isinstance(target_value, float) else str(target_value)
+            target_str = (
+                f"{target_value:,.2f}"
+                if isinstance(target_value, float)
+                else str(target_value)
+            )
 
             return ToolResult(
                 success=True,

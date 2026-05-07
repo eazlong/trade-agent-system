@@ -58,9 +58,9 @@ class GetExchangeAccountTool(BaseTool):
         try:
             from asgiref.sync import sync_to_async
 
-            accounts = await sync_to_async(
-                self._execute_query, thread_sensitive=True
-            )(exchange, label)
+            accounts = await sync_to_async(self._execute_query, thread_sensitive=True)(
+                exchange, label
+            )
             if not accounts:
                 parts = []
                 if exchange:

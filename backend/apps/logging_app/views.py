@@ -45,18 +45,20 @@ class LogListView(generics.ListAPIView):
 
         total = queryset.count()
         offset = (page - 1) * page_size
-        page_qs = queryset[offset: offset + page_size]
+        page_qs = queryset[offset : offset + page_size]
 
         serializer = self.get_serializer(page_qs, many=True)
         has_next = offset + page_size < total
 
-        return Response({
-            "count": total,
-            "page": page,
-            "page_size": page_size,
-            "has_next": has_next,
-            "results": serializer.data,
-        })
+        return Response(
+            {
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "has_next": has_next,
+                "results": serializer.data,
+            }
+        )
 
     def get_queryset(self):
         qs = SystemLog.objects.all()

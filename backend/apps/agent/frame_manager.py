@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
@@ -28,6 +29,7 @@ class FrameManager:
         self._data_feed_refs = 0  # 引用计数：trading+assist共享数据源
         self._riskguard = None
         self._order_executor = None
+        self._strategy_runner = None
 
         # 从 Redis 恢复持久化的框架状态
         self._restore_frame_states()
@@ -207,6 +209,7 @@ class FrameManager:
         if self._trading_state != FrameState.RUNNING:
             return
         self._trading_state = FrameState.STOPPING
+        await self.stop_strategy_runner()
         await self._stop_order_consumer()
         await self._stop_order_executor()
         await self._stop_risk_guard()
@@ -266,6 +269,53 @@ class FrameManager:
         else:
             raise ValueError(f"Unknown frame type: {frame_type!r}")
 
+    # --- Strategy Runner ---
+
+    async def start_strategy_runner(
+        self,
+        strategy_name: str,
+        symbol: str,
+        timeframe: str,
+        parameters: dict | None = None,
+        exchange_account_id: str = "",
+        user_id: str | None = None,
+        live_session_id: str | None = None,
+        initial_balance: Decimal = Decimal("0"),
+    ) -> None:
+        """启动策略运行器，在交易框架启动后调用。"""
+        from apps.strategy_engine.runner import StrategyRunner
+
+        if self._strategy_runner is not None:
+            logger.warning(
+                "[FrameManager] strategy runner already exists, stopping first"
+            )
+            await self.stop_strategy_runner()
+
+        self._strategy_runner = StrategyRunner()
+        await self._strategy_runner.start_live(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            parameters=parameters,
+            exchange_account_id=exchange_account_id,
+            user_id=user_id,
+            live_session_id=live_session_id,
+            initial_balance=initial_balance,
+        )
+        logger.info(
+            "[FrameManager] strategy runner started: %s %s %s",
+            strategy_name,
+            symbol,
+            timeframe,
+        )
+
+    async def stop_strategy_runner(self) -> None:
+        """停止策略运行器。"""
+        if self._strategy_runner is not None:
+            await self._strategy_runner.stop_live()
+            self._strategy_runner = None
+            logger.info("[FrameManager] strategy runner stopped")
+
     # --- Internal lifecycle methods (to be implemented) ---
 
     async def _start_data_feed(self) -> None:
@@ -285,7 +335,9 @@ class FrameManager:
 
         # 1. 加载并连接所有已注册的 crypto 数据源
         sources = DataSourceRegistry.list_registered()
-        logger.info("[FrameManager] starting data feed, registered sources: %s", sources)
+        logger.info(
+            "[FrameManager] starting data feed, registered sources: %s", sources
+        )
         for source_name in sources:
             try:
                 ds = DataSourceRegistry.get(source_name)
@@ -486,11 +538,15 @@ class FrameManager:
         @sync_to_async
         def _count_active_monitors():
             now = timezone.now()
-            return SignalMonitor.objects.filter(
-                status="active",
-            ).exclude(
-                expires_at__lt=now,
-            ).count()
+            return (
+                SignalMonitor.objects.filter(
+                    status="active",
+                )
+                .exclude(
+                    expires_at__lt=now,
+                )
+                .count()
+            )
 
         active_count = await _count_active_monitors()
         logger.info(
