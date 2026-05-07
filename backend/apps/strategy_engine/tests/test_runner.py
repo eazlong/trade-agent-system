@@ -24,7 +24,7 @@ class TestStrategyTester(TestCase):
 
     def test_valid_strategy(self):
         """测试有效的策略文件"""
-        content = '''
+        content = """
 from decimal import Decimal
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 
@@ -43,7 +43,7 @@ class TestStrategy(BaseStrategy):
         if self.ctx.position == 0:
             return self.ctx.buy(quantity=self.quantity, signal_name="entry")
         return None
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester(kline_count=50)
@@ -58,10 +58,10 @@ class TestStrategy(BaseStrategy):
 
     def test_syntax_error(self):
         """测试语法错误"""
-        content = '''
+        content = """
 def broken(
     # missing closing paren
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester()
@@ -73,13 +73,13 @@ def broken(
 
     def test_no_base_strategy_subclass(self):
         """测试没有继承 BaseStrategy 的类"""
-        content = '''
+        content = """
 class NotAStrategy:
     name = "not_a_strategy"
 
     def on_bar(self, kline, history):
         return None
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester()
@@ -91,7 +91,7 @@ class NotAStrategy:
 
     def test_missing_name(self):
         """测试 name 属性为空字符串"""
-        content = '''
+        content = """
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 
 class NamelessStrategy(BaseStrategy):
@@ -99,7 +99,7 @@ class NamelessStrategy(BaseStrategy):
 
     def on_bar(self, kline, history):
         return None
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester()
@@ -111,7 +111,7 @@ class NamelessStrategy(BaseStrategy):
 
     def test_runtime_error_in_on_bar(self):
         """测试 on_bar 中抛出运行时错误"""
-        content = '''
+        content = """
 from decimal import Decimal
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 
@@ -120,7 +120,7 @@ class BrokenStrategy(BaseStrategy):
 
     def on_bar(self, kline, history):
         raise ValueError("intentional error")
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester()
@@ -139,7 +139,7 @@ class BrokenStrategy(BaseStrategy):
 
     def test_invalid_return_type(self):
         """测试 on_bar 返回非 OrderSignal 类型"""
-        content = '''
+        content = """
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 
 class BadReturnStrategy(BaseStrategy):
@@ -147,7 +147,7 @@ class BadReturnStrategy(BaseStrategy):
 
     def on_bar(self, kline, history):
         return "not a signal"
-'''
+"""
         path = self._write_strategy_file(content)
         try:
             tester = StrategyTester(kline_count=50)

@@ -36,14 +36,16 @@ def _generate_mock_klines(n: int = 100) -> list[dict]:
         high_price = max(open_price, close_price) * (1 + abs(random.uniform(0, 0.01)))
         low_price = min(open_price, close_price) * (1 - abs(random.uniform(0, 0.01)))
 
-        klines.append({
-            "timestamp": f"2024-01-{(i // 24) + 1:02d}T{i % 24:02d}:00:00",
-            "open": round(open_price, 2),
-            "high": round(high_price, 2),
-            "low": round(low_price, 2),
-            "close": round(close_price, 2),
-            "volume": round(random.uniform(100, 1000), 2),
-        })
+        klines.append(
+            {
+                "timestamp": f"2024-01-{(i // 24) + 1:02d}T{i % 24:02d}:00:00",
+                "open": round(open_price, 2),
+                "high": round(high_price, 2),
+                "low": round(low_price, 2),
+                "close": round(close_price, 2),
+                "volume": round(random.uniform(100, 1000), 2),
+            }
+        )
         base_price = close_price
     return klines
 
@@ -51,7 +53,9 @@ def _generate_mock_klines(n: int = 100) -> list[dict]:
 class StrategyTester:
     """策略验证器：加载策略文件 → 验证语法 → 注册 → 用模拟数据运行 on_bar"""
 
-    def __init__(self, kline_count: int = 200, initial_capital: Decimal = Decimal("10000")):
+    def __init__(
+        self, kline_count: int = 200, initial_capital: Decimal = Decimal("10000")
+    ):
         self.kline_count = kline_count
         self.initial_capital = initial_capital
 
@@ -191,7 +195,7 @@ class StrategyTester:
         # 例如：atr(np.array(...), np.array(...), np.array(...), period=14)
         # 或：atr(highs, lows, closes, period=self.atr_period)
         atr_array_pattern = re.compile(
-            r'\batr\s*\(\s*[a-zA-Z_]\w*\s*,\s*[a-zA-Z_]\w*\s*,\s*[a-zA-Z_]\w*\s*[,)]'
+            r"\batr\s*\(\s*[a-zA-Z_]\w*\s*,\s*[a-zA-Z_]\w*\s*,\s*[a-zA-Z_]\w*\s*[,)]"
         )
         if atr_array_pattern.search(source):
             warnings.append(
@@ -231,9 +235,7 @@ class StrategyTester:
             r"def\s+on_bar\s*\(\s*self\s*,\s*kline\s*,\s*history\s*\)",
             r"def\s+on_bar\s*\(\s*self\s*,\s*kline\s*:\s*dict\s*,\s*history\s*\)",
         ]
-        has_valid_signature = any(
-            re.search(p, source) for p in on_bar_patterns
-        )
+        has_valid_signature = any(re.search(p, source) for p in on_bar_patterns)
         if not has_valid_signature:
             # 检查是否有 on_bar 定义但签名不匹配
             if re.search(r"def\s+on_bar\s*\(", source):

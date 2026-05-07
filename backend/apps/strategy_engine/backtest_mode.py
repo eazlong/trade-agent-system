@@ -246,7 +246,7 @@ class BacktestEngine:
         )
         self._trades.append(
             {
-"entry_time": entry_time_for_trade,
+                "entry_time": entry_time_for_trade,
                 "exit_time": exit_time,
                 "side": "long",
                 "entry_price": float(avg_cost),
@@ -311,7 +311,7 @@ class BacktestEngine:
                 "entry_time": entry_time_for_close,
                 "exit_time": kline.get("timestamp", ""),
                 "side": "long",
-"entry_price": float(avg_cost),
+                "entry_price": float(avg_cost),
                 "exit_price": float(fill_price),
                 "quantity": float(self._position),
                 "pnl": float(pnl),
@@ -365,7 +365,7 @@ class BacktestEngine:
             if dd < max_drawdown:
                 max_drawdown = dd
 
-# 胜率（仅统计已平仓的交易）
+        # 胜率（仅统计已平仓的交易）
         closed_trades = [t for t in self._trades if t.get("pnl") is not None]
         winning_trades = [t for t in closed_trades if t["pnl"] > 0]
         total_closed = len(closed_trades)

@@ -37,7 +37,14 @@ class TestSingleAssetPortfolio:
     def test_buy_with_quantity(self):
         ctx = make_ctx(position=Decimal("0.5"), prices={"BTC/USDT": Decimal("50000")})
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=1.0, period="1h", source="test", quantity=Decimal("0.1"))
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=1.0,
+                period="1h",
+                source="test",
+                quantity=Decimal("0.1"),
+            )
         ]
         model = SingleAssetPortfolio()
         targets = model.allocate(insights, ctx)
@@ -47,7 +54,13 @@ class TestSingleAssetPortfolio:
     def test_sell_creates_zero_target(self):
         ctx = make_ctx(position=Decimal("0.5"))
         insights = [
-            Insight(symbol="BTC/USDT", direction="sell", confidence=1.0, period="1h", source="test")
+            Insight(
+                symbol="BTC/USDT",
+                direction="sell",
+                confidence=1.0,
+                period="1h",
+                source="test",
+            )
         ]
         model = SingleAssetPortfolio()
         targets = model.allocate(insights, ctx)
@@ -57,7 +70,13 @@ class TestSingleAssetPortfolio:
     def test_sell_skipped_when_no_position(self):
         ctx = make_ctx(position=Decimal("0"))
         insights = [
-            Insight(symbol="BTC/USDT", direction="sell", confidence=1.0, period="1h", source="test")
+            Insight(
+                symbol="BTC/USDT",
+                direction="sell",
+                confidence=1.0,
+                period="1h",
+                source="test",
+            )
         ]
         model = SingleAssetPortfolio()
         targets = model.allocate(insights, ctx)
@@ -66,7 +85,13 @@ class TestSingleAssetPortfolio:
     def test_hold_ignored(self):
         ctx = make_ctx()
         insights = [
-            Insight(symbol="BTC/USDT", direction="hold", confidence=0.5, period="1h", source="test")
+            Insight(
+                symbol="BTC/USDT",
+                direction="hold",
+                confidence=0.5,
+                period="1h",
+                source="test",
+            )
         ]
         model = SingleAssetPortfolio()
         targets = model.allocate(insights, ctx)
@@ -75,7 +100,13 @@ class TestSingleAssetPortfolio:
     def test_buy_fallback_to_params(self):
         ctx = make_ctx(params={"quantity": Decimal("0.05")})
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=1.0, period="1h", source="test")
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=1.0,
+                period="1h",
+                source="test",
+            )
         ]
         model = SingleAssetPortfolio()
         targets = model.allocate(insights, ctx)
@@ -90,8 +121,20 @@ class TestEqualWeightPortfolio:
             prices={"BTC/USDT": Decimal("50000"), "ETH/USDT": Decimal("3000")},
         )
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=0.8, period="1h", source="test"),
-            Insight(symbol="ETH/USDT", direction="buy", confidence=0.9, period="1h", source="test"),
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=0.8,
+                period="1h",
+                source="test",
+            ),
+            Insight(
+                symbol="ETH/USDT",
+                direction="buy",
+                confidence=0.9,
+                period="1h",
+                source="test",
+            ),
         ]
         model = EqualWeightPortfolio()
         targets = model.allocate(insights, ctx)
@@ -109,7 +152,13 @@ class TestEqualWeightPortfolio:
     def test_hold_not_participating(self):
         ctx = make_ctx()
         insights = [
-            Insight(symbol="BTC/USDT", direction="hold", confidence=0.5, period="1h", source="test"),
+            Insight(
+                symbol="BTC/USDT",
+                direction="hold",
+                confidence=0.5,
+                period="1h",
+                source="test",
+            ),
         ]
         model = EqualWeightPortfolio()
         targets = model.allocate(insights, ctx)
@@ -121,7 +170,13 @@ class TestEqualWeightPortfolio:
             prices={"BTC/USDT": Decimal("50000")},
         )
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=1.0, period="1h", source="test"),
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=1.0,
+                period="1h",
+                source="test",
+            ),
         ]
         model = EqualWeightPortfolio()
         targets = model.allocate(insights, ctx)
@@ -136,8 +191,20 @@ class TestConfidenceWeightedPortfolio:
             prices={"BTC/USDT": Decimal("50000"), "ETH/USDT": Decimal("3000")},
         )
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=0.6, period="1h", source="test"),
-            Insight(symbol="ETH/USDT", direction="buy", confidence=0.4, period="1h", source="test"),
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=0.6,
+                period="1h",
+                source="test",
+            ),
+            Insight(
+                symbol="ETH/USDT",
+                direction="buy",
+                confidence=0.4,
+                period="1h",
+                source="test",
+            ),
         ]
         model = ConfidenceWeightedPortfolio()
         targets = model.allocate(insights, ctx)
@@ -156,7 +223,13 @@ class TestConfidenceWeightedPortfolio:
     def test_all_zero_confidence(self):
         ctx = make_ctx()
         insights = [
-            Insight(symbol="BTC/USDT", direction="buy", confidence=0.0, period="1h", source="test"),
+            Insight(
+                symbol="BTC/USDT",
+                direction="buy",
+                confidence=0.0,
+                period="1h",
+                source="test",
+            ),
         ]
         model = ConfidenceWeightedPortfolio()
         targets = model.allocate(insights, ctx)

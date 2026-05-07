@@ -198,10 +198,12 @@ _router.register_fallback_rules(
         (r"(计划|复盘|总结|周报)", "create_plan"),
         (r"(策略|代码|编写)", "generate_and_test_strategy"),
         (r"(研究|调研|收集.*资料|查找.*知识|搜索.*信息|内容研究)", "research_topic"),
-        (r"(价格|突破|跌破|高于|低于|提醒|通知|监控).*(BTC|ETH|币|\d{4,})", "supervisor"),
+        (
+            r"(价格|突破|跌破|高于|低于|提醒|通知|监控).*(BTC|ETH|币|\d{4,})",
+            "supervisor",
+        ),
     ]
 )
-
 
 
 MAX_REROUTE = 2
@@ -231,7 +233,10 @@ class SupervisorAgent(BaseAgent):
         # 从 prompt 元数据加载工具声明
         from .prompt_loader import _parse_frontmatter
         from pathlib import Path
-        prompt_file = Path(__file__).parent.parent.parent / "prompts" / "v1" / "supervisor.txt"
+
+        prompt_file = (
+            Path(__file__).parent.parent.parent / "prompts" / "v1" / "supervisor.txt"
+        )
         raw = prompt_file.read_text(encoding="utf-8")
         meta, _ = _parse_frontmatter(raw)
 
@@ -378,6 +383,7 @@ class SupervisorAgent(BaseAgent):
         mm = None
         if message.user_id:
             from apps.memory.manager import MemoryManager
+
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
 
         result = await self._route_to_agent(agent_name, message)
@@ -422,7 +428,7 @@ class SupervisorAgent(BaseAgent):
                         data=new_parsed["response"],
                     )
                 return await self._free_chat(message)
-# 新流程：parsed 直接是 agent name 或 frame intent
+            # 新流程：parsed 直接是 agent name 或 frame intent
             new_agent = str(new_parsed)
             if new_agent and new_agent != "free_chat" and new_agent != agent_name:
                 return await self._route_to_agent(new_agent, message)
@@ -440,7 +446,9 @@ class SupervisorAgent(BaseAgent):
                 agent_name,
             )
         else:
-            logger.info("[%s] Ending multi-turn session for user %s", self.name, message.user_id)
+            logger.info(
+                "[%s] Ending multi-turn session for user %s", self.name, message.user_id
+            )
             await session_mgr.clear_session_context(message.user_id)
 
         return result
@@ -588,11 +596,9 @@ class SupervisorAgent(BaseAgent):
                         data=new_parsed["response"],
                     )
                 return await self._free_chat(message)
-new_agent = str(new_parsed)
+            new_agent = str(new_parsed)
             if new_agent and new_agent != "free_chat" and new_agent not in attempted:
-                return await self._route_with_fallback(
-                    message, new_agent, attempted
-                )
+                return await self._route_with_fallback(message, new_agent, attempted)
 
             # 都失败
             return await self._free_chat(message)
@@ -664,14 +670,18 @@ new_agent = str(new_parsed)
             agents = [a for a in agents if a.get("name") not in exclude_agents]
 
         agent_descriptions = "\n".join(
-            f"- {a['name']}: {a.get('overview', '').replace(chr(10), chr(10) + '  ')}" for a in agents if a.get("name")
+            f"- {a['name']}: {a.get('overview', '').replace(chr(10), chr(10) + '  ')}"
+            for a in agents
+            if a.get("name")
         )
 
         # 框架意图列表（仍然需要检查）
         frame_intents = self._router.all_frame_intents()
         frame_block = ""
         if frame_intents:
-            frame_block = f"Framework intents (system actions): {json.dumps(frame_intents)}\n"
+            frame_block = (
+                f"Framework intents (system actions): {json.dumps(frame_intents)}\n"
+            )
 
         context_block = ""
         if context:
@@ -681,7 +691,9 @@ new_agent = str(new_parsed)
 
         exclude_block = ""
         if exclude_agents:
-            exclude_block = f"Exclude these agents (already tried): {exclude_agents}\n\n"
+            exclude_block = (
+                f"Exclude these agents (already tried): {exclude_agents}\n\n"
+            )
 
         skills_summary = self._get_skills_summary()
         skills_block = (
@@ -689,12 +701,16 @@ new_agent = str(new_parsed)
         )
 
         # Supervisor 自身能力（工具声明）
-        supervisor_tools = self._agent_tools if hasattr(self, '_agent_tools') and self._agent_tools else []
+        supervisor_tools = (
+            self._agent_tools
+            if hasattr(self, "_agent_tools") and self._agent_tools
+            else []
+        )
         supervisor_block = ""
         if supervisor_tools:
             supervisor_block = (
                 f"Your own tools (handle these yourself): {json.dumps(supervisor_tools)}\n"
-                f"If the user request matches these tools, reply: {{\"agent\": \"supervisor\"}}\n\n"
+                f'If the user request matches these tools, reply: {{"agent": "supervisor"}}\n\n'
             )
 
         user_prompt = (
@@ -830,7 +846,10 @@ new_agent = str(new_parsed)
             conversation_history = mm._l1.get("conversation_history", [])[-5:]
 
         if conversation_history:
-            history_block = "\n".join(f"{t['role']}({t.get('agent','supervisor')}): {t['text']}" for t in conversation_history)
+            history_block = "\n".join(
+                f"{t['role']}({t.get('agent', 'supervisor')}): {t['text']}"
+                for t in conversation_history
+            )
             user_prompt = f"[对话历史]\n{history_block}\n\n[当前消息]\n{text}"
         else:
             user_prompt = text
@@ -852,8 +871,18 @@ new_agent = str(new_parsed)
 
         if mm:
             updated = conversation_history[-4:] + [
-                {"role": "user", "agent": "supervisor", "text": text[:500], "ts": int(time.time())},
-                {"role": "agent", "agent": "supervisor", "text": content[:500], "ts": int(time.time())},
+                {
+                    "role": "user",
+                    "agent": "supervisor",
+                    "text": text[:500],
+                    "ts": int(time.time()),
+                },
+                {
+                    "role": "agent",
+                    "agent": "supervisor",
+                    "text": content[:500],
+                    "ts": int(time.time()),
+                },
             ]
             mm.write_l1("conversation_history", updated[-5:])
             await mm.write_l2(

@@ -34,9 +34,7 @@ class Insight:
         if self.direction not in ("buy", "sell", "hold"):
             raise ValueError(f"Invalid direction: {self.direction!r}")
         if not (0.0 <= self.confidence <= 1.0):
-            raise ValueError(
-                f"confidence must be in [0.0, 1.0], got {self.confidence}"
-            )
+            raise ValueError(f"confidence must be in [0.0, 1.0], got {self.confidence}")
         if self.quantity is not None and self.quantity <= Decimal("0"):
             raise ValueError(f"quantity must be positive, got {self.quantity}")
         if self.price is not None and self.price <= Decimal("0"):
@@ -62,9 +60,7 @@ class PortfolioTarget:
             raise ValueError(
                 f"target_quantity must be >= 0, got {self.target_quantity}"
             )
-        if self.target_weight is not None and not (
-            0.0 <= self.target_weight <= 1.0
-        ):
+        if self.target_weight is not None and not (0.0 <= self.target_weight <= 1.0):
             raise ValueError(
                 f"target_weight must be in [0.0, 1.0], got {self.target_weight}"
             )
@@ -195,7 +191,8 @@ class StrategyContext:
         return PortfolioContext(
             positions=self._positions.copy(),
             current_prices=self._current_prices.copy(),
-            total_capital=self._balance + sum(
+            total_capital=self._balance
+            + sum(
                 self._positions.get(s, Decimal("0")) * p
                 for s, p in self._current_prices.items()
             ),
@@ -277,9 +274,7 @@ class BaseStrategy(ABC):
         self.portfolio: BasePortfolioModel = SingleAssetPortfolio()
         self.risk_models: list[BaseRiskModel] = []
 
-    def on_bar(
-        self, kline: dict, history: list[dict]
-    ) -> "OrderSignal | None":
+    def on_bar(self, kline: dict, history: list[dict]) -> "OrderSignal | None":
         """
         每根 K 线完成时调用。
 
@@ -292,9 +287,7 @@ class BaseStrategy(ABC):
         """
         return None
 
-    def generate_insights(
-        self, kline: dict, history: list[dict]
-    ) -> list[Insight]:
+    def generate_insights(self, kline: dict, history: list[dict]) -> list[Insight]:
         """生成交易洞察。默认实现包装 on_bar() → Insight 转换。"""
         signal = self.on_bar(kline, history)
         if signal is None:
@@ -316,8 +309,16 @@ class BaseStrategy(ABC):
             targets = []
             for ins in insights:
                 if ins.direction == "buy":
-                    qty = ins.quantity if ins.quantity is not None else Decimal(
-                        str(context.params.get("quantity", context.params.get("position_size", 0)))
+                    qty = (
+                        ins.quantity
+                        if ins.quantity is not None
+                        else Decimal(
+                            str(
+                                context.params.get(
+                                    "quantity", context.params.get("position_size", 0)
+                                )
+                            )
+                        )
                     )
                     if qty <= Decimal("0"):
                         continue
@@ -325,19 +326,23 @@ class BaseStrategy(ABC):
                 elif ins.direction == "sell":
                     if context.position <= Decimal("0"):
                         continue
-                    targets.append(PortfolioTarget(
-                        symbol=ins.symbol,
-                        target_quantity=Decimal("0"),
-                        reason=ins.signal_name,
-                    ))
+                    targets.append(
+                        PortfolioTarget(
+                            symbol=ins.symbol,
+                            target_quantity=Decimal("0"),
+                            reason=ins.signal_name,
+                        )
+                    )
                     continue
                 else:
                     continue
-                targets.append(PortfolioTarget(
-                    symbol=ins.symbol,
-                    target_quantity=target_qty,
-                    reason=ins.signal_name,
-                ))
+                targets.append(
+                    PortfolioTarget(
+                        symbol=ins.symbol,
+                        target_quantity=target_qty,
+                        reason=ins.signal_name,
+                    )
+                )
             return targets
         # 委托给自定义 portfolio 模型
         return self.portfolio.allocate(insights, context)

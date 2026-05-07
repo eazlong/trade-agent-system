@@ -44,8 +44,16 @@ class SingleAssetPortfolio(BasePortfolioModel):
         targets = []
         for ins in insights:
             if ins.direction == "buy":
-                qty = ins.quantity if ins.quantity is not None else Decimal(
-                    str(context.params.get("quantity", context.params.get("position_size", 0)))
+                qty = (
+                    ins.quantity
+                    if ins.quantity is not None
+                    else Decimal(
+                        str(
+                            context.params.get(
+                                "quantity", context.params.get("position_size", 0)
+                            )
+                        )
+                    )
                 )
                 if qty <= Decimal("0"):
                     continue
@@ -83,14 +91,20 @@ class EqualWeightPortfolio(BasePortfolioModel):
                 qty = ins.quantity if ins.quantity is not None else Decimal("0")
                 if qty <= Decimal("0"):
                     continue
-                targets.append(_make_target(ins.symbol, qty, ins.signal_name, float(weight)))
+                targets.append(
+                    _make_target(ins.symbol, qty, ins.signal_name, float(weight))
+                )
                 continue
 
             allocated_capital = portfolio_ctx.total_capital * weight
-            qty = (allocated_capital / price).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            qty = (allocated_capital / price).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
+            )
             if qty <= Decimal("0"):
                 continue
-            targets.append(_make_target(ins.symbol, qty, ins.signal_name, float(weight)))
+            targets.append(
+                _make_target(ins.symbol, qty, ins.signal_name, float(weight))
+            )
 
         return targets
 
@@ -122,14 +136,20 @@ class ConfidenceWeightedPortfolio(BasePortfolioModel):
                 qty = ins.quantity if ins.quantity is not None else Decimal("0")
                 if qty <= Decimal("0"):
                     continue
-                targets.append(_make_target(ins.symbol, qty, ins.signal_name, float(weight_dec)))
+                targets.append(
+                    _make_target(ins.symbol, qty, ins.signal_name, float(weight_dec))
+                )
                 continue
 
             allocated_capital = portfolio_ctx.total_capital * weight_dec
-            qty = (allocated_capital / price).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            qty = (allocated_capital / price).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
+            )
             if qty <= Decimal("0"):
                 continue
-            targets.append(_make_target(ins.symbol, qty, ins.signal_name, float(weight_dec)))
+            targets.append(
+                _make_target(ins.symbol, qty, ins.signal_name, float(weight_dec))
+            )
 
         return targets
 
