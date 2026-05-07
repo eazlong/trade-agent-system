@@ -118,22 +118,36 @@ def atr(
         if closes is not None:
             # 三数组形式：atr(highs, lows, closes, period=N)
             # period 始终来自 keyword 参数
-            h = highs_or_history if isinstance(highs_or_history, np.ndarray) else np.array(highs_or_history, dtype=np.float64)
-            lo = period_or_lows if isinstance(period_or_lows, np.ndarray) else np.array(period_or_lows, dtype=np.float64)
-            c = closes if isinstance(closes, np.ndarray) else np.array(closes, dtype=np.float64)
+            h = (
+                highs_or_history
+                if isinstance(highs_or_history, np.ndarray)
+                else np.array(highs_or_history, dtype=np.float64)
+            )
+            lo = (
+                period_or_lows
+                if isinstance(period_or_lows, np.ndarray)
+                else np.array(period_or_lows, dtype=np.float64)
+            )
+            c = (
+                closes
+                if isinstance(closes, np.ndarray)
+                else np.array(closes, dtype=np.float64)
+            )
             return _compute_atr(h, lo, c, period)
         # 两数组形式：atr(highs_array, lows_array)
         p = period_or_lows if isinstance(period_or_lows, int) else period
         empty = np.array([])
-        h = highs_or_history if isinstance(highs_or_history, np.ndarray) else np.array(highs_or_history, dtype=np.float64)
+        h = (
+            highs_or_history
+            if isinstance(highs_or_history, np.ndarray)
+            else np.array(highs_or_history, dtype=np.float64)
+        )
         lo = period_or_lows if isinstance(period_or_lows, np.ndarray) else empty
         return _compute_atr(h, lo, empty, p)
 
     # 默认 atr(history, period)
     if closes is not None:
-        raise TypeError(
-            "当第一个参数为 K 线 dict 列表时，不能传入 closes 作为位置参数"
-        )
+        raise TypeError("当第一个参数为 K 线 dict 列表时，不能传入 closes 作为位置参数")
     h, lo = _extract_hl(highs_or_history)
     p = period_or_lows if isinstance(period_or_lows, int) else period
     return _compute_atr(h, lo, _extract_closes(highs_or_history), p)

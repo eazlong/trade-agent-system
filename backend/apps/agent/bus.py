@@ -190,7 +190,6 @@ async def nack_and_retry(
         await publish(stream, retry_payload)
 
 
-
 async def publish_reply(task_id: str, result: str, ttl: int = 60) -> None:
     """
     写入任务结果到 agent:reply:{task_id}（供 Channel 等待消费）。

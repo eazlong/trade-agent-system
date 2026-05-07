@@ -4,15 +4,19 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('backtest', '0005_add_live_session_and_order_link'),
+        ("backtest", "0005_add_live_session_and_order_link"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='backtesttrade',
-            name='trade_type',
-            field=models.CharField(choices=[('open', 'Open'), ('add', 'Add'), ('close', 'Close')], default='open', help_text='Type of trade: open (initial position), add (add to position), close (exit position)', max_length=8),
+            model_name="backtesttrade",
+            name="trade_type",
+            field=models.CharField(
+                choices=[("open", "Open"), ("add", "Add"), ("close", "Close")],
+                default="open",
+                help_text="Type of trade: open (initial position), add (add to position), close (exit position)",
+                max_length=8,
+            ),
         ),
     ]

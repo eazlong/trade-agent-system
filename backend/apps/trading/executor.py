@@ -256,13 +256,23 @@ class OrderExecutor:
                     if hasattr(account.api_secret_enc, "__bytes__")
                     else account.api_secret_enc
                 )
+                if not api_key_enc or not api_secret_enc:
+                    logger.warning(
+                        "Skipping adapter for %s (%s): empty API key or secret",
+                        exchange,
+                        account.label or "default",
+                    )
+                    continue
+
                 api_key = fernet.decrypt(api_key_enc).decode()
                 api_secret = fernet.decrypt(api_secret_enc).decode()
 
                 if exchange == "okx":
                     # OKX 需要额外的 passphrase，从 label 字段临时存储
                     passphrase = account.label or ""
-                    adapter = adapter_cls(api_key, api_secret, passphrase, account.testnet)
+                    adapter = adapter_cls(
+                        api_key, api_secret, passphrase, account.testnet
+                    )
                 else:
                     adapter = adapter_cls(api_key, api_secret, account.testnet)
 

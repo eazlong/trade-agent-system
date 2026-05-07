@@ -13,9 +13,10 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from asgiref.sync import sync_to_async
+from django.utils import timezone
 
 if TYPE_CHECKING:
-    from .base import BaseStrategy, OrderSignal
+    from .base import BaseStrategy, OrderSignal, PortfolioTarget, StrategyContext
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,10 @@ class BacktestEngine:
         """
         执行回测。
 
+        Phase 2 管线（5 步）:
+        ① select_universe → ② generate_insights → ③ construct_portfolio →
+        ④ apply_risk_filters → ⑤ _target_to_order
+
         Returns:
             回测统计结果字典
         """
@@ -75,10 +80,19 @@ class BacktestEngine:
 
         for i, kline in enumerate(self.ohlcv_data):
             history = self.ohlcv_data[: i + 1]
-            signal = self.strategy.on_bar(kline, history)
 
-            if signal:
-                self._process_signal(signal, kline)
+            # 同步当前 K 线价格到 context
+            self.strategy.ctx.set_price(self.symbol, Decimal(str(kline["close"])))
+
+            # Phase 2: 5-step pipeline
+            _ = self.strategy.select_universe()
+            insights = self.strategy.generate_insights(kline, history)
+            targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
+            safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
+            for target in safe_targets:
+                signal = self._target_to_order(target, self.strategy.ctx)
+                if signal:
+                    self._process_signal(signal, kline)
 
             # 记录权益点
             current_equity = self._cash + self._position_value(kline)
@@ -104,6 +118,18 @@ class BacktestEngine:
             self._close_position(last_kline, "end_of_backtest")
 
         return self._compute_stats()
+
+    def _target_to_order(
+        self, target: "PortfolioTarget", ctx: "StrategyContext"
+    ) -> "OrderSignal | None":
+        """将目标持仓差量转化为订单信号"""
+        diff = target.target_quantity - ctx.position
+        if diff == 0:
+            return None
+        if diff > 0:
+            return ctx.buy(diff, signal_name=target.reason)
+        else:
+            return ctx.sell(abs(diff), signal_name=target.reason)
 
     def _process_signal(self, signal: "OrderSignal", kline: dict) -> None:
         """处理策略信号，模拟成交"""
@@ -182,7 +208,7 @@ class BacktestEngine:
 
         # 同步回策略上下文，供策略后续判断使用
         self.strategy.ctx.balance = self._cash
-        self.strategy.ctx.position = self._position
+        self.strategy.ctx.set_position(self.symbol, self._position)
         self.strategy.ctx.avg_entry_price = self._avg_entry_price
 
     def _execute_sell(
@@ -214,13 +240,13 @@ class BacktestEngine:
 
         # 同步回策略上下文
         self.strategy.ctx.balance = self._cash
-        self.strategy.ctx.position = self._position
+        self.strategy.ctx.set_position(self.symbol, self._position)
         self.strategy.ctx.avg_entry_price = (
             self._avg_entry_price if self._position > 0 else Decimal("0")
         )
         self._trades.append(
             {
-"entry_time": entry_time_for_trade,
+                "entry_time": entry_time_for_trade,
                 "exit_time": exit_time,
                 "side": "long",
                 "entry_price": float(avg_cost),
@@ -285,7 +311,7 @@ class BacktestEngine:
                 "entry_time": entry_time_for_close,
                 "exit_time": kline.get("timestamp", ""),
                 "side": "long",
-"entry_price": float(avg_cost),
+                "entry_price": float(avg_cost),
                 "exit_price": float(fill_price),
                 "quantity": float(self._position),
                 "pnl": float(pnl),
@@ -306,7 +332,7 @@ class BacktestEngine:
 
         # 平仓后同步回策略上下文
         self.strategy.ctx.balance = self._cash
-        self.strategy.ctx.position = self._position
+        self.strategy.ctx.set_position(self.symbol, self._position)
         self.strategy.ctx.avg_entry_price = self._avg_entry_price
 
     def _position_value(self, kline: dict) -> Decimal:
@@ -339,7 +365,7 @@ class BacktestEngine:
             if dd < max_drawdown:
                 max_drawdown = dd
 
-# 胜率（仅统计已平仓的交易）
+        # 胜率（仅统计已平仓的交易）
         closed_trades = [t for t in self._trades if t.get("pnl") is not None]
         winning_trades = [t for t in closed_trades if t["pnl"] > 0]
         total_closed = len(closed_trades)
@@ -389,22 +415,30 @@ class BacktestEngine:
 
 
 async def _resolve_strategy_id(strategy_name: str) -> str | None:
-    """根据策略名称查找或创建 Strategy 模型，返回 UUID 字符串。"""
+    """根据策略名称查找或创建 Strategy 模型，返回 UUID 字符串。
+
+    会先将用户提交的策略名解析为注册中心的标准名，避免用户提交
+    非标准名（如类名）时创建出与 create 时不一致的 Strategy 记录。
+    """
     from asgiref.sync import sync_to_async
     from apps.trading.models import Strategy
+    from apps.strategy_engine.registry import StrategyRegistry
+
+    # 解析为标准名（如 "TurtleStrategy" → "turtle_strategy"）
+    canonical = StrategyRegistry._resolve_name(strategy_name) or strategy_name
 
     @sync_to_async
     def _get_or_create():
         obj, created = Strategy.objects.get_or_create(
-            name=strategy_name,
+            name=canonical,
             defaults={
-                "code_path": f"strategies/{strategy_name}.py",
+                "code_path": f"strategies/{canonical}.py",
                 "is_active": False,
             },
         )
         if created:
             logger.info(
-                f"[BacktestMode] created Strategy model: {obj.id} name={strategy_name}"
+                f"[BacktestMode] created Strategy model: {obj.id} name={canonical}"
             )
         return str(obj.id)
 

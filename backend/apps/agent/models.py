@@ -53,8 +53,15 @@ class TaskProgress(models.Model):
     """Completed/failed task history — running state lives in Redis, archived here."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    task_id = models.CharField(max_length=128, unique=True, db_index=True, verbose_name="Task ID")
-    user = models.ForeignKey("authentication.User", on_delete=models.SET_NULL, null=True, related_name="task_progress")
+    task_id = models.CharField(
+        max_length=128, unique=True, db_index=True, verbose_name="Task ID"
+    )
+    user = models.ForeignKey(
+        "authentication.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="task_progress",
+    )
     task_type = models.CharField(max_length=64)  # backtest, agent, data_fetch
     status = models.CharField(max_length=32)  # completed / failed
     progress = models.FloatField(default=0.0)

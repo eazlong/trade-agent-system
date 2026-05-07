@@ -62,14 +62,18 @@ class MockSessionManager:
         return self._store.get(user_id)
 
     async def set_session_context(self, user_id, state, active_agent=None, ttl=1800):
-        self.call_log.append(("set_session_context", user_id, state.value, active_agent))
+        self.call_log.append(
+            ("set_session_context", user_id, state.value, active_agent)
+        )
         self._store[user_id] = {
             "state": state.value,
             "active_agent": active_agent,
             "expires_at": time.time() + ttl,
         }
 
-    async def pause_session(self, user_id, active_agent, pause_ttl=300, pause_context=""):
+    async def pause_session(
+        self, user_id, active_agent, pause_ttl=300, pause_context=""
+    ):
         self.call_log.append(("pause_session", user_id, active_agent))
         self._store[user_id] = {
             "state": SessionState.PAUSED.value,
@@ -417,9 +421,7 @@ class TestSupervisorNormalRoute(unittest.TestCase):
             side_effect=KeyError("nonexistent"),
         ):
             result = asyncio.run(
-                sup._normal_route(
-                    AgentMessage(payload={"text": "hello"}, user_id="u1")
-                )
+                sup._normal_route(AgentMessage(payload={"text": "hello"}, user_id="u1"))
             )
 
         # Agent not found → _route_to_agent catches error, returns failure
@@ -471,9 +473,7 @@ class TestSupervisorMultiTurn(unittest.TestCase):
 
         with patch("apps.agent.registry.AgentRegistry.get", return_value=mock_quant):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "继续修改策略"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "继续修改策略"}, user_id="u1"))
             )
 
         mock_quant.handle.assert_called_once()
@@ -519,9 +519,7 @@ class TestSupervisorMultiTurn(unittest.TestCase):
             side_effect=make_agent_getter(quant=mock_quant, risk_advisor=mock_risk),
         ):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "仓位风险"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "仓位风险"}, user_id="u1"))
             )
 
         mock_quant.handle.assert_called_once()
@@ -546,9 +544,7 @@ class TestSupervisorMultiTurn(unittest.TestCase):
             side_effect=make_agent_getter(analyst=mock_analyst),
         ):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "天气怎么样"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "天气怎么样"}, user_id="u1"))
             )
 
         mock_analyst.handle.assert_called_once()
@@ -570,9 +566,7 @@ class TestSupervisorMultiTurn(unittest.TestCase):
 
         with patch("apps.agent.registry.AgentRegistry.get", return_value=mock_quant):
             asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "写策略"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "写策略"}, user_id="u1"))
             )
 
         # Session should be cleared
@@ -613,9 +607,7 @@ class TestSupervisorIntentSwitching(unittest.TestCase):
 
         with patch(
             "apps.agent.registry.AgentRegistry.get",
-            side_effect=make_agent_getter(
-                analyst=mock_analyst, risk_advisor=mock_risk
-            ),
+            side_effect=make_agent_getter(analyst=mock_analyst, risk_advisor=mock_risk),
         ):
             result = asyncio.run(
                 sup.handle(
@@ -648,9 +640,7 @@ class TestSupervisorIntentSwitching(unittest.TestCase):
             side_effect=make_agent_getter(quant=mock_quant, coach=mock_coach),
         ):
             asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "制定计划"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "制定计划"}, user_id="u1"))
             )
 
         # Session should be PAUSED after rejection
@@ -723,16 +713,16 @@ class TestSupervisorPausedSession(unittest.TestCase):
         }
 
         # Judge says false (not a continuation)
-        sup._llm.chat = AsyncMock(side_effect=[
-            "false",  # _judge_resume
-            llm_agent("quant"),  # _parse_intent
-        ])
+        sup._llm.chat = AsyncMock(
+            side_effect=[
+                "false",  # _judge_resume
+                llm_agent("quant"),  # _parse_intent
+            ]
+        )
 
         with patch("apps.agent.registry.AgentRegistry.get", return_value=mock_quant):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "新话题"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "新话题"}, user_id="u1"))
             )
 
         mock_quant.handle.assert_called_once()
@@ -757,9 +747,7 @@ class TestSupervisorPausedSession(unittest.TestCase):
 
         with patch("apps.agent.registry.AgentRegistry.get", return_value=mock_analyst):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "继续"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "继续"}, user_id="u1"))
             )
 
         # Should have resumed and routed to analyst
@@ -781,16 +769,16 @@ class TestSupervisorPausedSession(unittest.TestCase):
         }
 
         # LLM calls: archive summary + parse intent + free_chat
-        sup._llm.chat = AsyncMock(side_effect=[
-            "summary",  # archive summary
-            llm_agent("quant"),  # _parse_intent
-        ])
+        sup._llm.chat = AsyncMock(
+            side_effect=[
+                "summary",  # archive summary
+                llm_agent("quant"),  # _parse_intent
+            ]
+        )
 
         with patch("apps.agent.registry.AgentRegistry.get", return_value=mock_quant):
             result = asyncio.run(
-                sup.handle(
-                    AgentMessage(payload={"text": "写策略"}, user_id="u1")
-                )
+                sup.handle(AgentMessage(payload={"text": "写策略"}, user_id="u1"))
             )
 
         mock_quant.handle.assert_called_once()

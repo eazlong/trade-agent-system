@@ -22,8 +22,10 @@ class StrategyRegistry:
 
     _instance: StrategyRegistry | None = None
     _strategies: dict[str, type[BaseStrategy]] = {}
+    _class_name_index: dict[str, str] = {}  # lower-case class name → registered name
     _strategy_path: str = ""
     _initialized = False
+    _last_discover_time: float = 0.0
 
     def __init__(self):
         if not self._initialized:
@@ -46,24 +48,71 @@ class StrategyRegistry:
                 strategy_cls.__name__,
             )
         cls._strategies[name] = strategy_cls
+        # Also index by lower-case class name for fuzzy lookup
+        cls._class_name_index[strategy_cls.__name__.lower()] = name
         logger.info("Strategy registered: %s (%s)", name, strategy_cls.__name__)
         return strategy_cls
 
     @classmethod
+    def _resolve_name(cls, name: str) -> str:
+        """Resolve a strategy name with fuzzy matching.
+
+        Tries exact match → lower-case registered name → lower-case class name.
+        Returns the canonical registered name, or '' if not found.
+        """
+        # 1. Exact match on registered name
+        if name in cls._strategies:
+            return name
+
+        # 2. Case-insensitive match on registered names
+        name_lower = name.lower()
+        for registered in cls._strategies:
+            if registered.lower() == name_lower:
+                return registered
+
+        # 3. Match by class name (e.g. "TurtleStrategy" → "turtle_strategy")
+        if name_lower in cls._class_name_index:
+            return cls._class_name_index[name_lower]
+
+        return ""
+
+    @classmethod
+    def _lazy_discover(cls) -> None:
+        """如果策略路径已设置，尝试重新发现（处理启动后新增策略文件的场景）。
+
+        内置 30 秒节流，避免每次查不到都触发全量扫描。"""
+        import os
+        import time
+
+        if not cls._strategy_path or not os.path.isdir(cls._strategy_path):
+            return
+        now = time.monotonic()
+        if now - cls._last_discover_time < 30:
+            return
+        cls._last_discover_time = now
+        cls.discover()
+
+    @classmethod
     def get(cls, name: str) -> "BaseStrategy":
         """获取策略实例（通过 StrategyLoader 加载后实例化）"""
-        strategy_cls = cls._strategies.get(name)
-        if strategy_cls is None:
+        resolved = cls._resolve_name(name)
+        if not resolved:
+            cls._lazy_discover()
+            resolved = cls._resolve_name(name)
+        if not resolved:
             raise ValueError(f"Strategy not found: {name!r}")
-        return strategy_cls
+        return cls._strategies[resolved]
 
     @classmethod
     def get_class(cls, name: str) -> type["BaseStrategy"]:
-        """获取策略类"""
-        strategy_cls = cls._strategies.get(name)
-        if strategy_cls is None:
+        """获取策略类，支持按注册名、类名（大小写不敏感）查找"""
+        resolved = cls._resolve_name(name)
+        if not resolved:
+            cls._lazy_discover()
+            resolved = cls._resolve_name(name)
+        if not resolved:
             raise ValueError(f"Strategy not found: {name!r}")
-        return strategy_cls
+        return cls._strategies[resolved]
 
     @classmethod
     def list_registered(cls) -> list[str]:

@@ -191,7 +191,6 @@ class RiskGuard:
         """
         from django.db.models import Sum
         from django.utils import timezone
-        from apps.trading.models import Order
 
         today = timezone.now().date()
 

@@ -59,7 +59,12 @@ class StrategyRunner:
         """
         from .registry import StrategyRegistry
         from .base import StrategyContext
-        from .backtest_mode import BacktestEngine, save_backtest_result, _resolve_strategy_id, _get_strategy_id_from_result
+        from .backtest_mode import (
+            BacktestEngine,
+            save_backtest_result,
+            _resolve_strategy_id,
+            _get_strategy_id_from_result,
+        )
 
         # 加载策略类
         strategy_cls = StrategyRegistry.get_class(strategy_name)

@@ -117,51 +117,62 @@ def list_agents(request: Request) -> Response:
     agents_list = []
 
     # Supervisor 条目
-    agents_list.append({
-        "name": "supervisor",
-        "display_name": DISPLAY_NAME_MAP["supervisor"],
-        "role": ROLE_DESCRIPTIONS["supervisor"],
-        "description": DESCRIPTIONS["supervisor"],
-        "status": "ready",
-        "tools": [],
-        "intent": "route",
-        "tag_color": COLOR_MAP["supervisor"][0],
-        "tag_bg": COLOR_MAP["supervisor"][1],
-    })
+    agents_list.append(
+        {
+            "name": "supervisor",
+            "display_name": DISPLAY_NAME_MAP["supervisor"],
+            "role": ROLE_DESCRIPTIONS["supervisor"],
+            "description": DESCRIPTIONS["supervisor"],
+            "status": "ready",
+            "tools": [],
+            "intent": "route",
+            "tag_color": COLOR_MAP["supervisor"][0],
+            "tag_bg": COLOR_MAP["supervisor"][1],
+        }
+    )
 
     # Prompt 定义的子 Agent
     for agent_meta in prompt_agents:
         name = agent_meta["name"]
         is_loaded = name in instantiated
-        tag_color, tag_bg = COLOR_MAP.get(name, ("var(--color-text)", "var(--color-text-dim)"))
-        agents_list.append({
-            "name": name,
-            "display_name": DISPLAY_NAME_MAP.get(name, name),
-            "role": ROLE_DESCRIPTIONS.get(name, ""),
-            "description": agent_meta.get("overview", ""),
-            "status": "ready" if is_loaded else "standby",
-            "tools": agent_meta.get("tools", []),
-            "intent": agent_meta.get("intent", ""),
-            "tag_color": tag_color,
-            "tag_bg": tag_bg,
-        })
+        tag_color, tag_bg = COLOR_MAP.get(
+            name, ("var(--color-text)", "var(--color-text-dim)")
+        )
+        agents_list.append(
+            {
+                "name": name,
+                "display_name": DISPLAY_NAME_MAP.get(name, name),
+                "role": ROLE_DESCRIPTIONS.get(name, ""),
+                "description": agent_meta.get("overview", ""),
+                "status": "ready" if is_loaded else "standby",
+                "tools": agent_meta.get("tools", []),
+                "intent": agent_meta.get("intent", ""),
+                "tag_color": tag_color,
+                "tag_bg": tag_bg,
+            }
+        )
 
     # 框架条目
-    for frame_id, frame_key in [("trading_frame", "trading"), ("assist_frame", "assist")]:
+    for frame_id, frame_key in [
+        ("trading_frame", "trading"),
+        ("assist_frame", "assist"),
+    ]:
         frame_state = frame_st.get(frame_key, "stopped")
         tag_color, tag_bg = COLOR_MAP[frame_id]
-        agents_list.append({
-            "name": frame_id,
-            "display_name": DISPLAY_NAME_MAP[frame_id],
-            "role": ROLE_DESCRIPTIONS[frame_id],
-            "description": f"框架状态: {frame_state}",
-            "status": "running" if frame_state == "running" else "stopped",
-            "tools": [],
-            "intent": f"frame_{frame_key}",
-            "tag_color": tag_color,
-            "tag_bg": tag_bg,
-            "frame_state": frame_state,
-        })
+        agents_list.append(
+            {
+                "name": frame_id,
+                "display_name": DISPLAY_NAME_MAP[frame_id],
+                "role": ROLE_DESCRIPTIONS[frame_id],
+                "description": f"框架状态: {frame_state}",
+                "status": "running" if frame_state == "running" else "stopped",
+                "tools": [],
+                "intent": f"frame_{frame_key}",
+                "tag_color": tag_color,
+                "tag_bg": tag_bg,
+                "frame_state": frame_state,
+            }
+        )
 
     return Response({"agents": agents_list})
 
@@ -185,22 +196,26 @@ def list_scheduled_tasks(request: Request) -> Response:
         # 验证 task 是否真实存在（避免显示无效条目）
         if not _task_exists(task):
             continue
-        results.append({
-            "id": None,
-            "name": name,
-            "agent_name": kwargs.get("agent_name", "system"),
-            "message": kwargs.get("message", ""),
-            "schedule": schedule_str,
-            "enabled": True,
-            "last_run_at": None,
-            "total_run_count": 0,
-            "expires": None,
-            "start_time": None,
-            "source": "static",
-        })
+        results.append(
+            {
+                "id": None,
+                "name": name,
+                "agent_name": kwargs.get("agent_name", "system"),
+                "message": kwargs.get("message", ""),
+                "schedule": schedule_str,
+                "enabled": True,
+                "last_run_at": None,
+                "total_run_count": 0,
+                "expires": None,
+                "start_time": None,
+                "source": "static",
+            }
+        )
 
     # 2. 数据库动态任务（django-celery-beat）
-    tasks = PeriodicTask.objects.all().select_related("crontab", "interval").order_by("-id")
+    tasks = (
+        PeriodicTask.objects.all().select_related("crontab", "interval").order_by("-id")
+    )
     for task in tasks:
         schedule_desc = ""
         if task.crontab:
@@ -213,19 +228,23 @@ def list_scheduled_tasks(request: Request) -> Response:
         except Exception:
             kws = {}
 
-        results.append({
-            "id": task.id,
-            "name": task.name,
-            "agent_name": kws.get("agent_name", "N/A"),
-            "message": kws.get("message", ""),
-            "schedule": schedule_desc,
-            "enabled": task.enabled,
-            "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
-            "total_run_count": task.total_run_count,
-            "expires": task.expires.isoformat() if task.expires else None,
-            "start_time": task.start_time.isoformat() if task.start_time else None,
-            "source": "database",
-        })
+        results.append(
+            {
+                "id": task.id,
+                "name": task.name,
+                "agent_name": kws.get("agent_name", "N/A"),
+                "message": kws.get("message", ""),
+                "schedule": schedule_desc,
+                "enabled": task.enabled,
+                "last_run_at": task.last_run_at.isoformat()
+                if task.last_run_at
+                else None,
+                "total_run_count": task.total_run_count,
+                "expires": task.expires.isoformat() if task.expires else None,
+                "start_time": task.start_time.isoformat() if task.start_time else None,
+                "source": "database",
+            }
+        )
 
     return Response({"tasks": results})
 
@@ -233,6 +252,7 @@ def list_scheduled_tasks(request: Request) -> Response:
 def _task_exists(task_name: str) -> bool:
     """检查 Celery task 是否在当前环境中注册"""
     from celery_app import app as celery_app
+
     return task_name in celery_app.tasks
 
 
@@ -241,9 +261,12 @@ def _format_celery_schedule(schedule) -> str:
     from celery.schedules import crontab as celery_crontab, schedule as celery_schedule
 
     if isinstance(schedule, celery_crontab):
+
         def _cron_field(val, default="*"):
             """将 crontab 的 set 转为简洁表达式"""
-            if val == getattr(celery_crontab, "_meta", {}).get("fields", [{}])[0].get("default", None):
+            if val == getattr(celery_crontab, "_meta", {}).get("fields", [{}])[0].get(
+                "default", None
+            ):
                 return "*"
             # Check common patterns
             vals = sorted(val)
