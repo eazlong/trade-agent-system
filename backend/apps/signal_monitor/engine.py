@@ -54,9 +54,7 @@ class SignalMonitorEngine:
         start = time.monotonic()
 
         # 加载活跃监控
-        monitors = list(
-            SignalMonitor.objects.filter(status="active")
-        )
+        monitors = list(SignalMonitor.objects.filter(status="active"))
         if not monitors:
             return []
 
@@ -274,6 +272,9 @@ class SignalMonitorEngine:
         """执行预设动作"""
         action_type = monitor.action_type
 
+        if action_type == "validate_strategy":
+            return self._publish_strategy_validate(monitor, trigger_value)
+
         if action_type in ("notify", "notify_and_trade"):
             self._send_notification(monitor, trigger_value)
 
@@ -312,7 +313,9 @@ class SignalMonitorEngine:
         except Exception as e:
             import traceback
 
-            logger.error("Failed to send notification: %s\n%s", e, traceback.format_exc())
+            logger.error(
+                "Failed to send notification: %s\n%s", e, traceback.format_exc()
+            )
 
     def _send_telegram_message(self, user, message: str) -> None:
         """通过 Telegram 发送消息（同步 HTTP，支持代理）"""
@@ -338,11 +341,13 @@ class SignalMonitorEngine:
                 return
 
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = json.dumps({
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-            }).encode("utf-8")
+            payload = json.dumps(
+                {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }
+            ).encode("utf-8")
 
             req = urllib.request.Request(
                 url,
@@ -354,10 +359,12 @@ class SignalMonitorEngine:
             # 配置代理（如果有）
             proxy_url = getattr(settings, "TELEGRAM_PROXY", "") or ""
             if proxy_url:
-                proxy_handler = urllib.request.ProxyHandler({
-                    "http": proxy_url,
-                    "https": proxy_url,
-                })
+                proxy_handler = urllib.request.ProxyHandler(
+                    {
+                        "http": proxy_url,
+                        "https": proxy_url,
+                    }
+                )
                 opener = urllib.request.build_opener(proxy_handler)
                 opener.addheaders = [("Content-Type", "application/json")]
                 with opener.open(req, timeout=15) as resp:
@@ -377,7 +384,9 @@ class SignalMonitorEngine:
             body = e.read().decode() if e.fp else str(e)
             logger.error("Telegram HTTP %d error: %s", e.code, body)
         except Exception as e:
-            logger.error("Failed to send Telegram message to chat_id %s: %s", chat_id, e)
+            logger.error(
+                "Failed to send Telegram message to chat_id %s: %s", chat_id, e
+            )
 
     def _execute_trade(self, monitor: SignalMonitor, trigger_value: dict) -> None:
         """执行交易"""
@@ -409,6 +418,56 @@ class SignalMonitorEngine:
         except Exception as e:
             logger.error("Failed to execute trade: %s", e)
 
+    def _publish_strategy_validate(
+        self, monitor: SignalMonitor, trigger_value: dict
+    ) -> dict:
+        """发布策略验证事件到 Redis List，由 LiveStrategyRunner 消费。"""
+        import json
+
+        try:
+            import redis as sync_redis
+            from django.conf import settings
+
+            session_id = monitor.live_session_id
+            if not session_id:
+                logger.warning(
+                    "validate_strategy monitor %s has no live_session_id, skipping",
+                    monitor.id,
+                )
+                return {"action_type": "validate_strategy", "status": "skipped"}
+
+            r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+            try:
+                key = f"strategy:validate:{session_id}"
+                payload = json.dumps(
+                    {
+                        "monitor_id": str(monitor.id),
+                        "strategy_name": monitor.strategy_name,
+                        "symbol": monitor.symbol,
+                        "interval": monitor.interval,
+                        "trigger_value": trigger_value,
+                    }
+                )
+                r.rpush(key, payload)
+                r.expire(key, 300)  # 5分钟 TTL，防止消息堆积
+
+                logger.info(
+                    "Published validate event for strategy=%s session=%s key=%s",
+                    monitor.strategy_name,
+                    session_id,
+                    key,
+                )
+                return {"action_type": "validate_strategy", "status": "published"}
+            finally:
+                r.close()
+        except Exception as e:
+            logger.error("Failed to publish validate event: %s", e)
+            return {
+                "action_type": "validate_strategy",
+                "status": "error",
+                "error": str(e),
+            }
+
     def _load_klines_for_monitors(
         self, monitors: list[SignalMonitor]
     ) -> dict[str, list[dict]]:
@@ -430,9 +489,7 @@ class SignalMonitorEngine:
 
             # 缓存为空或不完整，从交易所获取历史 K 线
             klines = self._fetch_recent_klines(
-                monitor.symbol,
-                interval=monitor.interval,
-                limit=10
+                monitor.symbol, interval=monitor.interval, limit=10
             )
             if klines:
                 klines_map[monitor.symbol] = klines
@@ -459,7 +516,9 @@ class SignalMonitorEngine:
             logger.warning("Failed to fetch realtime price for %s: %s", symbol, e)
             return None
 
-    def _fetch_recent_klines(self, symbol: str, interval: str = "1h", limit: int = 5) -> list[dict]:
+    def _fetch_recent_klines(
+        self, symbol: str, interval: str = "1h", limit: int = 5
+    ) -> list[dict]:
         """从交易所获取最近的 K 线数据"""
         try:
             import ccxt
@@ -470,23 +529,35 @@ class SignalMonitorEngine:
             exchange = ccxt.binance({"enableRateLimit": True})
 
             # ccxt 时间框架映射
-            tf_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-                     "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h",
-                     "12h": "12h", "1d": "1d", "1w": "1w"}
+            tf_map = {
+                "1m": "1m",
+                "5m": "5m",
+                "15m": "15m",
+                "30m": "30m",
+                "1h": "1h",
+                "2h": "2h",
+                "4h": "4h",
+                "6h": "6h",
+                "12h": "12h",
+                "1d": "1d",
+                "1w": "1w",
+            }
             ccxt_tf = tf_map.get(interval, "1h")
 
             ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe=ccxt_tf, limit=limit)
 
             klines = []
             for candle in ohlcv:
-                klines.append({
-                    "timestamp": candle[0],
-                    "open": candle[1],
-                    "high": candle[2],
-                    "low": candle[3],
-                    "close": candle[4],
-                    "volume": candle[5],
-                })
+                klines.append(
+                    {
+                        "timestamp": candle[0],
+                        "open": candle[1],
+                        "high": candle[2],
+                        "low": candle[3],
+                        "close": candle[4],
+                        "volume": candle[5],
+                    }
+                )
 
             logger.debug("Fetched %d klines for %s", len(klines), symbol)
             return klines

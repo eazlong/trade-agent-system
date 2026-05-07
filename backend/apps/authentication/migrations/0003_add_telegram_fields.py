@@ -4,20 +4,23 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('authentication', '0002_create_admin_user'),
+        ("authentication", "0002_create_admin_user"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='user',
-            name='telegram_chat_id',
-            field=models.BigIntegerField(blank=True, null=True, verbose_name='Telegram Chat ID'),
+            model_name="user",
+            name="telegram_chat_id",
+            field=models.BigIntegerField(
+                blank=True, null=True, verbose_name="Telegram Chat ID"
+            ),
         ),
         migrations.AddField(
-            model_name='user',
-            name='telegram_id',
-            field=models.CharField(blank=True, max_length=64, null=True, verbose_name='Telegram User ID'),
+            model_name="user",
+            name="telegram_id",
+            field=models.CharField(
+                blank=True, max_length=64, null=True, verbose_name="Telegram User ID"
+            ),
         ),
     ]

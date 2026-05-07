@@ -62,7 +62,9 @@ class SubmitScheduledTaskTool(BaseTool):
         run_at = run_at.strip()
 
         # 相对时间：now+5m, now+1h, now+30s, now+2d
-        rel = __import__("re").match(r"^now\+(\d+)([smhd])$", run_at, __import__("re").IGNORECASE)
+        rel = __import__("re").match(
+            r"^now\+(\d+)([smhd])$", run_at, __import__("re").IGNORECASE
+        )
         if rel:
             value = int(rel.group(1))
             unit = rel.group(2).lower()
@@ -70,10 +72,13 @@ class SubmitScheduledTaskTool(BaseTool):
             return datetime.now(timezone.utc) + timedelta(**{deltas[unit]: value})
 
         # 相对时间：tomorrow HH:MM
-        tom_match = __import__("re").match(r"^tomorrow\s+(\d{1,2}):(\d{2})$", run_at, __import__("re").IGNORECASE)
+        tom_match = __import__("re").match(
+            r"^tomorrow\s+(\d{1,2}):(\d{2})$", run_at, __import__("re").IGNORECASE
+        )
         if tom_match:
             hour, minute = int(tom_match.group(1)), int(tom_match.group(2))
             from datetime import timedelta
+
             tomorrow = datetime.now(timezone.utc).replace(
                 hour=hour, minute=minute, second=0
             ) + timedelta(days=1)
@@ -85,7 +90,9 @@ class SubmitScheduledTaskTool(BaseTool):
         except ValueError:
             pass
 
-        raise ValueError(f"无法解析时间格式: {run_at}，支持 ISO 格式或 now+5m、tomorrow 09:00")
+        raise ValueError(
+            f"无法解析时间格式: {run_at}，支持 ISO 格式或 now+5m、tomorrow 09:00"
+        )
 
     async def execute(
         self,
@@ -118,7 +125,9 @@ class SubmitScheduledTaskTool(BaseTool):
             eta_str = eta.isoformat()
             logger.info(
                 "[SubmitScheduledTaskTool] scheduled task_id=%s agent=%s eta=%s",
-                task.id, agent_name, eta_str,
+                task.id,
+                agent_name,
+                eta_str,
             )
             return ToolResult(
                 success=True,
@@ -138,7 +147,9 @@ class SubmitScheduledTaskTool(BaseTool):
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         except Exception as e:
-            logger.error("[SubmitScheduledTaskTool] submit failed: %s", e, exc_info=True)
+            logger.error(
+                "[SubmitScheduledTaskTool] submit failed: %s", e, exc_info=True
+            )
             return ToolResult(success=False, error=f"提交定时任务失败: {e}")
 
 
@@ -219,23 +230,28 @@ class SubmitRecurringTaskTool(BaseTool):
             )
 
             import json as _json
+
             await sync_to_async(PeriodicTask.objects.update_or_create)(
                 name=task_name,
                 defaults={
                     "task": "apps.agent.tasks.execute_recurring_agent_task",
                     "crontab": schedule,
-                    "kwargs": _json.dumps({
-                        "agent_name": agent_name,
-                        "message": message,
-                        "user_id": user_id or "",
-                        "task_name": task_name,
-                    }),
+                    "kwargs": _json.dumps(
+                        {
+                            "agent_name": agent_name,
+                            "message": message,
+                            "user_id": user_id or "",
+                            "task_name": task_name,
+                        }
+                    ),
                 },
             )
 
             logger.info(
                 "[SubmitRecurringTaskTool] registered task_name=%s agent=%s cron=%s",
-                task_name, agent_name, cron_expression,
+                task_name,
+                agent_name,
+                cron_expression,
             )
             return ToolResult(
                 success=True,
@@ -252,7 +268,9 @@ class SubmitRecurringTaskTool(BaseTool):
                 },
             )
         except Exception as e:
-            logger.error("[SubmitRecurringTaskTool] register failed: %s", e, exc_info=True)
+            logger.error(
+                "[SubmitRecurringTaskTool] register failed: %s", e, exc_info=True
+            )
             return ToolResult(success=False, error=f"注册周期任务失败: {e}")
 
 
@@ -339,7 +357,9 @@ class CancelScheduledTaskTool(BaseTool):
                     },
                 )
         except Exception as e:
-            logger.error("[CancelScheduledTaskTool] cancel failed: %s", e, exc_info=True)
+            logger.error(
+                "[CancelScheduledTaskTool] cancel failed: %s", e, exc_info=True
+            )
             return ToolResult(success=False, error=f"取消任务失败: {e}")
 
 
@@ -364,7 +384,9 @@ class ListScheduledTasksTool(BaseTool):
             from django_celery_beat.models import PeriodicTask
 
             tasks = await sync_to_async(list)(
-                PeriodicTask.objects.filter(enabled=True).select_related('crontab', 'interval')
+                PeriodicTask.objects.filter(enabled=True).select_related(
+                    "crontab", "interval"
+                )
             )
             if not tasks:
                 return ToolResult(

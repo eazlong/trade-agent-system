@@ -92,9 +92,9 @@ class PromptLoader:
             meta, body = _parse_frontmatter(text)
             if meta and "name" in meta:
                 # 提取 body 前 5 行作为概述
-                overview_lines = [
-                    line for line in body.splitlines() if line.strip()
-                ][:5]
+                overview_lines = [line for line in body.splitlines() if line.strip()][
+                    :5
+                ]
                 meta["overview"] = "\n".join(overview_lines)
                 agents.append(meta)
         return agents

@@ -108,7 +108,9 @@ class TelegramChannel(BaseChannel):
         )
         await update.message.reply_text(help_text)
 
-    def _save_telegram_user(self, telegram_id: str, chat_id: int, username: str | None) -> None:
+    def _save_telegram_user(
+        self, telegram_id: str, chat_id: int, username: str | None
+    ) -> None:
         """保存或更新 Telegram 用户信息到数据库"""
         try:
             from apps.authentication.models import User
@@ -128,7 +130,9 @@ class TelegramChannel(BaseChannel):
                     user.save(update_fields=["telegram_id", "telegram_chat_id"])
                     logger.info(
                         "Saved telegram info for user %s: telegram_id=%s, chat_id=%s",
-                        user.username, telegram_id, chat_id,
+                        user.username,
+                        telegram_id,
+                        chat_id,
                     )
             else:
                 logger.debug(

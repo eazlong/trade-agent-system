@@ -114,13 +114,22 @@ class LLMClient:
                 # 5xx / 429 可重试，其他直接降级
                 if e.response.status_code in (429, 500, 502, 503, 504):
                     logger.warning(
-                        "HTTP %d, retry %d/%d", e.response.status_code, attempt, TOOL_CALL_MAX_RETRIES
+                        "HTTP %d, retry %d/%d",
+                        e.response.status_code,
+                        attempt,
+                        TOOL_CALL_MAX_RETRIES,
                     )
                 else:
                     break
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.RemoteProtocolError,
+            ) as e:
                 last_exc = e
-                logger.warning("Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES)
+                logger.warning(
+                    "Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES
+                )
             except Exception as e:
                 last_exc = e
                 break  # 配置错误等非可重试异常，直接降级
@@ -333,13 +342,22 @@ class LLMClient:
                 last_exc = e
                 if e.response.status_code in (429, 500, 502, 503, 504):
                     logger.warning(
-                        "HTTP %d, retry %d/%d", e.response.status_code, attempt, TOOL_CALL_MAX_RETRIES
+                        "HTTP %d, retry %d/%d",
+                        e.response.status_code,
+                        attempt,
+                        TOOL_CALL_MAX_RETRIES,
                     )
                 else:
                     break
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.RemoteProtocolError,
+            ) as e:
                 last_exc = e
-                logger.warning("Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES)
+                logger.warning(
+                    "Network error (%s), retry %d/%d", e, attempt, TOOL_CALL_MAX_RETRIES
+                )
             except Exception as e:
                 last_exc = e
                 break  # 配置错误等非可重试异常，直接降级

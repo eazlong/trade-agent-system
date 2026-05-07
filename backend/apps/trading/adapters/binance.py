@@ -150,6 +150,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         Demo 环境使用 v2 端点。
         """
         import logging
+
         logger = logging.getLogger(__name__)
 
         client = self._ensure_connected()
