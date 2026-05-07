@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from .base import BaseStrategy, OrderSignal
+    from .base import BaseStrategy, OrderSignal, PortfolioTarget
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class LiveStrategyRunner:
         self._running = False
         self._kline_history: list[dict] = []
         self._dispatcher = None
+        self._validation_task: "asyncio.Task | None" = None
 
     async def start(self) -> None:
         """启动实盘策略运行"""
@@ -64,9 +67,20 @@ class LiveStrategyRunner:
         # 订阅 K 线数据
         await self._subscribe_kline()
 
+        # 注册策略的最小周期信号到 SignalMonitor
+        await self._register_signal_monitors()
+
+        # 启动策略验证事件监听（由 SignalMonitor 触发后消费）
+        watch_signals = self.strategy.get_watch_signals()
+        if watch_signals:
+            self._validation_task = asyncio.create_task(
+                self._listen_validation()
+            )
+
         logger.info(
             f"[LiveStrategyRunner] started: strategy={self.strategy.name} "
-            f"symbol={self.symbol} tf={self.timeframe}"
+            f"symbol={self.symbol} tf={self.timeframe} "
+            f"watch_signals={len(watch_signals)}"
         )
 
     async def stop(self) -> None:
@@ -77,6 +91,19 @@ class LiveStrategyRunner:
         self._running = False
         self.strategy.on_stop()
         await self._unsubscribe_kline()
+
+        # 取消验证监听任务
+        if self._validation_task and not self._validation_task.done():
+            self._validation_task.cancel()
+            try:
+                await self._validation_task
+            except asyncio.CancelledError:
+                pass
+            self._validation_task = None
+
+        # 清理 SignalMonitor 记录
+        await self._unregister_signal_monitors()
+
         logger.info(f"[LiveStrategyRunner] stopped: {self.strategy.name}")
 
     async def on_kline(self, kline: dict) -> None:
@@ -98,11 +125,20 @@ class LiveStrategyRunner:
             self._kline_history = self._kline_history[-max_history:]
 
         try:
-            # 调用策略逻辑
-            signal = self.strategy.on_bar(kline, self._kline_history)
+            # 同步当前价格到 context
+            self.strategy.ctx.set_price(self.symbol, Decimal(str(kline.get("close", "0"))))
 
-            if signal:
-                await self._dispatch_signal(signal)
+            # Phase 2: 5-step pipeline
+            _ = self.strategy.select_universe()
+            insights = self.strategy.generate_insights(kline, self._kline_history)
+            targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
+            safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
+            for target in safe_targets:
+                signal = self._target_to_order(target)
+                if signal:
+                    await self._dispatch_signal(signal)
+                    estimated_price = Decimal(str(kline.get("close", "0")))
+                    self._apply_signal_to_context(signal, estimated_price)
         except Exception as e:
             logger.error(f"[LiveStrategyRunner] on_kline error: {e}", exc_info=True)
 
@@ -193,6 +229,43 @@ class LiveStrategyRunner:
                 f"[LiveStrategyRunner] failed to dispatch signal: {e}", exc_info=True
             )
 
+    def _apply_signal_to_context(
+        self, signal: "OrderSignal", estimated_price: "Decimal"
+    ) -> None:
+        """乐观更新 ctx.position/balance（假设市价单立即按 estimated_price 成交）。
+
+        这是 C4 修复：实盘模式下 ctx.position 持续追踪预期持仓。
+        回测模式由 BacktestEngine._execute_buy/_execute_sell 同步更新。
+        """
+        if signal.side == "buy":
+            cost = signal.quantity * estimated_price
+            self.strategy.ctx.position += signal.quantity
+            self.strategy.ctx.set_position(self.symbol, self.strategy.ctx.position)
+            self.strategy.ctx.balance -= cost
+        elif signal.side == "sell":
+            proceeds = signal.quantity * estimated_price
+            self.strategy.ctx.position -= signal.quantity
+            self.strategy.ctx.set_position(self.symbol, self.strategy.ctx.position)
+            self.strategy.ctx.balance += proceeds
+
+        logger.debug(
+            f"[LiveStrategyRunner] ctx updated: "
+            f"position={self.strategy.ctx.position} "
+            f"balance={self.strategy.ctx.balance}"
+        )
+
+    def _target_to_order(
+        self, target: "PortfolioTarget"
+    ) -> "OrderSignal | None":
+        """将目标持仓差量转化为订单信号"""
+        diff = target.target_quantity - self.strategy.ctx.position
+        if diff == 0:
+            return None
+        if diff > 0:
+            return self.strategy.ctx.buy(diff, signal_name=target.reason)
+        else:
+            return self.strategy.ctx.sell(abs(diff), signal_name=target.reason)
+
     async def load_initial_history(self, limit: int = 200) -> None:
         """
         启动时加载历史 K 线数据，确保策略有足够的历史数据运行。
@@ -212,4 +285,167 @@ class LiveStrategyRunner:
         except Exception as e:
             logger.warning(
                 f"[LiveStrategyRunner] failed to load historical klines: {e}"
+            )
+
+    async def _register_signal_monitors(self) -> None:
+        """将策略的 get_watch_signals() 注册到 SignalMonitor 数据库。"""
+        watch_signals = self.strategy.get_watch_signals()
+        if not watch_signals:
+            return
+
+        if not self.user_id:
+            logger.warning(
+                "[LiveStrategyRunner] cannot register signal monitors: no user_id"
+            )
+            return
+
+        from asgiref.sync import sync_to_async
+        from apps.signal_monitor.models import SignalMonitor
+
+        @sync_to_async
+        def _create_monitor(ws: dict) -> None:
+            SignalMonitor.objects.update_or_create(
+                strategy_name=self.strategy.name,
+                live_session_id=self.live_session_id or "",
+                symbol=self.symbol,
+                interval=ws.get("interval", self.timeframe),
+                defaults={
+                    "name": f"{self.strategy.name}:{ws.get('indicator_type', '')}",
+                    "user_id": self.user_id,
+                    "indicator_type": ws["indicator_type"],
+                    "indicator_params": ws.get("indicator_params", {}),
+                    "condition": ws["condition"],
+                    "trigger_type": ws.get("trigger_type", "continuous"),
+                    "action_type": "validate_strategy",
+                    "status": "active",
+                },
+            )
+
+        for ws in watch_signals:
+            try:
+                await _create_monitor(ws)
+                logger.info(
+                    "[LiveStrategyRunner] registered signal monitor: %s %s %s",
+                    self.strategy.name,
+                    ws.get("indicator_type"),
+                    ws.get("interval"),
+                )
+            except Exception as e:
+                logger.error(
+                    "[LiveStrategyRunner] failed to register signal monitor: %s",
+                    e,
+                )
+
+    async def _unregister_signal_monitors(self) -> None:
+        """清理该实盘会话的 SignalMonitor 记录。"""
+        if not self.live_session_id:
+            return
+
+        from asgiref.sync import sync_to_async
+        from apps.signal_monitor.models import SignalMonitor
+
+        @sync_to_async
+        def _cleanup():
+            SignalMonitor.objects.filter(
+                live_session_id=self.live_session_id,
+                strategy_name=self.strategy.name,
+            ).update(status="expired")
+
+        try:
+            await _cleanup()
+            logger.info(
+                "[LiveStrategyRunner] unregistered signal monitors for %s/%s",
+                self.strategy.name,
+                self.live_session_id,
+            )
+        except Exception as e:
+            logger.error(
+                "[LiveStrategyRunner] failed to unregister signal monitors: %s", e
+            )
+
+    async def _listen_validation(self) -> None:
+        """后台监听 Redis List，消费 SignalMonitor 发布的策略验证事件。"""
+        import json
+
+        import redis.asyncio as aioredis
+        from django.conf import settings
+
+        key = f"strategy:validate:{self.live_session_id}"
+        r = None
+
+        try:
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            while self._running:
+                try:
+                    result = await r.blpop(key, timeout=5)
+                    if result is None:
+                        continue
+                    _list_key, data = result
+                    event = json.loads(data)
+                    await self._on_validate_trigger(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "[LiveStrategyRunner] validation listener error: %s", e,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(1)
+        finally:
+            if r is not None:
+                await r.aclose()
+
+    async def _on_validate_trigger(self, event: dict) -> None:
+        """SignalMonitor 触发后，运行完整策略验证。
+
+        Args:
+            event: {
+                monitor_id, strategy_name, symbol, interval, trigger_value
+            }
+        """
+        logger.info(
+            "[LiveStrategyRunner] validate trigger received: %s %s",
+            event.get("strategy_name"),
+            event.get("symbol"),
+        )
+
+        try:
+            # 确保有足够的历史数据
+            if len(self._kline_history) < 10:
+                await self.load_initial_history(limit=200)
+                if len(self._kline_history) < 10:
+                    logger.warning(
+                        "[LiveStrategyRunner] insufficient kline history for validation"
+                    )
+                    return
+
+            # 用最新 K 线运行完整策略逻辑 (Phase 2 pipeline)
+            latest_kline = self._kline_history[-1]
+            self.strategy.ctx.set_price(self.symbol, Decimal(str(latest_kline.get("close", "0"))))
+            _ = self.strategy.select_universe()
+            insights = self.strategy.generate_insights(
+                latest_kline, self._kline_history
+            )
+            targets = self.strategy.construct_portfolio(
+                insights, self.strategy.ctx
+            )
+            safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
+            for target in safe_targets:
+                signal = self._target_to_order(target)
+                if signal:
+                    await self._dispatch_signal(signal)
+                    estimated_price = Decimal(str(latest_kline.get("close", "0")))
+                    self._apply_signal_to_context(signal, estimated_price)
+                    logger.info(
+                        "[LiveStrategyRunner] strategy confirmed signal: %s %s",
+                        signal.signal_name,
+                        signal.side,
+                    )
+                else:
+                    logger.info(
+                        "[LiveStrategyRunner] strategy rejected signal after full validation"
+                    )
+        except Exception as e:
+            logger.error(
+                "[LiveStrategyRunner] validate trigger error: %s", e, exc_info=True
             )
