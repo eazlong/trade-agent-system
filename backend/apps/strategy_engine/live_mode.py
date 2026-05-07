@@ -73,9 +73,7 @@ class LiveStrategyRunner:
         # 启动策略验证事件监听（由 SignalMonitor 触发后消费）
         watch_signals = self.strategy.get_watch_signals()
         if watch_signals:
-            self._validation_task = asyncio.create_task(
-                self._listen_validation()
-            )
+            self._validation_task = asyncio.create_task(self._listen_validation())
 
         logger.info(
             f"[LiveStrategyRunner] started: strategy={self.strategy.name} "
@@ -126,7 +124,9 @@ class LiveStrategyRunner:
 
         try:
             # 同步当前价格到 context
-            self.strategy.ctx.set_price(self.symbol, Decimal(str(kline.get("close", "0"))))
+            self.strategy.ctx.set_price(
+                self.symbol, Decimal(str(kline.get("close", "0")))
+            )
 
             # Phase 2: 5-step pipeline
             _ = self.strategy.select_universe()
@@ -254,9 +254,7 @@ class LiveStrategyRunner:
             f"balance={self.strategy.ctx.balance}"
         )
 
-    def _target_to_order(
-        self, target: "PortfolioTarget"
-    ) -> "OrderSignal | None":
+    def _target_to_order(self, target: "PortfolioTarget") -> "OrderSignal | None":
         """将目标持仓差量转化为订单信号"""
         diff = target.target_quantity - self.strategy.ctx.position
         if diff == 0:
@@ -387,7 +385,8 @@ class LiveStrategyRunner:
                     raise
                 except Exception as e:
                     logger.error(
-                        "[LiveStrategyRunner] validation listener error: %s", e,
+                        "[LiveStrategyRunner] validation listener error: %s",
+                        e,
                         exc_info=True,
                     )
                     await asyncio.sleep(1)
@@ -421,14 +420,14 @@ class LiveStrategyRunner:
 
             # 用最新 K 线运行完整策略逻辑 (Phase 2 pipeline)
             latest_kline = self._kline_history[-1]
-            self.strategy.ctx.set_price(self.symbol, Decimal(str(latest_kline.get("close", "0"))))
+            self.strategy.ctx.set_price(
+                self.symbol, Decimal(str(latest_kline.get("close", "0")))
+            )
             _ = self.strategy.select_universe()
             insights = self.strategy.generate_insights(
                 latest_kline, self._kline_history
             )
-            targets = self.strategy.construct_portfolio(
-                insights, self.strategy.ctx
-            )
+            targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
             safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
             for target in safe_targets:
                 signal = self._target_to_order(target)

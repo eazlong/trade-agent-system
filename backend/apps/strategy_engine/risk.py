@@ -78,7 +78,9 @@ class TotalExposureRisk(BaseRiskModel):
 
     def __init__(self, max_exposure_pct: float = 0.80):
         if not (0 < max_exposure_pct <= 1):
-            raise ValueError(f"max_exposure_pct must be in (0, 1], got {max_exposure_pct}")
+            raise ValueError(
+                f"max_exposure_pct must be in (0, 1], got {max_exposure_pct}"
+            )
         self.max_exposure_pct = max_exposure_pct
 
     def filter(

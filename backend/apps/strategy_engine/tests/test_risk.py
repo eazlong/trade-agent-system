@@ -91,7 +91,7 @@ class TestTotalExposureRisk:
         )
         targets = [
             make_target("BTC/USDT", 0.01),  # 500 USDT
-            make_target("ETH/USDT", 0.1),   # 300 USDT
+            make_target("ETH/USDT", 0.1),  # 300 USDT
         ]  # Total 800 USDT = 8% of 10000
         risk = TotalExposureRisk(max_exposure_pct=0.80)
         result = risk.filter(targets, ctx)
@@ -103,8 +103,10 @@ class TestTotalExposureRisk:
             prices={"BTC/USDT": Decimal("50000")},
         )
         targets = [
-            make_target("BTC/USDT", 0.1),   # 5000 USDT
-            make_target("BTC/USDT", 0.05),  # 2500 USDT (cumulative 7500 = 75%, ok at 80%)
+            make_target("BTC/USDT", 0.1),  # 5000 USDT
+            make_target(
+                "BTC/USDT", 0.05
+            ),  # 2500 USDT (cumulative 7500 = 75%, ok at 80%)
             make_target("BTC/USDT", 0.02),  # 1000 USDT (cumulative 8500 = 85%, reject)
         ]
         risk = TotalExposureRisk(max_exposure_pct=0.80)

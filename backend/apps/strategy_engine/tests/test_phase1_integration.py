@@ -15,6 +15,7 @@ from apps.strategy_engine.base import (
 
 class FakeStrategy(BaseStrategy):
     """用于测试的假策略"""
+
     name = "fake_strategy"
 
     def __init__(self, context: StrategyContext):
@@ -101,9 +102,7 @@ class TestGenerateInsights:
         ctx = self._make_context()
         ctx.symbol = "ETH/USDT"
         strategy = FakeStrategy(ctx)
-        strategy.set_return_signal(
-            OrderSignal(side="buy", quantity=Decimal("0.1"))
-        )
+        strategy.set_return_signal(OrderSignal(side="buy", quantity=Decimal("0.1")))
 
         insights = strategy.generate_insights({}, [])
         assert insights[0].symbol == "ETH/USDT"
