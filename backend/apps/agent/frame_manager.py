@@ -331,7 +331,6 @@ class FrameManager:
             return
 
         from apps.datasource.registry import DataSourceRegistry
-        from apps.datasource.base import DataType, KlineInterval, MarketType
 
         # 1. 加载并连接所有已注册的 crypto 数据源
         sources = DataSourceRegistry.list_registered()
@@ -378,45 +377,10 @@ class FrameManager:
         try:
             monitors = self._get_active_signal_monitors()
             for monitor in monitors:
-                symbol = monitor.symbol
-                interval_str = monitor.timeframe or "1h"
-                try:
-                    interval = KlineInterval(interval_str)
-                except ValueError:
-                    interval = KlineInterval.H1
-                    logger.warning(
-                        "[FrameManager] unknown timeframe %s, defaulting to 1h",
-                        interval_str,
-                    )
-
-                # 对每个已连接的数据源订阅 K 线
-                for source_name in DataSourceRegistry.list_registered():
-                    ds = DataSourceRegistry.get(source_name)
-                    if ds.is_connected() and DataType.KLINE in ds.supported_data_types:
-                        # 确定市场类型
-                        market = MarketType.SPOT
-                        if (
-                            hasattr(monitor, "market_type")
-                            and monitor.market_type == "futures"
-                        ):
-                            market = MarketType.FUTURES
-
-                        await ds.subscribe(
-                            symbol=symbol,
-                            data_type=DataType.KLINE,
-                            interval=interval,
-                            market_type=market,
-                            callback=lambda data, m=monitor: self._on_kline_data(
-                                data, m
-                            ),
-                        )
-                        logger.info(
-                            "[FrameManager] subscribed %s kline %s @%s (%s)",
-                            source_name,
-                            symbol,
-                            interval.value,
-                            market.value,
-                        )
+                await self.subscribe_signal_klines(
+                    symbol=monitor.symbol,
+                    interval_str=monitor.interval or "1h",
+                )
         except Exception as e:
             logger.warning("[FrameManager] signal monitor subscription failed: %s", e)
 
@@ -486,14 +450,57 @@ class FrameManager:
         except Exception:
             return []
 
-    def _on_kline_data(self, kline: dict, monitor) -> None:
+    async def subscribe_signal_klines(
+        self, symbol: str, interval_str: str = "1h"
+    ) -> None:
+        """为信号监控订阅指定 symbol 的 K 线 WebSocket 数据。
+
+        可在实盘策略启动后调用，将新注册的 SignalMonitor symbol
+        加入 WebSocket 实时回调，确保信号检查立即生效（而非仅依赖
+        Celery Beat 30s 轮询兜底）。
+
+        Args:
+            symbol: 交易对，如 "BTC/USDT"
+            interval_str: K 线周期，如 "1h", "15m"
+        """
+        from apps.datasource.registry import DataSourceRegistry
+        from apps.datasource.base import DataType, KlineInterval, MarketType
+
+        try:
+            interval = KlineInterval(interval_str)
+        except ValueError:
+            interval = KlineInterval.H1
+            logger.warning(
+                "[FrameManager] unknown interval %s, defaulting to 1h", interval_str
+            )
+
+        for source_name in DataSourceRegistry.list_registered():
+            ds = DataSourceRegistry.get(source_name)
+            if ds.is_connected() and DataType.KLINE in ds.supported_data_types:
+                await ds.subscribe(
+                    symbol=symbol,
+                    data_type=DataType.KLINE,
+                    interval=interval,
+                    market_type=MarketType.SPOT,
+                    callback=lambda data, sym=symbol: self._on_kline_data(data, sym),
+                )
+                logger.info(
+                    "[FrameManager] subscribed %s kline %s @%s for signal monitor",
+                    source_name,
+                    symbol,
+                    interval.value,
+                )
+
+    def _on_kline_data(self, kline: dict, symbol: str) -> None:
         """K 线数据回调：触发信号检查。"""
         try:
             from apps.signal_monitor.engine import SignalMonitorEngine
 
             engine = SignalMonitorEngine.get_instance()
-            symbol = kline.get("symbol", "")
-            klines = engine._load_klines_for_monitors([monitor]).get(symbol, [])
+            # 构造一个临时对象以满足 _load_klines_for_monitors 的接口（只需 .symbol 属性）
+            klines = engine._load_klines_for_monitors(
+                [type("_M", (), {"symbol": symbol})()]
+            ).get(symbol, [])
             if len(klines) >= 2:
                 engine.check_signals_for_kline(symbol, klines)
         except Exception as e:

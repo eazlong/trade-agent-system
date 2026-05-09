@@ -319,6 +319,8 @@ class LiveStrategyRunner:
                 },
             )
 
+        subscribed: set[tuple[str, str]] = set()
+
         for ws in watch_signals:
             try:
                 await _create_monitor(ws)
@@ -328,6 +330,18 @@ class LiveStrategyRunner:
                     ws.get("indicator_type"),
                     ws.get("interval"),
                 )
+
+                # 为新增的监控订阅 WebSocket K 线回调，确保实时信号检查生效
+                interval_str = ws.get("interval", self.timeframe)
+                key = (self.symbol, interval_str)
+                if key not in subscribed:
+                    subscribed.add(key)
+                    from apps.agent.frame_manager import FrameManager
+
+                    fm = FrameManager.get_instance()
+                    await fm.subscribe_signal_klines(
+                        symbol=self.symbol, interval_str=interval_str
+                    )
             except Exception as e:
                 logger.error(
                     "[LiveStrategyRunner] failed to register signal monitor: %s",
