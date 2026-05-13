@@ -525,6 +525,18 @@ class SupervisorAgent(BaseAgent):
                 ]
                 mm.write_l1("conversation_history", updated[-5:])
 
+                # 同时写入 Redis，保证跨进程一致性（方案A兜底）
+                try:
+                    import redis
+                    from django.conf import settings
+                    if hasattr(settings, "REDIS_URL") and settings.REDIS_URL:
+                        r = redis.from_url(settings.REDIS_URL)
+                        conv_key = f"conv:supervisor:{message.user_id}"
+                        r.set(conv_key, json.dumps(updated[-5:]), ex=86400)
+                        r.close()
+                except Exception as e:
+                    logger.debug("Redis conversation_history write failed: %s", e)
+
                 # 检查响应是否要求开始多轮对话
                 if hasattr(result.data, "get") and result.data.get(
                     "start_multi_turn", False
@@ -602,7 +614,23 @@ class SupervisorAgent(BaseAgent):
             try:
                 from apps.memory.manager import MemoryManager
                 mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
+                # 优先 L1，跨进程时 L1 为空则读 Redis
                 conv = mm._l1.get("conversation_history", [])
+                if not conv:
+                    try:
+                        import redis
+                        from django.conf import settings
+                        if hasattr(settings, "REDIS_URL") and settings.REDIS_URL:
+                            r = redis.from_url(settings.REDIS_URL)
+                            conv_key = f"conv:supervisor:{message.user_id}"
+                            conv_raw = r.get(conv_key)
+                            if conv_raw:
+                                conv = json.loads(conv_raw)
+                                # 回填 L1，加速后续读取
+                                mm.write_l1("conversation_history", conv)
+                            r.close()
+                    except Exception:
+                        pass
                 if len(conv) >= 2:
                     last_agent_entry = conv[-2]
                     if last_agent_entry.get("role") == "agent":
