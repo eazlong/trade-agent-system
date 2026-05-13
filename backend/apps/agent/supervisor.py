@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 from .base import BaseAgent, AgentMessage, AgentResult
@@ -168,36 +169,21 @@ def register_fallback_rule(pattern: str, intent: str):
 
 _router = IntentRouter.get_instance()
 
-# # 默认意图映射
-# _router.register_intents(
-#     {
-#         "analyze_market": "analyst",
-#         "generate_signal": "analyst",
-#         "generate_strategy": "quant",
-#         "run_backtest": "quant",
-#         "create_plan": "coach",
-#         "trading_system": "coach",
-#         "review_trade": "coach",
-#         "summarize_trades": "coach",
-#         "assess_risk": "risk_advisor",
-#     }
-# )
-
 # 默认框架意图
 _router.register_frame_intent("start_trading", "trading", "start")
 _router.register_frame_intent("stop_trading", "trading", "stop")
 _router.register_frame_intent("start_monitor", "assist", "start")
 _router.register_frame_intent("stop_monitor", "assist", "stop")
 
-# 默认降级规则
+# 默认降级规则（直接映射到 Agent 名称，非中间意图名）
 _router.register_fallback_rules(
     [
-        (r"(分析|行情|走势|K线|趋势).*(BTC|ETH|币|市场)", "analyze_market"),
-        (r"(回测|测试策略|历史数据)", "run_backtest"),
-        (r"(风险|止损|仓位|风控)", "assess_risk"),
-        (r"(计划|复盘|总结|周报)", "create_plan"),
-        (r"(策略|代码|编写)", "generate_and_test_strategy"),
-        (r"(研究|调研|收集.*资料|查找.*知识|搜索.*信息|内容研究)", "research_topic"),
+        (r"(分析|行情|走势|K线|趋势).*(BTC|ETH|币|市场)", "analyst"),
+        (r"(回测|测试策略|历史数据|backtest)", "quant"),
+        (r"(风险|止损|仓位|风控)", "risk_advisor"),
+        (r"(计划|复盘|总结|周报)", "coach"),
+        (r"(实现.*策略|创建.*策略|编写.*策略|生成.*策略代码)", "quant"),
+        (r"(研究|调研|收集.*资料|查找.*知识|搜索.*信息|内容研究|找.*策略|搜索.*策略)", "researcher"),
         (
             r"(价格|突破|跌破|高于|低于|提醒|通知|监控).*(BTC|ETH|币|\d{4,})",
             "supervisor",
@@ -232,7 +218,6 @@ class SupervisorAgent(BaseAgent):
 
         # 从 prompt 元数据加载工具声明
         from .prompt_loader import _parse_frontmatter
-        from pathlib import Path
 
         prompt_file = (
             Path(__file__).parent.parent.parent / "prompts" / "v1" / "supervisor.txt"
