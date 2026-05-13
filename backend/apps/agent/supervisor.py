@@ -593,8 +593,31 @@ class SupervisorAgent(BaseAgent):
     async def _route_to_agent(
         self, agent_name: str, message: AgentMessage
     ) -> AgentResult:
-        """懒加载并调用子Agent"""
+        """懒加载并调用子Agent，自动注入跨Agent上下文。"""
         from .registry import AgentRegistry
+
+        # 注入跨agent上下文：如果上一轮是其他agent回复了用户，
+        # 将其回复内容注入到当前消息的payload中，供目标agent参考。
+        if message.user_id:
+            try:
+                from apps.memory.manager import MemoryManager
+                mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
+                conv = mm._l1.get("conversation_history", [])
+                if len(conv) >= 2:
+                    last_agent_entry = conv[-2]
+                    if last_agent_entry.get("role") == "agent":
+                        prev_agent = last_agent_entry.get("agent", "")
+                        prev_response = last_agent_entry.get("text", "")
+                        if prev_agent and prev_agent != agent_name and prev_response:
+                            if "previous_agent_response" not in message.payload:
+                                message.payload["previous_agent_response"] = prev_response
+                                message.payload["previous_agent_name"] = prev_agent
+                                logger.info(
+                                    "[%s] Injecting context: %s -> %s",
+                                    self.name, prev_agent, agent_name,
+                                )
+            except Exception as e:
+                logger.debug("Context injection failed: %s", e)
 
         try:
             agent = AgentRegistry.get(agent_name)

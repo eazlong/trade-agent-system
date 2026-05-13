@@ -177,13 +177,24 @@ class _LLMAgent(BaseAgent):
         return AgentResult(task_id=message.task_id, success=True, data=response_data)
 
     def _build_context(self, message: AgentMessage) -> str:
-        """根据声明的 context_fields 从 payload 提取上下文"""
-        if not self._context_fields:
-            return ""
+        """根据声明的 context_fields 从 payload 提取上下文，
+        并自动注入 supervisor 传入的跨 agent 上下文。"""
         parts = []
-        for field in self._context_fields:
-            if value := message.payload.get(field):
-                parts.append(f"{field}: {value}")
+
+        # 跨 agent 上下文注入（方案C）
+        prev_response = message.payload.get("previous_agent_response")
+        prev_agent = message.payload.get("previous_agent_name")
+        if prev_response and prev_agent:
+            parts.append(
+                f"[来自 {prev_agent} Agent 的上一轮回复]\n{prev_response}"
+            )
+
+        # 声明的 context_fields
+        if self._context_fields:
+            for field in self._context_fields:
+                if value := message.payload.get(field):
+                    parts.append(f"{field}: {value}")
+
         return "\n".join(parts)
 
     def _should_continue_conversation(self, content: str) -> bool:
