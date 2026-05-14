@@ -115,6 +115,12 @@ class MockMemoryManager:
     async def retrieve(self, query, top_k=5):
         return []
 
+    async def get_conv_history(self, max_turns=5):
+        return self._l1.get("conv_history", [])
+
+    async def save_conv_history(self, history):
+        self._l1["conv_history"] = history
+
 
 def llm_agent(name):
     return json.dumps({"agent": name})

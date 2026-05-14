@@ -377,7 +377,7 @@ class SupervisorAgent(BaseAgent):
         if mm and result.success and not result.need_reroute:
             user_text = message.payload.get("text", "")[:500]
             agent_text = str(result.data)[:500] if result.data else ""
-            conversation_history = mm._l1.get("conversation_history", [])
+            conversation_history = await mm.get_conv_history(max_turns=5)
             updated = conversation_history[-4:] + [
                 {
                     "role": "user",
@@ -392,7 +392,7 @@ class SupervisorAgent(BaseAgent):
                     "ts": int(time.time()),
                 },
             ]
-            mm.write_l1("conversation_history", updated[-5:])
+            await mm.save_conv_history(updated[-5:])
 
         # SubAgent 拒收
         if result.need_reroute:
@@ -472,7 +472,7 @@ class SupervisorAgent(BaseAgent):
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            conversation_history = mm._l1.get("conversation_history", [])
+            conversation_history = await mm.get_conv_history(max_turns=5)
 
         parsed = message.intent or await self._parse_intent(
             message.payload.get("text", ""),
@@ -523,19 +523,7 @@ class SupervisorAgent(BaseAgent):
                         "ts": int(time.time()),
                     },
                 ]
-                mm.write_l1("conversation_history", updated[-5:])
-
-                # 同时写入 Redis，保证跨进程一致性（方案A兜底）
-                try:
-                    import redis
-                    from django.conf import settings
-                    if hasattr(settings, "REDIS_URL") and settings.REDIS_URL:
-                        r = redis.from_url(settings.REDIS_URL)
-                        conv_key = f"conv:supervisor:{message.user_id}"
-                        r.set(conv_key, json.dumps(updated[-5:]), ex=86400)
-                        r.close()
-                except Exception as e:
-                    logger.debug("Redis conversation_history write failed: %s", e)
+                await mm.save_conv_history(updated[-5:])
 
                 # 检查响应是否要求开始多轮对话
                 if hasattr(result.data, "get") and result.data.get(
@@ -614,25 +602,9 @@ class SupervisorAgent(BaseAgent):
             try:
                 from apps.memory.manager import MemoryManager
                 mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-                # 优先 L1，跨进程时 L1 为空则读 Redis
-                conv = mm._l1.get("conversation_history", [])
-                if not conv:
-                    try:
-                        import redis
-                        from django.conf import settings
-                        if hasattr(settings, "REDIS_URL") and settings.REDIS_URL:
-                            r = redis.from_url(settings.REDIS_URL)
-                            conv_key = f"conv:supervisor:{message.user_id}"
-                            conv_raw = r.get(conv_key)
-                            if conv_raw:
-                                conv = json.loads(conv_raw)
-                                # 回填 L1，加速后续读取
-                                mm.write_l1("conversation_history", conv)
-                            r.close()
-                    except Exception:
-                        pass
-                if len(conv) >= 2:
-                    last_agent_entry = conv[-2]
+                conv = await mm.get_conv_history(max_turns=5)
+                if len(conv) >= 1:
+                    last_agent_entry = conv[-1]
                     if last_agent_entry.get("role") == "agent":
                         prev_agent = last_agent_entry.get("agent", "")
                         prev_response = last_agent_entry.get("text", "")
@@ -879,7 +851,7 @@ class SupervisorAgent(BaseAgent):
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            conversation_history = mm._l1.get("conversation_history", [])[-5:]
+            conversation_history = (await mm.get_conv_history(max_turns=5))[-5:]
 
         if conversation_history:
             history_block = "\n".join(
@@ -920,7 +892,7 @@ class SupervisorAgent(BaseAgent):
                     "ts": int(time.time()),
                 },
             ]
-            mm.write_l1("conversation_history", updated[-5:])
+            await mm.save_conv_history(updated[-5:])
             await mm.write_l2(
                 content=f"user: {text}\nassistant: {content}",
                 memory_type="conversation",
