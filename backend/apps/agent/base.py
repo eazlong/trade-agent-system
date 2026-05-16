@@ -137,6 +137,42 @@ class BaseAgent(ABC):
             logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
             return f"Error: {e}"
 
+    def _try_parse_json_tool_call(self, content: str) -> dict | None:
+        """尝试从 LLM 文本回复中解析 JSON 格式的 tool call（fallback 路径）。
+
+        当 LLM 不支持原生 function calling 时，fallback 会让 LLM 输出
+        {"tool": "<name>", "args": {...}} 格式。此方法解析这种格式并返回
+        标准化的 tool call dict。
+        """
+        if not content or not content.strip():
+            return None
+        text = content.strip()
+        # 去掉 markdown 代码块包裹
+        if text.startswith("```"):
+            idx = text.find("\n")
+            text = text[idx + 1 :] if idx > 0 else text[3:]
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3]
+        # 提取 JSON 对象
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            import re
+
+            m = re.search(
+                r'\{[^{}]*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^{}]*\}\s*\}',
+                text,
+            )
+            if not m:
+                return None
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return None
+        if isinstance(data, dict) and "tool" in data and "args" in data:
+            return data
+        return None
+
     async def _run_tool_loop(
         self,
         system: str,
@@ -164,11 +200,29 @@ class BaseAgent(ABC):
                 content = resp.content
                 if is_fallback(content):
                     return ("", True)
-                return (content, False)
+
+                # 检查是否是 fallback 路径的 JSON tool call
+                json_tc = self._try_parse_json_tool_call(content)
+                if json_tc is None:
+                    return (content, False)
+
+                # 将 JSON tool call 转为标准 ToolCallRequest
+                tc = type(
+                    "ToolCallRequest",
+                    (),
+                    {
+                        "call_id": "json_tc_0",
+                        "name": json_tc["tool"],
+                        "arguments": json_tc["args"],
+                    },
+                )()
+                tool_calls = [tc]
+            else:
+                tool_calls = resp.tool_calls
 
             # 执行工具
             tool_results = []
-            for tc in resp.tool_calls:
+            for tc in tool_calls:
                 result_text = await self._execute_tool_call(tc)
                 tool_results.append(
                     {
@@ -177,6 +231,11 @@ class BaseAgent(ABC):
                         "content": result_text,
                     }
                 )
+                # Update last_alive so watchdog knows task is still making progress
+                from .task_tracker import tracker_context
+                tracker = tracker_context.get(None)
+                if tracker is not None:
+                    tracker.alive()
 
             messages.append(
                 {
@@ -191,7 +250,7 @@ class BaseAgent(ABC):
                                 "arguments": json.dumps(tc.arguments),
                             },
                         }
-                        for tc in resp.tool_calls
+                        for tc in tool_calls
                     ],
                 }
             )
