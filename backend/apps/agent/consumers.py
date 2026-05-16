@@ -100,10 +100,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         logger.info("[ChatWS] User %s chat: %s", self.user_id, text[:100])
 
-        # 发送处理中状态
         await self.send(
             text_data=json.dumps({"type": "status", "status": "processing"})
         )
+
+        async def on_tool_result(tool_name, result_text):
+            """工具执行进度回调 — 实时推送给前端"""
+            try:
+                await self.send(text_data=json.dumps({
+                    "type": "tool_progress",
+                    "tool": tool_name,
+                    "result": result_text[:2000],
+                }))
+            except Exception:
+                pass
 
         try:
             supervisor = SupervisorAgent.get_instance()
@@ -113,15 +123,32 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     recipient="supervisor",
                     payload={"text": text},
                     user_id=self.user_id,
-                )
+                ),
+                on_tool_result=on_tool_result,
             )
+
+            # 检测回测/异步任务提交 → 推送结构化确认
+            if (
+                isinstance(result.data, dict)
+                and result.data.get("task_id")
+                and result.success
+            ):
+                await self.send(text_data=json.dumps({
+                    "type": "task_submitted",
+                    "task_id": result.data["task_id"],
+                    "status": "success",
+                }))
 
             if result.success:
                 await self.send(
                     text_data=json.dumps(
                         {
                             "type": "chat_response",
-                            "data": result.data,
+                            "data": (
+                                result.data.get("content", str(result.data))
+                                if isinstance(result.data, dict)
+                                else result.data
+                            ),
                             "task_id": result.task_id,
                             "status": "done",
                         }
@@ -132,7 +159,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     text_data=json.dumps(
                         {
                             "type": "chat_response",
-                            "error": result.error,
+                            "error": result.error or "处理请求时发生错误，请稍后重试",
                             "task_id": result.task_id,
                             "status": "error",
                         }
