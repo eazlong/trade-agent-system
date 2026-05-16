@@ -24,12 +24,13 @@ django_asgi_app = get_asgi_application()
 _consumer = None
 _telegram_channel = None
 _progress_listener_task = None
+_watchdog = None
 logger = logging.getLogger(__name__)
 
 
 async def _listen_progress_notifications():
     """Background task: subscribe to Redis pubsub and forward to Telegram."""
-import json
+    import json
 
     import redis.asyncio as aioredis
 
@@ -47,7 +48,7 @@ import json
         r = aioredis.from_url(url, decode_responses=True)
         pubsub = r.pubsub()
         await pubsub.subscribe(_PROGRESS_CHANNEL)
-logger.info('[ASGI] Progress notification listener started')
+        logger.info('[ASGI] Progress notification listener started')
 
         async for message in pubsub.listen():
             if message["type"] != "message":
@@ -58,7 +59,7 @@ logger.info('[ASGI] Progress notification listener started')
                 if _telegram_channel and _telegram_channel._app:
                     await _telegram_channel.send_message(text)
                 else:
-logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
+                    logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
             except Exception:
                 logger.warning("[ASGI] failed to process progress notification", exc_info=True)
     except (asyncio.CancelledError, GeneratorExit, RuntimeError):
@@ -81,7 +82,7 @@ class LifespanHandler:
         pass
 
     async def __call__(self, scope, receive, send):
-        global _consumer, _telegram_channel, _progress_listener_task
+        global _consumer, _telegram_channel, _progress_listener_task, _watchdog
 
         # 确保 scope 类型是 lifespan
         assert scope["type"] == "lifespan"
@@ -101,6 +102,13 @@ class LifespanHandler:
 
                         # 恢复并自动重启之前运行的框架
                         await self._restore_frames()
+
+                        # 启动 SessionWatchdog
+                        from apps.agent.session_watchdog import SessionWatchdog
+
+                        _watchdog = SessionWatchdog()
+                        await _watchdog.start()
+                        logger.info("[ASGI] SessionWatchdog started")
 
                         # 启动 TelegramChannel
                         await self._start_telegram_channel()
@@ -132,6 +140,11 @@ class LifespanHandler:
                         if _telegram_channel:
                             await _telegram_channel.stop()
                             logger.info("[ASGI] TelegramChannel stopped")
+
+                        # 停止 SessionWatchdog
+                        if _watchdog:
+                            await _watchdog.stop()
+                            logger.info("[ASGI] SessionWatchdog stopped")
 
                         # 停止 AgentTaskConsumer
                         if _consumer:
