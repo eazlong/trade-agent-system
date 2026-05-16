@@ -166,6 +166,21 @@ async def nack_and_retry(
     调用方先 ack 原消息再调用此函数。
     """
     if retry_count >= _MAX_RETRY:
+        # Save original_task to Redis Hash so watchdog can recover it
+        task_id = payload.get("task_id", "")
+        if task_id:
+            redis_key = f"task:progress:{task_id}"
+            r = await _get_redis(stream)
+            try:
+                await r.hset(redis_key, mapping={
+                    "status": "dlq",
+                    "retry_count": str(retry_count),
+                    "original_task": json.dumps(payload),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+            finally:
+                await r.aclose()
+
         dlq = f"{stream}:dlq"
         dlq_payload = dict(payload)
         dlq_payload["dlq_reason"] = f"exceeded {_MAX_RETRY} retries"
