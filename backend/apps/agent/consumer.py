@@ -86,6 +86,12 @@ class AgentTaskConsumer:
                     "[AgentTaskConsumer] Handle task cancelled for task_id=%s", task_id
                 )
                 raise
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[AgentTaskConsumer] timeout task_id=%s, retrying", task_id
+                )
+                await bus.ack(AGENT_TASKS, CG_AGENTS, msg_id)
+                await bus.nack_and_retry(AGENT_TASKS, fields, retry_count)
             except Exception as e:
                 logger.error(
                     "[AgentTaskConsumer] dispatch error task_id=%s: %s", task_id, e
@@ -98,6 +104,7 @@ class AgentTaskConsumer:
         import json
         from .base import AgentMessage
         from .supervisor import SupervisorAgent
+        from .task_tracker import TaskTracker, tracker_context
 
         payload_raw = fields.get("payload", "{}")
         payload = (
@@ -105,18 +112,49 @@ class AgentTaskConsumer:
         )
 
         user_id = fields.get("user_id", "")
-        msg = AgentMessage(
-            sender="channel",
-            recipient="supervisor",
+        task_id = fields.get("task_id", "")
+        text = payload.get("text", "")
+
+        tracker = TaskTracker(
+            task_id=task_id,
             user_id=user_id,
-            payload=payload,
-            intent=payload.get("intent"),
+            task_type="agent",
         )
-        supervisor = SupervisorAgent.get_instance()
-        result = await supervisor.handle(msg)
-        if result.success:
-            # 如果结果是字典格式，且包含content字段，则返回content
-            if isinstance(result.data, dict) and "content" in result.data:
-                return result.data["content"]
-            return str(result.data)
-        return f"[错误] {result.error}"
+        token = tracker_context.set(tracker)
+        try:
+            tracker.start(f"收到指令：{text[:80]}")
+
+            msg = AgentMessage(
+                sender="channel",
+                recipient="supervisor",
+                user_id=user_id,
+                payload=payload,
+                intent=payload.get("intent"),
+            )
+            supervisor = SupervisorAgent.get_instance()
+
+            # Hard timeout: 280s prevents LLM/tool hangs at source
+            result = await asyncio.wait_for(
+                supervisor.handle(msg),
+                timeout=280,
+            )
+
+            if result.success:
+                result_text = ""
+                if isinstance(result.data, dict) and "content" in result.data:
+                    result_text = result.data["content"]
+                else:
+                    result_text = str(result.data)
+                tracker.complete(result_text[:300])
+                return result_text
+            else:
+                tracker.fail(result.error)
+                return f"[错误] {result.error}"
+        except asyncio.TimeoutError:
+            tracker.fail("处理超时（280秒），任务已自动重试")
+            raise
+        except Exception as e:
+            tracker.fail(str(e))
+            raise
+        finally:
+            tracker_context.reset(token)
