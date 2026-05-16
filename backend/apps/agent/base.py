@@ -179,6 +179,7 @@ class BaseAgent(ABC):
         messages: list[dict],
         tools: list[dict],
         max_tokens: int = 2048,
+        on_tool_result=None,
     ) -> tuple[str, bool]:
         """通用工具调用循环。子类可复用。
 
@@ -224,6 +225,8 @@ class BaseAgent(ABC):
             tool_results = []
             for tc in tool_calls:
                 result_text = await self._execute_tool_call(tc)
+                if on_tool_result:
+                    await on_tool_result(tc.name, result_text)
                 tool_results.append(
                     {
                         "role": "tool",
@@ -278,7 +281,7 @@ class BaseAgent(ABC):
         return result
 
     @abstractmethod
-    async def handle(self, message: AgentMessage) -> AgentResult:
+    async def handle(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         """处理一条消息，返回结果"""
 
     async def start(self) -> None:
