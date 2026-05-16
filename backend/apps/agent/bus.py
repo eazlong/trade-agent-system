@@ -166,20 +166,27 @@ async def nack_and_retry(
     调用方先 ack 原消息再调用此函数。
     """
     if retry_count >= _MAX_RETRY:
-        # Save original_task to Redis Hash so watchdog can recover it
+        # Save original_task to Redis Hash so watchdog can recover it.
+        # Best-effort: must not block DLQ publish if Redis write fails.
         task_id = payload.get("task_id", "")
         if task_id:
             redis_key = f"task:progress:{task_id}"
-            r = await _get_redis(stream)
             try:
-                await r.hset(redis_key, mapping={
-                    "status": "dlq",
-                    "retry_count": str(retry_count),
-                    "original_task": json.dumps(payload),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                })
-            finally:
-                await r.aclose()
+                r = await _get_redis(stream)
+                try:
+                    await r.hset(redis_key, mapping={
+                        "status": "dlq",
+                        "retry_count": str(retry_count),
+                        "original_task": json.dumps(payload),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    await r.expire(redis_key, 86400)
+                except Exception:
+                    logger.exception("[bus] failed to save original_task for %s, continuing to DLQ", task_id)
+                finally:
+                    await r.aclose()
+            except Exception:
+                logger.exception("[bus] failed to get Redis for %s, continuing to DLQ", task_id)
 
         dlq = f"{stream}:dlq"
         dlq_payload = dict(payload)
