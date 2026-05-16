@@ -3,15 +3,14 @@ Unified task progress tracker for long-running async tasks.
 
 Supports Celery tasks and Redis Stream Agent tasks with:
 - Milestone notifications (key stages, throttled)
-- Heartbeat keepalive (auto background thread)
 - Redis Hash for running state + PG archive for completed tasks
+- Health checks via centralized Celery beat task (check_task_health)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -91,18 +90,22 @@ class TaskTracker:
         user_id: str,
         channel: str = "telegram",
         task_type: str = "agent",
-        heartbeat_interval: int = 120,
+        heartbeat_interval: int = 60,
+        original_task: dict | None = None,
+        max_retries: int = 1,
+        expected_duration: int = 240,
     ):
         self.task_id = task_id
         self.user_id = user_id
         self.channel = channel
         self.task_type = task_type
         self.heartbeat_interval = heartbeat_interval
+        self.original_task = original_task
+        self.max_retries = max_retries
+        self.expected_duration = expected_duration
         self._last_push: float = 0
         self._start_ts: float = 0
         self._milestones: list[dict] = []
-        self._stop_event = threading.Event()
-        self._heartbeat_thread: threading.Thread | None = None
         self._redis_key = f"task:progress:{task_id}"
 
     # ------------------------------------------------------------------
@@ -110,12 +113,22 @@ class TaskTracker:
     # ------------------------------------------------------------------
 
     def start(self, initial_message: str = "任务已启动") -> None:
-        """Mark task as started: write Redis, push notification, start heartbeat."""
+        """Mark task as started: write Redis, push notification."""
         self._start_ts = time.time()
         self._last_push = self._start_ts
-        self._save_redis("running", {"step": initial_message, "progress": 0})
+        data: dict[str, Any] = {
+            "step": initial_message,
+            "progress": 0,
+            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+            "last_alive": datetime.now(timezone.utc).isoformat(),
+            "retry_count": 0,
+            "max_retries": self.max_retries,
+            "expected_duration": str(self.expected_duration),
+        }
+        if self.original_task:
+            data["original_task"] = json.dumps(self.original_task, ensure_ascii=False)
+        self._save_redis("running", data)
         self._notify(_format_progress_message(self.task_id, initial_message))
-        self._start_heartbeat()
         logger.info(
             "[TaskTracker] task %s started for user %s", self.task_id, self.user_id
         )
@@ -123,7 +136,10 @@ class TaskTracker:
     def milestone(self, message: str, progress: float | None = None) -> None:
         """Record a milestone. Pushes immediately if throttle allows, else just logs to Redis."""
         now = time.time()
-        data: dict[str, Any] = {"step": message}
+        data: dict[str, Any] = {
+            "step": message,
+            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        }
         if progress is not None:
             data["progress"] = progress
 
@@ -145,15 +161,14 @@ class TaskTracker:
         else:
             logger.debug("[TaskTracker] milestone throttled: %s", message)
 
-    def heartbeat(self) -> None:
-        """Manual heartbeat tick (usually auto-run by background thread)."""
-        self._save_redis(
-            "running", {"last_heartbeat": datetime.now(timezone.utc).isoformat()}
-        )
+    def alive(self) -> None:
+        """Update last_alive timestamp (call after long tool executions)."""
+        self._save_redis("running", {
+            "last_alive": datetime.now(timezone.utc).isoformat(),
+        })
 
     def complete(self, result: str) -> None:
         """Mark task completed: push final result, update Redis, trigger async archive."""
-        self._stop_event.set()
         elapsed = _format_duration(self._start_ts)
         short_id = self.task_id[:8]
         self._notify(f"✅ 任务 #{short_id} 完成\n耗时：{elapsed}\n结果：{result[:300]}")
@@ -171,7 +186,6 @@ class TaskTracker:
 
     def fail(self, error: str) -> None:
         """Mark task failed: push error, update Redis, archive."""
-        self._stop_event.set()
         short_id = self.task_id[:8]
         self._notify(f"❌ 任务 #{short_id} 失败\n错误：{error[:300]}")
         self._save_redis(
@@ -186,10 +200,8 @@ class TaskTracker:
         logger.error("[TaskTracker] task %s failed: %s", self.task_id, error)
 
     def stop(self) -> None:
-        """Stop heartbeat thread. Called in finally block."""
-        self._stop_event.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2)
+        """Clean up tracker state (called in finally block)."""
+        logger.info("[TaskTracker] task %s stopped", self.task_id)
 
     @classmethod
     def get_current(cls) -> TaskTracker | None:
@@ -238,31 +250,6 @@ class TaskTracker:
             _send_notification_redis(self.user_id, text)
         except Exception:
             logger.warning("[TaskTracker] notification delivery failed", exc_info=True)
-
-    def _start_heartbeat(self) -> None:
-        """Start daemon heartbeat thread."""
-
-        def _tick():
-            while not self._stop_event.is_set():
-                waited = self._stop_event.wait(self.heartbeat_interval)
-                if waited:  # stop event was set
-                    break
-                if time.time() - self._last_push >= self.heartbeat_interval:
-                    elapsed = _format_duration(self._start_ts)
-                    short_id = self.task_id[:8]
-                    self._notify(
-                        f"⏳ 任务 #{short_id} 仍在运行中...\n已运行：{elapsed}"
-                    )
-                    self._last_push = time.time()
-                    self._save_redis(
-                        "running",
-                        {"last_heartbeat": datetime.now(timezone.utc).isoformat()},
-                    )
-
-        self._heartbeat_thread = threading.Thread(
-            target=_tick, daemon=True, name=f"tracker-hb-{self.task_id[:8]}"
-        )
-        self._heartbeat_thread.start()
 
     def _trigger_archive(self, result: str) -> None:
         """Dispatch Celery task to archive this tracker's data to PostgreSQL."""
@@ -332,9 +319,5 @@ def track_task(
     except Exception as e:
         tracker.fail(str(e))
         raise
-    else:
-        # Caller should call tracker.complete() explicitly with result
-        pass
     finally:
-        tracker.stop()
         tracker_context.reset(token)
