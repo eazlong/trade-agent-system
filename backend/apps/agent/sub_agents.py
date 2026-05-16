@@ -72,9 +72,7 @@ class _LLMAgent(BaseAgent):
         mem = self._get_memory_manager(message)
 
         # 获取最近的对话记录
-        recent_conv = mem._l1.get("conv_history", [])[
-            -max_turns * 2 :
-        ]  # 每轮对话包含用户和助手
+        recent_conv = await mem.get_conv_history(max_turns=max_turns * 2)
 
         logger.debug(
             "[%s] Retrieved recent conversation from memory: %s", self.name, recent_conv
@@ -90,7 +88,7 @@ class _LLMAgent(BaseAgent):
 
         return context_messages
 
-    async def handle(self, message: AgentMessage) -> AgentResult:
+    async def handle(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         text = message.payload.get("text", "")
         logger.info(
             "[%s] Handling message with intent: %s, payload keys: %s， %s",
@@ -123,7 +121,8 @@ class _LLMAgent(BaseAgent):
         logger.debug("[%s] Final user prompt:\n%s", self.name, user_prompt[:1000])
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048
+            system, messages, tools, max_tokens=2048,
+            on_tool_result=on_tool_result,
         )
 
         if is_fb:
@@ -134,11 +133,13 @@ class _LLMAgent(BaseAgent):
         # 检查拒收信号
         rejection = self._check_rejection(content)
         if rejection:
+            reason = rejection.get("reason", "不属于本Agent职责范围")
             return AgentResult(
                 task_id=message.task_id,
                 success=False,
+                error=f"请求被 {self.name} 拒收: {reason}",
                 need_reroute=True,
-                reroute_reason=rejection.get("reason", "不属于本Agent职责范围"),
+                reroute_reason=reason,
                 reroute_suggestion=rejection.get("suggested_agent", ""),
             )
 
@@ -157,7 +158,7 @@ class _LLMAgent(BaseAgent):
         mem.write_l1(message.task_id, f"Q:{text[:200]}|A:{content[:200]}")
 
         # 更新对话历史到L1记忆
-        conv_history = mem._l1.get("conv_history", [])
+        conv_history = await mem.get_conv_history(max_turns=10)
 
         # 添加用户消息
         conv_history.append(
@@ -168,7 +169,7 @@ class _LLMAgent(BaseAgent):
             {"role": "assistant", "text": content[:200], "ts": int(time.time())}
         )
         # 限制对话历史长度
-        mem._l1["conv_history"] = conv_history[-20:]  # 保留最近10轮对话
+        await mem.save_conv_history(conv_history[-20:])  # 保留最近10轮对话
 
         await mem.write_l2(
             content=f"user: {text}\nassistant: {content}",
