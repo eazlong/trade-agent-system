@@ -263,7 +263,7 @@ class SupervisorAgent(BaseAgent):
             cls._instance = cls()
         return cls._instance
 
-    async def handle(self, message: AgentMessage) -> AgentResult:
+    async def handle(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         session_mgr = get_session_manager()
         session_ctx = await session_mgr.get_session_context(message.user_id)
 
@@ -273,17 +273,20 @@ class SupervisorAgent(BaseAgent):
 
             if state == SessionState.PAUSED.value:
                 return await self._handle_paused_session(
-                    message, session_ctx, session_mgr
+                    message, session_ctx, session_mgr, on_tool_result
                 )
 
             if state == SessionState.MULTI_TURN.value:
-                return await self._handle_multi_turn(message, session_ctx, session_mgr)
+                return await self._handle_multi_turn(
+                    message, session_ctx, session_mgr, on_tool_result
+                )
 
         # ========== 正常路由流程 ==========
-        return await self._normal_route(message)
+        return await self._normal_route(message, on_tool_result)
 
     async def _handle_paused_session(
-        self, message: AgentMessage, ctx: dict, session_mgr
+        self, message: AgentMessage, ctx: dict, session_mgr,
+        on_tool_result=None,
     ) -> AgentResult:
         """处理暂停中的会话"""
         paused_at = ctx.get("paused_at", 0)
@@ -292,7 +295,7 @@ class SupervisorAgent(BaseAgent):
         # 超时 → 归档
         if time.time() - paused_at > ttl:
             await self._archive_paused_session(message.user_id, ctx, session_mgr)
-            return await self._normal_route(message)
+            return await self._normal_route(message, on_tool_result=on_tool_result)
 
         # Supervisor 判断是否应恢复原会话
         should_resume = await self._judge_resume(message, ctx)
@@ -300,10 +303,10 @@ class SupervisorAgent(BaseAgent):
         if should_resume:
             agent_name = ctx["active_agent"]
             await session_mgr.resume_session(message.user_id, agent_name)
-            return await self._route_to_agent(agent_name, message)
+            return await self._route_to_agent(agent_name, message, on_tool_result=on_tool_result)
 
         # 继续处理当前意图，保持暂停状态
-        return await self._normal_route(message)
+        return await self._normal_route(message, on_tool_result=on_tool_result)
 
     async def _judge_resume(self, message: AgentMessage, paused_ctx: dict) -> bool:
         """让 Supervisor 判断当前消息是否属于暂停中的对话的延续"""
@@ -356,13 +359,14 @@ class SupervisorAgent(BaseAgent):
         logger.info("[%s] Paused session archived for user %s", self.name, user_id)
 
     async def _handle_multi_turn(
-        self, message: AgentMessage, ctx: dict, session_mgr
+        self, message: AgentMessage, ctx: dict, session_mgr,
+        on_tool_result=None,
     ) -> AgentResult:
         """处理多轮对话中的消息"""
         agent_name = ctx["active_agent"]
         if not agent_name:
             await session_mgr.clear_session_context(message.user_id)
-            return await self._normal_route(message)
+            return await self._normal_route(message, on_tool_result=on_tool_result)
 
         # 初始化 MemoryManager
         mm = None
@@ -371,7 +375,7 @@ class SupervisorAgent(BaseAgent):
 
             mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
 
-        result = await self._route_to_agent(agent_name, message)
+        result = await self._route_to_agent(agent_name, message, on_tool_result=on_tool_result)
 
         # 写入统一对话历史
         if mm and result.success and not result.need_reroute:
@@ -412,14 +416,14 @@ class SupervisorAgent(BaseAgent):
                         success=True,
                         data=new_parsed["response"],
                     )
-                return await self._free_chat(message)
+                return await self._free_chat(message, on_tool_result=on_tool_result)
             # 新流程：parsed 直接是 agent name 或 frame intent
             new_agent = str(new_parsed)
             if new_agent and new_agent != "free_chat" and new_agent != agent_name:
-                return await self._route_to_agent(new_agent, message)
+                return await self._route_to_agent(new_agent, message, on_tool_result=on_tool_result)
 
             # 无法路由，走 free_chat
-            return await self._free_chat(message)
+            return await self._free_chat(message, on_tool_result=on_tool_result)
 
         # 检查是否继续多轮
         if isinstance(result.data, dict) and result.data.get(
@@ -456,7 +460,7 @@ class SupervisorAgent(BaseAgent):
             pause_context=pause_context,
         )
 
-    async def _normal_route(self, message: AgentMessage) -> AgentResult:
+    async def _normal_route(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         """正常路由流程：意图解析 → 路由 → 结果"""
         logger.info(
             "[%s] Handling message with intent: %s, payload keys: %s",
@@ -487,7 +491,7 @@ class SupervisorAgent(BaseAgent):
                     task_id=message.task_id, success=True, data=response_text
                 )
             # response 为空（LLM 降级），用 _free_chat 处理
-            return await self._free_chat(message)
+            return await self._free_chat(message, on_tool_result=on_tool_result)
 
         # 新流程：parsed 直接是 agent name 或 frame intent
         resolved: str = str(parsed)
@@ -498,12 +502,25 @@ class SupervisorAgent(BaseAgent):
 
         # Supervisor 自己处理（使用自身工具）
         if resolved == "supervisor":
-            return await self._self_execute(message)
+            return await self._self_execute(message, on_tool_result=on_tool_result)
 
         # 路由子Agent（parsed 直接是 agent name）
         agent_name = resolved
         if agent_name and agent_name != "unknown":
-            result = await self._route_to_agent(agent_name, message)
+            result = await self._route_to_agent(agent_name, message, on_tool_result=on_tool_result)
+
+            # 子Agent 拒收 → 尝试重路由到建议的 agent
+            if result.need_reroute:
+                logger.info(
+                    "Agent %s rejected in normal_route: %s, suggesting %s",
+                    agent_name, result.reroute_reason, result.reroute_suggestion,
+                )
+                if result.reroute_suggestion and result.reroute_suggestion != agent_name:
+                    return await self._route_to_agent(
+                        result.reroute_suggestion, message, on_tool_result=on_tool_result
+                    )
+                # 无法重路由，转自由对话
+                return await self._free_chat(message, on_tool_result=on_tool_result)
 
             # 路由成功时写入统一对话历史
             if mm and result.success and not result.need_reroute:
@@ -538,10 +555,11 @@ class SupervisorAgent(BaseAgent):
             return result
 
         # 未知意图
-        return await self._free_chat(message)
+        return await self._free_chat(message, on_tool_result=on_tool_result)
 
     async def _route_with_fallback(
-        self, message: AgentMessage, intent: str, attempted: set | None = None
+        self, message: AgentMessage, intent: str, attempted: set | None = None,
+        on_tool_result=None,
     ) -> AgentResult:
         """带拒收重路由的 Agent 调用。
 
@@ -552,10 +570,10 @@ class SupervisorAgent(BaseAgent):
         agent_name = self._router.get_agent_for_intent(intent) or intent
 
         if not agent_name or agent_name in attempted or len(attempted) >= MAX_REROUTE:
-            return await self._free_chat(message)
+            return await self._free_chat(message, on_tool_result=on_tool_result)
 
         attempted.add(agent_name)
-        result = await self._route_to_agent(agent_name, message)
+        result = await self._route_to_agent(agent_name, message, on_tool_result=on_tool_result)
 
         # SubAgent 拒收
         if result.need_reroute:
@@ -564,7 +582,7 @@ class SupervisorAgent(BaseAgent):
             # 优先用 SubAgent 建议的目标
             if result.reroute_suggestion and result.reroute_suggestion not in attempted:
                 return await self._route_with_fallback(
-                    message, result.reroute_suggestion, attempted
+                    message, result.reroute_suggestion, attempted, on_tool_result=on_tool_result
                 )
 
             # 重新解析意图（排除已尝试的 Agent）
@@ -580,18 +598,18 @@ class SupervisorAgent(BaseAgent):
                         success=True,
                         data=new_parsed["response"],
                     )
-                return await self._free_chat(message)
+                return await self._free_chat(message, on_tool_result=on_tool_result)
             new_agent = str(new_parsed)
             if new_agent and new_agent != "free_chat" and new_agent not in attempted:
-                return await self._route_with_fallback(message, new_agent, attempted)
+                return await self._route_with_fallback(message, new_agent, attempted, on_tool_result=on_tool_result)
 
             # 都失败
-            return await self._free_chat(message)
+            return await self._free_chat(message, on_tool_result=on_tool_result)
 
         return result
 
     async def _route_to_agent(
-        self, agent_name: str, message: AgentMessage
+        self, agent_name: str, message: AgentMessage, on_tool_result=None,
     ) -> AgentResult:
         """懒加载并调用子Agent，自动注入跨Agent上下文。"""
         from .registry import AgentRegistry
@@ -623,7 +641,7 @@ class SupervisorAgent(BaseAgent):
             agent = AgentRegistry.get(agent_name)
             message.sender = "supervisor"
             message.recipient = agent_name
-            return await agent.handle(message)
+            return await agent.handle(message, on_tool_result=on_tool_result)
         except Exception as e:
             logger.error("Routing to %s failed: %s", agent_name, e)
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
@@ -819,7 +837,7 @@ class SupervisorAgent(BaseAgent):
         except Exception as e:
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
 
-    async def _self_execute(self, message: AgentMessage) -> AgentResult:
+    async def _self_execute(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         """Supervisor 使用自身工具执行任务。"""
         self._current_user_id = message.user_id or ""
         text = message.payload.get("text", "")
@@ -828,7 +846,7 @@ class SupervisorAgent(BaseAgent):
         messages = [{"role": "user", "content": text}]
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048
+            system, messages, tools, max_tokens=2048, on_tool_result=on_tool_result
         )
 
         if is_fb:
@@ -840,7 +858,7 @@ class SupervisorAgent(BaseAgent):
 
         return AgentResult(task_id=message.task_id, success=True, data=content)
 
-    async def _free_chat(self, message: AgentMessage) -> AgentResult:
+    async def _free_chat(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         """未识别意图，LLM自由对话，支持工具调用"""
         self._current_user_id = message.user_id or ""
         text = message.payload.get("text", "")
@@ -867,7 +885,7 @@ class SupervisorAgent(BaseAgent):
         messages = [{"role": "user", "content": user_prompt}]
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048
+            system, messages, tools, max_tokens=2048, on_tool_result=on_tool_result
         )
 
         if is_fb:
