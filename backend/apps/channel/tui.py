@@ -237,7 +237,7 @@ class TUIChannel(BaseChannel):
                 console.print(md)
             except Exception:
                 console.print(result)
-            self._persist_history(text, result)
+            await self._persist_history(text, result)
 
         console.print()
 
@@ -333,17 +333,18 @@ class TUIChannel(BaseChannel):
         )
         return f"[对话历史]\n{history_block}\n\n[当前消息]\n{text}"
 
-    def _persist_history(self, user_text: str, agent_text: str) -> None:
+    async def _persist_history(self, user_text: str, agent_text: str) -> None:
         """持久化对话历史到 L1"""
         try:
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=self._user_id)
-            updated = mm._l1.get("conv_history", [])[-18:] + [
+            conv = await mm.get_conv_history(max_turns=10)
+            updated = conv[-18:] + [
                 {"role": "user", "text": user_text[:200], "ts": 0},
                 {"role": "assistant", "text": agent_text[:200], "ts": 0},
             ]
-            mm.write_l1("conv_history", updated)
+            await mm.save_conv_history(updated)
         except Exception:
             pass
 

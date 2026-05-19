@@ -1,6 +1,14 @@
 import uuid
 from django.db import models
 
+# Safe import of pgvector VectorField with TextField fallback
+try:
+    from pgvector.django import VectorField
+except ImportError:
+    VectorField = lambda dimensions, **kwargs: models.TextField(  # noqa: E731
+        null=True, blank=True, **kwargs
+    )
+
 
 class AgentMemory(models.Model):
     """L3 长期记忆（pgvector存储，语义检索）"""
@@ -20,13 +28,20 @@ class AgentMemory(models.Model):
     metadata = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # --- New fields (P0-04) ---
+    user_id = models.CharField(max_length=64, db_index=True, default="")
+    agent_name = models.CharField(max_length=32, default="")
+    session_id = models.CharField(max_length=64, blank=True, default="")
+    embedding = VectorField(dimensions=768, null=True)
+
     class Meta:
         db_table = "agent_memory"
         indexes = [
             models.Index(
                 fields=["agent_type", "-created_at"],
                 name="agent_memor_agent_t_ce224a_idx",
-            )
+            ),
+            models.Index(fields=["user_id"], name="agent_memory_user_id_idx"),
         ]
 
 
