@@ -83,7 +83,15 @@ class LLMClient:
                     "temperature": temperature,
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                body = resp.text
+                logger.error(
+                    "LLM API error %d for %s:\n%s",
+                    resp.status_code,
+                    resp.url,
+                    body[:2000],
+                )
+                resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
 
     async def chat_with_tools(
@@ -137,10 +145,38 @@ class LLMClient:
         logger.warning(
             f"OpenAI tool call failed ({last_exc}), falling back to plain chat"
         )
+        
         # 降级：拼接工具描述到system prompt，让LLM输出JSON
         tool_desc = json.dumps(tools, ensure_ascii=False)
         fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
-        user_text = messages[-1].get("content", "") if messages else ""
+        # 将完整对话历史格式化（不仅取最后一条），让LLM在多轮工具调用中也能看到上下文
+        conversation_parts = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role == "user":
+                conversation_parts.append(f"[用户] {content}")
+            elif role == "assistant":
+                tc_info = ""
+                if "tool_calls" in m:
+                    tc_info = (
+                        " (调用了工具: "
+                        + ", ".join(
+                            f"{tc['function']['name']}"
+                            for tc in m.get("tool_calls", [])
+                        )
+                        + ")"
+                    )
+                conversation_parts.append(f"[助手] {content}{tc_info}")
+            elif role == "tool":
+                conversation_parts.append(
+                    f"[工具返回 {m.get('tool_call_id', '')}] {content[:600]}"
+                )
+        user_text = (
+            "\n\n---\n\n".join(conversation_parts)
+            if conversation_parts
+            else (messages[-1].get("content", "") if messages else "")
+        )
         result = await self.chat(fallback_system, user_text, max_tokens, temperature)
         return LLMToolResponse(content=result)
 
@@ -174,7 +210,15 @@ class LLMClient:
                     "temperature": temperature,
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                body = resp.text
+                logger.error(
+                    "LLM API error %d for %s:\n%s",
+                    resp.status_code,
+                    resp.url,
+                    body[:2000],
+                )
+                resp.raise_for_status()
             msg = resp.json()["choices"][0]["message"]
             raw_calls = msg.get("tool_calls") or []
             tool_calls = []
@@ -193,7 +237,9 @@ class LLMClient:
                     )
                 )
             return LLMToolResponse(
-                content=msg.get("content") or "", tool_calls=tool_calls
+                content=msg.get("content") or "",
+                tool_calls=tool_calls,
+                reasoning_content=msg.get("reasoning_content") or "",
             )
 
     async def _call_anthropic(
@@ -389,6 +435,7 @@ class LLMClient:
         proxy = getattr(settings, "OPENAI_PROXY", "") or None
 
         chunks: list[str] = []
+        reasoning_chunks: list[str] = []
         tool_calls_map: dict[int, dict] = {}  # index → {name, arguments}
         full_messages = [{"role": "system", "content": system}] + messages
 
@@ -407,7 +454,15 @@ class LLMClient:
                     "stream": True,
                 },
             ) as resp:
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    logger.error(
+                        "LLM stream API error %d for %s:\n%s",
+                        resp.status_code,
+                        resp.url,
+                        body.decode(errors="replace")[:2000],
+                    )
+                    resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line or not line.startswith("data: "):
@@ -419,6 +474,11 @@ class LLMClient:
                         delta = json.loads(data)["choices"][0]["delta"]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+
+                    # reasoning_content delta (DeepSeek thinking mode)
+                    rc_token = delta.get("reasoning_content", "")
+                    if rc_token:
+                        reasoning_chunks.append(rc_token)
 
                     # content delta
                     content_token = delta.get("content", "") or delta.get("text", "")
@@ -455,7 +515,11 @@ class LLMClient:
                     arguments=args,
                 )
             )
-        return LLMToolResponse(content="".join(chunks), tool_calls=tool_calls)
+        return LLMToolResponse(
+            content="".join(chunks),
+            tool_calls=tool_calls,
+            reasoning_content="".join(reasoning_chunks),
+        )
 
 
 def is_fallback(response: str) -> bool:
@@ -476,10 +540,12 @@ class LLMToolResponse:
     """chat_with_tools的返回值"""
 
     def __init__(
-        self, content: str = "", tool_calls: list[ToolCallRequest] | None = None
+        self, content: str = "", tool_calls: list[ToolCallRequest] | None = None,
+        reasoning_content: str = "",
     ):
         self.content = content
         self.tool_calls: list[ToolCallRequest] = tool_calls or []
+        self.reasoning_content = reasoning_content
 
     @property
     def has_tool_calls(self) -> bool:

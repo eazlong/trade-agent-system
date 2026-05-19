@@ -240,23 +240,24 @@ class BaseAgent(ABC):
                 if tracker is not None:
                     tracker.alive()
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": resp.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-            )
+            assistant_msg = {
+                "role": "assistant",
+                "content": resp.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            if resp.reasoning_content:
+                assistant_msg["reasoning_content"] = resp.reasoning_content
+            messages.append(assistant_msg)
             messages.extend(tool_results)
 
         # 超出轮次，让 LLM 总结
