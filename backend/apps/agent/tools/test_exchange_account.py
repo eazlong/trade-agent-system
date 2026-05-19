@@ -23,15 +23,15 @@ class TestGetExchangeAccountTool(TestCase):
             is_active=True,
         )
         ExchangeAccount.objects.create(
-            exchange="okx",
-            label="okx_main",
+            exchange="binance",
+            label="binance_spot",
             api_key_enc=b"key2",
             api_secret_enc=b"secret2",
             is_active=True,
         )
         ExchangeAccount.objects.create(
-            exchange="bybit",
-            label="bybit_test",
+            exchange="binance",
+            label="binance_inactive",
             api_key_enc=b"key3",
             api_secret_enc=b"secret3",
             is_active=False,
@@ -48,25 +48,23 @@ class TestGetExchangeAccountTool(TestCase):
         self.assertTrue(result.success)
         self.assertIn("2 个", result.data)
         self.assertIn("binance_main", result.data)
-        self.assertIn("okx_main", result.data)
+        self.assertIn("binance_spot", result.data)
         # 不活跃的不应该出现
-        self.assertNotIn("bybit_test", result.data)
+        self.assertNotIn("binance_inactive", result.data)
 
     def test_filter_by_exchange(self):
         """按交易所类型筛选"""
         result = self._run(exchange="binance")
         self.assertTrue(result.success)
-        self.assertIn("1 个", result.data)
+        self.assertIn("2 个", result.data)
         self.assertIn("binance_main", result.data)
-        self.assertNotIn("okx_main", result.data)
 
     def test_filter_by_label(self):
         """按标签关键词模糊匹配"""
         result = self._run(label="main")
         self.assertTrue(result.success)
-        self.assertIn("2 个", result.data)
+        self.assertIn("1 个", result.data)
         self.assertIn("binance_main", result.data)
-        self.assertIn("okx_main", result.data)
 
     def test_no_match_returns_friendly_message(self):
         """无匹配结果返回友好提示"""

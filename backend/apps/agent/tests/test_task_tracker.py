@@ -1,4 +1,4 @@
-"""Tests for TaskTracker: milestone throttling, heartbeat, lifecycle, and notification."""
+"""Tests for TaskTracker: milestone throttling, lifecycle, notification, and retry fields."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ def _make_tracker(**kwargs):
     defaults = {
         "task_id": str(uuid.uuid4()),
         "user_id": "test-user",
-        "heartbeat_interval": 2,  # Short interval for fast tests
     }
     defaults.update(kwargs)
     return TaskTracker(**defaults)
@@ -46,8 +45,6 @@ class TestTaskTrackerLifecycle:
     def test_start_writes_redis_and_notifies(self):
         tracker = _make_tracker()
         tracker.start()
-
-        tracker.stop()
         assert len(tracker._milestones) == 0
 
     @pytest.mark.usefixtures("_mock_deps")
@@ -59,16 +56,28 @@ class TestTaskTrackerLifecycle:
 
         assert len(tracker._milestones) == 1
         assert tracker._milestones[0]["message"] == "下载数据完成"
-        tracker.stop()
 
     @pytest.mark.usefixtures("_mock_deps")
     def test_fail_records_error(self):
         tracker = _make_tracker()
         tracker.start()
         tracker.fail("Connection timeout")
-
         assert len(tracker._milestones) == 0
-        tracker.stop()
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_start_writes_retry_fields(self):
+        """start() should write retry_count=0 and max_retries to Redis."""
+        tracker = _make_tracker(max_retries=3)
+        tracker.start()
+        assert tracker.max_retries == 3
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_start_stores_original_task(self):
+        """start() should store original_task in Redis."""
+        original = {"celery_task": "some.task", "args": [], "kwargs": {"user_id": "u1"}}
+        tracker = _make_tracker(original_task=original)
+        tracker.start()
+        assert tracker.original_task == original
 
 
 class TestTaskTrackerThrottling:
@@ -77,37 +86,18 @@ class TestTaskTrackerThrottling:
         tracker = _make_tracker(heartbeat_interval=60)
         tracker.start()
 
-        # Rapid-fire milestones — throttled, no extra push
         for i in range(5):
             tracker.milestone(f"step {i}", progress=i * 0.1)
 
-        # Milestones should still be recorded
         assert len(tracker._milestones) == 5
-        tracker.stop()
 
     @pytest.mark.usefixtures("_mock_deps")
     def test_milestone_pushed_after_interval(self):
-        tracker = _make_tracker(heartbeat_interval=1)  # 1 second for fast test
-        tracker.start()
-
-        time.sleep(1.1)  # Wait past the interval
-        tracker.milestone("after wait", progress=0.5)
-
-        tracker.stop()
-
-
-class TestTaskTrackerHeartbeat:
-    @pytest.mark.usefixtures("_mock_deps")
-    def test_heartbeat_sends_keepalive(self):
         tracker = _make_tracker(heartbeat_interval=1)
         tracker.start()
 
-        # Wait for one heartbeat cycle
-        time.sleep(2.5)
-        tracker.stop()
-
-        # Heartbeat thread should have run
-        assert tracker._heartbeat_thread is not None
+        time.sleep(1.1)
+        tracker.milestone("after wait", progress=0.5)
 
 
 class TestTaskTrackerContext:
@@ -119,7 +109,6 @@ class TestTaskTrackerContext:
             assert TaskTracker.get_current() is tracker
         finally:
             tracker_context.reset(token)
-        tracker.stop()
 
     def test_get_current_returns_none_without_tracker(self):
         assert TaskTracker.get_current() is None

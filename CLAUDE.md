@@ -26,16 +26,13 @@ DJANGO_SETTINGS_MODULE=core.settings.dev uv run python manage.py migrate
 python manage.py migrate
 ```
 
-### 运行服务（开发需要同时跑多个进程）
+### 运行服务
 ```bash
-# 终端 1: Django ASGI 服务器
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run python manage.py runserver
+# 后端（Django + Celery Worker + Celery Beat + Redis + PostgreSQL）
+docker-compose up -d --build
 
-# 终端 2: Celery Worker
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app worker -l info
-
-# 终端 3: Celery Beat（定时调度）
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run celery -A celery_app beat -l info
+# 前端
+npm run dev
 ```
 
 ### 测试

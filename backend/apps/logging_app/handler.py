@@ -4,6 +4,7 @@ Custom logging handler that writes logs to:
 2. Redis Stream — for real-time SSE streaming
 """
 
+import json
 import logging
 import os
 import threading
@@ -65,7 +66,7 @@ class SystemLogHandler(logging.Handler):
                 "logger": record.name,
                 "message": msg,
                 "trace_id": trace_id,
-                "extra": extra_data,
+                "extra": json.dumps(extra_data),
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
 

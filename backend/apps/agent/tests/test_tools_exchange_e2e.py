@@ -165,17 +165,17 @@ class TestExchangeAccountToolE2E(TransactionTestCase):
             is_active=True,
         )
         ExchangeAccount.objects.create(
-            exchange="okx",
-            label="OKX主账号",
-            api_key_enc=b"encrypted_key_okx",
-            api_secret_enc=b"encrypted_secret_okx",
+            exchange="binance",
+            label="币安现货账号",
+            api_key_enc=b"encrypted_key_binance_spot",
+            api_secret_enc=b"encrypted_secret_binance_spot",
             is_active=True,
         )
         ExchangeAccount.objects.create(
-            exchange="bybit",
-            label="Bybit测试",
-            api_key_enc=b"encrypted_key_bybit",
-            api_secret_enc=b"encrypted_secret_bybit",
+            exchange="binance",
+            label="币安合约账号",
+            api_key_enc=b"encrypted_key_binance_futures",
+            api_secret_enc=b"encrypted_secret_binance_futures",
             is_active=False,  # 非活跃
         )
 
@@ -189,8 +189,8 @@ class TestExchangeAccountToolE2E(TransactionTestCase):
         self.assertTrue(result.success)
         self.assertIn("2 个", result.data)
         self.assertIn("币安主账号", result.data)
-        self.assertIn("OKX主账号", result.data)
-        self.assertNotIn("Bybit测试", result.data)  # 非活跃不应出现
+        self.assertIn("币安现货账号", result.data)
+        self.assertNotIn("币安合约账号", result.data)  # 非活跃不应出现
 
     def test_execute_tool_filter_by_exchange(self):
         """工具应按交易所类型筛选"""
@@ -200,9 +200,9 @@ class TestExchangeAccountToolE2E(TransactionTestCase):
         result = _run(tool.execute(exchange="binance"))
 
         self.assertTrue(result.success)
-        self.assertIn("1 个", result.data)
+        self.assertIn("2 个", result.data)
         self.assertIn("币安主账号", result.data)
-        self.assertNotIn("OKX主账号", result.data)
+        self.assertNotIn("币安合约账号", result.data)
 
     def test_execute_tool_filter_by_label(self):
         """工具应按标签关键词模糊匹配"""

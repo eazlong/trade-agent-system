@@ -13,14 +13,14 @@ class GetExchangeAccountTool(BaseTool):
     """
     查询用户交易所账号基本信息。
 
-    根据交易所类型（如 binance、okx、bybit）或标签筛选，
+    根据交易所类型（如 binance）或标签筛选，
     返回账号的基本信息（不含 API 密钥明文）。
     """
 
     name = "get_exchange_account"
     description = (
         "查询用户的交易所账号基本信息。"
-        '可按交易所类型（exchange 参数）筛选，如 "binance"、"okx"、"bybit"。'
+        '可按交易所类型（exchange 参数）筛选，如 "binance"。'
         "返回结果包括账号标签、交易所名称、是否活跃、创建时间等，不包含 API 密钥。"
     )
 
@@ -31,7 +31,7 @@ class GetExchangeAccountTool(BaseTool):
             "properties": {
                 "exchange": {
                     "type": "string",
-                    "description": "可选，交易所类型筛选。支持值：binance, okx, bybit",
+                    "description": "可选，交易所类型筛选。支持值：binance",
                 },
                 "label": {
                     "type": "string",

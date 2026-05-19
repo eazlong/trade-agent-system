@@ -1,6 +1,5 @@
 """Root conftest — force test database settings."""
 import os
-import sys
 
 # Debug: print what settings module is being used
 print(f'[conftest] DJANGO_SETTINGS_MODULE = {os.environ.get("DJANGO_SETTINGS_MODULE", "NOT SET")}')
@@ -20,7 +19,8 @@ if not settings.configured:
 
 print(f'[conftest] After import - settings.DATABASES = {settings.DATABASES.get("default", {})}')
 
-if not django.apps.apps.ready:
+from django.apps import apps
+if not apps.ready:
     django.setup()
 
 from django.db import connections

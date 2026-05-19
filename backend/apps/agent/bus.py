@@ -166,7 +166,7 @@ async def nack_and_retry(
     调用方先 ack 原消息再调用此函数。
     """
     if retry_count >= _MAX_RETRY:
-        # Save original_task to Redis Hash so watchdog can recover it.
+        # Save original_task to Redis Hash so check_task_health can recover it.
         # Best-effort: must not block DLQ publish if Redis write fails.
         task_id = payload.get("task_id", "")
         if task_id:

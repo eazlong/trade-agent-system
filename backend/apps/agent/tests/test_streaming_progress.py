@@ -41,8 +41,8 @@ async def test_on_tool_result_called_on_tool_execution(agent):
         "call_id": "call_1", "name": "submit_backtest",
         "arguments": {"strategy_name": "macd", "symbol": "BTCUSDT", "timeframe": "1h"},
     })
-    Resp1 = type("Resp", (), {"has_tool_calls": True, "content": "", "tool_calls": [ToolCall]})
-    Resp2 = type("Resp", (), {"has_tool_calls": False, "content": "done"})
+    Resp1 = type("Resp", (), {"has_tool_calls": True, "content": "", "tool_calls": [ToolCall], "reasoning_content": ""})
+    Resp2 = type("Resp", (), {"has_tool_calls": False, "content": "done", "reasoning_content": ""})
 
     agent._execute_tool_call = AsyncMock(
         return_value='{"task_id": "abc123", "status": "PENDING"}'
@@ -69,7 +69,7 @@ async def test_on_tool_result_not_called_when_no_tools(agent):
     """无工具调用时回调不被调用"""
     callback = AsyncMock()
 
-    Resp = type("Resp", (), {"has_tool_calls": False, "content": "hello"})
+    Resp = type("Resp", (), {"has_tool_calls": False, "content": "hello", "reasoning_content": ""})
 
     with patch("apps.agent.llm_client.LLMClient.get_instance") as mock_get:
         mock_llm = MagicMock()
@@ -87,7 +87,7 @@ async def test_on_tool_result_not_called_when_no_tools(agent):
 @pytest.mark.asyncio
 async def test_without_callback_still_works(agent):
     """不传 on_tool_result 时仍能正常工作（向后兼容）"""
-    Resp = type("Resp", (), {"has_tool_calls": False, "content": "hello"})
+    Resp = type("Resp", (), {"has_tool_calls": False, "content": "hello", "reasoning_content": ""})
 
     with patch("apps.agent.llm_client.LLMClient.get_instance") as mock_get:
         mock_llm = MagicMock()

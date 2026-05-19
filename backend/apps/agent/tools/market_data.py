@@ -55,7 +55,7 @@ class FetchOHLCVTool(BaseTool):
                 },
                 "exchange": {
                     "type": "string",
-                    "description": "交易所名称，如 binance、okx、bybit",
+                    "description": "交易所名称，如 binance",
                     "default": "binance",
                 },
             },
