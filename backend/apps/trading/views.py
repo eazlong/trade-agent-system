@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 
 from asgiref.sync import async_to_sync
@@ -8,6 +9,8 @@ from rest_framework.response import Response
 from django.utils import timezone
 from .models import Order, Strategy, LiveSession
 from .serializers import OrderSerializer, StrategySerializer, LiveSessionSerializer
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(["GET"])
@@ -41,9 +44,6 @@ def strategy_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def trading_summary(request):
-    """
-    汇总交易概览：总权益、今日盈亏、活跃订单数、持仓数。
-    """
     from django.utils import timezone
     from apps.exchange.models import ExchangeAccount
     from apps.trading.models import DailySnapshot
@@ -88,10 +88,6 @@ def trading_summary(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def position_list(request):
-    """
-    获取当前持仓列表。
-    优先从 OrderExecutor 实时查询，回退到空列表。
-    """
     from apps.exchange.models import ExchangeAccount
     from apps.trading.executor import OrderExecutor
 
@@ -184,7 +180,6 @@ def account_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def live_session_list(request):
-    """列出用户的实盘会话"""
     sessions = LiveSession.objects.filter(user=request.user).order_by("-created_at")[
         :50
     ]
@@ -194,7 +189,6 @@ def live_session_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def live_session_detail(request, pk):
-    """获取会话详情"""
     try:
         session = LiveSession.objects.get(pk=pk, user=request.user)
     except LiveSession.DoesNotExist:
@@ -287,26 +281,78 @@ def live_session_create(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_start(request, pk):
-    """启动实盘会话"""
     from apps.agent.frame_manager import FrameManager
 
     try:
-        session = LiveSession.objects.get(pk=pk, user=request.user)
+        session = LiveSession.objects.select_related(
+            "strategy", "exchange_account", "user", "backtest_result"
+        ).get(pk=pk, user=request.user)
     except LiveSession.DoesNotExist:
         return Response({"error": "Live session not found"}, status=404)
 
-    if session.status != "pending":
+    if session.status not in ("pending", "error", "running", "stopped"):
         return Response(
             {"error": f"Session is {session.status}, cannot start"}, status=400
         )
 
+    if not session.exchange_account:
+        return Response({"error": "No exchange account configured"}, status=400)
+
+    frame_manager = FrameManager.get_instance()
+
+    # 如果已在运行，先停掉旧框架（处理之前框架崩溃导致的幽灵状态）
+    if session.status == "running":
+        logger.warning(
+            "Session %s is already running, stopping old frame before restart", pk
+        )
+        try:
+            async_to_sync(frame_manager.stop_strategy_runner)()
+        except Exception:
+            pass
+        try:
+            async_to_sync(frame_manager.stop_trading_frame)()
+        except Exception:
+            pass
+
+    # 1. 启动交易框架
+    try:
+        async_to_sync(frame_manager.start_trading_frame)(mode=session.mode)
+    except Exception as e:
+        logger.exception("Failed to start trading frame for session %s: %s", pk, e)
+        return Response({"error": f"Failed to start trading frame: {e}"}, status=500)
+
+    # 2. 启动策略运行器（内部会注册信号监控到 SignalMonitor）
+    timeframe = session.backtest_result.timeframe if session.backtest_result else "1h"
+
+    try:
+        async_to_sync(frame_manager.start_strategy_runner)(
+            strategy_name=session.strategy.name,
+            symbol=session.symbol,
+            timeframe=timeframe,
+            parameters=session.config or {},
+            exchange_account_id=str(session.exchange_account.id),
+            user_id=str(session.user.id),
+            live_session_id=str(session.id),
+            initial_balance=session.initial_capital,
+        )
+    except Exception as e:
+        logger.exception("Failed to start strategy for session %s: %s", pk, e)
+        # 回滚已启动的交易框架
+        async_to_sync(frame_manager.stop_trading_frame)()
+        return Response({"error": f"Failed to start strategy: {e}"}, status=500)
+
     session.status = "running"
     session.started_at = timezone.now()
-    session.save(update_fields=["status", "started_at", "updated_at"])
+    session.stopped_at = None
+    session.save(update_fields=["status", "started_at", "stopped_at", "updated_at"])
 
-    # 启动交易框架
-    frame_manager = FrameManager.get_instance()
-    async_to_sync(frame_manager.start_trading_frame)(mode=session.mode)
+    logger.info(
+        "Live session %s started: strategy=%s symbol=%s timeframe=%s",
+        pk,
+        session.strategy.name,
+        session.symbol,
+        timeframe,
+    )
 
     return Response({"status": session.status, "message": "Trading framework started"})
 
@@ -314,7 +360,6 @@ def live_session_start(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_pause(request, pk):
-    """暂停会话"""
     try:
         session = LiveSession.objects.get(pk=pk, user=request.user)
     except LiveSession.DoesNotExist:
@@ -334,7 +379,6 @@ def live_session_pause(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_resume(request, pk):
-    """恢复会话"""
     try:
         session = LiveSession.objects.get(pk=pk, user=request.user)
     except LiveSession.DoesNotExist:
@@ -354,7 +398,6 @@ def live_session_resume(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_stop(request, pk):
-    """停止会话"""
     from apps.agent.frame_manager import FrameManager
 
     try:
@@ -371,8 +414,9 @@ def live_session_stop(request, pk):
     session.stopped_at = timezone.now()
     session.save(update_fields=["status", "stopped_at", "updated_at"])
 
-    # 停止交易框架
+    # 停止策略运行器和交易框架
     frame_manager = FrameManager.get_instance()
+    async_to_sync(frame_manager.stop_strategy_runner)()
     async_to_sync(frame_manager.stop_trading_frame)()
 
     return Response({"status": session.status, "message": "Session stopped"})
@@ -381,10 +425,6 @@ def live_session_stop(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_promote(request, pk):
-    """
-    将 paper 会话升级为 live。
-    验证该会话曾以 paper 模式运行过，创建新的 live 模式会话。
-    """
     try:
         session = LiveSession.objects.get(pk=pk, user=request.user)
     except LiveSession.DoesNotExist:

@@ -32,6 +32,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _to_bytes(value):
+    """将 memoryview/bytearray 等类型统一转为 bytes，供 Fernet 解密使用。"""
+    if isinstance(value, (bytes, str)):
+        return value
+    if isinstance(value, (memoryview, bytearray)):
+        return bytes(value)
+    return None
+
+
 class OrderExecutor:
     """
     订单执行器（随交易框架懒加载，由 FrameManager 管理生命周期）。
@@ -100,7 +109,7 @@ class OrderExecutor:
         下单主流程。
 
         Args:
-            exchange: 交易所名称 ('binance' | 'okx')
+            exchange: 交易所名称 ('binance')
             symbol: 交易对符号（如 'BTCUSDT'）
             side: 买卖方向 ('buy' | 'sell')
             order_type: 订单类型 ('market' | 'limit')
@@ -117,6 +126,7 @@ class OrderExecutor:
             ValueError: 交易所适配器不存在
             PermissionError: RiskGuard 拒绝下单
         """
+        logger.info(f"[OrderExecutor] submit: {exchange} {symbol} {side} {order_type} qty={quantity}")
         uid = user_id  # 保留引用供 finally 使用
         if not self._running:
             raise RuntimeError("OrderExecutor is not running")
@@ -246,16 +256,8 @@ class OrderExecutor:
                 continue
 
             try:
-                api_key_enc = (
-                    bytes(account.api_key_enc)
-                    if hasattr(account.api_key_enc, "__bytes__")
-                    else account.api_key_enc
-                )
-                api_secret_enc = (
-                    bytes(account.api_secret_enc)
-                    if hasattr(account.api_secret_enc, "__bytes__")
-                    else account.api_secret_enc
-                )
+                api_key_enc = _to_bytes(account.api_key_enc)
+                api_secret_enc = _to_bytes(account.api_secret_enc)
                 if not api_key_enc or not api_secret_enc:
                     logger.warning(
                         "Skipping adapter for %s (%s): empty API key or secret",
@@ -267,14 +269,7 @@ class OrderExecutor:
                 api_key = fernet.decrypt(api_key_enc).decode()
                 api_secret = fernet.decrypt(api_secret_enc).decode()
 
-                if exchange == "okx":
-                    # OKX 需要额外的 passphrase，从 label 字段临时存储
-                    passphrase = account.label or ""
-                    adapter = adapter_cls(
-                        api_key, api_secret, passphrase, account.testnet
-                    )
-                else:
-                    adapter = adapter_cls(api_key, api_secret, account.testnet)
+                adapter = adapter_cls(api_key, api_secret, account.testnet)
 
                 await adapter.connect()
                 self._adapters[exchange] = adapter

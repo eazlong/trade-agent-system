@@ -191,7 +191,7 @@ class TestOrderExecutorL2(unittest.TestCase):
         """shutdown() 应断开所有 adapter"""
         mock_adapter1 = AsyncMock()
         mock_adapter2 = AsyncMock()
-        self.executor._adapters = {"binance": mock_adapter1, "okx": mock_adapter2}
+        self.executor._adapters = {"binance": mock_adapter1}
         self.executor._running = True
         OrderExecutor._instance = self.executor
 
