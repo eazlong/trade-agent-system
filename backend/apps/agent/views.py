@@ -262,7 +262,7 @@ def _format_celery_schedule(schedule) -> str:
 
     if isinstance(schedule, celery_crontab):
 
-        def _cron_field(val, default="*"):
+        def _cron_field(val):
             """将 crontab 的 set 转为简洁表达式"""
             if val == getattr(celery_crontab, "_meta", {}).get("fields", [{}])[0].get(
                 "default", None

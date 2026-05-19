@@ -8,8 +8,6 @@ import asyncio
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema
-
 from .serializers import (
     KlineRequestSerializer,
     KlineResponseSerializer,
@@ -21,7 +19,6 @@ from .serializers import (
     SubscriptionResponseSerializer,
     DataSourceStatusSerializer,
     QualityReportSerializer,
-    ConnectRequestSerializer,
     DataSourceConfigSerializer,
 )
 from ..registry import DataSourceRegistry
