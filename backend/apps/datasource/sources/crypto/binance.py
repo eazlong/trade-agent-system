@@ -11,10 +11,12 @@ import asyncio
 import json
 import logging
 import time
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
 import aiohttp
 import ccxt.async_support as ccxt
+from django.conf import settings
 
 from apps.datasource.base import (
     BaseDataSource,
@@ -72,8 +74,8 @@ class BinanceDataSource(BaseDataSource):
         KlineInterval.M1_MONTH,
     ]
 
-    ws_spot_endpoint = "wss://stream.binance.com:9443/ws"
-    ws_futures_endpoint = "wss://fstream.binance.com/ws"
+    ws_spot_endpoint = "wss://stream.binance.com:443/ws"
+    ws_futures_endpoint = "wss://fstream.binance.com:443/ws"
 
     rest_spot_endpoint = "https://api.binance.com"
     rest_futures_endpoint = "https://fapi.binance.com"
@@ -108,6 +110,11 @@ class BinanceDataSource(BaseDataSource):
         # 质量监控
         self._monitor = get_quality_monitor()
 
+    @property
+    def _proxy(self) -> Optional[str]:
+        """获取代理 URL，从 Django settings 读取 WEB_PROXY"""
+        return getattr(settings, "WEB_PROXY", "") or None
+
     # ==================== WebSocket 连接 ====================
 
     async def connect_websocket(self) -> bool:
@@ -122,10 +129,30 @@ class BinanceDataSource(BaseDataSource):
                 self.ws_futures_endpoint,
             )
 
-            # 创建 HTTP 客户端
+            # 创建 HTTP 客户端（带代理）
             if self._http_client is None:
-                self._http_client = aiohttp.ClientSession()
-                logger.info("[Binance] HTTP client created")
+                proxy = self._proxy
+                if proxy:
+                    from urllib.parse import urlparse
+                    from aiohttp_socks import ProxyConnector, ProxyType
+                    parsed = urlparse(proxy)
+                    _proxy_type = {
+                        "socks5": ProxyType.SOCKS5,
+                        "socks5h": ProxyType.SOCKS5,
+                        "socks4": ProxyType.SOCKS4,
+                    }.get(parsed.scheme, ProxyType.HTTP)
+                    connector = ProxyConnector(
+                        proxy_type=_proxy_type,
+                        host=parsed.hostname,
+                        port=parsed.port,
+                        username=parsed.username,
+                        password=parsed.password,
+                        rdns=True,
+                    )
+                    self._http_client = aiohttp.ClientSession(connector=connector)
+                else:
+                    self._http_client = aiohttp.ClientSession()
+                logger.info("[Binance] HTTP client created, proxy=%s", proxy)
 
             # 仅在配置了现货时连接现货 WebSocket
             if MarketType.SPOT in active_types:
@@ -169,7 +196,10 @@ class BinanceDataSource(BaseDataSource):
 
         except Exception as e:
             self._ws_status = ConnectionStatus.ERROR
-            logger.error("[Binance] WebSocket connection error: %s", e)
+            logger.error(
+                "[Binance] WebSocket connection error: %s: %s\n%s",
+                type(e).__name__, e, traceback.format_exc(),
+            )
             return False
 
     async def disconnect_websocket(self) -> bool:
@@ -200,6 +230,9 @@ class BinanceDataSource(BaseDataSource):
 
             self._ws_status = ConnectionStatus.DISCONNECTED
 
+            # 清空旧订阅，避免 _resubscribe_all 在新连接中发送过期流
+            self._subscriptions.clear()
+
             logger.info("[Binance] WebSocket disconnected")
             return True
 
@@ -217,16 +250,16 @@ class BinanceDataSource(BaseDataSource):
                         json.loads(msg.data), MarketType.SPOT
                     )
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    print(f"Spot WebSocket error: {self._ws_spot.exception()}")
+                    logger.error("[Binance] spot WS error: %s", self._ws_spot.exception())
                     break
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    print("Spot WebSocket closed")
+                    logger.warning("[Binance] spot WS closed")
                     break
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Spot WebSocket receive error: {e}")
+                logger.error("[Binance] spot WS receive error: %s: %s", type(e).__name__, e)
                 await asyncio.sleep(1)
 
     async def _ws_futures_receiver(self) -> None:
@@ -239,16 +272,16 @@ class BinanceDataSource(BaseDataSource):
                         json.loads(msg.data), MarketType.FUTURES
                     )
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    print(f"Futures WebSocket error: {self._ws_futures.exception()}")
+                    logger.error("[Binance] futures WS error: %s", self._ws_futures.exception())
                     break
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    print("Futures WebSocket closed")
+                    logger.warning("[Binance] futures WS closed")
                     break
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Futures WebSocket receive error: {e}")
+                logger.error("[Binance] futures WS receive error: %s: %s", type(e).__name__, e)
                 await asyncio.sleep(1)
 
     async def _handle_websocket_message(
@@ -281,6 +314,7 @@ class BinanceDataSource(BaseDataSource):
             )
 
             # 触发回调
+            logger.info(f"[DataSource] kline: {kline.get('symbol')} close={kline.get('close')} vol={kline.get('volume')}")
             self._trigger_callbacks(DataType.KLINE, kline)
 
         elif event_type == "trade" or event_type == "aggTrade":
@@ -325,7 +359,7 @@ class BinanceDataSource(BaseDataSource):
             try:
                 await self._send_subscribe(sub_info)
             except Exception as e:
-                print(f"Resubscribe error for {sub_key}: {e}")
+                logger.error("[Binance] resubscribe error for %s: %s", sub_key, e)
 
     async def _send_subscribe(self, sub_info: Dict) -> None:
         """发送订阅请求"""
@@ -338,6 +372,12 @@ class BinanceDataSource(BaseDataSource):
         ws = self._ws_spot if market_type == MarketType.SPOT else self._ws_futures
 
         if ws is None or ws.closed:
+            logger.warning(
+                "[Binance] _send_subscribe skipped: ws=%s (market=%s, symbol=%s)",
+                "None" if ws is None else "closed",
+                market_type.value,
+                symbol,
+            )
             return
 
         # 构建订阅参数
@@ -429,7 +469,7 @@ class BinanceDataSource(BaseDataSource):
                     raise Exception(f"API error {resp.status}: {error_text}")
 
         except Exception as e:
-            print(f"Binance fetch_klines error: {e}")
+            logger.error("[Binance] fetch_klines error: %s", e)
             return []
 
     async def fetch_trades(
@@ -475,7 +515,7 @@ class BinanceDataSource(BaseDataSource):
                     raise Exception(f"API error {resp.status}: {error_text}")
 
         except Exception as e:
-            print(f"Binance fetch_trades error: {e}")
+            logger.error("[Binance] fetch_trades error: %s", e)
             return []
 
     async def fetch_ticker(
@@ -513,17 +553,21 @@ class BinanceDataSource(BaseDataSource):
                     raise Exception(f"API error {resp.status}: {error_text}")
 
         except Exception as e:
-            print(f"Binance fetch_ticker error: {e}")
+            logger.error(f"[Binance] fetch_ticker error: {e}")
             return {}
 
     async def _init_ccxt(self, market_type: MarketType) -> None:
         """初始化 CCXT 客户端"""
+        options = {"enableRateLimit": True}
+        proxy = self._proxy
+        if proxy:
+            options["aiohttp_proxy"] = proxy
         if market_type == MarketType.SPOT:
             if self._ccxt_spot is None:
-                self._ccxt_spot = ccxt.binance({"enableRateLimit": True})
+                self._ccxt_spot = ccxt.binance(options)
         else:
             if self._ccxt_futures is None:
-                self._ccxt_futures = ccxt.binanceusdm({"enableRateLimit": True})
+                self._ccxt_futures = ccxt.binanceusdm(options)
 
     # ==================== 数据订阅 ====================
 
@@ -542,6 +586,8 @@ class BinanceDataSource(BaseDataSource):
 
         # 生成订阅键
         sub_key = f"{symbol}:{data_type.value}:{interval.value if interval else 'none'}:{market_type.value}"
+       
+        logger.info("[Binance] subscribe: %s", sub_key)
 
         # 存储订阅信息
         self._subscriptions[sub_key] = {
@@ -559,7 +605,7 @@ class BinanceDataSource(BaseDataSource):
                 await self._send_subscribe(self._subscriptions[sub_key])
                 return True
             except Exception as e:
-                print(f"Binance subscribe error: {e}")
+                logger.error(f"[Binance] subscribe error: {e}")
                 return False
 
         return True
@@ -600,7 +646,7 @@ class BinanceDataSource(BaseDataSource):
                     await ws.send_str(json.dumps(msg))
 
             except Exception as e:
-                print(f"Binance unsubscribe error: {e}")
+                logger.error("[Binance] unsubscribe error: %s", e)
 
         # 移除订阅
         del self._subscriptions[sub_key]

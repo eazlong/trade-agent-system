@@ -5,7 +5,7 @@ from django.db import models
 
 class ExchangeAccount(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    exchange = models.CharField(max_length=32)  # binance / okx / bybit
+    exchange = models.CharField(max_length=32)  # binance (MVP)
     label = models.CharField(max_length=64, blank=True)
     api_key_enc = models.BinaryField()  # Fernet加密
     api_secret_enc = models.BinaryField()

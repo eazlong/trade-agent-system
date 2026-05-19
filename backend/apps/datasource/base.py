@@ -1,21 +1,24 @@
 """
 数据源基类
 
-定义数据源的核心接口：
+定义数据源的核心接口（当前仅 Binance 实现）：
 - WebSocket 实时数据捕获
 - REST API 历史数据获取
-- 数据清洗和标准化
+- 数据标准化
 - 连接管理
 - 错误处理
 """
 
 import asyncio
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from enum import Enum
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 class DataType(Enum):
@@ -49,7 +52,6 @@ class MarketType(Enum):
 
     SPOT = "spot"  # 现货
     FUTURES = "futures"  # 合约（永续）
-    MARGIN = "margin"  # 杠杆
 
 
 class ConnectionStatus(Enum):
@@ -85,7 +87,7 @@ class BaseDataSource(ABC):
     name: str = ""
 
     # 数据源类型
-    source_type: str = ""  # 'crypto' | 'stock'
+    source_type: str = ""  # 'crypto'
 
     # 支持的数据类型
     supported_data_types: List[DataType] = []
@@ -391,6 +393,7 @@ class BaseDataSource(ABC):
             data: 数据内容
         """
         callbacks = self._callbacks.get(data_type, [])
+        logger.debug(f"[DataSource] triggering {len(callbacks)} callbacks for {data_type}")
         for callback in callbacks:
             try:
                 callback(data)

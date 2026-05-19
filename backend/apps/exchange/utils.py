@@ -29,7 +29,7 @@ def create_exchange_account(
     创建新的交易所账户
 
     Args:
-        exchange: 交易所名称 (binance, okx, bybit)
+        exchange: 交易所名称 (binance)
         label: 账户标签
         api_key: API密钥
         api_secret: API密钥密钥

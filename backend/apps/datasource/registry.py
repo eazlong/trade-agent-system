@@ -1,7 +1,8 @@
 """
-数据源注册中心
+数据源注册中心（单数据源模式）
 
 使用装饰器模式实现懒加载单例，按需加载数据源。
+当前仅注册 Binance 数据源。
 """
 
 import threading
@@ -15,7 +16,6 @@ class DataSourceRegistry:
     使用类装饰器 @DataSourceRegistry.register 实现懒加载：
     - 首次调用 get() 时才实例化数据源
     - 单例模式确保同一数据源只有一个实例
-    - 支持异步初始化
     """
 
     _instance: Optional["DataSourceRegistry"] = None
@@ -47,28 +47,18 @@ class DataSourceRegistry:
             @DataSourceRegistry.register('binance')
             class BinanceDataSource(BaseDataSource):
                 ...
-
-            # 或者使用类属性 name
-            @DataSourceRegistry.register()
-            class BinanceDataSource(BaseDataSource):
-                name = 'binance'
         """
 
         def decorator(source_class: Type) -> Type:
-            # 获取数据源名称
             source_name = name or getattr(source_class, "name", None)
             if not source_name:
                 raise ValueError(
                     "DataSource must have a 'name' attribute or be registered with explicit name"
                 )
 
-            # 注册类（不实例化）
             cls._registry[source_name] = source_class
-
-            # 创建实例化锁
             cls._instance_locks[source_name] = threading.Lock()
 
-            # 添加便捷方法
             source_class.get = lambda: cls.get(source_name)
             source_class.is_loaded = lambda: source_name in cls._instances
 
@@ -82,8 +72,8 @@ class DataSourceRegistry:
         获取数据源实例（懒加载）
 
         Args:
-            name: 数据源名称
-            market_types: 可选的市场类型列表，用于配置数据源只连接特定市场
+            name: 数据源名称（目前仅 'binance'）
+            market_types: 可选的市场类型列表，用于配置只连接特定市场
 
         Returns:
             数据源实例（首次调用时创建）
@@ -93,32 +83,25 @@ class DataSourceRegistry:
                 f"DataSource '{name}' not registered. Available: {list(cls._registry.keys())}"
             )
 
-        # 检查是否已实例化
         if name in cls._instances:
             return cls._instances[name]
 
-        # 获取实例化锁（防止并发创建）
         lock = cls._instance_locks.get(name)
         if not lock:
             lock = threading.Lock()
             cls._instance_locks[name] = lock
 
         with lock:
-            # 双重检查（防止锁内重复创建）
             if name in cls._instances:
                 return cls._instances[name]
 
-            # 实例化数据源
             source_class = cls._registry[name]
             instance = source_class()
 
-            # 如果传入了市场类型配置，设置到实例上
             if market_types is not None and hasattr(instance, "set_market_types"):
                 instance.set_market_types(market_types)
 
-            # 存储实例
             cls._instances[name] = instance
-
             return instance
 
     @classmethod
@@ -150,14 +133,12 @@ class DataSourceRegistry:
         if name in cls._instances:
             instance = cls._instances[name]
 
-            # 如果有 cleanup 方法，调用它
             if hasattr(instance, "cleanup"):
                 try:
                     instance.cleanup()
                 except Exception as e:
                     print(f"Error cleaning up DataSource '{name}': {e}")
 
-            # 移除实例
             del cls._instances[name]
             return True
 

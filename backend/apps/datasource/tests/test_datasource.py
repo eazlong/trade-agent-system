@@ -216,7 +216,7 @@ class TestDataSubscriptionManager:
         )
         sub.subscribe(
             user_id="user2",
-            source="okx",
+            source="binance",
             symbol="ETH/USDT",
             data_type="kline",
             interval="5m",

@@ -28,17 +28,17 @@ class TestExchangeAccountModel(TestCase):
 
     def test_string_representation(self):
         account = ExchangeAccount.objects.create(
-            exchange="okx",
-            label="my_okx",
+            exchange="binance",
+            label="my_binance",
             api_key_enc=b"key",
             api_secret_enc=b"secret",
         )
-        self.assertIn("okx", str(account))
-        self.assertIn("my_okx", str(account))
+        self.assertIn("binance", str(account))
+        self.assertIn("my_binance", str(account))
 
     def test_inactive_account(self):
         account = ExchangeAccount.objects.create(
-            exchange="bybit",
+            exchange="binance",
             label="frozen",
             is_active=False,
         )

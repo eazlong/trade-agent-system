@@ -37,14 +37,8 @@ class DataSourceViewSet(viewsets.ViewSet):
 
     提供数据源状态查询、连接管理等功能
     """
-
-    @extend_schema(
-        summary="获取所有已注册的数据源",
-        responses={200: DataSourceStatusSerializer(many=True)},
-    )
     @action(detail=False, methods=["get"])
     def list_sources(self, request):
-        """获取所有已注册的数据源列表"""
         sources = DataSourceRegistry.list_registered()
         result = []
 
@@ -67,12 +61,8 @@ class DataSourceViewSet(viewsets.ViewSet):
 
         return Response(result)
 
-    @extend_schema(
-        summary="获取指定数据源状态", responses={200: DataSourceStatusSerializer}
-    )
     @action(detail=False, methods=["get"], url_path="status/(?P<source_name>[^/.]+)")
     def status(self, request, source_name=None):
-        """获取指定数据源的状态"""
         if not DataSourceRegistry.is_loaded(source_name):
             return Response(
                 {"name": source_name, "is_loaded": False, "status": "not_loaded"}
@@ -92,12 +82,8 @@ class DataSourceViewSet(viewsets.ViewSet):
             }
         )
 
-    @extend_schema(
-        summary="连接数据源", request=ConnectRequestSerializer, responses={200: dict}
-    )
     @action(detail=False, methods=["post"], url_path="connect/(?P<source_name>[^/.]+)")
     def connect(self, request, source_name=None):
-        """连接指定数据源的 WebSocket"""
         try:
             source = DataSourceRegistry.get(source_name)
 
@@ -127,7 +113,6 @@ class DataSourceViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-    @extend_schema(summary="断开数据源连接", responses={200: dict})
     @action(
         detail=False, methods=["post"], url_path="disconnect/(?P<source_name>[^/.]+)"
     )
@@ -154,11 +139,6 @@ class DataSourceViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-    @extend_schema(
-        summary="配置数据源市场类型",
-        request=DataSourceConfigSerializer,
-        responses={200: dict},
-    )
     @action(detail=False, methods=["post"], url_path="config/(?P<source_name>[^/.]+)")
     def set_config(self, request, source_name=None):
         """持久化配置数据源的市场类型"""
@@ -197,12 +177,6 @@ class MarketDataViewSet(viewsets.ViewSet):
 
     提供历史数据和实时数据查询接口
     """
-
-    @extend_schema(
-        summary="获取 K 线数据",
-        request=KlineRequestSerializer,
-        responses={200: KlineResponseSerializer(many=True)},
-    )
     @action(detail=False, methods=["get", "post"])
     def klines(self, request):
         """
@@ -257,11 +231,6 @@ class MarketDataViewSet(viewsets.ViewSet):
 
         return Response(klines)
 
-    @extend_schema(
-        summary="获取行情快照",
-        request=TickerRequestSerializer,
-        responses={200: TickerResponseSerializer},
-    )
     @action(detail=False, methods=["get", "post"])
     def ticker(self, request):
         """获取实时行情快照"""
@@ -302,11 +271,6 @@ class MarketDataViewSet(viewsets.ViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-    @extend_schema(
-        summary="获取成交数据",
-        request=TradeRequestSerializer,
-        responses={200: TradeResponseSerializer(many=True)},
-    )
     @action(detail=False, methods=["get", "post"])
     def trades(self, request):
         """获取历史成交数据"""
@@ -354,12 +318,6 @@ class SubscriptionViewSet(viewsets.ViewSet):
 
     提供数据订阅管理功能
     """
-
-    @extend_schema(
-        summary="创建数据订阅",
-        request=SubscriptionRequestSerializer,
-        responses={200: SubscriptionResponseSerializer},
-    )
     def create(self, request):
         """创建数据订阅"""
         serializer = SubscriptionRequestSerializer(data=request.data)
@@ -381,7 +339,6 @@ class SubscriptionViewSet(viewsets.ViewSet):
 
         return Response({"subscription_id": sub_id, "status": "active"})
 
-    @extend_schema(summary="取消数据订阅", responses={200: dict})
     def destroy(self, request, pk=None):
         """取消数据订阅"""
         sub_manager = get_subscription_manager()
@@ -394,10 +351,6 @@ class SubscriptionViewSet(viewsets.ViewSet):
                 {"error": "Subscription not found"}, status=status.HTTP_404_NOT_FOUND
             )
 
-    @extend_schema(
-        summary="获取用户的订阅列表",
-        responses={200: SubscriptionResponseSerializer(many=True)},
-    )
     def list(self, request):
         """获取当前用户的所有订阅"""
         sub_manager = get_subscription_manager()
@@ -428,10 +381,6 @@ class QualityMonitorViewSet(viewsets.ViewSet):
 
     提供数据质量报告查询功能
     """
-
-    @extend_schema(
-        summary="获取数据质量报告", responses={200: QualityReportSerializer(many=True)}
-    )
     def list(self, request):
         """获取所有数据质量报告"""
         monitor = get_quality_monitor()
@@ -459,14 +408,12 @@ class QualityMonitorViewSet(viewsets.ViewSet):
 
         return Response(result)
 
-    @extend_schema(summary="获取数据质量统计", responses={200: dict})
     @action(detail=False, methods=["get"])
     def stats(self, request):
         """获取数据质量统计信息"""
         monitor = get_quality_monitor()
         return Response(monitor.get_stats())
 
-    @extend_schema(summary="触发数据质量检查", responses={200: dict})
     @action(detail=False, methods=["post"])
     def check(self, request):
         """手动触发数据质量检查"""

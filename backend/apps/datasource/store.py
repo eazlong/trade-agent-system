@@ -8,12 +8,15 @@
 - 高效访问接口
 """
 
+import logging
 import time
 import threading
 from typing import Dict, List, Optional
 from collections import OrderedDict
 from datetime import datetime
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -142,6 +145,7 @@ class MemoryDataStore:
         Returns:
             是否成功存储
         """
+        logger.debug(f"[DataStore] store {data_type} {symbol} ts={data.get('timestamp')}")
         # 生成键
         if key is None:
             timestamp = data.get("timestamp", datetime.now())

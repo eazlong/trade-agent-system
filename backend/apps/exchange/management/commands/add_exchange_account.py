@@ -15,7 +15,7 @@ class Command(BaseCommand):
             "--exchange",
             type=str,
             required=True,
-            help="Exchange name (e.g., binance, okx, bybit)",
+            help="Exchange name (e.g., binance)",
         )
         parser.add_argument("--label", type=str, help="Account label/description")
 

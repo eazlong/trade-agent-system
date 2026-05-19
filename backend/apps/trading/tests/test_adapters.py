@@ -10,7 +10,6 @@ import unittest
 
 from apps.trading.adapters.base import OrderRequest, OrderResponse, Position
 from apps.trading.adapters.binance import BinanceAdapter
-from apps.trading.adapters.okx import OKXAdapter
 
 
 class TestBinanceAdapterL1(unittest.TestCase):
@@ -65,7 +64,6 @@ class TestBinanceAdapterL1(unittest.TestCase):
         from apps.trading.adapters import ADAPTER_MAP
 
         self.assertIn("binance", ADAPTER_MAP)
-        self.assertIn("okx", ADAPTER_MAP)
 
     @patch("httpx.AsyncClient")
     def test_binance_connect_sets_client(self, mock_client_cls):
@@ -171,94 +169,3 @@ class TestBinanceAdapterL1(unittest.TestCase):
         adapter = BinanceAdapter("test_key", "test_secret")
         # _client is None by default
         asyncio.run(adapter.disconnect())  # should not raise
-
-
-class TestOKXAdapterL1(unittest.TestCase):
-    """L1: OKX 适配器签名和请求验证"""
-
-    def test_okx_passphrase_required(self):
-        """OKX adapter 需要 passphrase 参数"""
-        adapter = OKXAdapter("key", "secret", "passphrase")
-        self.assertEqual(adapter._passphrase, "passphrase")
-
-    @patch("httpx.AsyncClient")
-    def test_okx_place_order_uses_json_body(self, mock_client_cls):
-        """OKX place_order() 应使用 JSON body 而非 form data"""
-        adapter = OKXAdapter("test_key", "test_secret", "test_passphrase")
-        mock_client = AsyncMock()
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "code": "0",
-            "data": [{"ordId": "123", "state": "live", "filledSz": "0", "avgPx": ""}],
-        }
-        mock_client.post.return_value = mock_response
-        adapter._client = mock_client
-
-        req = OrderRequest(
-            exchange="okx",
-            symbol="BTC-USDT-SWAP",
-            order_type="market",
-            side="buy",
-            quantity=Decimal("1"),
-            price=None,
-        )
-        asyncio.run(adapter.place_order(req))
-
-        mock_client.post.assert_called_once()
-        call_kwargs = mock_client.post.call_args[1]
-        self.assertIn("json", call_kwargs)
-
-    @patch("httpx.AsyncClient")
-    def test_okx_error_response_raises(self, mock_client_cls):
-        """OKX 返回错误码时抛异常"""
-        adapter = OKXAdapter("test_key", "test_secret", "test_passphrase")
-        mock_client = AsyncMock()
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "code": "1",
-            "msg": "Insufficient margin",
-        }
-        mock_client.post.return_value = mock_response
-        adapter._client = mock_client
-
-        req = OrderRequest(
-            exchange="okx",
-            symbol="BTC-USDT-SWAP",
-            order_type="market",
-            side="buy",
-            quantity=Decimal("1"),
-            price=None,
-        )
-        with self.assertRaises(RuntimeError):
-            asyncio.run(adapter.place_order(req))
-
-    @patch("httpx.AsyncClient")
-    def test_okx_get_positions_filters_zero(self, mock_client_cls):
-        """OKX get_positions() 应过滤零仓位"""
-        adapter = OKXAdapter("test_key", "test_secret", "test_passphrase")
-        mock_client = AsyncMock()
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "data": [
-                {
-                    "instId": "BTC-USDT-SWAP",
-                    "pos": "0",
-                    "avgEntryPx": "0",
-                    "upl": "0",
-                    "lever": "10",
-                },
-                {
-                    "instId": "ETH-USDT-SWAP",
-                    "pos": "5",
-                    "avgEntryPx": "3000",
-                    "upl": "50",
-                    "lever": "5",
-                },
-            ]
-        }
-        mock_client.get.return_value = mock_response
-        adapter._client = mock_client
-
-        positions = asyncio.run(adapter.get_positions())
-        self.assertEqual(len(positions), 1)
-        self.assertEqual(positions[0].symbol, "ETH-USDT-SWAP")
