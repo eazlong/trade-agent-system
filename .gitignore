@@ -5,3 +5,16 @@ __pycache__/
 .DS_Store
 docker-compose.override.yml
 data/
+
+# Coverage
+.coverage
+
+# Documentation (not for commit)
+docs/
+backend/docs/
+
+# Superpowers framework
+.superpowers/
+
+# Temp/one-off scripts
+*CUDA_VISIBLE_DEVICES*
