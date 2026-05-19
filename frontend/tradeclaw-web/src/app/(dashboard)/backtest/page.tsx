@@ -21,7 +21,7 @@ export default function BacktestListPage() {
     backtestApi
       .getList({ page, page_size: PAGE_SIZE })
       .then((data) => {
-        setResults(data.results);
+        setResults(data.results ?? []);
         setTotalPages(data.num_pages);
         setTotalCount(data.count);
       })
@@ -30,7 +30,7 @@ export default function BacktestListPage() {
   }, [page]);
 
   const fmtDate = (d: string) =>
-    new Date(d).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+    new Date(d).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
 
   return (
     <DashboardShell>

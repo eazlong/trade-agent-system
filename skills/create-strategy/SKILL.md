@@ -207,6 +207,33 @@ class {StrategyName}Strategy(BaseStrategy):
 
     def on_stop(self) -> None:
         """策略停止时调用"""
+
+    def get_watch_signals(self) -> list[dict]:
+        """返回最小周期信号配置，由 LiveStrategyRunner 注册到 SignalMonitor 做初筛。
+
+        每个 dict 包含:
+            interval: str         — K线周期 (如 "15m", "1h")
+            indicator_type: str   — 指标类型 (donchian/bollinger/rsi/price_watch/...)
+            indicator_params: dict — 指标参数 (如 {"period": 20})
+            condition: dict       — 触发条件，格式见下方说明
+            trigger_type: str     — "once"(单次) 或 "continuous"(持续)
+
+        默认返回 []。子类覆盖此方法启用两阶段信号检测：
+        1. SignalMonitor 按最小周期检测单指标条件（轻量初筛）
+        2. 触发后运行完整 on_bar() 验证多指标组合条件
+
+        条件格式示例:
+            # 价格上穿唐奇安通道上轨
+            {"operator": "cross_above", "left": {"field": "price"},
+             "right": {"field": "upper"}}
+            # 价格大于指定值
+            {"operator": "gt", "left": {"field": "price"},
+             "right": {"value": 50000}}
+            # RSI 小于阈值
+            {"operator": "lt", "left": {"field": "rsi"},
+             "right": {"value": 30}}
+        """
+        return []
 ```
 
 ### 关键 API 参考
@@ -230,6 +257,50 @@ class {StrategyName}Strategy(BaseStrategy):
 | `self.last_bar(symbol?, timeframe?)` | 获取最后一根 K 线 |
 | `self.higher_tf()` | 获取更高周期 DataFeed |
 | `self.lower_tf()` | 获取更低周期 DataFeed |
+| `self.get_watch_signals() -> list[dict]` | 返回最小周期信号配置，部署实盘时自动注册到 SignalMonitor |
+
+#### get_watch_signals — 实盘信号预筛选（可选覆盖）
+
+当策略部署到实盘/测试网时，`LiveStrategyRunner` 会调用此方法将最小周期信号注册到 `SignalMonitor`，实现两阶段信号检测：
+
+```
+SignalMonitor 定时检查单指标条件（轻量初筛）
+  → 触发 → Redis List 事件 → LiveStrategyRunner 消费
+  → 运行完整 on_bar() 验证多指标组合 → dispatch 交易信号
+```
+
+**典型场景**：策略需要"4h EMA 趋势向上 + 15m 价格突破 Donchian 上轨"，则只需将 15m Donchian 突破注册为 watch signal，4h EMA 趋势在 `on_bar()` 中完整验证。
+
+**返回值格式**：`list[dict]`，每个 dict 字段：
+
+| 字段 | 类型 | 说明 | 示例 |
+|------|------|------|------|
+| `interval` | str | K线周期 | `"15m"` |
+| `indicator_type` | str | 指标类型（donchian/bollinger/rsi/price_watch等） | `"donchian"` |
+| `indicator_params` | dict | 指标参数 | `{"period": 20}` |
+| `condition` | dict | 触发条件 | 见下方 |
+| `trigger_type` | str | `"once"`（单次）或 `"continuous"`（持续） | `"continuous"` |
+
+**condition 支持的运算符**：`gt`（大于）、`lt`（小于）、`gte`（≥）、`lte`（≤）、`eq`（等于）、`cross_above`（上穿）、`cross_below`（下穿）
+
+**condition 操作数**：`{"field": "price"}` 引用价格，`{"field": "upper"}` 引用指标字段，`{"value": 50000}` 引用常量
+
+```python
+def get_watch_signals(self) -> list[dict]:
+    return [
+        {
+            "interval": "15m",
+            "indicator_type": "donchian",
+            "indicator_params": {"period": 20},
+            "condition": {
+                "operator": "cross_above",
+                "left": {"field": "price"},
+                "right": {"field": "upper"},
+            },
+            "trigger_type": "continuous",
+        }
+    ]
+```
 
 #### 可用技术指标（来自 `indicators`）
 

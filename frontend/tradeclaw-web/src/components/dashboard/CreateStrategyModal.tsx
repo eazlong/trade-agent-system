@@ -97,10 +97,7 @@ export default function CreateStrategyModal({ open, onClose }: ModalProps) {
 
         <div className="flex gap-2.5 justify-end">
           <button onClick={onClose} className="px-4.5 py-2 rounded-lg text-xs font-semibold bg-transparent border border-[rgba(255,255,255,0.12)] text-text2 hover:bg-bg2 hover:text-text transition-all cursor-pointer">
-            取消
-          </button>
-          <button onClick={onClose} className="px-4.5 py-2 rounded-lg text-xs font-semibold bg-green text-black hover:opacity-85 transition-all cursor-pointer">
-            先回测，再部署
+            关闭
           </button>
         </div>
       </div>
