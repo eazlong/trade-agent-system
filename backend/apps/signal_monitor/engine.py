@@ -500,13 +500,18 @@ class SignalMonitorEngine:
         """从交易所获取实时价格"""
         try:
             import ccxt
+            from django.conf import settings
 
             # 解析交易对
             base, quote = symbol.split("/")
             ccxt_symbol = f"{base}/{quote}"
 
             # 创建交易所实例（使用公开接口，不需要认证）
-            exchange = ccxt.binance({"enableRateLimit": True})
+            options: dict[str, Any] = {"enableRateLimit": True}
+            proxy_url = getattr(settings, "WEB_PROXY", "") or ""
+            if proxy_url:
+                options["proxies"] = {"http": proxy_url, "https": proxy_url}
+            exchange = ccxt.binance(options)
             ticker = exchange.fetch_ticker(ccxt_symbol)
             price = ticker.get("last")
             if price:
@@ -522,11 +527,16 @@ class SignalMonitorEngine:
         """从交易所获取最近的 K 线数据"""
         try:
             import ccxt
+            from django.conf import settings
 
             base, quote = symbol.split("/")
             ccxt_symbol = f"{base}/{quote}"
 
-            exchange = ccxt.binance({"enableRateLimit": True})
+            options: dict[str, Any] = {"enableRateLimit": True}
+            proxy_url = getattr(settings, "WEB_PROXY", "") or ""
+            if proxy_url:
+                options["proxies"] = {"http": proxy_url, "https": proxy_url}
+            exchange = ccxt.binance(options)
 
             # ccxt 时间框架映射
             tf_map = {

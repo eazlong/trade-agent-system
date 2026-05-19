@@ -35,6 +35,7 @@ class SignalMonitor(models.Model):
         ("notify", "发送通知"),
         ("trade", "执行交易"),
         ("notify_and_trade", "通知并交易"),
+        ("validate_strategy", "策略验证"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -88,6 +89,20 @@ class SignalMonitor(models.Model):
         blank=True,
         related_name="signal_monitors",
         verbose_name="关联回测",
+    )
+
+    # 策略关联（当 action_type 为 validate_strategy 时使用）
+    strategy_name = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        verbose_name="策略名称",
+    )
+    live_session_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="实盘会话 ID",
     )
 
     # 时间

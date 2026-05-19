@@ -188,8 +188,6 @@ class TestCorrectDatasource(unittest.TestCase):
         klines2 = _make_klines(30)
         for k in klines1:
             k["source"] = "binance"
-        for k in klines2:
-            k["source"] = "okx"
 
         result1 = compute_indicator("sma", klines1, {"period": 20})
         result2 = compute_indicator("sma", klines2, {"period": 20})

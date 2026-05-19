@@ -4,6 +4,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 import redis
 
@@ -375,7 +376,10 @@ class FrameManager:
 
         # 2. 根据活跃信号监控自动订阅对应的 K 线数据
         try:
-            monitors = self._get_active_signal_monitors()
+            monitors = await self._get_active_signal_monitors()
+            logger.info(
+                "[FrameManager] signal monitors to subscribe: %d", len(monitors)
+            )
             for monitor in monitors:
                 await self.subscribe_signal_klines(
                     symbol=monitor.symbol,
@@ -438,16 +442,24 @@ class FrameManager:
         self._persist_frame_state()
         logger.info("[FrameManager] data feed stopped")
 
-    def _get_active_signal_monitors(self) -> list:
-        """获取活跃的信号监控列表（同步，不依赖异步）。"""
+    async def _get_active_signal_monitors(self) -> list:
+        """获取活跃的信号监控列表。"""
         try:
             from apps.signal_monitor.models import SignalMonitor
             from django.utils import timezone
 
-            monitors = list(SignalMonitor.objects.filter(status="active"))
-            now = timezone.now()
-            return [m for m in monitors if not m.expires_at or m.expires_at > now]
-        except Exception:
+            @sync_to_async
+            def _query():
+                monitors = list(SignalMonitor.objects.filter(status="active"))
+                now = timezone.now()
+                return [m for m in monitors if not m.expires_at or m.expires_at > now]
+
+            return await _query()
+        except Exception as e:
+            logger.warning(
+                "[FrameManager] failed to get active signal monitors: %s: %s",
+                type(e).__name__, e,
+            )
             return []
 
     async def subscribe_signal_klines(
@@ -474,22 +486,38 @@ class FrameManager:
                 "[FrameManager] unknown interval %s, defaulting to 1h", interval_str
             )
 
-        for source_name in DataSourceRegistry.list_registered():
+        registered = DataSourceRegistry.list_registered()
+        if not registered:
+            logger.warning("[FrameManager] no data sources registered, cannot subscribe kline")
+            return
+
+        for source_name in registered:
             ds = DataSourceRegistry.get(source_name)
-            if ds.is_connected() and DataType.KLINE in ds.supported_data_types:
-                await ds.subscribe(
-                    symbol=symbol,
-                    data_type=DataType.KLINE,
-                    interval=interval,
-                    market_type=MarketType.SPOT,
-                    callback=lambda data, sym=symbol: self._on_kline_data(data, sym),
-                )
-                logger.info(
-                    "[FrameManager] subscribed %s kline %s @%s for signal monitor",
+            if not ds.is_connected():
+                logger.warning(
+                    "[FrameManager] data source %s not connected, skip kline subscribe",
                     source_name,
-                    symbol,
-                    interval.value,
                 )
+                continue
+            if DataType.KLINE not in ds.supported_data_types:
+                logger.warning(
+                    "[FrameManager] data source %s does not support KLINE, skip",
+                    source_name,
+                )
+                continue
+            await ds.subscribe(
+                symbol=symbol,
+                data_type=DataType.KLINE,
+                interval=interval,
+                market_type=MarketType.SPOT,
+                callback=lambda data, sym=symbol: self._on_kline_data(data, sym),
+            )
+            logger.info(
+                "[FrameManager] subscribed %s kline %s @%s for signal monitor",
+                source_name,
+                symbol,
+                interval.value,
+            )
 
     def _on_kline_data(self, kline: dict, symbol: str) -> None:
         """K 线数据回调：触发信号检查。"""
@@ -497,9 +525,8 @@ class FrameManager:
             from apps.signal_monitor.engine import SignalMonitorEngine
 
             engine = SignalMonitorEngine.get_instance()
-            # 构造一个临时对象以满足 _load_klines_for_monitors 的接口（只需 .symbol 属性）
             klines = engine._load_klines_for_monitors(
-                [type("_M", (), {"symbol": symbol})()]
+                [type("_M", (), {"symbol": symbol, "interval": "1h"})()]
             ).get(symbol, [])
             if len(klines) >= 2:
                 engine.check_signals_for_kline(symbol, klines)
@@ -536,29 +563,26 @@ class FrameManager:
 
         信号监控由 Celery Beat 每 30 秒定时驱动（check_signals 任务），
         同时 WebSocket 数据源的 K 线回调也会触发实时检查（_on_kline_data）。
-        此处主要验证 Celery Beat 是否运行并输出监控摘要。
+        启动时重新为所有活跃监控器订阅 K 线数据。
         """
-        from apps.signal_monitor.models import SignalMonitor
-        from django.utils import timezone
-        from asgiref.sync import sync_to_async
-
-        @sync_to_async
-        def _count_active_monitors():
-            now = timezone.now()
-            return (
-                SignalMonitor.objects.filter(
-                    status="active",
-                )
-                .exclude(
-                    expires_at__lt=now,
-                )
-                .count()
-            )
-
-        active_count = await _count_active_monitors()
+        monitors = await self._get_active_signal_monitors()
+        active_count = len(monitors)
         logger.info(
             "[FrameManager] signal monitor started: %d active monitors", active_count
         )
+
+        # 确保活跃的 signal monitor 都订阅了 WebSocket K 线数据
+        for monitor in monitors:
+            try:
+                await self.subscribe_signal_klines(
+                    symbol=monitor.symbol,
+                    interval_str=monitor.interval or "1h",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[FrameManager] signal monitor kline subscribe failed for %s: %s",
+                    monitor.symbol, e
+                )
 
     async def _stop_signal_monitor(self) -> None:
         logger.info("[FrameManager] signal monitor stopped")

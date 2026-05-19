@@ -194,6 +194,30 @@ def compute_stoch(
     return {"k": k_line, "d": d_line}
 
 
+def compute_donchian(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    period: int = 20,
+) -> dict[str, np.ndarray]:
+    """唐奇安通道 (Donchian Channel)
+
+    返回 {"upper": array, "lower": array}
+    - upper: N 周期最高价
+    - lower: N 周期最低价
+    """
+    n = len(highs)
+    upper = np.full(n, np.nan)
+    lower = np.full(n, np.nan)
+    if n < period:
+        return {"upper": upper, "lower": lower}
+
+    for i in range(period - 1, n):
+        upper[i] = np.max(highs[i - period + 1 : i + 1])
+        lower[i] = np.min(lows[i - period + 1 : i + 1])
+
+    return {"upper": upper, "lower": lower}
+
+
 def compute_price_watch(closes: np.ndarray, **kwargs) -> dict[str, float]:
     """价格监控：返回当前最新价格，用于简单的价格比较条件。"""
     if len(closes) == 0:
@@ -210,6 +234,7 @@ INDICATOR_REGISTRY: dict[str, Any] = {
     "bollinger": compute_bollinger,
     "atr": compute_atr,
     "stoch": compute_stoch,
+    "donchian": compute_donchian,
     "price_watch": compute_price_watch,
 }
 
@@ -255,6 +280,11 @@ def compute_indicator(
         highs = np.array([k["high"] for k in klines], dtype=np.float64)
         lows = np.array([k["low"] for k in klines], dtype=np.float64)
         return func(highs, lows, closes, **params)
+
+    if indicator_type == "donchian":
+        highs = np.array([k["high"] for k in klines], dtype=np.float64)
+        lows = np.array([k["low"] for k in klines], dtype=np.float64)
+        return func(highs, lows, **params)
 
     if indicator_type == "price_watch":
         return func(closes)
