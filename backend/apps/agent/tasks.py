@@ -233,7 +233,8 @@ def archive_task_progress(
 
 
 # ---------------------------------------------------------------------------
-# Task health check — centralized heartbeat & zombie detection
+# Task health check — centralized zombie detection, heartbeat, and auto-retry
+# This is the SOLE zombie detection mechanism for all task types.
 # ---------------------------------------------------------------------------
 
 
@@ -261,10 +262,12 @@ def check_task_health(self) -> dict:
         user_id = data.get("user_id", "")
         updated_str = data.get("updated_at", "")
         last_hb_str = data.get("last_heartbeat", "")
+        last_alive_str = data.get("last_alive", "")
 
         try:
             updated = datetime.fromisoformat(updated_str) if updated_str else None
             last_hb = datetime.fromisoformat(last_hb_str) if last_hb_str else None
+            last_alive = datetime.fromisoformat(last_alive_str) if last_alive_str else None
         except ValueError:
             continue
 
@@ -272,6 +275,12 @@ def check_task_health(self) -> dict:
             continue
 
         age = (datetime.now(timezone.utc) - updated).total_seconds()
+        # 取 updated_at 和 last_alive 中较新的时间戳判定僵尸
+        # last_alive 由 tracker.alive() 在工具执行后显式更新，比 updated_at 更精确
+        alive_age = None
+        if last_alive:
+            alive_age = (datetime.now(timezone.utc) - last_alive).total_seconds()
+            age = min(age, alive_age)
 
         if age > _ZOMBIE_TIMEOUT:
             zombie_ids.append((task_id, user_id, age))
@@ -323,7 +332,16 @@ def _handle_zombie_task(
     short_id = task_id[:8]
     age_str = f"{int(age)}秒"
 
-    if retry_count < max_retries and original_task_str:
+    # original_task 缺失：无法重试，直接标记僵尸并通知用户
+    if not original_task_str:
+        r.hset(redis_key, "status", "zombie")
+        _send_notification_redis(
+            user_id,
+            f"任务 #{short_id} 异常中断，请重新发送指令",
+        )
+        return
+
+    if retry_count < max_retries:
         # 自动重试
         try:
             original_task = json.loads(original_task_str)
@@ -440,3 +458,45 @@ def _send_heartbeat_notification(
     if progress > 0:
         parts.append(f"进度：{int(progress * 100)}%")
     _send_notification_redis(user_id, "\n".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Session expiry check — warns users before multi-turn sessions expire
+# ---------------------------------------------------------------------------
+
+_SESSION_WARN_BEFORE = 300  # warn when session TTL drops below this (seconds)
+
+
+@app.task(bind=True)
+def check_session_expiry(self) -> dict:
+    """扫描 session:*:context，对即将过期的 multi_turn 会话发提醒。"""
+    import json
+    import time
+    import redis
+    from django.conf import settings
+    from apps.agent.task_tracker import _send_notification_redis
+
+    url = settings.REDIS_URL
+    r = redis.from_url(url, decode_responses=True)
+    warned = 0
+    for key in r.scan_iter("session:*:context"):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not data or data.get("state") != "multi_turn":
+            continue
+        expires_at = data.get("expires_at", 0)
+        remaining = expires_at - time.time()
+        if 0 < remaining < _SESSION_WARN_BEFORE:
+            user_id = key.split(":")[1]
+            _send_notification_redis(
+                user_id,
+                f"会话即将过期（{int(remaining)}秒）\n请继续对话以保持会话",
+            )
+            warned += 1
+
+    return {"warned": warned}

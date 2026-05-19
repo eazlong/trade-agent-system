@@ -24,7 +24,7 @@ django_asgi_app = get_asgi_application()
 _consumer = None
 _telegram_channel = None
 _progress_listener_task = None
-_watchdog = None
+_dlq_consumer = None
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +82,7 @@ class LifespanHandler:
         pass
 
     async def __call__(self, scope, receive, send):
-        global _consumer, _telegram_channel, _progress_listener_task, _watchdog
+        global _consumer, _telegram_channel, _progress_listener_task, _dlq_consumer
 
         # 确保 scope 类型是 lifespan
         assert scope["type"] == "lifespan"
@@ -103,12 +103,12 @@ class LifespanHandler:
                         # 恢复并自动重启之前运行的框架
                         await self._restore_frames()
 
-                        # 启动 SessionWatchdog
-                        from apps.agent.session_watchdog import SessionWatchdog
+                        # 启动 DeadLetterConsumer
+                        from apps.agent.dlq_consumer import DeadLetterConsumer
 
-                        _watchdog = SessionWatchdog()
-                        await _watchdog.start()
-                        logger.info("[ASGI] SessionWatchdog started")
+                        _dlq_consumer = DeadLetterConsumer(block_ms=10000)
+                        await _dlq_consumer.start()
+                        logger.info("[ASGI] DeadLetterConsumer started")
 
                         # 启动 TelegramChannel
                         await self._start_telegram_channel()
@@ -141,10 +141,10 @@ class LifespanHandler:
                             await _telegram_channel.stop()
                             logger.info("[ASGI] TelegramChannel stopped")
 
-                        # 停止 SessionWatchdog
-                        if _watchdog:
-                            await _watchdog.stop()
-                            logger.info("[ASGI] SessionWatchdog stopped")
+                        # 停止 DeadLetterConsumer
+                        if _dlq_consumer:
+                            await _dlq_consumer.stop()
+                            logger.info("[ASGI] DeadLetterConsumer stopped")
 
                         # 停止 AgentTaskConsumer
                         if _consumer:
