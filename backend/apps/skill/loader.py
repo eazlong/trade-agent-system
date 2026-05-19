@@ -32,18 +32,6 @@ class SkillMetadata:
 
 
 class AgentSkillsLoader:
-    """
-    Loader for agent SKILL.md files.
-
-    Searches two skill directories (agent-specific shadows global):
-    - Global shared skills:  ~/.tradelogx/skills/{skill_name}/SKILL.md
-    - Agent-specific skills: ~/.tradelogx/workspace/{agent_name}/skills/{skill_name}/SKILL.md
-
-    Supports progressive loading:
-    - list_skills()     → brief summary for selection
-    - load_skill()      → full content for context injection
-    - build_summary()   → XML block for system prompt
-    """
 
     def __init__(self, agent_name: str = "", search_root: Path | None = None):
         self.agent_name = agent_name
@@ -57,10 +45,7 @@ class AgentSkillsLoader:
             self.agent_skills_dir = (
                 WORKSPACE_ROOT / agent_name / "skills" if agent_name else None
             )
-
-    # ------------------------------------------------------------------ #
     #  Directory helpers                                                   #
-    # ------------------------------------------------------------------ #
 
     def _iter_skill_dirs(self) -> list[tuple[Path, str]]:
         """
@@ -83,10 +68,7 @@ class AgentSkillsLoader:
                     seen[skill_dir.name] = (skill_dir, "agent")
 
         return list(seen.values())
-
-    # ------------------------------------------------------------------ #
     #  Public API                                                          #
-    # ------------------------------------------------------------------ #
 
     def list_skills(self) -> list[dict[str, Any]]:
         """
@@ -213,10 +195,7 @@ class AgentSkillsLoader:
                 if meta.extra.get("always"):
                     result.append(s["name"])
         return result
-
-    # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
-    # ------------------------------------------------------------------ #
 
     def _format_skill_block(self, name: str, content: str) -> str:
         """Strip frontmatter and wrap in a named section."""
@@ -329,19 +308,6 @@ _loader_cache: dict[str, AgentSkillsLoader] = {}
 
 
 def get_skills_loader(agent_name: str = "") -> AgentSkillsLoader:
-    """
-    Get an AgentSkillsLoader for the given agent.
-
-    Each agent gets its own loader instance that searches both:
-    - ~/.tradelogx/skills/             (global shared skills)
-    - ~/.tradelogx/workspace/{agent}/skills/  (agent-specific skills)
-
-    Args:
-        agent_name: Agent name for agent-specific skill lookup.
-
-    Returns:
-        Cached AgentSkillsLoader instance.
-    """
     if agent_name not in _loader_cache:
         _loader_cache[agent_name] = AgentSkillsLoader(agent_name=agent_name)
     return _loader_cache[agent_name]
