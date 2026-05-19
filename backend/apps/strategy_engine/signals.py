@@ -92,6 +92,8 @@ class SignalDispatcher:
         """
         from apps.riskguard.guard import RiskGuard
 
+        logger.info(f"[SignalDispatcher] dispatching {signal.signal_name} {symbol} side={signal.side} qty={signal.quantity}")
+
         riskguard = RiskGuard.get_instance()
         if riskguard:
             from apps.trading.adapters.base import OrderRequest

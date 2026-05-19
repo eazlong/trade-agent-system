@@ -20,18 +20,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 默认手续费率
-DEFAULT_COMMISSION_RATE = Decimal("0.001")  # 0.1%
+DEFAULT_COMMISSION_RATE = Decimal("0.001")
 
 
 def _parse_dt(value: str | None) -> datetime | None:
-    """将 ISO 时间字符串转为 timezone-aware datetime"""
     if not value or not isinstance(value, str):
         return None
     dt = datetime.fromisoformat(value)
-    if timezone.is_aware(dt):
-        return dt
-    return timezone.make_aware(dt)
+    return dt if timezone.is_aware(dt) else timezone.make_aware(dt)
 
 
 class BacktestEngine:
@@ -415,17 +411,11 @@ class BacktestEngine:
 
 
 async def _resolve_strategy_id(strategy_name: str) -> str | None:
-    """根据策略名称查找或创建 Strategy 模型，返回 UUID 字符串。
-
-    会先将用户提交的策略名解析为注册中心的标准名，避免用户提交
-    非标准名（如类名）时创建出与 create 时不一致的 Strategy 记录。
-    """
     from asgiref.sync import sync_to_async
     from apps.trading.models import Strategy
     from apps.strategy_engine.registry import StrategyRegistry
 
-    # 解析为标准名（如 "TurtleStrategy" → "turtle_strategy"）
-    canonical = StrategyRegistry._resolve_name(strategy_name) or strategy_name
+    canonical = strategy_name
 
     @sync_to_async
     def _get_or_create():
@@ -480,15 +470,6 @@ def create_empty_result(
     parameters: dict,
     user_id: str | None = None,
 ) -> str | None:
-    """
-    提前创建空的回测结果记录，供前端实时展示运行状态。
-
-    Sync version — call directly from Celery tasks or other sync code.
-    For async callers, use `create_empty_result_async` instead.
-
-    Returns:
-        BacktestResult UUID 字符串，失败时返回 None
-    """
     from apps.backtest.models import BacktestResult
     from apps.trading.models import Strategy
 

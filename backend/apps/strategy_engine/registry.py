@@ -1,5 +1,5 @@
 """
-策略注册中心
+策略注册中心（MVP 精简版）
 
 复用 AgentRegistry 的装饰器注册模式。
 策略类使用 @register_strategy 装饰器自动注册。
@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -22,14 +21,10 @@ class StrategyRegistry:
 
     _instance: StrategyRegistry | None = None
     _strategies: dict[str, type[BaseStrategy]] = {}
-    _class_name_index: dict[str, str] = {}  # lower-case class name → registered name
     _strategy_path: str = ""
-    _initialized = False
-    _last_discover_time: float = 0.0
 
     def __init__(self):
-        if not self._initialized:
-            self._initialized = True
+        pass
 
     @classmethod
     def get_instance(cls) -> "StrategyRegistry":
@@ -42,77 +37,22 @@ class StrategyRegistry:
         """装饰器：注册策略类"""
         name = strategy_cls.name
         if name in cls._strategies:
-            logger.warning(
-                "Strategy '%s' already registered, overwriting with %s",
-                name,
-                strategy_cls.__name__,
-            )
+            logger.warning("Strategy '%s' already registered, overwriting", name)
         cls._strategies[name] = strategy_cls
-        # Also index by lower-case class name for fuzzy lookup
-        cls._class_name_index[strategy_cls.__name__.lower()] = name
-        logger.info("Strategy registered: %s (%s)", name, strategy_cls.__name__)
+        logger.info("Strategy registered: %s", name)
         return strategy_cls
 
     @classmethod
-    def _resolve_name(cls, name: str) -> str:
-        """Resolve a strategy name with fuzzy matching.
-
-        Tries exact match → lower-case registered name → lower-case class name.
-        Returns the canonical registered name, or '' if not found.
-        """
-        # 1. Exact match on registered name
-        if name in cls._strategies:
-            return name
-
-        # 2. Case-insensitive match on registered names
-        name_lower = name.lower()
-        for registered in cls._strategies:
-            if registered.lower() == name_lower:
-                return registered
-
-        # 3. Match by class name (e.g. "TurtleStrategy" → "turtle_strategy")
-        if name_lower in cls._class_name_index:
-            return cls._class_name_index[name_lower]
-
-        return ""
-
-    @classmethod
-    def _lazy_discover(cls) -> None:
-        """如果策略路径已设置，尝试重新发现（处理启动后新增策略文件的场景）。
-
-        内置 30 秒节流，避免每次查不到都触发全量扫描。"""
-        import os
-        import time
-
-        if not cls._strategy_path or not os.path.isdir(cls._strategy_path):
-            return
-        now = time.monotonic()
-        if now - cls._last_discover_time < 30:
-            return
-        cls._last_discover_time = now
-        cls.discover()
-
-    @classmethod
-    def get(cls, name: str) -> "BaseStrategy":
-        """获取策略实例（通过 StrategyLoader 加载后实例化）"""
-        resolved = cls._resolve_name(name)
-        if not resolved:
-            cls._lazy_discover()
-            resolved = cls._resolve_name(name)
-        if not resolved:
+    def get(cls, name: str) -> type["BaseStrategy"]:
+        """获取策略类（精确匹配）"""
+        if name not in cls._strategies:
             raise ValueError(f"Strategy not found: {name!r}")
-        return cls._strategies[resolved]
+        return cls._strategies[name]
 
     @classmethod
     def get_class(cls, name: str) -> type["BaseStrategy"]:
-        """获取策略类，支持按注册名、类名（大小写不敏感）查找"""
-        resolved = cls._resolve_name(name)
-        if not resolved:
-            cls._lazy_discover()
-            resolved = cls._resolve_name(name)
-        if not resolved:
-            raise ValueError(f"Strategy not found: {name!r}")
-        return cls._strategies[resolved]
+        """别名：获取策略类（兼容旧调用）"""
+        return cls.get(name)
 
     @classmethod
     def list_registered(cls) -> list[str]:
@@ -120,82 +60,43 @@ class StrategyRegistry:
 
     @classmethod
     def set_strategy_path(cls, path: str) -> None:
-        """设置策略文件目录路径"""
+        """设置策略文件目录"""
         cls._strategy_path = path
 
     @classmethod
     def discover(cls) -> list[str]:
         """自动发现并注册策略模块"""
+        import os, sys, importlib
+        from .base import BaseStrategy
         path = cls._strategy_path
-        if not path:
+        if not path or not os.path.isdir(path):
             return cls.list_registered()
-        return cls.discover_path(path)
-
-    @classmethod
-    def discover_path(cls, path: str) -> list[str]:
-        """扫描指定目录，发现并注册策略模块"""
-        import os
-        import sys
-
-        if not path:
-            return cls.list_registered()
-
-        if not os.path.isdir(path):
-            logger.warning("Strategy path does not exist: %s", path)
-            return cls.list_registered()
-
         discovered = []
         for filename in os.listdir(path):
             if filename.endswith(".py") and not filename.startswith("_"):
                 module_name = filename[:-3]
                 try:
-                    # 确保路径在 sys.path 中
                     if path not in sys.path:
                         sys.path.insert(0, path)
-
-                    # 避免缓存：如果模块已加载，先删除以便重新加载
                     if module_name in sys.modules:
                         del sys.modules[module_name]
-
                     mod = importlib.import_module(module_name)
-                    # 触发装饰器注册
                     for attr_name in dir(mod):
                         attr = getattr(mod, attr_name)
-                        if (
-                            isinstance(attr, type)
-                            and hasattr(attr, "name")
-                            and getattr(attr, "__module__", "") == module_name
-                        ):
-                            from .base import BaseStrategy
-
-                            if (
-                                issubclass(attr, BaseStrategy)
-                                and attr is not BaseStrategy
-                            ):
-                                cls.register(attr)
-                                discovered.append(attr.name)
+                        if (isinstance(attr, type) and hasattr(attr, "name")
+                                and getattr(attr, "__module__", "") == module_name
+                                and issubclass(attr, BaseStrategy) and attr is not BaseStrategy):
+                            cls.register(attr)
+                            discovered.append(attr.name)
                 except Exception as e:
                     logger.warning("Failed to discover strategy %s: %s", module_name, e)
-
         return discovered
 
 
 def register_strategy(
     name: str | None = None,
 ) -> callable:
-    """装饰器：注册策略类
-
-    用法:
-        @register_strategy
-        class MyStrategy(BaseStrategy):
-            name = "my_strategy"
-            ...
-
-        @register_strategy(name="custom_name")
-        class MyStrategy(BaseStrategy):
-            name = "my_strategy"  # will be overridden
-            ...
-    """
+    """装饰器：注册策略类"""
 
     def decorator(target):
         StrategyRegistry.register(target)
@@ -205,5 +106,5 @@ def register_strategy(
 
 
 def get_strategy(name: str):
-    """便捷函数：获取策略实例的类（需要由调用方传入 context 实例化）"""
-    return StrategyRegistry.get_class(name)
+    """便捷函数：获取策略类"""
+    return StrategyRegistry.get(name)

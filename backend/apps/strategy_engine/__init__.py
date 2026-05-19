@@ -28,12 +28,7 @@ from .risk import (
     StopLossRisk,
     TotalExposureRisk,
 )
-from .universe import (
-    BaseUniverseModel,
-    FixedListUniverse,
-    HybridUniverse,
-    VolumeTopUniverse,
-)
+from .universe import BaseUniverseModel, FixedListUniverse
 
 __all__ = [
     # 基础数据结构
@@ -50,8 +45,6 @@ __all__ = [
     # Phase 2: Universe
     "BaseUniverseModel",
     "FixedListUniverse",
-    "HybridUniverse",
-    "VolumeTopUniverse",
     # Phase 2: Portfolio
     "BasePortfolioModel",
     "ConfidenceWeightedPortfolio",

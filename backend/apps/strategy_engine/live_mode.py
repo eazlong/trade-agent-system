@@ -20,14 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 class LiveStrategyRunner:
-    """
-    实盘策略运行器：订阅 K 线 → 执行策略 → 分发信号
-
-    生命周期：
-    1. start() → 加载策略、订阅 K 线
-    2. _on_kline() → 每根 K 线回调调用 strategy.on_bar()
-    3. stop() → 停止策略、取消订阅
-    """
 
     def __init__(
         self,
@@ -114,6 +106,8 @@ class LiveStrategyRunner:
         """
         if not self._running:
             return
+
+        logger.info(f"[LiveStrategy] on_kline: {self.symbol} close={kline.get('close')}")
 
         # 更新历史
         self._kline_history.append(kline)
