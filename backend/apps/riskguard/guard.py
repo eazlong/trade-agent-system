@@ -88,26 +88,33 @@ class RiskGuard:
         3. 仓位上限
         4. 日内回撤
         """
+        logger.info(f"[RiskGuard] pre_trade_check: {request.symbol} {request.side}")
+
         if not user_id:
             return True, "OK"
 
         # 1. 熔断器检查
         if await self._is_circuit_open(user_id):
+            logger.warning(f"[RiskGuard] REJECTED: 熔断器触发，今日禁止交易")
             return False, "熔断器触发，今日禁止交易"
 
         # 2. 日内交易次数
         daily_count = await self._get_daily_trade_count(user_id)
         if daily_count >= self.MAX_DAILY_TRADES:
-            return False, f"日内交易次数已达上限 {self.MAX_DAILY_TRADES}"
+            reason = f"日内交易次数已达上限 {self.MAX_DAILY_TRADES}"
+            logger.warning(f"[RiskGuard] REJECTED: {reason}")
+            return False, reason
 
         # 3. 仓位上限
         position_ok, reason = await self._check_position_limit(request, user_id)
         if not position_ok:
+            logger.warning(f"[RiskGuard] REJECTED: {reason}")
             return False, reason
 
         # 4. 日内回撤
         drawdown_ok, reason = await self._check_drawdown(user_id)
         if not drawdown_ok:
+            logger.warning(f"[RiskGuard] REJECTED: {reason}")
             return False, reason
 
         return True, "OK"
@@ -187,7 +194,8 @@ class RiskGuard:
         """
         日内已实现回撤检查。
         对比期初净值（从 daily_account_snapshot 表读取）。
-        简化：若当日亏损超过初始资金的5%，禁止交易。
+        若当日亏损超过初始资金的5%，禁止交易。
+        若无法获取数据，保守策略返回拒绝。
         """
         from django.db.models import Sum
         from django.utils import timezone
@@ -203,35 +211,44 @@ class RiskGuard:
                 status="filled",
                 created_at__date=today,
             ).aggregate(total_pnl=Sum("realized_pnl"))
-            return result["total_pnl"] or Decimal("0")
+            return result["total_pnl"]
 
         @sync_to_async
         def get_initial_balance():
             """从 daily_account_snapshot 读取期初余额"""
-            try:
-                from apps.trading.models import DailySnapshot
+            from apps.trading.models import DailySnapshot
 
-                snap = (
-                    DailySnapshot.objects.filter(
-                        user_id=user_id,
-                        date__lt=today,
-                    )
-                    .order_by("-date")
-                    .first()
+            snap = (
+                DailySnapshot.objects.filter(
+                    user_id=user_id,
+                    date__lt=today,
                 )
-                if snap:
-                    return snap.total_equity
-            except Exception:
-                pass
+                .order_by("-date")
+                .first()
+            )
+            if snap:
+                return snap.total_equity
             return None
 
-        pnl = await get_today_pnl()
+        try:
+            pnl = await get_today_pnl()
+        except Exception:
+            return False, "无法获取当日已实现盈亏数据"
+
+        # 无已成交订单，视作无亏损
+        if pnl is None:
+            pnl = Decimal("0")
+
         if pnl >= 0:
             return True, ""
 
-        initial = await get_initial_balance()
+        try:
+            initial = await get_initial_balance()
+        except Exception:
+            return False, "无法获取期初资金数据"
+
         if initial is None or initial == 0:
-            return True, ""
+            return False, "无法获取期初资金数据"
 
         drawdown = abs(pnl) / initial
         if drawdown > self.MAX_DAILY_DRAWDOWN:
