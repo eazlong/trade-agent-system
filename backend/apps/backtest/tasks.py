@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from celery_app import app
@@ -27,7 +27,10 @@ def run_backtest_task(
     parameters: dict | None = None,
     strategy_id: str | None = None,
     exchange: str = "binance",
+    start_date: str = "",
+    end_date: str = "",
     user_id: str | None = None,
+    result_id: str | None = None,
 ) -> dict:
     """
     异步执行策略回测。
@@ -41,7 +44,10 @@ def run_backtest_task(
         parameters: 策略参数
         strategy_id: Strategy 模型 UUID（用于关联回测结果）
         exchange: 交易所
+        start_date: 回测开始日期（ISO 格式，如 2024-01-01），空字符串表示不限
+        end_date: 回测结束日期（ISO 格式，如 2024-12-31），空字符串表示不限
         user_id: 发起回测的用户 ID
+        result_id: BacktestResult UUID（如果已提前创建占位记录）
 
     Returns:
         回测统计结果
@@ -61,13 +67,49 @@ def run_backtest_task(
         f"tf={timeframe} exchange={exchange}"
     )
 
+    # Create placeholder BacktestResult so the UI shows the task immediately.
+    # If result_id was already provided (e.g. from the REST create endpoint),
+    # skip creating a duplicate.
+    if not result_id:
+        try:
+            from apps.strategy_engine.backtest_mode import create_empty_result
+            from apps.strategy_engine.backtest_mode import (
+                _resolve_strategy_id as _resolve_sid,
+            )
+            import asyncio as _aio
+
+            _sid = strategy_id or _aio.run(_resolve_sid(strategy_name))
+            if _sid:
+                _s = start_date or (date.today() - timedelta(days=30)).isoformat()
+                _e = end_date or date.today().isoformat()
+                result_id = create_empty_result(
+                    strategy_id=_sid,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_date=_s,
+                    end_date=_e,
+                    initial_capital=initial_capital,
+                    parameters=parameters or {},
+                    user_id=user_id,
+                )
+                strategy_id = _sid
+                logger.info(
+                    f"[BacktestTask] created placeholder result_id=%s", result_id
+                )
+        except Exception:
+            logger.warning(
+                "[BacktestTask] failed to create placeholder result", exc_info=True
+            )
+
     try:
         # 1. 获取历史 OHLCV 数据
         tracker.milestone("正在获取历史K线数据...", progress=0.1)
         self.update_state(
             state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
         )
-        ohlcv_data = _fetch_ohlcv_sync(symbol, timeframe, exchange)
+        ohlcv_data = _fetch_ohlcv_sync(
+            symbol, timeframe, exchange, start_date=start_date, end_date=end_date
+        )
         if not ohlcv_data:
             tracker.fail(f"未能获取 {symbol} {timeframe} 的历史K线数据")
             raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
@@ -95,6 +137,7 @@ def run_backtest_task(
                     parameters=parameters,
                     strategy_id=strategy_id,
                     commission_rate=Decimal(str(commission_rate)),
+                    result_id=result_id,
                 )
             )
         finally:
@@ -119,7 +162,9 @@ def _fetch_ohlcv_sync(
     symbol: str,
     timeframe: str,
     exchange: str = "binance",
-    limit: int = 500,
+    limit: int = 1000,
+    start_date: str = "",
+    end_date: str = "",
 ) -> list[dict]:
     """同步获取历史 OHLCV 数据（供 Celery task 使用）"""
     import ccxt.async_support as ccxt
@@ -128,6 +173,20 @@ def _fetch_ohlcv_sync(
     symbol_normalized = symbol.replace("-", "/").replace("_", "/")
     if "/" not in symbol_normalized:
         symbol_normalized = f"{symbol_normalized}/USDT"
+
+    since_ms: int | None = None
+    end_ms: int | None = None
+
+    if start_date:
+        try:
+            since_ms = int(datetime.fromisoformat(start_date).timestamp() * 1000)
+        except (ValueError, TypeError):
+            logger.warning(f"[BacktestTask] invalid start_date={start_date}, ignoring")
+    if end_date:
+        try:
+            end_ms = int(datetime.fromisoformat(end_date).timestamp() * 1000)
+        except (ValueError, TypeError):
+            logger.warning(f"[BacktestTask] invalid end_date={end_date}, ignoring")
 
     async def _fetch():
         exchange_class = getattr(ccxt, exchange.lower(), None)
@@ -142,7 +201,9 @@ def _fetch_ohlcv_sync(
 
         ex = exchange_class(options)
         try:
-            ohlcv = await ex.fetch_ohlcv(symbol_normalized, timeframe, limit=limit)
+            ohlcv = await ex.fetch_ohlcv(
+                symbol_normalized, timeframe, since=since_ms, limit=limit
+            )
         finally:
             await ex.close()
 
@@ -152,9 +213,13 @@ def _fetch_ohlcv_sync(
 
         result = []
         for candle in ohlcv:
+            ts_ms = int(candle[0])
+            # Filter by end_date
+            if end_ms is not None and ts_ms > end_ms:
+                continue
             result.append(
                 {
-                    "timestamp": datetime.fromtimestamp(candle[0] / 1000).isoformat(),
+                    "timestamp": datetime.fromtimestamp(ts_ms / 1000).isoformat(),
                     "open": float(candle[1]),
                     "high": float(candle[2]),
                     "low": float(candle[3]),
