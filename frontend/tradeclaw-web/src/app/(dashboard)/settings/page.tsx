@@ -1052,6 +1052,42 @@ function AddMonitorForm({ onClose, onAdded }: AddMonitorFormProps) {
   );
 }
 
+// ── Memory utility functions ──
+
+function memoryAgentTypeColor(type: string): string {
+  switch (type) {
+    case "user":
+      return "bg-green-dim text-green";
+    case "strategy":
+      return "bg-blue-dim text-blue";
+    case "risk":
+      return "bg-amber-dim text-amber";
+    default:
+      return "bg-text3/20 text-text3";
+  }
+}
+
+function memoryTruncatedContent(content: string): string {
+  const lines = content.split("\n").slice(0, 3).join("\n");
+  return lines.length > 200 ? lines.slice(0, 200) + "..." : lines;
+}
+
+function memoryTitle(content: string): string {
+  const firstLine = content.split("\n")[0];
+  return firstLine.length > 80 ? firstLine.slice(0, 80) + "..." : firstLine;
+}
+
+function memoryFormattedDate(dateStr: string): string {
+  if (!dateStr) return "—";
+  return new Date(dateStr).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 interface MemoryListProps {
   memories: Memory[];
   loading: boolean;
@@ -1059,39 +1095,6 @@ interface MemoryListProps {
 }
 
 function MemoryList({ memories, loading, onDelete }: MemoryListProps) {
-  const getAgentTypeColor = (type: string) => {
-    switch (type) {
-      case "user":
-        return "bg-green-dim text-green";
-      case "strategy":
-        return "bg-blue-dim text-blue";
-      case "risk":
-        return "bg-amber-dim text-amber";
-      default:
-        return "bg-text3/20 text-text3";
-    }
-  };
-
-  const getTruncatedContent = (content: string): string => {
-    const lines = content.split("\n").slice(0, 3).join("\n");
-    return lines.length > 200 ? lines.slice(0, 200) + "..." : lines;
-  };
-
-  const getTitle = (content: string): string => {
-    const firstLine = content.split("\n")[0];
-    return firstLine.length > 80 ? firstLine.slice(0, 80) + "..." : firstLine;
-  };
-
-  const formatDate = (dateStr: string): string => {
-    return new Date(dateStr).toLocaleString("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  };
-
   if (loading) {
     return (
       <div className="p-5 flex flex-col gap-4">
@@ -1123,10 +1126,6 @@ function MemoryList({ memories, loading, onDelete }: MemoryListProps) {
             key={mem.id}
             memory={mem}
             onDelete={onDelete}
-            getAgentTypeColor={getAgentTypeColor}
-            getTruncatedContent={getTruncatedContent}
-            getTitle={getTitle}
-            formatDate={formatDate}
           />
         ))}
       </div>
@@ -1137,36 +1136,28 @@ function MemoryList({ memories, loading, onDelete }: MemoryListProps) {
 interface MemoryCardProps {
   memory: Memory;
   onDelete: (id: string) => void;
-  getAgentTypeColor: (type: string) => string;
-  getTruncatedContent: (content: string) => string;
-  getTitle: (content: string) => string;
-  formatDate: (dateStr: string) => string;
 }
 
 function MemoryCard({
   memory,
   onDelete,
-  getAgentTypeColor,
-  getTruncatedContent,
-  getTitle,
-  formatDate,
 }: MemoryCardProps) {
   const [expanded, setExpanded] = useState(false);
-  const content = expanded ? memory.content : getTruncatedContent(memory.content);
+  const content = expanded ? memory.content : memoryTruncatedContent(memory.content);
 
   return (
     <div className="bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg px-4 py-3">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <span
-            className={`text-[9px] px-1.5 py-0.5 rounded-sm font-semibold ${getAgentTypeColor(memory.agent_type)}`}
+            className={`text-[9px] px-1.5 py-0.5 rounded-sm font-semibold ${memoryAgentTypeColor(memory.agent_type)}`}
           >
             {memory.agent_type}
           </span>
-          <span className="text-xs font-semibold text-text">{getTitle(memory.content)}</span>
+          <span className="text-xs font-semibold text-text">{memoryTitle(memory.content)}</span>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-[9px] text-text3 font-mono">{formatDate(memory.created_at)}</span>
+          <span className="text-[9px] text-text3 font-mono">{memoryFormattedDate(memory.created_at)}</span>
           <button
             onClick={() => onDelete(memory.id)}
             className="text-[10px] text-red hover:opacity-80 cursor-pointer"
@@ -1175,7 +1166,7 @@ function MemoryCard({
           </button>
         </div>
       </div>
-      <div className="text-[10px] text-text2 line-clamp-3 whitespace-pre-wrap leading-relaxed">
+      <div className={`text-[10px] text-text2 whitespace-pre-wrap leading-relaxed ${!expanded ? "line-clamp-3" : ""}`}>
         {content}
       </div>
       <button
