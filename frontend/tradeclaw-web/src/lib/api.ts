@@ -679,3 +679,18 @@ export const signalMonitorApi = {
       { status: enabled ? "active" : "disabled" }
     ),
 };
+
+// ── Memory API ──
+
+export interface Memory {
+  id: string;
+  agent_type: string;
+  content: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export const memoryApi = {
+  list: () => request<Memory[]>("/api/memory/"),
+  delete: (id: string) => request<void>(`/api/memory/${id}/`, "DELETE"),
+};
