@@ -42,8 +42,12 @@ class _LLMAgent(BaseAgent):
         from apps.agent.tools.base import ToolRegistry
 
         if self._agent_tools:
+            seen = set()
             schemas = []
             for tool_name in self._agent_tools:
+                if tool_name in seen:
+                    continue
+                seen.add(tool_name)
                 tool = ToolRegistry.get(tool_name)
                 if tool:
                     schemas.append(tool.schema)
@@ -82,6 +86,10 @@ class _LLMAgent(BaseAgent):
         for item in recent_conv:
             if isinstance(item, dict):
                 role = item.get("role", "user")
+                # MemoryManager may store "agent" role entries (from supervisor),
+                # which DeepSeek/OpenAI don't accept — map to "assistant"
+                if role == "agent":
+                    role = "assistant"
                 text = item.get("text", "")
                 if text:
                     context_messages.append({"role": role, "content": text})
@@ -125,10 +133,29 @@ class _LLMAgent(BaseAgent):
             on_tool_result=on_tool_result,
         )
 
+        # 安全防护：如果 LLM 始终返回空内容，直接让 LLM 回复用户消息
         if is_fb:
             return AgentResult(
                 task_id=message.task_id, success=False, error="LLM暂时不可用"
             )
+
+        if not content or not content.strip():
+            logger.warning(
+                "[%s] _run_tool_loop returned empty content, "
+                "falling back to direct LLM reply for task_id=%s",
+                self.name, message.task_id,
+            )
+            content = await self._llm.chat(
+                system=system,
+                user=user_prompt,
+                max_tokens=2048,
+            )
+            if not content or not content.strip():
+                return AgentResult(
+                    task_id=message.task_id,
+                    success=False,
+                    error="Agent 未能生成有效回复",
+                )
 
         # 检查拒收信号
         rejection = self._check_rejection(content)
@@ -289,6 +316,8 @@ def _build_dynamic_agent_class(meta: dict) -> type:
     def make_init(self):
         _LLMAgent.__init__(self)
         self._agent_tools.extend(tools)
+        # Deduplicate: prompt-declared tools may overlap with class defaults
+        self._agent_tools = list(dict.fromkeys(self._agent_tools))
         self._context_fields = context_fields
 
     agent_cls = type(

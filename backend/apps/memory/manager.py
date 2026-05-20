@@ -56,6 +56,8 @@ class MemoryManager:
             od[key] = value
             if len(od) > _L1_MAX:
                 od.popitem(last=False)
+        logger.debug("[MEM] write_l1 | user=%s agent=%s | key=%s",
+                    self.user_id, self.agent_name, key)
 
     # ====== L2 写入 ======
     async def write_l2(
@@ -82,12 +84,16 @@ class MemoryManager:
             await self._redis.lpush(p_key, json.dumps(entry))
             await self._redis.ltrim(p_key, 0, 99)
             await self._redis.expire(p_key, 86400)
+            logger.debug("[MEM] write_l2 private | user=%s agent=%s | key=%s | content=%s",
+                        self.user_id, self.agent_name, p_key, content)
             # 共享记忆
             if shared:
                 s_key = MemoryKey.l2_shared(self.user_id)
                 await self._redis.lpush(s_key, json.dumps(entry))
                 await self._redis.ltrim(s_key, 0, 199)
                 await self._redis.expire(s_key, 86400)
+                logger.debug("[MEM] write_l2 shared | user=%s agent=%s | key=%s | content=%s",
+                            self.user_id, self.agent_name, s_key, content)
         except Exception as e:
             logger.warning("L2 write failed: %s", e)
 
@@ -98,23 +104,29 @@ class MemoryManager:
             from apps.agent.models import AgentMemory
             from asgiref.sync import sync_to_async
 
-            await sync_to_async(AgentMemory.objects.create)(
+            obj = await sync_to_async(AgentMemory.objects.create)(
                 agent_type=self.agent_type,
                 agent_name=self.agent_name,
                 user_id=self.user_id,
                 content=content,
                 metadata=metadata or {},
             )
+            logger.debug("[MEM] write_l3 | user=%s agent=%s | id=%s | content=%s",
+                        self.user_id, self.agent_name, obj.id, content)
         except Exception as e:
             logger.warning("L3 write failed: %s", e)
 
     # ====== 对话历史读写 ======
     async def save_conv_history(self, history: list) -> None:
         """保存对话历史到 L1 + L2 双写"""
-        # L1 write always proceeds; L2 skipped if Redis unavailable
         if self._redis is None:
             logger.debug("save_conv_history L2 skipped (Redis unavailable)")
             self.write_l1("conv_history", history)
+            logger.info(
+                "[MEM] save_conv_history L1 only | user=%s agent=%s | turns=%d | latest=%s",
+                self.user_id, self.agent_name, len(history),
+                history[-1] if history else "N/A",
+            )
             return
         try:
             self.write_l1("conv_history", history)
@@ -122,6 +134,11 @@ class MemoryManager:
                 MemoryKey.conv_history(self.user_id),
                 json.dumps(history),
                 ex=86400,
+            )
+            logger.debug(
+                "[MEM] save_conv_history L1+L2 | user=%s agent=%s | turns=%d | latest=%s",
+                self.user_id, self.agent_name, len(history),
+                history[-1] if history else "N/A",
             )
         except Exception as e:
             logger.debug("save_conv_history L2 failed, L1 still ok: %s", e)
@@ -134,7 +151,7 @@ class MemoryManager:
             with self._l1_lock:
                 conv = self._l1.get("conv_history")
                 if conv is not None:
-                    return conv[-max_turns * 2 :] if conv else []
+                    return await self._log_conv_history_result("L1", conv[-max_turns * 2 :])
 
             # L1 miss，读 L2
             if redis_available:
@@ -143,7 +160,7 @@ class MemoryManager:
                     if raw:
                         conv = json.loads(raw)
                         self.write_l1("conv_history", conv)  # 回填 L1
-                        return conv[-max_turns * 2 :] if conv else []
+                        return await self._log_conv_history_result("L2", conv[-max_turns * 2 :])
                 except Exception as e:
                     logger.debug("L2 conv read failed: %s", e)
 
@@ -154,14 +171,22 @@ class MemoryManager:
                     if raw:
                         conv = json.loads(raw)
                         self.write_l1("conv_history", conv)
-                        return conv[-max_turns * 2 :] if conv else []
+                        return await self._log_conv_history_result("L2(old_key)", conv[-max_turns * 2 :])
                 except Exception as e:
                     logger.debug("Old key conv read failed: %s", e)
 
-            return []
+            return await self._log_conv_history_result("MISS", [])
         except Exception as e:
             logger.debug("get_conv_history failed: %s", e)
             return []
+
+    async def _log_conv_history_result(self, source: str, conv: list) -> list:
+        """统一记录对话历史读取结果"""
+        logger.info(
+            "[MEM] get_conv_history | source=%s | user=%s agent=%s | turns=%d | history=%s",
+            source, self.user_id, self.agent_name, len(conv), conv,
+        )
+        return conv
 
     # ====== 检索 ======
     async def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
@@ -198,7 +223,12 @@ class MemoryManager:
 
         # P1-01: 按时间戳降序排序后截断
         results.sort(key=lambda r: r.get("ts", 0), reverse=True)
-        return results[:top_k]
+        final = results[:top_k]
+        logger.info(
+            "[MEM] retrieve | user=%s agent=%s | query=%s | found=%d/%d | results=%s",
+            self.user_id, self.agent_name, query, len(final), top_k, final,
+        )
+        return final
 
     async def _retrieve_l2_private(
         self,

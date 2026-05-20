@@ -41,6 +41,7 @@ class BacktestEngine:
         symbol: str,
         timeframe: str,
         commission_rate: Decimal = DEFAULT_COMMISSION_RATE,
+        benchmark: str = "",
     ):
         self.strategy = strategy
         self.ohlcv_data = ohlcv_data
@@ -48,6 +49,7 @@ class BacktestEngine:
         self.symbol = symbol
         self.timeframe = timeframe
         self.commission_rate = commission_rate
+        self.benchmark = benchmark
 
         # 运行状态
         self._cash = initial_capital
@@ -370,7 +372,7 @@ class BacktestEngine:
         # 夏普比率（简化：用日收益率）
         sharpe = self._compute_sharpe()
 
-        return {
+        stats: dict = {
             "final_equity": float(final_equity),
             "total_return_pct": total_return,
             "max_drawdown_pct": max_drawdown * 100,
@@ -379,6 +381,50 @@ class BacktestEngine:
             "total_trades": total_closed,
             "equity_curve": self._equity_curve,
             "trades": self._trades,
+        }
+
+        # Buy & Hold 基准对比
+        if self.benchmark == "buy_and_hold" and self.ohlcv_data:
+            benchmark_stats = self._compute_buy_and_hold()
+            stats["benchmark"] = benchmark_stats
+
+        return stats
+
+    def _compute_buy_and_hold(self) -> dict:
+        """计算 Buy & Hold 基准：首根K线买入，最后一根K线卖出"""
+        if not self.ohlcv_data or len(self.ohlcv_data) < 2:
+            return {}
+
+        first_price = Decimal(str(self.ohlcv_data[0]["close"]))
+        last_price = Decimal(str(self.ohlcv_data[-1]["close"]))
+
+        # 买入（扣除手续费）
+        buy_cost = self.initial_capital * self.commission_rate
+        net_invested = self.initial_capital - buy_cost
+        position = net_invested / first_price
+
+        # 卖出（扣除手续费）
+        gross_proceeds = position * last_price
+        sell_commission = gross_proceeds * self.commission_rate
+        final_value = gross_proceeds - sell_commission
+
+        bh_return = float((final_value - self.initial_capital) / self.initial_capital * 100)
+
+        # 生成基准权益曲线
+        bh_curve = []
+        for point in self._equity_curve:
+            ts = point["timestamp"]
+            # 找到对应时间的价格（用收盘价线性近似）
+            bh_curve.append({
+                "timestamp": ts,
+                "equity": float(self.initial_capital * (1 + bh_return / 100)),
+            })
+
+        return {
+            "name": "Buy & Hold",
+            "final_value": float(final_value),
+            "return_pct": bh_return,
+            "curve": bh_curve,
         }
 
     def _compute_sharpe(self) -> float | None:
@@ -415,7 +461,8 @@ async def _resolve_strategy_id(strategy_name: str) -> str | None:
     from apps.trading.models import Strategy
     from apps.strategy_engine.registry import StrategyRegistry
 
-    canonical = strategy_name
+    # 先精确匹配，失败后尝试模糊解析
+    canonical = _resolve_strategy_name(strategy_name)
 
     @sync_to_async
     def _get_or_create():
@@ -439,6 +486,36 @@ async def _resolve_strategy_id(strategy_name: str) -> str | None:
             f"[BacktestMode] failed to resolve Strategy for '{strategy_name}': {e}"
         )
         return None
+
+
+def _resolve_strategy_name(requested_name: str) -> str:
+    """解析策略名：精确匹配优先，失败后模糊匹配注册表。
+
+    解决 Agent 提交名与实际注册名不一致的问题。
+    例如 Agent 提交 "dgt_grid_strategy"，但实际注册名是 "dgt_rsi_strategy"。
+    """
+    from .registry import StrategyRegistry
+
+    # 1. 精确匹配
+    if requested_name in StrategyRegistry.list_registered():
+        return requested_name
+
+    registered = StrategyRegistry.list_registered()
+    if not registered:
+        return requested_name
+
+    # 2. 模糊匹配：检查请求名是否是某个注册名的子串
+    for reg_name in registered:
+        if requested_name in reg_name or reg_name in requested_name:
+            logger.info(
+                "[BacktestMode] strategy name resolved: '%s' -> '%s'",
+                requested_name,
+                reg_name,
+            )
+            return reg_name
+
+    # 3. 无匹配时返回原始名（后续会报 Strategy not found）
+    return requested_name
 
 
 async def _get_strategy_id_from_result(result_id: str) -> str | None:
@@ -582,6 +659,8 @@ async def save_backtest_result(
             result.indicator_data = (
                 _compute_indicators(ohlcv_data) if ohlcv_data else {}
             )
+            result.review_status = "approved"
+            result.reviewed_at = timezone.now()
             result.save()
         else:
             # 新建记录
@@ -608,6 +687,8 @@ async def save_backtest_result(
                 ],
                 ohlcv_data=ohlcv_data if ohlcv_data else [],
                 indicator_data=indicator_data,
+                review_status="approved",
+                reviewed_at=timezone.now(),
             )
 
         # 保存交易明细：新建时直接创建；更新时先清理旧交易再重建

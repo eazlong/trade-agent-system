@@ -189,23 +189,55 @@ class BaseAgent(ABC):
         from .llm_client import LLMClient, is_fallback
 
         llm = LLMClient.get_instance()
+        had_tool_results = False  # tracks whether any tools were executed
 
-        for _ in range(self._max_tool_rounds):
+        for round_idx in range(self._max_tool_rounds):
             resp = await llm.chat_with_tools(
                 system=system,
                 messages=messages,
                 tools=tools,
                 max_tokens=max_tokens,
             )
+            content_len = len(resp.content) if resp.content else 0
+            logger.info(
+                "[%s] _run_tool_loop round %d/%d: has_tool_calls=%s, "
+                "content_len=%d, reasoning=%s",
+                self.name,
+                round_idx + 1,
+                self._max_tool_rounds,
+                resp.has_tool_calls,
+                content_len,
+                bool(resp.reasoning_content),
+            )
             if not resp.has_tool_calls:
                 content = resp.content
                 if is_fallback(content):
+                    logger.warning(
+                        "[%s] _run_tool_loop round %d: detected fallback marker",
+                        self.name, round_idx + 1,
+                    )
                     return ("", True)
 
                 # 检查是否是 fallback 路径的 JSON tool call
                 json_tc = self._try_parse_json_tool_call(content)
                 if json_tc is None:
-                    return (content, False)
+                    if content and content.strip():
+                        return (content, False)
+                    # 空内容但之前有工具执行结果，强制 LLM 总结
+                    if had_tool_results:
+                        logger.warning(
+                            "[%s] LLM returned empty content after tool execution, "
+                            "forcing summary",
+                            self.name,
+                        )
+                        break
+                    # 既无工具也无内容，跳过本轮
+                    logger.debug(
+                        "[%s] _run_tool_loop round %d: empty content, no tool calls, "
+                        "skipping (had_tool_results=%s)",
+                        self.name, round_idx + 1, had_tool_results,
+                    )
+                    continue
 
                 # 将 JSON tool call 转为标准 ToolCallRequest
                 tc = type(
@@ -234,6 +266,7 @@ class BaseAgent(ABC):
                         "content": result_text,
                     }
                 )
+                had_tool_results = True
                 # Update last_alive so watchdog knows task is still making progress
                 from .task_tracker import tracker_context
                 tracker = tracker_context.get(None)
@@ -260,7 +293,12 @@ class BaseAgent(ABC):
             messages.append(assistant_msg)
             messages.extend(tool_results)
 
-        # 超出轮次，让 LLM 总结
+        # 超出轮次或 LLM 返回空内容但有工具结果，让 LLM 总结
+        logger.info(
+            "[%s] _run_tool_loop exiting loop: had_tool_results=%s, "
+            "message_count=%d, requesting summary from LLM",
+            self.name, had_tool_results, len(messages),
+        )
         history_text = "\n".join(
             f"[{m.get('role', 'user')}]: {m.get('content', '')}" for m in messages
         )
@@ -269,6 +307,13 @@ class BaseAgent(ABC):
             user=f"{history_text}\n\n请根据以上工具调用结果给出最终回答。",
             max_tokens=max_tokens,
         )
+        final_len = len(final) if final else 0
+        if not final or not final.strip():
+            logger.warning(
+                "[%s] _run_tool_loop summary returned empty content "
+                "(final_len=%d, had_tool_results=%s, messages=%d)",
+                self.name, final_len, had_tool_results, len(messages),
+            )
         return (final, False)
 
     async def run_tool(self, tool_name: str, **kwargs) -> Any:

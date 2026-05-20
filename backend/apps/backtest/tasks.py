@@ -31,6 +31,7 @@ def run_backtest_task(
     end_date: str = "",
     user_id: str | None = None,
     result_id: str | None = None,
+    benchmark: str = "",
 ) -> dict:
     """
     异步执行策略回测。
@@ -53,7 +54,15 @@ def run_backtest_task(
         回测统计结果
     """
     from apps.agent.task_tracker import TaskTracker, tracker_context
+    from apps.strategy_engine.registry import StrategyRegistry
+    from apps.strategy_engine.backtest_mode import _resolve_strategy_name
     from apps.strategy_engine.runner import StrategyRunner
+
+    # Re-discover strategies to include any added after worker startup
+    StrategyRegistry.discover()
+
+    # Resolve strategy name to canonical registered name
+    strategy_name = _resolve_strategy_name(strategy_name)
 
     # Setup tracker for progress monitoring
     tracker = TaskTracker(
@@ -138,9 +147,11 @@ def run_backtest_task(
                     strategy_id=strategy_id,
                     commission_rate=Decimal(str(commission_rate)),
                     result_id=result_id,
+                    benchmark=benchmark,
                 )
             )
         finally:
+            _close_async_resources(loop)
             loop.close()
 
         total_trades = stats.get("total_trades", 0)
@@ -235,3 +246,19 @@ def _fetch_ohlcv_sync(
     except Exception as e:
         logger.error(f"[BacktestTask] OHLCV fetch failed: {e}", exc_info=True)
         return []
+
+
+def _close_async_resources(loop: asyncio.AbstractEventLoop) -> None:
+    """显式关闭 Redis 连接等异步资源，防止 __del__ 在 loop 关闭后报错。"""
+    try:
+        from apps.memory.redis_client import RedisPool
+
+        client = RedisPool.get_client()
+
+        async def _aclose():
+            await client.aclose()
+
+        loop.run_until_complete(_aclose())
+        RedisPool.close_client()
+    except Exception:
+        pass

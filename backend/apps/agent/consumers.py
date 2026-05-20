@@ -4,6 +4,7 @@ import logging
 import traceback
 from urllib.parse import parse_qs
 
+from apps.agent import ws_pending
 from apps.agent.base import AgentMessage, AgentResult
 from apps.agent.supervisor import SupervisorAgent
 
@@ -14,6 +15,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
     """SupervisorAgent WebSocket 聊天消费者
 
     客户端通过 WebSocket 发送聊天消息，SupervisorAgent 处理后返回响应。
+    断线期间的消息会缓存到 Redis，重连后自动投递。
+
     协议格式:
     - 发送: {"type": "chat", "text": "用户消息"}
     - 接收: {"type": "chat_response", "data": "回复内容", "task_id": "...", "status": "done|error"}
@@ -58,6 +61,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.send(text_data=json.dumps({"type": "status", "status": "connected"}))
 
+        # 投递断线期间缓存的待发消息
+        pending = await ws_pending.drain(self.user_id)
+        if pending:
+            logger.info("[ChatWS] Delivering %d pending messages to user %s", len(pending), self.user_id)
+            for msg in pending:
+                await self.send(text_data=json.dumps(msg, ensure_ascii=False))
+
     async def disconnect(self, close_code):
         user_id = getattr(self, "user_id", "unknown")
         logger.info("[ChatWS] User %s disconnected (code=%s)", user_id, close_code)
@@ -70,48 +80,49 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if message_type == "chat":
                 await self._handle_chat(data)
             elif message_type == "ping":
-                await self.send(text_data=json.dumps({"type": "pong"}))
+                await self._safe_send({"type": "pong"})
             else:
-                await self.send(
-                    text_data=json.dumps(
-                        {
-                            "type": "error",
-                            "error": f"Unknown message type: {message_type}",
-                        }
-                    )
+                await self._safe_send(
+                    {"type": "error", "error": f"Unknown message type: {message_type}"}
                 )
 
         except json.JSONDecodeError:
             logger.error("[ChatWS] Invalid JSON received")
-            await self.send(
-                text_data=json.dumps({"type": "error", "error": "Invalid JSON"})
-            )
+            await self._safe_send({"type": "error", "error": "Invalid JSON"})
         except Exception as e:
             logger.error("[ChatWS] Error processing message: %s", e)
-            await self.send(text_data=json.dumps({"type": "error", "error": str(e)}))
+            await self._safe_send({"type": "error", "error": str(e)})
+
+    async def _safe_send(self, message: dict) -> bool:
+        """发送消息，断线时缓存到 Redis 待重连后投递。返回是否发送成功。"""
+        try:
+            await self.send(text_data=json.dumps(message, ensure_ascii=False))
+            return True
+        except Exception:
+            user_id = getattr(self, "user_id", "unknown")
+            logger.info("[ChatWS] Send failed (client disconnected), buffering for user %s", user_id)
+            await ws_pending.store(user_id, message)
+            return False
 
     async def _handle_chat(self, data):
         text = data.get("text", "").strip()
         if not text:
-            await self.send(
-                text_data=json.dumps({"type": "error", "error": "text is required"})
-            )
+            await self._safe_send({"type": "error", "error": "text is required"})
             return
 
         logger.info("[ChatWS] User %s chat: %s", self.user_id, text[:100])
 
-        await self.send(
-            text_data=json.dumps({"type": "status", "status": "processing"})
-        )
+        # processing 状态是瞬时的，不做缓存
+        await self._safe_send({"type": "status", "status": "processing"})
 
         async def on_tool_result(tool_name, result_text):
-            """工具执行进度回调 — 实时推送给前端"""
+            """工具执行进度回调 — 实时推送给前端，断线直接丢弃。"""
             try:
                 await self.send(text_data=json.dumps({
                     "type": "tool_progress",
                     "tool": tool_name,
                     "result": result_text[:2000],
-                }))
+                }, ensure_ascii=False))
             except Exception:
                 pass
 
@@ -133,49 +144,37 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 and result.data.get("task_id")
                 and result.success
             ):
-                await self.send(text_data=json.dumps({
+                await self._safe_send({
                     "type": "task_submitted",
                     "task_id": result.data["task_id"],
                     "status": "success",
-                }))
+                })
 
             if result.success:
-                await self.send(
-                    text_data=json.dumps(
-                        {
-                            "type": "chat_response",
-                            "data": (
-                                result.data.get("content", str(result.data))
-                                if isinstance(result.data, dict)
-                                else result.data
-                            ),
-                            "task_id": result.task_id,
-                            "status": "done",
-                        }
-                    )
-                )
+                await self._safe_send({
+                    "type": "chat_response",
+                    "data": (
+                        result.data.get("content", str(result.data))
+                        if isinstance(result.data, dict)
+                        else result.data
+                    ),
+                    "task_id": result.task_id,
+                    "status": "done",
+                })
             else:
-                await self.send(
-                    text_data=json.dumps(
-                        {
-                            "type": "chat_response",
-                            "error": result.error or "处理请求时发生错误，请稍后重试",
-                            "task_id": result.task_id,
-                            "status": "error",
-                        }
-                    )
-                )
+                await self._safe_send({
+                    "type": "chat_response",
+                    "error": result.error or "处理请求时发生错误，请稍后重试",
+                    "task_id": result.task_id,
+                    "status": "error",
+                })
 
         except Exception as e:
             logger.error(
                 "[ChatWS] Supervisor handle error: %s\n%s", e, traceback.format_exc()
             )
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "chat_response",
-                        "error": str(e),
-                        "status": "error",
-                    }
-                )
-            )
+            await self._safe_send({
+                "type": "chat_response",
+                "error": str(e),
+                "status": "error",
+            })

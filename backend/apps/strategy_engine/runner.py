@@ -39,6 +39,7 @@ class StrategyRunner:
         git_commit_hash: str = "",
         commission_rate: Decimal = Decimal("0.001"),
         result_id: str | None = None,
+        benchmark: str = "",
     ) -> dict:
         """
         用历史数据回放策略。
@@ -103,6 +104,7 @@ class StrategyRunner:
             symbol=symbol,
             timeframe=timeframe,
             commission_rate=commission_rate,
+            benchmark=benchmark,
         )
         stats = await engine.run()
 

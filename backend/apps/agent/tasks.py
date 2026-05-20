@@ -489,6 +489,8 @@ def check_session_expiry(self) -> dict:
             continue
         if not data or data.get("state") != "multi_turn":
             continue
+
+        logger.debug("[check_session_expiry] checking %s", key)
         expires_at = data.get("expires_at", 0)
         remaining = expires_at - time.time()
         if 0 < remaining < _SESSION_WARN_BEFORE:
@@ -498,5 +500,5 @@ def check_session_expiry(self) -> dict:
                 f"会话即将过期（{int(remaining)}秒）\n请继续对话以保持会话",
             )
             warned += 1
-
+    
     return {"warned": warned}

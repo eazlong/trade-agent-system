@@ -80,6 +80,10 @@ class SubmitBacktestTool(BaseTool):
                     "type": "string",
                     "description": "回测结束日期（ISO 格式，如 2024-12-31），默认今天",
                 },
+                "benchmark": {
+                    "type": "string",
+                    "description": "基准策略名称，用于对比（如 buy_and_hold），可选",
+                },
             },
             "required": ["strategy_name", "symbol", "timeframe"],
         }
@@ -96,25 +100,67 @@ class SubmitBacktestTool(BaseTool):
             )
 
         try:
+            from datetime import date, timedelta
+            from decimal import Decimal
+            from apps.strategy_engine.backtest_mode import (
+                create_empty_result_async,
+                _resolve_strategy_id,
+            )
             from apps.backtest.tasks import run_backtest_task
+
+            strategy_id = kwargs.get("strategy_id")
+            if not strategy_id:
+                strategy_id = await _resolve_strategy_id(strategy_name)
+            if not strategy_id:
+                return ToolResult(
+                    success=False,
+                    error=f"无法解析策略: {strategy_name}",
+                )
+
+            start_date = kwargs.get("start_date", "")
+            if not start_date:
+                start_date = (date.today() - timedelta(days=30)).isoformat()
+            end_date = kwargs.get("end_date", "")
+            if not end_date:
+                end_date = date.today().isoformat()
+            initial_capital = kwargs.get("initial_capital", 10000)
+            parameters = kwargs.get("parameters") or {}
+
+            result_id = await create_empty_result_async(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=Decimal(str(initial_capital)),
+                parameters=parameters,
+            )
+            if not result_id:
+                return ToolResult(
+                    success=False,
+                    error="创建回测占位记录失败",
+                )
 
             task = run_backtest_task.apply_async(
                 kwargs={
                     "strategy_name": strategy_name,
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "initial_capital": kwargs.get("initial_capital", 10000),
+                    "initial_capital": initial_capital,
                     "commission_rate": kwargs.get("commission_rate", 0.001),
-                    "parameters": kwargs.get("parameters"),
-                    "strategy_id": kwargs.get("strategy_id"),
+                    "parameters": parameters,
+                    "strategy_id": strategy_id,
                     "exchange": kwargs.get("exchange", "binance"),
-                    "start_date": kwargs.get("start_date", ""),
-                    "end_date": kwargs.get("end_date", ""),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "result_id": result_id,
+                    "benchmark": kwargs.get("benchmark", ""),
                 }
             )
             logger.info(
-                "[SubmitBacktestTool] submitted task_id=%s strategy=%s symbol=%s tf=%s",
+                "[SubmitBacktestTool] submitted task_id=%s result_id=%s strategy=%s symbol=%s tf=%s",
                 task.id,
+                result_id,
                 strategy_name,
                 symbol,
                 timeframe,
@@ -123,6 +169,7 @@ class SubmitBacktestTool(BaseTool):
                 success=True,
                 data={
                     "task_id": task.id,
+                    "result_id": result_id,
                     "status": "PENDING",
                     "message": (
                         f"回测任务已提交，task_id={task.id}。"

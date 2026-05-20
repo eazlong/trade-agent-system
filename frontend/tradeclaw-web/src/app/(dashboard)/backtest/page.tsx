@@ -182,7 +182,11 @@ export default function BacktestListPage() {
         </div>
       )}
 
-      <CreateStrategyModal open={modalOpen} onClose={() => setModalOpen(false)} />
+      <CreateStrategyModal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        onCreated={() => setPage(1)}
+      />
     </DashboardShell>
   );
 }

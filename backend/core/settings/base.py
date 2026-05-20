@@ -103,6 +103,7 @@ REDIS_DB_POSITION = 5
 REDIS_DB_MEMORY = 6
 REDIS_DB_RISK = 7
 REDIS_DB_FRAME = 8  # 框架状态持久化
+REDIS_DB_WS_PENDING = 9  # WebSocket 断线待发消息缓存
 
 CELERY_BROKER_URL = os.environ.get("REDIS_URL", "redis://localhost:6379") + "/2"
 CELERY_RESULT_BACKEND = os.environ.get("REDIS_URL", "redis://localhost:6379") + "/2"
@@ -235,5 +236,6 @@ LOGGING = {
             "handlers": ["console"],
             "propagate": False,
         },
+        # "celery": {"level": "WARNING", "handlers": ["console"], "propagate": False},
     },
 }
