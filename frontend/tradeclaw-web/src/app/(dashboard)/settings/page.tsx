@@ -8,6 +8,8 @@ import {
   riskApi,
   scheduledTaskApi,
   signalMonitorApi,
+  memoryApi,
+  Memory,
   SignalMonitor,
   ScheduledTask,
   RiskConfig as RiskConfigType,
@@ -58,6 +60,10 @@ export default function SettingsPage() {
   const [monitorsLoading, setMonitorsLoading] = useState(false);
   const [showAddMonitor, setShowAddMonitor] = useState(false);
 
+  // Memories
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [memoriesLoading, setMemoriesLoading] = useState(false);
+
   // Load existing exchange accounts and risk config
   const loadInitialData = useCallback(async () => {
     try {
@@ -101,6 +107,30 @@ export default function SettingsPage() {
     }
   }, []);
 
+  const loadMemories = useCallback(async () => {
+    setMemoriesLoading(true);
+    try {
+      const res = await memoryApi.list();
+      setMemories(res);
+    } catch {
+      // API not available
+    } finally {
+      setMemoriesLoading(false);
+    }
+  }, []);
+
+  const handleDeleteMemory = async (id: string) => {
+    if (!confirm("确定要删除该记忆吗？此操作不可撤销。")) {
+      return;
+    }
+    try {
+      await memoryApi.delete(id);
+      loadMemories();
+    } catch (err) {
+      alert(`删除失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  };
+
   // Load scheduled tasks when tab is activated
   useEffect(() => {
     if (activeTab === "scheduled") {
@@ -114,6 +144,13 @@ export default function SettingsPage() {
       loadSignalMonitors();
     }
   }, [activeTab, loadSignalMonitors]);
+
+  // Load memories when tab is activated
+  useEffect(() => {
+    if (activeTab === "memory") {
+      loadMemories();
+    }
+  }, [activeTab, loadMemories]);
 
   useEffect(() => {
     loadInitialData();
@@ -206,6 +243,7 @@ export default function SettingsPage() {
     { key: "risk", label: "风控" },
     { key: "scheduled", label: "定时任务" },
     { key: "signals", label: "信号监控" },
+    { key: "memory", label: "记忆" },
     { key: "account", label: "账户" },
   ];
 
@@ -837,6 +875,14 @@ export default function SettingsPage() {
           </div>
         )}
 
+        {activeTab === "memory" && (
+          <MemoryList
+            memories={memories}
+            loading={memoriesLoading}
+            onDelete={handleDeleteMemory}
+          />
+        )}
+
         {/* Save button for general tab only */}
         {activeTab === "general" && (
           <div className="px-5 py-3 border-t border-[rgba(255,255,255,0.07)] flex justify-end">
@@ -1002,6 +1048,142 @@ function AddMonitorForm({ onClose, onAdded }: AddMonitorFormProps) {
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+interface MemoryListProps {
+  memories: Memory[];
+  loading: boolean;
+  onDelete: (id: string) => void;
+}
+
+function MemoryList({ memories, loading, onDelete }: MemoryListProps) {
+  const getAgentTypeColor = (type: string) => {
+    switch (type) {
+      case "user":
+        return "bg-green-dim text-green";
+      case "strategy":
+        return "bg-blue-dim text-blue";
+      case "risk":
+        return "bg-amber-dim text-amber";
+      default:
+        return "bg-text3/20 text-text3";
+    }
+  };
+
+  const getTruncatedContent = (content: string): string => {
+    const lines = content.split("\n").slice(0, 3).join("\n");
+    return lines.length > 200 ? lines.slice(0, 200) + "..." : lines;
+  };
+
+  const getTitle = (content: string): string => {
+    const firstLine = content.split("\n")[0];
+    return firstLine.length > 80 ? firstLine.slice(0, 80) + "..." : firstLine;
+  };
+
+  const formatDate = (dateStr: string): string => {
+    return new Date(dateStr).toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  if (loading) {
+    return (
+      <div className="p-5 flex flex-col gap-4">
+        <div className="text-xs font-semibold text-text">记忆</div>
+        <div className="flex items-center justify-center py-12 text-text3 text-xs">
+          正在加载...
+        </div>
+      </div>
+    );
+  }
+
+  if (memories.length === 0) {
+    return (
+      <div className="p-5 flex flex-col gap-4">
+        <div className="text-xs font-semibold text-text">记忆</div>
+        <div className="text-center py-12 text-[11px] text-text3 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg">
+          暂无记忆
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-5 flex flex-col gap-4">
+      <div className="text-xs font-semibold text-text">记忆 ({memories.length})</div>
+      <div className="flex flex-col gap-2">
+        {memories.map((mem) => (
+          <MemoryCard
+            key={mem.id}
+            memory={mem}
+            onDelete={onDelete}
+            getAgentTypeColor={getAgentTypeColor}
+            getTruncatedContent={getTruncatedContent}
+            getTitle={getTitle}
+            formatDate={formatDate}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface MemoryCardProps {
+  memory: Memory;
+  onDelete: (id: string) => void;
+  getAgentTypeColor: (type: string) => string;
+  getTruncatedContent: (content: string) => string;
+  getTitle: (content: string) => string;
+  formatDate: (dateStr: string) => string;
+}
+
+function MemoryCard({
+  memory,
+  onDelete,
+  getAgentTypeColor,
+  getTruncatedContent,
+  getTitle,
+  formatDate,
+}: MemoryCardProps) {
+  const [expanded, setExpanded] = useState(false);
+  const content = expanded ? memory.content : getTruncatedContent(memory.content);
+
+  return (
+    <div className="bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-lg px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span
+            className={`text-[9px] px-1.5 py-0.5 rounded-sm font-semibold ${getAgentTypeColor(memory.agent_type)}`}
+          >
+            {memory.agent_type}
+          </span>
+          <span className="text-xs font-semibold text-text">{getTitle(memory.content)}</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-[9px] text-text3 font-mono">{formatDate(memory.created_at)}</span>
+          <button
+            onClick={() => onDelete(memory.id)}
+            className="text-[10px] text-red hover:opacity-80 cursor-pointer"
+          >
+            删除
+          </button>
+        </div>
+      </div>
+      <div className="text-[10px] text-text2 line-clamp-3 whitespace-pre-wrap leading-relaxed">
+        {content}
+      </div>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="text-[10px] text-text3 mt-1 cursor-pointer hover:text-text transition-colors"
+      >
+        {expanded ? "收起 ▲" : "展开 ▼"}
+      </button>
     </div>
   );
 }
