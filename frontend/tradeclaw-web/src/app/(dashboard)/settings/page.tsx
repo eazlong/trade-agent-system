@@ -119,17 +119,17 @@ export default function SettingsPage() {
     }
   }, []);
 
-  const handleDeleteMemory = async (id: string) => {
+  const handleDeleteMemory = useCallback(async (id: string) => {
     if (!confirm("确定要删除该记忆吗？此操作不可撤销。")) {
       return;
     }
     try {
       await memoryApi.delete(id);
-      loadMemories();
+      await loadMemories();
     } catch (err) {
       alert(`删除失败: ${err instanceof Error ? err.message : "未知错误"}`);
     }
-  };
+  }, [loadMemories]);
 
   // Load scheduled tasks when tab is activated
   useEffect(() => {
