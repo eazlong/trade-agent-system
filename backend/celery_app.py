@@ -4,6 +4,10 @@ from celery.schedules import crontab
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.dev')
 
+# Set strategy path for auto-discovery of strategy modules
+from apps.strategy_engine.registry import StrategyRegistry
+StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
+
 app = Celery('trade_agent')
 app.config_from_object('django.conf:settings', namespace='CELERY')
 app.autodiscover_tasks()

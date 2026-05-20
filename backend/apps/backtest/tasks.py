@@ -58,6 +58,10 @@ def run_backtest_task(
     from apps.strategy_engine.backtest_mode import _resolve_strategy_name
     from apps.strategy_engine.runner import StrategyRunner
 
+    # Ensure strategy path is set before discovery
+    if not StrategyRegistry._strategy_path:
+        StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
+
     # Re-discover strategies to include any added after worker startup
     StrategyRegistry.discover()
 

@@ -412,12 +412,13 @@ class BacktestEngine:
 
         # 生成基准权益曲线
         bh_curve = []
+        bh_return_decimal = Decimal(str(bh_return)) / Decimal("100")
         for point in self._equity_curve:
             ts = point["timestamp"]
             # 找到对应时间的价格（用收盘价线性近似）
             bh_curve.append({
                 "timestamp": ts,
-                "equity": float(self.initial_capital * (1 + bh_return / 100)),
+                "equity": float(self.initial_capital * (1 + bh_return_decimal)),
             })
 
         return {
