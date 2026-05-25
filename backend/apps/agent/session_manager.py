@@ -47,8 +47,8 @@ class SessionManager:
         user_id: str,
         state: SessionState,
         active_agent: Optional[str] = None,
-        ttl: int = 1800,
-    ) -> None:  # 默认30分钟过期
+        ttl: int = 28800,
+    ) -> None:  # 默认8小时过期
         """设置用户会话上下文"""
         r = await self.get_redis()
         key = f"session:{user_id}:context"
@@ -66,7 +66,7 @@ class SessionManager:
         self,
         user_id: str,
         active_agent: str,
-        pause_ttl: int = 300,
+        pause_ttl: int = 14400,
         pause_context: str = "",
     ) -> None:
         """暂停多轮对话会话"""
@@ -86,7 +86,7 @@ class SessionManager:
         await r.setex(key, pause_ttl, json.dumps(context, ensure_ascii=False))
 
     async def resume_session(
-        self, user_id: str, agent_name: str, ttl: int = 1800
+        self, user_id: str, agent_name: str, ttl: int = 86400
     ) -> None:
         """恢复暂停的会话为多轮对话"""
         r = await self.get_redis()
