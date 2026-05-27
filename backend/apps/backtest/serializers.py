@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import BacktestResult, BacktestTrade
+from .models import BacktestResult, BacktestTrade, GridSearchJob
 
 
 class BacktestResultSerializer(serializers.ModelSerializer):
@@ -27,6 +27,8 @@ class BacktestResultSerializer(serializers.ModelSerializer):
             "review_status",
             "review_notes",
             "reviewed_at",
+            "is_grid_search",
+            "grid_search_id",
             "created_at",
         ]
         read_only_fields = [
@@ -98,3 +100,30 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+
+class GridSearchJobSerializer(serializers.ModelSerializer):
+    strategy_name = serializers.CharField(source="strategy.name", read_only=True)
+
+    class Meta:
+        model = GridSearchJob
+        fields = [
+            "id",
+            "strategy_name",
+            "symbol",
+            "timeframe",
+            "start_date",
+            "end_date",
+            "initial_capital",
+            "status",
+            "source",
+            "total_combinations",
+            "completed_combinations",
+            "best_result",
+            "sort_by",
+            "error_log",
+            "celery_task_id",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
