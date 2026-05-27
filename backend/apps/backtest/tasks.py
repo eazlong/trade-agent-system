@@ -454,3 +454,74 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
     finally:
         tracker.stop()
         tracker_context.reset(token)
+
+
+@app.task
+def scan_grid_search_schedules():
+    """扫描活跃的 GridSearchSchedule 并自动提交网格搜索任务。"""
+    from datetime import date, timedelta
+    from django.utils import timezone
+
+    from apps.backtest.models import GridSearchJob, GridSearchSchedule
+
+    now = timezone.now()
+    for schedule in GridSearchSchedule.objects.filter(is_active=True):
+        if not _should_run_schedule(schedule, now):
+            continue
+
+        job = GridSearchJob.objects.create(
+            strategy=schedule.strategy,
+            symbol=schedule.symbol,
+            timeframe=schedule.timeframe,
+            start_date=(date.today() - timedelta(days=schedule.lookback_days)).isoformat(),
+            end_date=date.today().isoformat(),
+            initial_capital=0,
+            search_config=schedule.search_config,
+            sort_by=schedule.search_config.get("sort_by", "sharpe_ratio"),
+            source="cron",
+            user_id=schedule.user_id,
+        )
+
+        task = run_grid_search_task.apply_async(
+            kwargs={"job_id": str(job.id), "user_id": str(schedule.user_id)},
+            queue='grid_search',
+        )
+        job.celery_task_id = task.id
+        job.save(update_fields=["celery_task_id"])
+
+        schedule.last_run_at = now
+        schedule.save(update_fields=["last_run_at"])
+
+
+def _should_run_schedule(schedule, now) -> bool:
+    """简单的 cron 匹配：解析 5-field cron 表达式并检查当前时间是否匹配。"""
+    try:
+        parts = schedule.cron_schedule.split()
+        if len(parts) != 5:
+            return False
+        minute, hour, dom, month, dow = parts
+
+        def _match(field, value):
+            if field == "*":
+                return True
+            if "," in field:
+                return str(value) in field.split(",")
+            if "-" in field:
+                lo, hi = map(int, field.split("-"))
+                return lo <= value <= hi
+            if "/" in field:
+                base, step = field.split("/")
+                if base == "*":
+                    return value % int(step) == 0
+                return (value - int(base)) % int(step) == 0
+            return str(value) == field
+
+        return (
+            _match(minute, now.minute)
+            and _match(hour, now.hour)
+            and _match(dom, now.day)
+            and _match(month, now.month)
+            and _match(dow, now.weekday())
+        )
+    except Exception:
+        return False
