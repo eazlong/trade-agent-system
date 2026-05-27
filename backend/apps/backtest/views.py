@@ -1,10 +1,14 @@
 from datetime import date, timedelta
 
+import logging
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.core.paginator import Paginator
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from .models import BacktestResult, BacktestTrade
 from .serializers import (
@@ -281,3 +285,205 @@ def result_rerun(request, pk):
             "message": f"回测任务已重新提交，task_id={task.id}",
         }
     )
+
+
+# ============================================================
+# Grid Search API
+# ============================================================
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def grid_search_create(request):
+    """提交网格搜索任务。"""
+    from .models import GridSearchJob
+    from .tasks import run_grid_search_task
+    from apps.trading.models import Strategy
+
+    strategy_id = request.data.get("strategy_id")
+    symbol = request.data.get("symbol")
+    timeframe = request.data.get("timeframe")
+    grid_search = request.data.get("grid_search")
+
+    if not all([strategy_id, symbol, timeframe]):
+        return Response(
+            {"error": "strategy_id, symbol, timeframe 为必填项"}, status=400
+        )
+    if not grid_search or not grid_search.get("parameters"):
+        return Response(
+            {"error": "grid_search.parameters 为必填项"}, status=400
+        )
+
+    try:
+        strategy = Strategy.objects.get(id=strategy_id)
+    except Strategy.DoesNotExist:
+        return Response({"error": f"Strategy not found: {strategy_id}"}, status=404)
+
+    user_id = str(request.user.id)
+    if GridSearchJob.objects.filter(user_id=user_id, status="running").exists():
+        return Response(
+            {"error": "您有一个正在运行的网格搜索任务，请先等待完成或取消"},
+            status=429,
+        )
+
+    start_date = request.data.get("start_date", "")
+    if not start_date:
+        start_date = (date.today() - timedelta(days=30)).isoformat()
+    end_date = request.data.get("end_date", "")
+    if not end_date:
+        end_date = date.today().isoformat()
+
+    initial_capital = request.data.get("initial_capital", 10000)
+
+    # Validate ranges
+    for param_name, range_def in grid_search["parameters"].items():
+        if isinstance(range_def, dict):
+            min_val = range_def.get("min")
+            max_val = range_def.get("max")
+            step = range_def.get("step")
+            if min_val is not None and max_val is not None and step is not None:
+                if min_val >= max_val:
+                    return Response(
+                        {"error": f"参数 {param_name}: min 必须 < max"}, status=400
+                    )
+                if step <= 0:
+                    return Response(
+                        {"error": f"参数 {param_name}: step 必须 > 0"}, status=400
+                    )
+
+    from apps.strategy_engine.grid_search import generate_combinations
+
+    try:
+        preview_combos = generate_combinations(
+            {"parameters": grid_search["parameters"], "max_combinations": 101}
+        )
+        total = len(preview_combos)
+        if total > 100:
+            return Response(
+                {"error": f"参数组合数 {total} 超过上限 100，请缩小搜索范围"},
+                status=400,
+            )
+    except ValueError as e:
+        return Response({"error": str(e)}, status=400)
+
+    job = GridSearchJob.objects.create(
+        strategy=strategy,
+        symbol=symbol,
+        timeframe=timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        search_config={
+            "parameters": grid_search["parameters"],
+            "sort_by": grid_search.get("sort_by", "sharpe_ratio"),
+            "max_combinations": grid_search.get("max_combinations", 100),
+        },
+        sort_by=grid_search.get("sort_by", "sharpe_ratio"),
+        source="api",
+        user=request.user,
+    )
+
+    task = run_grid_search_task.apply_async(
+        kwargs={"job_id": str(job.id), "user_id": user_id},
+        queue="grid_search",
+    )
+    job.celery_task_id = task.id
+    job.save(update_fields=["celery_task_id"])
+
+    return Response(
+        {
+            "grid_search_id": str(job.id),
+            "task_id": task.id,
+            "total_combinations": total,
+            "message": f"网格搜索任务已提交，共 {total} 个参数组合",
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def grid_search_detail(request, pk):
+    """查询网格搜索任务状态"""
+    from .models import GridSearchJob
+
+    try:
+        job = GridSearchJob.objects.select_related("strategy").get(pk=pk)
+    except GridSearchJob.DoesNotExist:
+        return Response({"error": "Grid search job not found"}, status=404)
+
+    if not request.user.is_superuser and str(job.user_id) != str(request.user.id):
+        return Response({"error": "无权访问此任务"}, status=403)
+
+    from .serializers import GridSearchJobSerializer
+
+    return Response(GridSearchJobSerializer(job).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def grid_search_results(request, pk):
+    """查询网格搜索任务的所有子回测结果"""
+    from .models import GridSearchJob
+
+    try:
+        job = GridSearchJob.objects.get(pk=pk)
+    except GridSearchJob.DoesNotExist:
+        return Response({"error": "Grid search job not found"}, status=404)
+
+    if not request.user.is_superuser and str(job.user_id) != str(request.user.id):
+        return Response({"error": "无权访问此任务"}, status=403)
+
+    sort = request.query_params.get("sort", job.sort_by or "-sharpe_ratio")
+    page_size = min(int(request.query_params.get("page_size", 20)), 200)
+
+    results = BacktestResult.objects.filter(
+        grid_search_id=job.id
+    ).order_by(f"-{sort}" if not sort.startswith("-") else sort)
+
+    paginator = Paginator(results, page_size)
+    page_obj = paginator.get_page(request.query_params.get("page", 1))
+
+    from .serializers import BacktestResultSerializer
+
+    return Response(
+        {
+            "job_id": str(job.id),
+            "status": job.status,
+            "total_combinations": job.total_combinations,
+            "completed_combinations": job.completed_combinations,
+            "count": paginator.count,
+            "num_pages": paginator.num_pages,
+            "current_page": page_obj.number,
+            "results": BacktestResultSerializer(page_obj, many=True).data,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def grid_search_cancel(request, pk):
+    """取消网格搜索任务"""
+    from celery_app import app as celery_app
+    from .models import GridSearchJob
+
+    try:
+        job = GridSearchJob.objects.get(pk=pk)
+    except GridSearchJob.DoesNotExist:
+        return Response({"error": "Grid search job not found"}, status=404)
+
+    if not request.user.is_superuser and str(job.user_id) != str(request.user.id):
+        return Response({"error": "无权操作此任务"}, status=403)
+
+    if job.status in ("completed", "cancelled", "failed"):
+        return Response({"error": f"任务已结束（{job.status}）"}, status=400)
+
+    job.status = "cancelled"
+    job.save(update_fields=["status"])
+
+    if job.celery_task_id:
+        try:
+            celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+        except Exception:
+            logger.warning("Failed to revoke celery task %s", job.celery_task_id)
+
+    return Response({"message": "网格搜索任务已取消"})
