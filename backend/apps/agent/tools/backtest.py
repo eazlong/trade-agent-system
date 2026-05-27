@@ -84,6 +84,34 @@ class SubmitBacktestTool(BaseTool):
                     "type": "string",
                     "description": "基准策略名称，用于对比（如 buy_and_hold），可选",
                 },
+                "grid_search": {
+                    "type": "object",
+                    "description": (
+                        "启用网格搜索时，指定参数范围进行自动优化。"
+                        "当 grid_search.enabled=true 时，系统将生成参数组合并批量执行回测。"
+                    ),
+                    "properties": {
+                        "enabled": {"type": "boolean", "default": False},
+                        "parameters": {
+                            "type": "object",
+                            "description": (
+                                "每个参数的搜索范围，格式: "
+                                '{"ma_fast": {"min": 5, "max": 20, "step": 1}}'
+                            ),
+                        },
+                        "sort_by": {
+                            "type": "string",
+                            "description": "排序指标",
+                            "enum": ["sharpe_ratio", "total_return_pct", "win_rate"],
+                            "default": "sharpe_ratio",
+                        },
+                        "max_combinations": {
+                            "type": "integer",
+                            "description": "最大组合数上限",
+                            "default": 100,
+                        },
+                    },
+                },
             },
             "required": ["strategy_name", "symbol", "timeframe"],
         }
@@ -126,6 +154,62 @@ class SubmitBacktestTool(BaseTool):
             initial_capital = kwargs.get("initial_capital", 10000)
             parameters = kwargs.get("parameters") or {}
 
+            # Check if grid search is enabled
+            grid_search = kwargs.get("grid_search") or {}
+            if grid_search.get("enabled"):
+                from asgiref.sync import sync_to_async
+                from apps.trading.models import Strategy
+                from apps.backtest.models import GridSearchJob
+                from apps.backtest.tasks import run_grid_search_task as run_grid_search
+
+                try:
+                    gs_strategy = await Strategy.objects.aget(id=strategy_id)
+                except Strategy.DoesNotExist:
+                    return ToolResult(
+                        success=False,
+                        error=f"无法找到策略: {strategy_id}",
+                    )
+
+                gs_user_id = kwargs.get("user_id", "")
+
+                create_job = sync_to_async(GridSearchJob.objects.create)
+                job = await create_job(
+                    strategy=gs_strategy,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    initial_capital=Decimal(str(initial_capital)),
+                    search_config={
+                        "parameters": grid_search.get("parameters", {}),
+                        "sort_by": grid_search.get("sort_by", "sharpe_ratio"),
+                        "max_combinations": grid_search.get("max_combinations", 100),
+                    },
+                    sort_by=grid_search.get("sort_by", "sharpe_ratio"),
+                    source="agent",
+                    user_id=gs_user_id if gs_user_id else None,
+                )
+
+                gs_task = run_grid_search.apply_async(
+                    kwargs={"job_id": str(job.id), "user_id": gs_user_id},
+                    queue='grid_search',
+                )
+                await sync_to_async(lambda: job.__class__.objects.filter(id=job.id).update(celery_task_id=gs_task.id))(job)
+
+                return ToolResult(
+                    success=True,
+                    data={
+                        "task_id": gs_task.id,
+                        "grid_search_id": str(job.id),
+                        "status": "PENDING",
+                        "message": (
+                            f"网格搜索任务已提交，task_id={gs_task.id}。"
+                            f"策略={strategy_name} 标的={symbol} 周期={timeframe}。"
+                            "使用 get_task_result 查询进度。"
+                        ),
+                    },
+                )
+
             result_id = await create_empty_result_async(
                 strategy_id=strategy_id,
                 symbol=symbol,
@@ -155,6 +239,7 @@ class SubmitBacktestTool(BaseTool):
                     "end_date": end_date,
                     "result_id": result_id,
                     "benchmark": kwargs.get("benchmark", ""),
+                    "user_id": kwargs.get("user_id"),
                 }
             )
             logger.info(
