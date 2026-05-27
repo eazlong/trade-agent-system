@@ -59,11 +59,9 @@ def generate_combinations(
         if step <= 0:
             raise ValueError(f"Parameter '{param_name}': step must be > 0, got {step}")
 
-        values = []
-        current = min_val
-        while current <= max_val:
-            values.append(current)
-            current += step
+        # Use integer count to avoid floating-point drift; round to avoid fp errors
+        n_steps = int(round((max_val - min_val) / step))
+        values = [round(min_val + i * step, 10) for i in range(n_steps + 1)]
         range_values[param_name] = values
 
     if not range_values:

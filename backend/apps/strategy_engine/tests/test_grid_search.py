@@ -71,7 +71,16 @@ class TestGenerateCombinations:
         with pytest.raises(ValueError):
             generate_combinations(config, base_params={})
 
-    def test_no_ranges_raises(self):
-        """未定义任何参数范围应抛出异常"""
+    def test_float_step_values(self):
+        """浮点数步长应正确生成（避免累积误差）"""
+        config = {"parameters": {"stop_loss": {"min": 0.0, "max": 0.3, "step": 0.1}}}
+        combos = generate_combinations(config, base_params={})
+        assert len(combos) == 4
+        assert combos[0] == {"stop_loss": 0.0}
+        assert combos[3] == {"stop_loss": 0.3}
+
+    def test_negative_step_raises(self):
+        """负数 step 应抛出异常"""
+        config = {"parameters": {"ma": {"min": 1, "max": 10, "step": -1}}}
         with pytest.raises(ValueError):
-            generate_combinations({"parameters": {}}, base_params={})
+            generate_combinations(config, base_params={})
