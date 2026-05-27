@@ -166,9 +166,14 @@ class GridSearchJob(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
+        blank=True,
         related_name="grid_search_jobs",
     )
-    strategy = models.ForeignKey("trading.Strategy", on_delete=models.CASCADE)
+    strategy = models.ForeignKey(
+        "trading.Strategy",
+        on_delete=models.CASCADE,
+        related_name="strategy_grid_jobs",
+    )
     symbol = models.CharField(max_length=32)
     timeframe = models.CharField(max_length=8)
     start_date = models.DateField()
@@ -198,7 +203,7 @@ class GridSearchJob(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"GridSearchJob({self.id}) strategy={self.strategy} status={self.status}"
+        return f"GridSearchJob({self.symbol}/{self.timeframe} status={self.status})"
 
 
 class GridSearchSchedule(models.Model):
@@ -210,9 +215,14 @@ class GridSearchSchedule(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
+        blank=True,
         related_name="grid_search_schedules",
     )
-    strategy = models.ForeignKey("trading.Strategy", on_delete=models.CASCADE)
+    strategy = models.ForeignKey(
+        "trading.Strategy",
+        on_delete=models.CASCADE,
+        related_name="strategy_grid_schedules",
+    )
     symbol = models.CharField(max_length=32)
     timeframe = models.CharField(max_length=8)
     lookback_days = models.IntegerField(default=30)
@@ -229,4 +239,4 @@ class GridSearchSchedule(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"GridSearchSchedule({self.name}) active={self.is_active}"
+        return f"GridSearchSchedule({self.name} {self.symbol}/{self.timeframe})"
