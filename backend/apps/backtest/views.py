@@ -433,12 +433,16 @@ def grid_search_results(request, pk):
     if not request.user.is_superuser and str(job.user_id) != str(request.user.id):
         return Response({"error": "无权访问此任务"}, status=403)
 
+    # Whitelist allowed sort fields
+    ALLOWED_SORT_FIELDS = {"sharpe_ratio", "total_return_pct", "win_rate", "max_drawdown", "total_trades", "-sharpe_ratio", "-total_return_pct", "-win_rate", "-max_drawdown", "-total_trades"}
     sort = request.query_params.get("sort", job.sort_by or "-sharpe_ratio")
+    if sort not in ALLOWED_SORT_FIELDS:
+        sort = f"-{job.sort_by}" if job.sort_by and not job.sort_by.startswith("-") else f"-{job.sort_by or 'sharpe_ratio'}"
     page_size = min(int(request.query_params.get("page_size", 20)), 200)
 
     results = BacktestResult.objects.filter(
         grid_search_id=job.id
-    ).order_by(f"-{sort}" if not sort.startswith("-") else sort)
+    ).order_by(sort)
 
     paginator = Paginator(results, page_size)
     page_obj = paginator.get_page(request.query_params.get("page", 1))
