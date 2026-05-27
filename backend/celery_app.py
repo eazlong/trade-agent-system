@@ -16,6 +16,12 @@ app.autodiscover_tasks()
 import apps.agent.tasks  # noqa: F401
 import apps.backtest.tasks  # noqa: F401
 import apps.signal_monitor.tasks  # noqa: F401
+import apps.channel.tasks  # noqa: F401
+
+# Grid search independent queue
+app.conf.task_routes = {
+    'apps.backtest.tasks.run_grid_search_task': {'queue': 'grid_search'},
+}
 
 app.conf.beat_schedule = {
     # Sync positions from exchange every 5 minutes
@@ -50,6 +56,11 @@ app.conf.beat_schedule = {
     'check-signals': {
         'task': 'apps.signal_monitor.tasks.check_signals',
         'schedule': 30.0,
+    },
+    # Refresh expiring Feishu user tokens every 15 minutes
+    'refresh-feishu-user-tokens': {
+        'task': 'apps.channel.tasks.refresh_feishu_user_tokens',
+        'schedule': 900.0,
     },
     # Clean expired signal monitors every hour
     'clean-expired-monitors': {

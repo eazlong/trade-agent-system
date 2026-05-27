@@ -266,3 +266,191 @@ def _close_async_resources(loop: asyncio.AbstractEventLoop) -> None:
         RedisPool.close_client()
     except Exception:
         pass
+
+
+@app.task(
+    bind=True,
+    max_retries=1,
+    acks_late=True,
+    track_started=True,
+    soft_time_limit=1800,
+    time_limit=3600,
+    queue='grid_search',
+)
+def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
+    """
+    执行网格搜索任务，批量回测所有参数组合。
+
+    Args:
+        job_id: GridSearchJob UUID
+        user_id: 发起任务的用户 ID（定时任务时可能为 None）
+
+    Returns:
+        {"job_id": str, "total": int, "completed": int, "best_result_id": str}
+    """
+    from celery.exceptions import SoftTimeLimitExceeded
+    from django.utils import timezone
+
+    from apps.backtest.models import BacktestResult, GridSearchJob
+    from apps.agent.task_tracker import TaskTracker, tracker_context
+    from apps.strategy_engine.grid_search import generate_combinations
+    from apps.strategy_engine.runner import StrategyRunner
+
+    try:
+        job = GridSearchJob.objects.select_related("strategy").get(id=job_id)
+    except GridSearchJob.DoesNotExist:
+        logger.error(f"[GridSearchTask] job {job_id} not found")
+        return {"error": "job not found"}
+
+    if user_id and str(job.user_id) != user_id:
+        logger.error(
+            f"[GridSearchTask] user mismatch: job={job.user_id} requested={user_id}"
+        )
+        return {"error": "user mismatch"}
+
+    tracker = TaskTracker(
+        task_id=self.request.id, user_id=str(user_id or ""), task_type="grid_search"
+    )
+    token = tracker_context.set(tracker)
+    tracker.start(f"开始网格搜索：{job.symbol} {job.timeframe}")
+
+    try:
+        job.status = "running"
+        job.celery_task_id = self.request.id
+        job.save(update_fields=["status", "celery_task_id"])
+
+        config = job.search_config
+        strategy_name = job.strategy.name
+        combinations = generate_combinations(config)
+        job.total_combinations = len(combinations)
+        job.save(update_fields=["total_combinations"])
+
+        tracker.milestone(
+            f"已生成 {len(combinations)} 个参数组合", progress=0.05
+        )
+
+        tracker.milestone("正在获取历史K线数据...", progress=0.1)
+        ohlcv_data = _fetch_ohlcv_sync(
+            job.symbol,
+            job.timeframe,
+            exchange="binance",
+            start_date=job.start_date.isoformat() if isinstance(job.start_date, date) else str(job.start_date),
+            end_date=job.end_date.isoformat() if isinstance(job.end_date, date) else str(job.end_date),
+        )
+        if not ohlcv_data:
+            tracker.fail(f"未能获取 {job.symbol} {job.timeframe} 的历史K线数据")
+            job.status = "failed"
+            job.error_log = [{"error": "failed to fetch OHLCV data"}]
+            job.save(update_fields=["status", "error_log"])
+            return {"error": "OHLCV fetch failed"}
+
+        tracker.milestone(f"已获取 {len(ohlcv_data)} 条K线数据", progress=0.2)
+
+        runner = StrategyRunner()
+        results = []
+        loop = asyncio.new_event_loop()
+        start_time = timezone.now().timestamp()
+
+        for idx, params in enumerate(combinations):
+            try:
+                job.refresh_from_db()
+                if job.status == "cancelled":
+                    tracker.milestone("任务已被取消", progress=0.0)
+                    return {"cancelled": True, "completed": idx}
+            except Exception:
+                pass
+
+            combo_label = ", ".join(f"{k}={v}" for k, v in params.items())
+            progress = 0.2 + 0.7 * ((idx + 1) / max(len(combinations), 1))
+            tracker.milestone(
+                f"执行组合 [{idx + 1}/{len(combinations)}]: {combo_label}",
+                progress=progress,
+            )
+
+            try:
+                stats = loop.run_until_complete(
+                    runner.run_backtest(
+                        strategy_name=strategy_name,
+                        symbol=job.symbol,
+                        timeframe=job.timeframe,
+                        ohlcv_data=ohlcv_data,
+                        initial_capital=Decimal(str(job.initial_capital)),
+                        parameters=params,
+                        strategy_id=str(job.strategy_id),
+                        commission_rate=Decimal(str(job.commission_rate)),
+                        benchmark="",
+                    )
+                )
+                result_id = stats.get("result_id")
+                if result_id:
+                    BacktestResult.objects.filter(id=result_id).update(
+                        grid_search_id=job.id, is_grid_search=True
+                    )
+                    results.append(
+                        {"result_id": result_id, "params": params, **stats}
+                    )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as e:
+                job.error_log = job.error_log + [
+                    {"combination_index": idx, "params": params, "error": str(e)}
+                ]
+                job.save(update_fields=["error_log"])
+                logger.warning(
+                    f"[GridSearchTask] combination {idx} failed: {e}"
+                )
+
+            job.completed_combinations = idx + 1
+            job.save(update_fields=["completed_combinations"])
+
+        loop.close()
+
+        # 排序并标记最优结果
+        sort_key = job.sort_by or "sharpe_ratio"
+        if results:
+            sorted_results = sorted(
+                results,
+                key=lambda r: r.get(sort_key, 0) or 0,
+                reverse=True,
+            )
+            best = sorted_results[0]
+            best_result_id = best.get("result_id")
+            if best_result_id:
+                try:
+                    best_result_obj = BacktestResult.objects.get(id=best_result_id)
+                    job.best_result = best_result_obj
+                except BacktestResult.DoesNotExist:
+                    pass
+
+        elapsed = int(timezone.now().timestamp() - start_time)
+        best_val = results[0].get(sort_key) if results else "N/A"
+        job.status = "completed"
+        job.save(update_fields=["status", "completed_combinations", "best_result"])
+
+        tracker.complete(
+            f"网格搜索完成：{len(results)}/{job.total_combinations}，"
+            f"耗时 {elapsed}s，最优 {sort_key}={best_val}"
+        )
+
+        return {
+            "job_id": str(job.id),
+            "total_combinations": job.total_combinations,
+            "completed_combinations": job.completed_combinations,
+            "best_result_id": str(job.best_result_id) if job.best_result else None,
+        }
+
+    except SoftTimeLimitExceeded:
+        job.status = "failed"
+        job.error_log = job.error_log + [{"error": "soft time limit exceeded"}]
+        job.save(update_fields=["status", "error_log"])
+        tracker.fail("网格搜索超时")
+        return {"error": "time limit exceeded"}
+    except Exception as e:
+        job.status = "failed"
+        job.error_log = job.error_log + [{"error": str(e)}]
+        job.save(update_fields=["status", "error_log"])
+        tracker.fail(f"网格搜索失败: {e}")
+        raise
+    finally:
+        tracker.stop()
+        tracker_context.reset(token)
