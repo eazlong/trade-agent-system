@@ -78,6 +78,25 @@ class BacktestResult(models.Model):
         help_text='{"ma7": [...], "ma25": [...], "macd": {"dif": [...], "dea": [...], "hist": [...]}, "rsi": [...]}',
     )
 
+    # Advanced performance metrics (computed from equity curve and trades)
+    metrics = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Advanced stats: sortino/calmar/annualized/profit_factor/etc.",
+    )
+
+    # Grid search fields
+    grid_search_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="所属网格搜索任务 ID",
+    )
+    is_grid_search = models.BooleanField(
+        default=False,
+        help_text="是否为网格搜索的子回测",
+    )
+
     class Meta:
         db_table = "backtest_results"
 
@@ -124,3 +143,90 @@ class BacktestTrade(models.Model):
     class Meta:
         db_table = "backtest_trades"
         ordering = ["entry_time"]
+
+
+class GridSearchJob(models.Model):
+    """网格搜索任务，聚合多个 BacktestResult"""
+
+    STATUS_CHOICES = [
+        ("pending", "待执行"),
+        ("running", "运行中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("cancelled", "已取消"),
+    ]
+    SOURCE_CHOICES = [
+        ("agent", "Agent 对话"),
+        ("cron", "定时任务"),
+        ("api", "REST API"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="grid_search_jobs",
+    )
+    strategy = models.ForeignKey("trading.Strategy", on_delete=models.CASCADE)
+    symbol = models.CharField(max_length=32)
+    timeframe = models.CharField(max_length=8)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    initial_capital = models.DecimalField(max_digits=20, decimal_places=2)
+    commission_rate = models.DecimalField(max_digits=6, decimal_places=4, default=0.001)
+    search_config = models.JSONField(default=dict)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="pending")
+    source = models.CharField(max_length=8, choices=SOURCE_CHOICES, default="api")
+    total_combinations = models.IntegerField(default=0)
+    completed_combinations = models.IntegerField(default=0)
+    best_result = models.ForeignKey(
+        "backtest.BacktestResult",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="best_grid_result",
+    )
+    sort_by = models.CharField(max_length=32, default="sharpe_ratio")
+    error_log = models.JSONField(default=list, blank=True)
+    celery_task_id = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "grid_search_jobs"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"GridSearchJob({self.id}) strategy={self.strategy} status={self.status}"
+
+
+class GridSearchSchedule(models.Model):
+    """周期性网格搜索任务配置"""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=64)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="grid_search_schedules",
+    )
+    strategy = models.ForeignKey("trading.Strategy", on_delete=models.CASCADE)
+    symbol = models.CharField(max_length=32)
+    timeframe = models.CharField(max_length=8)
+    lookback_days = models.IntegerField(default=30)
+    search_config = models.JSONField(default=dict)
+    cron_schedule = models.CharField(max_length=32)
+    is_active = models.BooleanField(default=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    next_run_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "grid_search_schedules"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"GridSearchSchedule({self.name}) active={self.is_active}"
