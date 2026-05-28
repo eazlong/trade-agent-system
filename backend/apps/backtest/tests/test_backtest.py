@@ -178,3 +178,11 @@ class TestBacktestResultModel(TestCase):
             )
         self.assertEqual(result.trades.count(), 3)
         self.assertEqual(result.trades.filter(side="long").count(), 2)
+
+
+def test_serializer_includes_metrics_field():
+    """BacktestResultSerializer and BacktestDetailSerializer must include metrics field."""
+    from apps.backtest.serializers import BacktestResultSerializer, BacktestDetailSerializer
+
+    assert "metrics" in BacktestResultSerializer.Meta.fields
+    assert "metrics" in BacktestDetailSerializer.Meta.fields
