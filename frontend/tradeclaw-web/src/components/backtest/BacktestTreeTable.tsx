@@ -39,7 +39,6 @@ const renderChildRow = (r: BacktestResult) => (
     <td colSpan={11} className="p-0">
       <div className="ml-[30px] bg-bg2/50 rounded-md my-1 border border-[rgba(255,255,255,0.07)]">
         <div className="flex gap-4 p-3">
-          {/* Left: Parameters */}
           <div className="flex-1 min-w-0">
             <div className="text-[11px] font-bold text-green mb-2 font-mono">
               📋 策略参数
@@ -56,7 +55,6 @@ const renderChildRow = (r: BacktestResult) => (
                 ))}
             </div>
           </div>
-          {/* Right: Full Metrics */}
           <div className="flex-1 min-w-0">
             <div className="text-[11px] font-bold text-green mb-2 font-mono">
               📊 完整指标
@@ -140,16 +138,10 @@ export default function BacktestTreeTable({ groups, initialExpanded }: BacktestT
                   isExpanded={isExpanded}
                   isOrphaned={isOrphaned}
                   onToggle={() => toggle(group.job_id || "")}
-                  fmtPct={fmtPct}
-                  fmtNum={fmtNum}
-                  fmtDate={fmtDate}
-                  renderParams={renderParams}
-                  renderChildRow={renderChildRow}
                 />
               );
             }
 
-            // single
             const r = group.result;
             if (!r) return null;
             return (
@@ -191,27 +183,16 @@ export default function BacktestTreeTable({ groups, initialExpanded }: BacktestT
   );
 }
 
-/** Separate sub-component to keep main component readable */
 function GroupRow({
   group,
   isExpanded,
   isOrphaned,
   onToggle,
-  fmtPct,
-  fmtNum,
-  fmtDate,
-  renderParams,
-  renderChildRow,
 }: {
   group: BacktestGroup;
   isExpanded: boolean;
   isOrphaned: boolean;
   onToggle: () => void;
-  fmtPct: (v: number | null | undefined) => string;
-  fmtNum: (v: number | null | undefined) => string;
-  fmtDate: (d: string) => string;
-  renderParams: (params: Record<string, unknown>) => React.ReactNode;
-  renderChildRow: (r: BacktestResult) => React.ReactNode;
 }) {
   const borderColor = isOrphaned ? "border-gray-600" : "border-green/40";
   const bg = isOrphaned ? "bg-bg2/30" : "bg-bg2/40";
@@ -254,7 +235,6 @@ function GroupRow({
         </td>
       </tr>
 
-      {/* Summary row under collapsed group */}
       {!isExpanded && (
         <tr className={`border-b ${borderColor} ${bg}`}>
           <td colSpan={11} className="py-1.5 px-4 text-xs text-text3 font-mono pl-[40px]">
@@ -269,7 +249,6 @@ function GroupRow({
         </tr>
       )}
 
-      {/* Expanded child rows */}
       {isExpanded &&
         group.results?.map((r) => renderChildRow(r))}
     </>
