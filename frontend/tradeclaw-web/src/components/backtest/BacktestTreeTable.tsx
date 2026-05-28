@@ -87,10 +87,11 @@ const renderChildRow = (r: BacktestResult) => (
 
 interface BacktestTreeTableProps {
   groups: BacktestGroup[];
+  initialExpanded?: Set<string>;
 }
 
-export default function BacktestTreeTable({ groups }: BacktestTreeTableProps) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+export default function BacktestTreeTable({ groups, initialExpanded }: BacktestTreeTableProps) {
+  const [expanded, setExpanded] = useState<Set<string>>(initialExpanded || new Set());
 
   const toggle = (id: string) => {
     setExpanded((prev) => {

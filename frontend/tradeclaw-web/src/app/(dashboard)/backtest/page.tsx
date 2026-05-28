@@ -1,36 +1,89 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import Link from "next/link";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import DashboardShell from "@/components/layout/DashboardShell";
-import { backtestApi, type BacktestResult } from "@/lib/api";
+import { backtestApi, type BacktestGroup } from "@/lib/api";
+import BacktestFilterBar, { type FilterType } from "@/components/backtest/BacktestFilterBar";
+import BacktestTreeTable from "@/components/backtest/BacktestTreeTable";
 import CreateStrategyModal from "@/components/dashboard/CreateStrategyModal";
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 10;
 
 export default function BacktestListPage() {
-  const [results, setResults] = useState<BacktestResult[]>([]);
+  const [groups, setGroups] = useState<BacktestGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
+  const [groupCount, setGroupCount] = useState(0);
   const [modalOpen, setModalOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [filterType, setFilterType] = useState<FilterType>("all");
 
-  useEffect(() => {
+  const fetchData = useCallback(() => {
     setLoading(true);
+    setError(null);
     backtestApi
-      .getList({ page, page_size: PAGE_SIZE })
+      .getGroupedList({ page, page_size: PAGE_SIZE })
       .then((data) => {
-        setResults(data.results ?? []);
+        setGroups(data.groups ?? []);
         setTotalPages(data.num_pages);
-        setTotalCount(data.count);
+        setTotalCount(data.total_records);
+        setGroupCount(data.group_count);
       })
-      .catch(() => setResults([]))
+      .catch((e) => {
+        setError(e?.message || "获取回测数据失败，请稍后重试");
+        setGroups([]);
+      })
       .finally(() => setLoading(false));
   }, [page]);
 
-  const fmtDate = (d: string) =>
-    new Date(d).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const hasChildMatch = useCallback((group: BacktestGroup, q: string) => {
+    if (group.type === "grid_search" || group.type === "orphaned_grid_search") {
+      return group.results?.some((r) =>
+        r.strategy_name?.toLowerCase().includes(q) ||
+        r.symbol?.toLowerCase().includes(q)
+      );
+    }
+    return false;
+  }, []);
+
+  const { filteredGroups, expandedOnMatch } = useMemo(() => {
+    if (!search.trim()) {
+      return { filteredGroups: groups, expandedOnMatch: new Set<string>() };
+    }
+
+    const q = search.toLowerCase();
+    const expanded = new Set<string>();
+    const filtered = groups.filter((group) => {
+      if (group.type === "grid_search" || group.type === "orphaned_grid_search") {
+        const matchJobName = group.job_name?.toLowerCase().includes(q);
+        const matchSymbol = group.symbol?.toLowerCase().includes(q);
+        if (matchJobName || matchSymbol) return true;
+        const childMatch = hasChildMatch(group, q);
+        if (childMatch) {
+          expanded.add(group.job_id || "");
+          return true;
+        }
+        return false;
+      }
+      return (
+        group.result?.strategy_name?.toLowerCase().includes(q) ||
+        group.result?.symbol?.toLowerCase().includes(q)
+      );
+    });
+    return { filteredGroups: filtered, expandedOnMatch: expanded };
+  }, [groups, search, hasChildMatch]);
+
+  const handleFilterChange = useCallback((values: { search: string; filterType: FilterType }) => {
+    setSearch(values.search);
+    setFilterType(values.filterType);
+  }, []);
 
   return (
     <DashboardShell>
@@ -47,145 +100,94 @@ export default function BacktestListPage() {
         </button>
       </div>
 
+      <BacktestFilterBar onChange={handleFilterChange} />
+
       {loading ? (
         <div className="text-xs text-text3 py-8 text-center">加载中...</div>
-      ) : results.length === 0 ? (
-        <div className="text-xs text-text3 py-8 text-center">
-          暂无回测记录
+      ) : error ? (
+        <div className="text-xs text-red py-8 text-center font-mono">
+          {error}
+          <button
+            onClick={fetchData}
+            className="ml-3 text-green hover:underline cursor-pointer"
+          >
+            重试
+          </button>
         </div>
       ) : (
-        <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden">
-          <table className="w-full text-xs font-mono">
-            <thead>
-              <tr className="text-text3 border-b border-[rgba(255,255,255,0.07)]">
-                <th className="text-left py-2.5 px-4 font-semibold">策略</th>
-                <th className="text-left py-2.5 px-4 font-semibold">品种</th>
-                <th className="text-left py-2.5 px-4 font-semibold">周期</th>
-                <th className="text-left py-2.5 px-4 font-semibold">日期区间</th>
-                <th className="text-right py-2.5 px-4 font-semibold">收益率</th>
-                <th className="text-right py-2.5 px-4 font-semibold">夏普</th>
-                <th className="text-right py-2.5 px-4 font-semibold">最大回撤</th>
-                <th className="text-right py-2.5 px-4 font-semibold">交易数</th>
-                <th className="text-right py-2.5 px-4 font-semibold">胜率</th>
-                <th className="text-right py-2.5 px-4 font-semibold">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {results.map((r) => (
-                <tr
-                  key={r.id}
-                  className="border-b border-[rgba(255,255,255,0.04)] hover:bg-bg2/50 transition-colors"
+        <>
+          <BacktestTreeTable groups={filteredGroups} initialExpanded={expandedOnMatch} />
+          {filteredGroups.length > 0 && totalPages > 1 && (
+            <div className="flex items-center justify-between mt-3 text-xs font-mono">
+              <span className="text-text3">
+                共 {totalCount} 条 / {groupCount} 组，第 {page}/{totalPages} 页
+              </span>
+              <div className="flex gap-1.5">
+                <button
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page === 1}
+                  className="px-2.5 py-1 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                 >
-                  <td className="py-2 px-4 text-text font-semibold">{r.strategy_name}</td>
-                  <td className="py-2 px-4 text-text font-semibold">{r.symbol}</td>
-                  <td className="py-2 px-4 text-text2">{r.timeframe}</td>
-                  <td className="py-2 px-4 text-text3">
-                    {fmtDate(r.start_date)} ~ {fmtDate(r.end_date)}
-                  </td>
-                  <td
-                    className={`py-2 px-4 text-right font-semibold ${
-                      r.total_return_pct >= 0 ? "text-green" : "text-red"
-                    }`}
+                  上一页
+                </button>
+                {page > 2 && (
+                  <button
+                    onClick={() => setPage(1)}
+                    className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
                   >
-                    {r.total_return_pct >= 0 ? "+" : ""}
-                    {r.total_return_pct.toFixed(2)}%
-                  </td>
-                  <td className="py-2 px-4 text-right text-text">
-                    {r.sharpe_ratio?.toFixed(2) ?? "—"}
-                  </td>
-                  <td className="py-2 px-4 text-right text-red">
-                    {r.max_drawdown_pct?.toFixed(2) ?? "—"}%
-                  </td>
-                  <td className="py-2 px-4 text-right text-text2">
-                    {r.total_trades}
-                  </td>
-                  <td className="py-2 px-4 text-right text-text2">
-                    {r.win_rate ? `${(r.win_rate * 100).toFixed(1)}%` : "—"}
-                  </td>
-                  <td className="py-2 px-4 text-right">
-                    <Link
-                      href={`/backtest/${r.id}`}
-                      className="text-green hover:underline cursor-pointer"
-                    >
-                      详情
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {!loading && results.length > 0 && totalPages > 1 && (
-        <div className="flex items-center justify-between mt-3 text-xs font-mono">
-          <span className="text-text3">
-            共 {totalCount} 条，第 {page}/{totalPages} 页
-          </span>
-          <div className="flex gap-1.5">
-            <button
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page === 1}
-              className="px-2.5 py-1 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              上一页
-            </button>
-            {page > 2 && (
-              <button
-                onClick={() => setPage(1)}
-                className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
-              >
-                1
-              </button>
-            )}
-            {page > 3 && (
-              <span className="px-1 py-1 text-text3">…</span>
-            )}
-            {page > 1 && (
-              <button
-                onClick={() => setPage(page - 1)}
-                className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
-              >
-                {page - 1}
-              </button>
-            )}
-            <span className="w-8 h-7 flex items-center justify-center rounded-md bg-green/10 border border-green/30 text-green font-semibold">
-              {page}
-            </span>
-            {page < totalPages && (
-              <button
-                onClick={() => setPage(page + 1)}
-                className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
-              >
-                {page + 1}
-              </button>
-            )}
-            {page < totalPages - 2 && (
-              <span className="px-1 py-1 text-text3">…</span>
-            )}
-            {page < totalPages - 1 && (
-              <button
-                onClick={() => setPage(totalPages)}
-                className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
-              >
-                {totalPages}
-              </button>
-            )}
-            <button
-              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              disabled={page === totalPages}
-              className="px-2.5 py-1 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-            >
-              下一页
-            </button>
-          </div>
-        </div>
+                    1
+                  </button>
+                )}
+                {page > 3 && (
+                  <span className="px-1 py-1 text-text3">…</span>
+                )}
+                {page > 1 && (
+                  <button
+                    onClick={() => setPage(page - 1)}
+                    className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
+                  >
+                    {page - 1}
+                  </button>
+                )}
+                <span className="w-8 h-7 flex items-center justify-center rounded-md bg-green/10 border border-green/30 text-green font-semibold">
+                  {page}
+                </span>
+                {page < totalPages && (
+                  <button
+                    onClick={() => setPage(page + 1)}
+                    className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
+                  >
+                    {page + 1}
+                  </button>
+                )}
+                {page < totalPages - 2 && (
+                  <span className="px-1 py-1 text-text3">…</span>
+                )}
+                {page < totalPages - 1 && (
+                  <button
+                    onClick={() => setPage(totalPages)}
+                    className="w-8 h-7 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text transition-colors"
+                  >
+                    {totalPages}
+                  </button>
+                )}
+                <button
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page === totalPages}
+                  className="px-2.5 py-1 rounded-md bg-bg1 border border-[rgba(255,255,255,0.07)] text-text2 hover:text-text disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <CreateStrategyModal
         open={modalOpen}
         onClose={() => setModalOpen(false)}
-        onCreated={() => setPage(1)}
+        onCreated={() => { setPage(1); fetchData(); }}
       />
     </DashboardShell>
   );
