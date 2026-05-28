@@ -462,6 +462,7 @@ export interface BacktestResult {
   total_trades: number;
   git_commit_hash: string;
   parameters: Record<string, unknown>;
+  metrics?: Record<string, any>;
   review_status: "pending" | "approved" | "rejected";
   review_notes: string;
   reviewed_at: string | null;
@@ -560,6 +561,30 @@ export interface PaginatedBacktestResults {
   results: BacktestResult[];
 }
 
+export interface BacktestGroup {
+  type: 'grid_search' | 'single' | 'orphaned_grid_search';
+  job_id?: string;
+  job_name?: string;
+  symbol: string;
+  timeframe: string;
+  status?: 'running' | 'completed' | 'failed' | 'pending' | 'cancelled';
+  total_combinations?: number;
+  completed?: number;
+  best_return_pct?: number;
+  best_sharpe?: number;
+  created_at: string;
+  results?: BacktestResult[];  // for grid_search / orphaned
+  result?: BacktestResult;     // for single
+}
+
+export interface GroupedBacktestResponse {
+  groups: BacktestGroup[];
+  group_count: number;
+  total_records: number;
+  num_pages: number;
+  current_page: number;
+}
+
 export interface BacktestListParams {
   page?: number;
   page_size?: number;
@@ -572,6 +597,16 @@ export const backtestApi = {
     if (params?.page_size) query.set("page_size", String(params.page_size));
     const qs = query.toString();
     return request<PaginatedBacktestResults>(
+      `/api/backtest/results/${qs ? `?${qs}` : ""}`
+    );
+  },
+  getGroupedList: (params?: BacktestListParams) => {
+    const query = new URLSearchParams();
+    query.set("grouped", "1");
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.page_size) query.set("page_size", String(params.page_size));
+    const qs = query.toString();
+    return request<GroupedBacktestResponse>(
       `/api/backtest/results/${qs ? `?${qs}` : ""}`
     );
   },
@@ -693,4 +728,39 @@ export interface Memory {
 export const memoryApi = {
   list: () => request<Memory[]>("/api/memory/"),
   delete: (id: string) => request<void>(`/api/memory/${id}/`, "DELETE"),
+};
+
+// ── Channel / Feishu API ──
+
+export interface FeishuAuthStatus {
+  authorized: boolean;
+  open_id?: string;
+  expires_at?: string;
+  created_at?: string;
+}
+
+export interface FeishuQRInitResponse {
+  session_id: string;
+  qr_url: string;
+  expires_in: number;
+}
+
+export interface FeishuQRStatusResponse {
+  session_id: string;
+  status: "pending" | "completed" | "expired" | "failed";
+}
+
+export interface FeishuUrlInitResponse {
+  session_id: string;
+  authorize_url: string;
+}
+
+export const channelApi = {
+  feishuStatus: () => request<FeishuAuthStatus>("/api/channel/auth/lark/status/"),
+  feishuQR: () => request<FeishuQRInitResponse>("/api/channel/auth/lark/qr/"),
+  feishuQRStatus: (sessionId: string) =>
+    request<FeishuQRStatusResponse>(`/api/channel/auth/lark/qr/${sessionId}/status/`),
+  feishuUrl: () => request<FeishuUrlInitResponse>("/api/channel/auth/lark/url/"),
+  feishuRefresh: () => request<{ status: string; expires_at: string }>("/api/channel/auth/lark/refresh/", "POST"),
+  feishuRevoke: () => request<void>("/api/channel/auth/lark/revoke/", "DELETE"),
 };
