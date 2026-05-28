@@ -21,6 +21,12 @@ from .serializers import (
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def result_list(request):
+    # --- grouped mode ---
+    grouped = request.query_params.get("grouped") == "1"
+    if grouped:
+        return _build_grouped_response(request)
+
+    # --- original flat mode (unchanged) ---
     page = int(request.query_params.get("page", 1))
     page_size = min(int(request.query_params.get("page_size", 20)), 200)
     queryset = BacktestResult.objects.order_by("-created_at")
@@ -34,6 +40,102 @@ def result_list(request):
             "results": BacktestResultSerializer(page_obj, many=True).data,
         }
     )
+
+
+def _build_grouped_response(request):
+    """按 grid_search_id 聚合回测结果，返回分组结构。"""
+    from .models import GridSearchJob
+    from .serializers import BacktestResultSerializer, GridSearchGroupSerializer, SingleGroupSerializer
+    from collections import defaultdict
+
+    user = request.user
+    # 只查当前用户的回测
+    results = BacktestResult.objects.filter(user=user).select_related("strategy")
+
+    # 按 grid_search_id 分组
+    grid_map = defaultdict(list)
+    singles = []
+    for r in results:
+        if r.is_grid_search and r.grid_search_id:
+            grid_map[r.grid_search_id].append(r)
+        else:
+            singles.append(r)
+
+    groups = []
+
+    # 构建网格搜索分组
+    job_ids = list(grid_map.keys())
+    # prefetch jobs
+    jobs_by_id = {}
+    if job_ids:
+        for job in GridSearchJob.objects.filter(id__in=job_ids).select_related("strategy"):
+            jobs_by_id[str(job.id)] = job
+
+    for job_id, job_results in grid_map.items():
+        job = jobs_by_id.get(str(job_id))
+        if job:
+            strategy_name = job.strategy.name if job.strategy else "Unknown"
+            job_name = f"{strategy_name} - {job.symbol}/{job.timeframe}"
+            # 计算最佳指标
+            best_return = max((r.total_return_pct or 0) for r in job_results)
+            best_sharpe = max((r.sharpe_ratio or 0) for r in job_results)
+            groups.append({
+                "type": "grid_search",
+                "job_id": str(job_id),
+                "job_name": job_name,
+                "symbol": job.symbol,
+                "timeframe": job.timeframe,
+                "status": job.status,
+                "total_combinations": job.total_combinations,
+                "completed": job.completed_combinations,
+                "best_return_pct": best_return,
+                "best_sharpe": best_sharpe,
+                "created_at": job.created_at,
+                "results": BacktestResultSerializer(job_results, many=True).data,
+            })
+        else:
+            # 已删除的 job → orphaned
+            first = job_results[0]
+            groups.append({
+                "type": "orphaned_grid_search",
+                "job_id": str(job_id),
+                "job_name": "未知任务",
+                "symbol": first.symbol,
+                "timeframe": first.timeframe,
+                "status": "completed",
+                "total_combinations": len(job_results),
+                "completed": len(job_results),
+                "best_return_pct": max((r.total_return_pct or 0) for r in job_results),
+                "best_sharpe": max((r.sharpe_ratio or 0) for r in job_results),
+                "created_at": first.created_at,
+                "results": BacktestResultSerializer(job_results, many=True).data,
+            })
+
+    # 单次回测
+    for r in singles:
+        groups.append({
+            "type": "single",
+            "result": BacktestResultSerializer(r).data,
+        })
+
+    # 按 created_at 倒序
+    groups.sort(
+        key=lambda g: g.get("created_at") or g.get("result", {}).get("created_at") or "",
+        reverse=True,
+    )
+
+    page_size = 10  # groups per page
+    paginator = Paginator(groups, page_size)
+    page_num = int(request.query_params.get("page", 1))
+    page_obj = paginator.get_page(page_num)
+
+    return Response({
+        "groups": page_obj.object_list,
+        "group_count": paginator.count,
+        "total_records": results.count(),
+        "num_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+    })
 
 
 @api_view(["GET"])

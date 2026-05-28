@@ -129,3 +129,25 @@ class GridSearchJobSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class GridSearchGroupSerializer(serializers.Serializer):
+    """序列化一个分组（网格搜索任务）"""
+    type = serializers.CharField(default="grid_search")
+    job_id = serializers.UUIDField()
+    job_name = serializers.CharField()
+    symbol = serializers.CharField()
+    timeframe = serializers.CharField()
+    status = serializers.CharField()
+    total_combinations = serializers.IntegerField()
+    completed = serializers.IntegerField()
+    best_return_pct = serializers.FloatField(allow_null=True)
+    best_sharpe = serializers.FloatField(allow_null=True)
+    created_at = serializers.DateTimeField()
+    results = serializers.ListField(child=serializers.DictField())
+
+
+class SingleGroupSerializer(serializers.Serializer):
+    """序列化一个单次回测分组"""
+    type = serializers.CharField(default="single")
+    result = serializers.DictField()

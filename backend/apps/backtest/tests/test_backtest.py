@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import date, datetime
 
+import pytest
 from django.test import TestCase
 
 from apps.backtest.models import BacktestResult, BacktestTrade
@@ -186,3 +187,105 @@ def test_serializer_includes_metrics_field():
 
     assert "metrics" in BacktestResultSerializer.Meta.fields
     assert "metrics" in BacktestDetailSerializer.Meta.fields
+
+
+@pytest.mark.django_db
+def test_grouped_list_returns_groups():
+    """GET /api/backtest/results/?grouped=1 returns grouped response shape."""
+    from rest_framework.test import APIClient
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    user = User.objects.create_user(email="test@example.com", username="testuser", password="testpass123")
+    client = APIClient()
+    client.force_authenticate(user=user)
+
+    resp = client.get("/api/backtest/results/?grouped=1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "groups" in data
+    assert "group_count" in data
+    assert "total_records" in data
+    assert "num_pages" in data
+    assert "current_page" in data
+    assert isinstance(data["groups"], list)
+
+
+@pytest.mark.django_db
+def test_grouped_list_grid_search_group():
+    """Grouped API should group BacktestResults by grid_search_id."""
+    from rest_framework.test import APIClient
+    from django.contrib.auth import get_user_model
+    from apps.backtest.models import GridSearchJob, BacktestResult
+    from apps.trading.models import Strategy
+    from datetime import date, timedelta
+
+    User = get_user_model()
+    user = User.objects.create_user(email="test@example.com", username="testuser", password="testpass123")
+    strategy = Strategy.objects.create(name="TestStrategy", code_path="/test", git_commit_hash="abc123")
+    job = GridSearchJob.objects.create(
+        strategy=strategy, symbol="BTC/USDT", timeframe="1h",
+        start_date=date.today() - timedelta(days=30), end_date=date.today(),
+        initial_capital=10000, user=user, search_config={"parameters": {}},
+    )
+    r1 = BacktestResult.objects.create(
+        strategy=strategy, user=user, symbol="BTC/USDT", timeframe="1h",
+        start_date=date.today() - timedelta(days=30), end_date=date.today(),
+        initial_capital=10000, final_capital=11000, total_return_pct=10.0,
+        sharpe_ratio=1.5, grid_search_id=job.id, is_grid_search=True,
+        parameters={"period": 20},
+    )
+    r2 = BacktestResult.objects.create(
+        strategy=strategy, user=user, symbol="BTC/USDT", timeframe="1h",
+        start_date=date.today() - timedelta(days=30), end_date=date.today(),
+        initial_capital=10000, final_capital=10500, total_return_pct=5.0,
+        sharpe_ratio=1.0, grid_search_id=job.id, is_grid_search=True,
+        parameters={"period": 26},
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.get("/api/backtest/results/?grouped=1")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Should have at least one grid_search group
+    grid_groups = [g for g in data["groups"] if g["type"] == "grid_search"]
+    assert len(grid_groups) >= 1
+    group = grid_groups[0]
+    assert group["job_id"] == str(job.id)
+    assert group["symbol"] == "BTC/USDT"
+    assert len(group["results"]) == 2
+    # Results should have metrics field
+    assert "metrics" in group["results"][0]
+
+
+@pytest.mark.django_db
+def test_grouped_list_single_backtest():
+    """Non-grid-search results should appear as single groups."""
+    from rest_framework.test import APIClient
+    from django.contrib.auth import get_user_model
+    from apps.backtest.models import BacktestResult
+    from apps.trading.models import Strategy
+    from datetime import date, timedelta
+
+    User = get_user_model()
+    user = User.objects.create_user(email="test@example.com", username="testuser", password="testpass123")
+    strategy = Strategy.objects.create(name="SingleStrategy", code_path="/test", git_commit_hash="abc123")
+    BacktestResult.objects.create(
+        strategy=strategy, user=user, symbol="ETH/USDT", timeframe="4h",
+        start_date=date.today() - timedelta(days=30), end_date=date.today(),
+        initial_capital=10000, final_capital=10800, total_return_pct=8.0,
+        sharpe_ratio=1.2, is_grid_search=False,
+        parameters={"rsi_period": 14},
+    )
+
+    client = APIClient()
+    client.force_authenticate(user=user)
+    resp = client.get("/api/backtest/results/?grouped=1")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    singles = [g for g in data["groups"] if g["type"] == "single"]
+    assert len(singles) >= 1
+    assert singles[0]["result"]["symbol"] == "ETH/USDT"
