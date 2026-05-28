@@ -383,8 +383,8 @@ export default function BacktestDetailPage() {
         </p>
       </div>
 
-      {/* Metrics Cards */}
-      <div className="grid grid-cols-6 gap-3 mb-4">
+      {/* Metrics Cards - Basic */}
+      <div className="grid grid-cols-6 gap-3 mb-3">
         {[
           { label: "初始资金", value: Number(detail.initial_capital).toLocaleString() },
           { label: "最终资金", value: Number(detail.final_capital).toLocaleString() },
@@ -417,6 +417,34 @@ export default function BacktestDetailPage() {
           </div>
         ))}
       </div>
+
+      {/* Metrics Cards - Advanced */}
+      {detail.metrics && Object.keys(detail.metrics).length > 0 && (
+        <div className="grid grid-cols-6 gap-3 mb-4">
+          {[
+            { label: "Sortino", value: fmtNum(detail.metrics.sortino), cls: "text-text" },
+            { label: "Calmar", value: fmtNum(detail.metrics.calmar), cls: "text-text" },
+            { label: "Profit Factor", value: fmtNum(detail.metrics.profit_factor), cls: "text-text" },
+            { label: "年化收益", value: fmtNum(detail.metrics.annualized_return) + "%", cls: "text-text" },
+            { label: "平均持仓", value: fmtNum(detail.metrics.avg_hold_time) + "h", cls: "text-text" },
+            { label: "盈亏比", value: fmtNum(detail.metrics.win_loss_ratio), cls: "text-text" },
+          ]
+            .filter((m) => m.value !== "—")
+            .map((m, i) => (
+              <div
+                key={i}
+                className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl px-4 py-3"
+              >
+                <div className="text-[10px] text-text3 uppercase tracking-wider mb-1">
+                  {m.label}
+                </div>
+                <div className={`text-sm font-mono font-bold ${m.cls}`}>
+                  {m.value}
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
 
       {/* Review & Deploy Section */}
       {detail && (
