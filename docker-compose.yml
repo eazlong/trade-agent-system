@@ -1,6 +1,9 @@
 services:
   db:
     image: timescale/timescaledb-ha:pg16
+    command: >
+      -c max_connections=100
+      -c shared_buffers=256MB
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-trade_agent}
       POSTGRES_USER: ${POSTGRES_USER:-trade}
@@ -48,6 +51,7 @@ services:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
       - DB_HOST=db
+      - DB_CONN_MAX_AGE=15        # ASGI: short-lived connections
     env_file:
       - ./backend/.env
     depends_on:
@@ -62,7 +66,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: celery -A celery_app worker -l info
+    command: celery -A celery_app worker -l info --concurrency=4 -Q celery,grid_search
     volumes:
       - ./backend:/app
       - ~/.tradelogx:/root/.tradelogx
@@ -70,12 +74,33 @@ services:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
       - DB_HOST=db
+      - DB_CONN_MAX_AGE=0         # Worker: no persistent connections
       - WEB_PROXY=socks5://host.docker.internal:7890
       - CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
     env_file:
       - ./backend/.env
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - backend
+    networks:
+      - agent-net
+
+  lark-ws:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m apps.channel.lark_ws
+    volumes:
+      - ./backend:/app
+      - ~/.tradelogx:/root/.tradelogx
+    environment:
+      - DJANGO_SETTINGS_MODULE=core.settings.dev
+      - REDIS_URL=redis://redis:6379
+      - DB_HOST=db
+      - DB_CONN_MAX_AGE=30        # Lark WS: long-lived, low frequency
+    env_file:
+      - ./backend/.env
     depends_on:
       - backend
     networks:
@@ -92,6 +117,7 @@ services:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
       - DB_HOST=db
+      - DB_CONN_MAX_AGE=60        # Beat: very infrequent, keep alive
     env_file:
       - ./backend/.env
     depends_on:
