@@ -584,3 +584,14 @@ lower = float(bb["lower"][-1])
 2. 用 `[-1]` 取最新元素
 3. 用 `float()` 转为 Python 原生标量
 4. 之后才能安全使用 `== 0`、`is None`、`< >` 等比较运算
+
+### get_watch_signals 格式要求
+
+**必须返回正确格式** — `list[dict]`，每个 dict 必须包含以下五个字段：
+- `interval` — K线周期（如 `"1h"`）
+- `indicator_type` — 指标类型（如 `"rsi"`）
+- `indicator_params` — 指标参数字典（如 `{"period": 14}`）
+- `condition` — 触发条件字典
+- `trigger_type` — 触发类型（`"once"` 或 `"continuous"`）
+
+空策略返回 `[]`，实盘策略必须有完整实现。
