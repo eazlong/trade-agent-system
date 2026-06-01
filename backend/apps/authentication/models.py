@@ -30,6 +30,9 @@ class User(AbstractBaseUser):
     telegram_chat_id = models.BigIntegerField(
         null=True, blank=True, verbose_name="Telegram Chat ID"
     )
+    feishu_open_id = models.CharField(
+        max_length=128, null=True, blank=True, verbose_name="Feishu Open ID"
+    )
     is_active = models.BooleanField(default=True)
     is_frozen = models.BooleanField(default=False)  # 风控冻结
     is_admin = models.BooleanField(default=False)

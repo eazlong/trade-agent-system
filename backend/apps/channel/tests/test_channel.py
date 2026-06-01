@@ -89,3 +89,117 @@ class TestBaseChannel(unittest.TestCase):
         # 尝试实例化抽象类应抛出 TypeError
         with self.assertRaises(TypeError):
             BaseChannel()
+
+
+class TestLarkChannel(unittest.TestCase):
+    """测试飞书 Lark Channel"""
+
+    def setUp(self):
+        from apps.channel.lark import LarkChannel
+
+        self.channel = LarkChannel(
+            app_id="test_app_id",
+            app_secret="test_app_secret",
+            verification_token="test_verify_token",
+            encrypt_key="",
+            supervisor_agent=MagicMock(),
+        )
+
+    def test_channel_name(self):
+        self.assertEqual(self.channel.name, "lark")
+
+    def test_send_message_without_chat_id(self):
+        """没有 chat_id 时不应发送消息"""
+        self.channel._chat_id = ""
+        result = asyncio.run(self.channel.send_message("test"))
+        self.assertIsNone(result)
+
+    def test_send_photo_without_chat_id(self):
+        """没有 chat_id 时不应发送照片"""
+        self.channel._chat_id = ""
+        result = asyncio.run(self.channel.send_photo(b"image_data", "caption"))
+        self.assertIsNone(result)
+
+    def test_extract_content_from_dict(self):
+        """从字典响应提取 content"""
+        reply = '{"content": "hello world"}'
+        self.assertEqual(self.channel._extract_content(reply), "hello world")
+
+    def test_extract_content_from_dict_obj(self):
+        """从 dict 对象提取 content"""
+        reply = {"content": "hello", "extra": "data"}
+        self.assertEqual(self.channel._extract_content(reply), "hello")
+
+    def test_extract_content_from_plain_string(self):
+        """纯字符串直接返回"""
+        self.assertEqual(self.channel._extract_content("plain text"), "plain text")
+
+    def test_url_verification_challenge(self):
+        """飞书 URL 验证挑战应返回 challenge"""
+        import json
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        body = '{"type": "url_verification", "token": "test_verify_token", "challenge": "abc123"}'
+        request = factory.post(
+            "/api/channel/webhook/lark/",
+            data=body,
+            content_type="application/json",
+        )
+        response = self.channel.handle_webhook(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["challenge"], "abc123")
+
+    def test_url_verification_wrong_token(self):
+        """错误的 verification token 应返回 403"""
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        body = '{"type": "url_verification", "token": "wrong_token", "challenge": "abc123"}'
+        request = factory.post(
+            "/api/channel/webhook/lark/",
+            data=body,
+            content_type="application/json",
+        )
+        response = self.channel.handle_webhook(request)
+        self.assertEqual(response.status_code, 403)
+
+    def test_invalid_json_body(self):
+        """无效 JSON 应返回 400"""
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        request = factory.post(
+            "/api/channel/webhook/lark/",
+            data="not json",
+            content_type="application/json",
+        )
+        response = self.channel.handle_webhook(request)
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_text_message_ignored(self):
+        """非文本消息类型应被忽略（不崩溃）"""
+        import json
+        from django.test import RequestFactory
+
+        factory = RequestFactory()
+        body = json.dumps({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "message": {
+                    "chat_id": "test_chat",
+                    "message_type": "image",
+                    "content": '{"image_key": "img_123"}',
+                },
+                "sender": {"sender_id": {"open_id": "user_123"}},
+            },
+        })
+        request = factory.post(
+            "/api/channel/webhook/lark/",
+            data=body,
+            content_type="application/json",
+        )
+        # 不应抛出异常
+        response = self.channel.handle_webhook(request)
+        self.assertEqual(response.status_code, 200)

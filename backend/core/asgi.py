@@ -29,12 +29,10 @@ logger = logging.getLogger(__name__)
 
 
 async def _listen_progress_notifications():
-    """Background task: subscribe to Redis pubsub and forward to Telegram."""
+    """Background task: subscribe to Redis pubsub and forward to active channel."""
     import json
 
     import redis.asyncio as aioredis
-
-    from apps.channel.telegram import TelegramChannel
 
     _PROGRESS_CHANNEL = "task:progress:notifications"
     from django.conf import settings
@@ -56,10 +54,10 @@ async def _listen_progress_notifications():
             try:
                 data = json.loads(message["data"])
                 text = data.get("text", "")
-                if _telegram_channel and _telegram_channel._app:
-                    await _telegram_channel.send_message(text)
-                else:
-                    logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
+                user_id = data.get("user_id", "")
+                if not text:
+                    continue
+                await _route_notification(user_id, text)
             except Exception:
                 logger.warning("[ASGI] failed to process progress notification", exc_info=True)
     except (asyncio.CancelledError, GeneratorExit, RuntimeError):
@@ -73,6 +71,41 @@ async def _listen_progress_notifications():
                 await pubsub.aclose()
             except Exception:
                 pass
+
+
+async def _route_notification(user_id: str, text: str):
+    """Route a notification to the user's active channel (Telegram or Lark)."""
+    from asgiref.sync import sync_to_async
+    from apps.channel.channel_resolver import get_user_active_channel
+
+    target = await sync_to_async(get_user_active_channel)(user_id)
+
+    if target is None:
+        # Fallback: try Telegram in-memory instance (legacy behavior)
+        if _telegram_channel and _telegram_channel._app:
+            await _telegram_channel.send_message(text)
+        else:
+            logger.debug("[ASGI] no active channel for user %s, dropping: %s", user_id, text[:50])
+        return
+
+    if target.channel_type == "telegram":
+        if _telegram_channel and _telegram_channel._app:
+            old_chat_id = _telegram_channel._chat_id
+            try:
+                _telegram_channel._chat_id = int(target.chat_id)
+                await _telegram_channel.send_message(text)
+            finally:
+                _telegram_channel._chat_id = old_chat_id
+        else:
+            logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
+
+    elif target.channel_type == "lark":
+        try:
+            from apps.channel.lark_ws import _get_channel as _get_lark_channel
+            lark = _get_lark_channel()
+            await lark.send_message_to_user(target.user_open_id, text)
+        except Exception:
+            logger.warning("[ASGI] failed to send Lark notification", exc_info=True)
 
 
 class LifespanHandler:

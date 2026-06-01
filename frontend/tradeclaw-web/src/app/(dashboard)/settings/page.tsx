@@ -9,10 +9,12 @@ import {
   scheduledTaskApi,
   signalMonitorApi,
   memoryApi,
+  channelApi,
   Memory,
   SignalMonitor,
   ScheduledTask,
   RiskConfig as RiskConfigType,
+  FeishuAuthStatus,
 } from "@/lib/api";
 
 export default function SettingsPage() {
@@ -63,6 +65,13 @@ export default function SettingsPage() {
   // Memories
   const [memories, setMemories] = useState<Memory[]>([]);
   const [memoriesLoading, setMemoriesLoading] = useState(false);
+
+  // Feishu auth
+  const [feishuStatus, setFeishuStatus] = useState<FeishuAuthStatus | null>(null);
+  const [feishuLoading, setFeishuLoading] = useState(false);
+  const [qrSessionId, setQrSessionId] = useState<string | null>(null);
+  const [qrUrl, setQrUrl] = useState<string>("");
+  const [authMode, setAuthMode] = useState<"qr" | "url">("qr");
 
   // Load existing exchange accounts and risk config
   const loadInitialData = useCallback(async () => {
@@ -119,6 +128,61 @@ export default function SettingsPage() {
     }
   }, []);
 
+  const loadFeishuStatus = useCallback(async () => {
+    try {
+      const res = await channelApi.feishuStatus();
+      setFeishuStatus(res);
+    } catch {
+      // API not available
+    }
+  }, []);
+
+  const handleFeishuRevoke = async () => {
+    if (!confirm("确定要撤销飞书授权吗？此操作不可撤销。")) return;
+    try {
+      await channelApi.feishuRevoke();
+      setFeishuStatus(null);
+      loadFeishuStatus();
+    } catch (err) {
+      alert(`撤销失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  };
+
+  const handleFeishuRefresh = async () => {
+    try {
+      await channelApi.feishuRefresh();
+      alert("Token 刷新成功");
+      loadFeishuStatus();
+    } catch (err) {
+      alert(`刷新失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    }
+  };
+
+  const handleStartQR = async () => {
+    setFeishuLoading(true);
+    try {
+      const res = await channelApi.feishuQR();
+      setQrSessionId(res.session_id);
+      setQrUrl(res.qr_url);
+    } catch (err) {
+      alert(`获取二维码失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setFeishuLoading(false);
+    }
+  };
+
+  const handleStartUrl = async () => {
+    setFeishuLoading(true);
+    try {
+      const res = await channelApi.feishuUrl();
+      window.open(res.authorize_url, "_blank");
+    } catch (err) {
+      alert(`获取授权链接失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setFeishuLoading(false);
+    }
+  };
+
   const handleDeleteMemory = useCallback(async (id: string) => {
     if (!confirm("确定要删除该记忆吗？此操作不可撤销。")) {
       return;
@@ -151,6 +215,37 @@ export default function SettingsPage() {
       loadMemories();
     }
   }, [activeTab, loadMemories]);
+
+  // Load feishu status when tab is activated
+  useEffect(() => {
+    if (activeTab === "feishu") {
+      loadFeishuStatus();
+    }
+  }, [activeTab, loadFeishuStatus]);
+
+  // Poll QR status when QR auth is in progress
+  useEffect(() => {
+    if (!qrSessionId || feishuStatus?.authorized) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await channelApi.feishuQRStatus(qrSessionId);
+        if (res.status === "completed") {
+          clearInterval(interval);
+          setQrSessionId(null);
+          setQrUrl("");
+          await loadFeishuStatus();
+        } else if (res.status === "expired" || res.status === "failed") {
+          clearInterval(interval);
+          setQrSessionId(null);
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [qrSessionId, feishuStatus?.authorized, loadFeishuStatus]);
 
   useEffect(() => {
     loadInitialData();
@@ -244,6 +339,7 @@ export default function SettingsPage() {
     { key: "scheduled", label: "定时任务" },
     { key: "signals", label: "信号监控" },
     { key: "memory", label: "记忆" },
+    { key: "feishu", label: "飞书授权" },
     { key: "account", label: "账户" },
   ];
 
@@ -881,6 +977,140 @@ export default function SettingsPage() {
             loading={memoriesLoading}
             onDelete={handleDeleteMemory}
           />
+        )}
+
+        {activeTab === "feishu" && (
+          <div className="p-5 flex flex-col gap-4">
+            <div className="text-xs font-semibold text-text mb-1">飞书授权</div>
+
+            {/* Auth status */}
+            {feishuStatus?.authorized ? (
+              <>
+                <div className="bg-green/5 border border-green/20 rounded-lg p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="w-2 h-2 rounded-full bg-green" />
+                    <span className="text-xs font-semibold text-green">已授权</span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 text-[10px]">
+                    <div>
+                      <div className="text-text3">Open ID</div>
+                      <div className="font-mono text-xs text-text2">{feishuStatus.open_id}</div>
+                    </div>
+                    <div>
+                      <div className="text-text3">过期时间</div>
+                      <div className="font-mono text-xs text-text2">
+                        {feishuStatus.expires_at
+                          ? new Date(feishuStatus.expires_at).toLocaleString("zh-CN")
+                          : "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-text3">授权时间</div>
+                      <div className="font-mono text-xs text-text2">
+                        {feishuStatus.created_at
+                          ? new Date(feishuStatus.created_at).toLocaleString("zh-CN")
+                          : "—"}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleFeishuRefresh}
+                    className="bg-blue text-black text-xs font-semibold px-4 py-2 rounded-lg hover:opacity-85 transition-all cursor-pointer"
+                  >
+                    刷新 Token
+                  </button>
+                  <button
+                    onClick={handleFeishuRevoke}
+                    className="bg-red-dim border border-red/20 text-red text-xs font-semibold px-4 py-2 rounded-lg hover:bg-red/20 transition-all cursor-pointer"
+                  >
+                    撤销授权
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Auth mode selector */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setAuthMode("qr")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer transition-all border ${
+                      authMode === "qr"
+                        ? "bg-green-dim border-green/20 text-green"
+                        : "bg-bg2 border-[rgba(255,255,255,0.07)] text-text3 hover:text-text"
+                    }`}
+                  >
+                    扫码授权
+                  </button>
+                  <button
+                    onClick={() => setAuthMode("url")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold cursor-pointer transition-all border ${
+                      authMode === "url"
+                        ? "bg-green-dim border-green/20 text-green"
+                        : "bg-bg2 border-[rgba(255,255,255,0.07)] text-text3 hover:text-text"
+                    }`}
+                  >
+                    链接授权
+                  </button>
+                </div>
+
+                {/* QR mode */}
+                {authMode === "qr" && (
+                  <div className="flex flex-col items-center gap-4 py-8">
+                    {qrUrl ? (
+                      <>
+                        <div className="bg-white rounded-xl p-4 w-64 h-64 flex items-center justify-center">
+                          <img
+                            src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrUrl)}`}
+                            alt="飞书授权二维码"
+                            className="w-48 h-48"
+                          />
+                        </div>
+                        <div className="text-xs text-text3">请使用飞书 App 扫码授权</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-16 h-16 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-xl flex items-center justify-center text-2xl">
+                          📱
+                        </div>
+                        <div className="text-xs text-text3 text-center max-w-xs">
+                          点击按钮获取二维码，然后用飞书 App 扫码完成授权
+                        </div>
+                      </>
+                    )}
+                    <button
+                      onClick={handleStartQR}
+                      disabled={feishuLoading || !!qrSessionId}
+                      className="bg-green text-black text-xs font-semibold px-5 py-2 rounded-lg hover:opacity-85 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {feishuLoading ? "加载中..." : qrSessionId ? "等待扫码..." : "获取二维码"}
+                    </button>
+                  </div>
+                )}
+
+                {/* URL mode */}
+                {authMode === "url" && (
+                  <div className="flex flex-col items-center gap-4 py-8">
+                    <div className="w-16 h-16 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-xl flex items-center justify-center text-2xl">
+                      🔗
+                    </div>
+                    <div className="text-xs text-text3 text-center max-w-xs">
+                      点击按钮将打开飞书授权页面，在新窗口中完成授权
+                    </div>
+                    <button
+                      onClick={handleStartUrl}
+                      disabled={feishuLoading}
+                      className="bg-green text-black text-xs font-semibold px-5 py-2 rounded-lg hover:opacity-85 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {feishuLoading ? "跳转中..." : "打开授权页面"}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         )}
 
         {/* Save button for general tab only */}

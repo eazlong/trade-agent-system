@@ -35,6 +35,10 @@ ccxt==4.3.50
 python-telegram-bot==21.3
 socksio==1.0.0
 
+# Lark / Feishu Channel
+requests>=2.31.0
+lark-oapi>=1.4.0
+
 # Risk / Crypto
 cryptography==42.0.8
 grpcio==1.64.1
