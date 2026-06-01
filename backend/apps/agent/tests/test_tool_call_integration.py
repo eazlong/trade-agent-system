@@ -47,3 +47,51 @@ async def test_execute_tool_call_pushes_notification():
 
     # Cleanup
     tracker_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_multiple_tool_calls_push_sequentially():
+    """Test multiple tool calls in sequence push notifications in order."""
+    from apps.agent.base import BaseAgent
+    from apps.agent.task_tracker import TaskTracker, tracker_context
+
+    class MockAgent(BaseAgent):
+        name = "test_agent"
+        async def handle(self, message, on_tool_result=None):
+            pass
+
+    agent = MockAgent()
+    agent._current_user_id = "user-1"
+
+    tracker = TaskTracker(task_id="test-123", user_id="user-1")
+    token = tracker_context.set(tracker)
+    tracker.start()
+
+    # Mock multiple tool calls
+    tc1 = MagicMock()
+    tc1.name = "get_kline_data"
+    tc1.arguments = {"symbol": "BTC"}
+
+    tc2 = MagicMock()
+    tc2.name = "get_balance"
+    tc2.arguments = {"user_id": "user-1"}
+
+    with patch.object(agent, 'run_tool', new_callable=AsyncMock) as mock_run_tool:
+        mock_run_tool.return_value = MagicMock(success=True, data="result")
+
+        with patch.object(tracker, 'tool_call') as mock_tool_call:
+            await agent._execute_tool_call(tc1)
+            await agent._execute_tool_call(tc2)
+
+            # Verify two calls in correct order
+            assert mock_tool_call.call_count == 2
+            calls = mock_tool_call.call_args_list
+
+            # First call
+            assert calls[0][0][0] == "get_kline_data"
+            assert "symbol" in calls[0][0][1]
+
+            # Second call
+            assert calls[1][0][0] == "get_balance"
+
+    tracker_context.reset(token)
