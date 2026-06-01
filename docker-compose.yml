@@ -4,6 +4,8 @@ services:
     command: >
       -c max_connections=100
       -c shared_buffers=256MB
+      -c idle_in_transaction_session_timeout=30000
+      -c idle_session_timeout=60000
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-trade_agent}
       POSTGRES_USER: ${POSTGRES_USER:-trade}
@@ -37,6 +39,31 @@ services:
     networks:
       - agent-net
 
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      - DATABASE_URL=postgres://trade:trade@db:5432/trade_agent
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=150
+      - DEFAULT_POOL_SIZE=30
+      - MIN_POOL_SIZE=5
+      - RESERVE_POOL_SIZE=5
+      - RESERVE_POOL_TIMEOUT=3
+      - SERVER_IDLE_TIMEOUT=30
+      - SERVER_CONNECT_TIMEOUT=3
+      - CLIENT_IDLE_TIMEOUT=0          # 无超时（长连接监听任务）
+      - CLIENT_LOGIN_TIMEOUT=3
+      - ADMIN_USERS=pgbouncer_admin
+      - STATS_USERS=pgbouncer_stats
+      - IGNORE_STARTUP_PARAMETERS=extra_float_digits
+    ports:
+      - "6432:5432"                    # PgBouncer 内部监听 5432，映射到宿主机 6432
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - agent-net
+
   backend:
     build:
       context: ./backend
@@ -50,15 +77,14 @@ services:
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
-      - DB_HOST=db
-      - DB_CONN_MAX_AGE=15        # ASGI: short-lived connections
+      - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
+      - DB_PORT=6432                   # PgBouncer 端口
+      - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
     env_file:
       - ./backend/.env
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - pgbouncer
+      - redis
     networks:
       - agent-net
 
@@ -73,8 +99,9 @@ services:
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
-      - DB_HOST=db
-      - DB_CONN_MAX_AGE=0         # Worker: no persistent connections
+      - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
+      - DB_PORT=6432                   # PgBouncer 端口
+      - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
       - WEB_PROXY=socks5://host.docker.internal:7890
       - CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
     env_file:
@@ -82,7 +109,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - backend
+      - pgbouncer                      # 依赖 pgbouncer（而非 backend）
     networks:
       - agent-net
 
@@ -97,12 +124,13 @@ services:
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
-      - DB_HOST=db
-      - DB_CONN_MAX_AGE=30        # Lark WS: long-lived, low frequency
+      - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
+      - DB_PORT=6432                   # PgBouncer 端口
+      - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
     env_file:
       - ./backend/.env
     depends_on:
-      - backend
+      - pgbouncer                      # 依赖 pgbouncer（而非 backend）
     networks:
       - agent-net
 
@@ -116,12 +144,13 @@ services:
     environment:
       - DJANGO_SETTINGS_MODULE=core.settings.dev
       - REDIS_URL=redis://redis:6379
-      - DB_HOST=db
-      - DB_CONN_MAX_AGE=60        # Beat: very infrequent, keep alive
+      - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
+      - DB_PORT=6432                   # PgBouncer 端口
+      - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
     env_file:
       - ./backend/.env
     depends_on:
-      - backend
+      - pgbouncer                      # 依赖 pgbouncer（而非 backend）
     networks:
       - agent-net
 

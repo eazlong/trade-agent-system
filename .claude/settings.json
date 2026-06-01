@@ -42,7 +42,28 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/suggest-compact.js\""
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/suggest-compact.js\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/config-protection.js\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/mcp-health-check.js\"",
+            "timeout": 5
           }
         ]
       }
@@ -53,7 +74,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/pre-compact.js\""
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-compact.js\"",
+            "timeout": 10
           }
         ]
       }
@@ -64,7 +86,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/session-start.js\""
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-start-bootstrap.js\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys\" || echo 'Not a git repo, skipping'",
+            "timeout": 10
           }
         ]
       }
@@ -134,26 +167,24 @@
             "command": "node -e \"const{execSync}=require('child_process');const fs=require('fs');const path=require('path');let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const i=JSON.parse(d);const p=i.tool_input?.file_path;if(p&&fs.existsSync(p)){const bd=path.resolve(p.replace(/\\/backend\\/.*/,'/backend')||'backend');try{const r=execSync('uv run ruff check --no-fix --output-format text '+p+' 2>&1',{cwd:bd,encoding:'utf8',stdio:['pipe','pipe','pipe']});const lines=r.trim().split('\\n').filter(l=>l.trim()).slice(0,10);if(lines.length&&!lines[0].startsWith('All checks'))console.error('[Hook] ruff issues:\\n'+lines.join('\\n'))}catch(e){const out=(e.stdout||'').trim().split('\\n').filter(l=>l.trim()).slice(0,10);if(out.length)console.error('[Hook] ruff issues:\\n'+out.join('\\n'))}}console.log(d)})\""
           }
         ]
-      }
-    ],
-    "Stop": [
+      },
       {
-        "matcher": "*",
+        "matcher": "Edit|Write|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/check-console-log.js\""
+            "command": "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys\" || true",
+            "timeout": 30
           }
         ]
-      }
-    ],
-    "SessionEnd": [
+      },
       {
-        "matcher": "*",
+        "matcher": "Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/session-end.js\""
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-edit-accumulator.js\"",
+            "timeout": 10
           }
         ]
       },
@@ -162,7 +193,109 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/Users/gongzuoyonghu/.claude/plugins/marketplaces/everything-claude-code/scripts/hooks/evaluate-session.js\""
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-activity-tracker.js\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/ecc-metrics-bridge.js\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/ecc-context-monitor.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/stop-format-typecheck.js\"",
+            "timeout": 300
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/check-console-log.js\"",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-end.js\"",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/evaluate-session.js\"",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/cost-tracker.js\"",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-end-marker.js\"",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/mcp-health-check.js\"",
+            "timeout": 10
           }
         ]
       }

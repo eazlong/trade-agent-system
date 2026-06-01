@@ -18,3 +18,5 @@ backend/docs/
 
 # Temp/one-off scripts
 *CUDA_VISIBLE_DEVICES*
+# Added by code-review-graph
+.code-review-graph/

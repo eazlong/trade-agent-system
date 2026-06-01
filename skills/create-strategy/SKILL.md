@@ -140,6 +140,48 @@ def on_bar(self, kline: dict, history: list[dict]) -> OrderSignal | None:
 - **禁止在 on_bar 中调用 `ctx.history()`** — history 直接作为参数传入
 - `ctx`（StrategyContext）通过 `self.ctx` 访问
 
+### 两个常见陷阱（CRITICAL — 90% 的零交易 bug 由此引起）
+
+#### 陷阱 1：调用了 `ctx.buy()` 但没有 `return`
+
+**错误写法（产生 0 交易）：**
+```python
+def on_bar(self, kline, history):
+    if should_buy:
+        self.ctx.buy(quantity=qty, signal_name="entry")  # ❌ 生成信号但丢弃了
+        return None  # ❌ 引擎收到 None，认为无信号
+```
+
+**正确写法：**
+```python
+def on_bar(self, kline, history):
+    if should_buy:
+        return self.ctx.buy(quantity=qty, signal_name="entry")  # ✅ 返回信号
+    return None
+```
+
+**规则**：`self.ctx.buy()` / `self.ctx.sell()` / `self.ctx.close_position()` **必须作为返回值返回**，不能仅调用而不 return。
+
+#### 陷阱 2：缺少 `@register_strategy()` 装饰器
+
+**错误写法：**
+```python
+from apps.strategy_engine.base import BaseStrategy
+
+class MyStrategy(BaseStrategy):  # ❌ 未注册，回测引擎找不到
+    name = "my_strategy"
+```
+
+**正确写法：**
+```python
+from apps.strategy_engine.base import BaseStrategy
+from apps.strategy_engine.registry import register_strategy
+
+@register_strategy()
+class MyStrategy(BaseStrategy):  # ✅ 已注册
+    name = "my_strategy"
+```
+
 ### 文件模板结构
 
 ```python
@@ -157,8 +199,10 @@ from decimal import Decimal
 
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 from apps.strategy_engine.indicators import rsi, sma, ema, macd, bollinger, atr, stoch
+from apps.strategy_engine.registry import register_strategy
 
 
+@register_strategy()
 class {StrategyName}Strategy(BaseStrategy):
     """{策略描述}"""
 
@@ -194,11 +238,14 @@ class {StrategyName}Strategy(BaseStrategy):
         # 访问上下文用 self.ctx
         # self.ctx.position  # 当前持仓
         # self.ctx.balance   # 当前余额
-        # self.ctx.buy(...)  # 买入信号
-        # self.ctx.sell(...) # 卖出信号
 
+        # ⚠️ 必须 return 信号，不能仅调用！
         # 买入前检查：self.ctx.position == 0
         # 卖出前检查：self.ctx.position > 0
+
+        # ✅ 正确：return self.ctx.buy(quantity=..., signal_name="entry")
+        # ✅ 正确：return self.ctx.sell(quantity=..., signal_name="exit")
+        # ✅ 正确：return self.ctx.close_position(signal_name="take_profit")
 
         return None
 
@@ -244,10 +291,13 @@ class {StrategyName}Strategy(BaseStrategy):
 |------|------|
 | `self.ctx.position` | 当前持仓量 |
 | `self.ctx.balance` | 当前余额 |
-| `self.ctx.buy(quantity, signal_name)` | 发买入信号 |
-| `self.ctx.sell(quantity, signal_name)` | 发卖出信号 |
-| `self.ctx.close_position()` | 平仓信号 |
+| `self.ctx.buy(quantity, signal_name)` | 发买入信号 — **必须 return** |
+| `self.ctx.sell(quantity, signal_name)` | 发卖出信号 — **必须 return** |
+| `self.ctx.close_position(signal_name)` | 平仓信号 — **必须 return** |
 | `self.ctx.params` | 策略参数字典 |
+
+> ⚠️ 以上所有发信号的方法**必须作为 `on_bar` 的返回值返回**，不能仅调用而不 return。
+> 引擎通过 `on_bar` 的返回值判断是否有信号，调用但不 return = 0 交易。
 
 #### BaseStrategy 便捷方法
 
@@ -329,7 +379,9 @@ self.ctx.close_position()
 
 ### 代码质量要求
 
+- **必须使用 `@register_strategy()` 装饰器** — 否则回测引擎无法发现策略
 - `on_bar` 签名必须是 `(self, kline: dict, history: list[dict])`，禁止使用其他签名
+- **必须 `return` 信号** — `ctx.buy()` / `ctx.sell()` / `ctx.close_position()` 必须作为 `on_bar` 的返回值返回，禁止仅调用不 return
 - `ctx` 通过 `self.ctx` 访问，禁止在 `on_bar` 内调用 `ctx.history()`
 - 所有参数从 `self.ctx.params` 读取，支持运行时配置
 - `params_schema` 定义所有可调参数及其类型/默认值

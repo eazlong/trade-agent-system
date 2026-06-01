@@ -358,8 +358,8 @@ export default function BacktestDetailPage() {
       day: "2-digit",
     });
 
-  const fmtNum = (v: number | null, decimals = 2) =>
-    v !== null ? v.toFixed(decimals) : "—";
+  const fmtNum = (v: number | null | undefined, decimals = 2) =>
+    v != null ? v.toFixed(decimals) : "—";
 
   const tabs: { key: TabKey; label: string }[] = [
     { key: "kline", label: "K线图" },
@@ -422,12 +422,12 @@ export default function BacktestDetailPage() {
       {detail.metrics && Object.keys(detail.metrics).length > 0 && (
         <div className="grid grid-cols-6 gap-3 mb-4">
           {[
-            { label: "Sortino", value: fmtNum(detail.metrics.sortino), cls: "text-text" },
-            { label: "Calmar", value: fmtNum(detail.metrics.calmar), cls: "text-text" },
+            { label: "Sortino", value: fmtNum(detail.metrics.sortino_ratio), cls: "text-text" },
+            { label: "Calmar", value: fmtNum(detail.metrics.calmar_ratio), cls: "text-text" },
             { label: "Profit Factor", value: fmtNum(detail.metrics.profit_factor), cls: "text-text" },
-            { label: "年化收益", value: fmtNum(detail.metrics.annualized_return) + "%", cls: "text-text" },
-            { label: "平均持仓", value: fmtNum(detail.metrics.avg_hold_time) + "h", cls: "text-text" },
-            { label: "盈亏比", value: fmtNum(detail.metrics.win_loss_ratio), cls: "text-text" },
+            { label: "年化收益", value: fmtNum(detail.metrics.annualized_return_pct) + "%", cls: "text-text" },
+            { label: "平均持仓棒数", value: fmtNum(detail.metrics.avg_trade_duration_bars), cls: "text-text" },
+            { label: "最大连胜", value: fmtNum(detail.metrics.max_consecutive_losses), cls: "text-text" },
           ]
             .filter((m) => m.value !== "—")
             .map((m, i) => (
