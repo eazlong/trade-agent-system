@@ -99,6 +99,10 @@ class AgentTaskConsumer:
                 # 先 ack 原消息（从 PEL 移除），再按策略重发或写 DLQ
                 await bus.ack(AGENT_TASKS, CG_AGENTS, msg_id)
                 await bus.nack_and_retry(AGENT_TASKS, fields, retry_count)
+            finally:
+                from asgiref.sync import sync_to_async
+                from django.db import connections
+                await sync_to_async(connections.close_all)()
 
     async def _dispatch(self, fields: dict) -> str:
         import json

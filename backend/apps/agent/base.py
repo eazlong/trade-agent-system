@@ -53,6 +53,7 @@ class BaseAgent(ABC):
     def __init__(self):
         self._running = False
         self._skills_loader = None
+        self._current_user_id: str = ""
 
     # ------------------------------------------------------------------ #
     #  工具 & 技能（公共逻辑）                                              #
@@ -113,6 +114,7 @@ class BaseAgent(ABC):
         """执行单个工具调用，返回结果字符串。
 
         特殊处理 load_skill（传 agent_name）。
+        自动注入 user_id（如果工具支持）。
         """
         try:
             if tc.name == "load_skill":
@@ -128,6 +130,9 @@ class BaseAgent(ABC):
                 )
                 result = await tool.execute(skill_name=skill_name)
             else:
+                # 注入 user_id（如果工具支持）
+                if self._current_user_id and not tc.arguments.get("user_id"):
+                    tc.arguments["user_id"] = self._current_user_id
                 result = await self.run_tool(tc.name, **tc.arguments)
 
             if result.success:

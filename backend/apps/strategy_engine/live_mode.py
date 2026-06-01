@@ -70,7 +70,9 @@ class LiveStrategyRunner:
         logger.info(
             f"[LiveStrategyRunner] started: strategy={self.strategy.name} "
             f"symbol={self.symbol} tf={self.timeframe} "
-            f"watch_signals={len(watch_signals)}"
+            f"watch_signals={len(watch_signals)} "
+            f"exchange_account={self.exchange_account_id} "
+            f"user={self.user_id} live_session={self.live_session_id}"
         )
 
     async def stop(self) -> None:
@@ -122,17 +124,55 @@ class LiveStrategyRunner:
                 self.symbol, Decimal(str(kline.get("close", "0")))
             )
 
-            # Phase 2: 5-step pipeline
-            _ = self.strategy.select_universe()
+            # Phase 2: 5-step pipeline with diagnostic logging
+            universe = self.strategy.select_universe()
             insights = self.strategy.generate_insights(kline, self._kline_history)
+            logger.debug(
+                f"[LiveStrategyRunner] pipeline: universe={universe} "
+                f"insights={len(insights)} "
+                f"insight_details={[f'{i.direction} {i.symbol} conf={i.confidence}' for i in insights]}"
+            )
+
             targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
+            logger.debug(
+                f"[LiveStrategyRunner] portfolio: targets={len(targets)} "
+                f"target_details={[f'{t.symbol} qty={t.target_quantity} reason={t.reason}' for t in targets]}"
+            )
+
             safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
+            filtered_count = len(targets) - len(safe_targets)
+            if filtered_count > 0:
+                logger.warning(
+                    f"[LiveStrategyRunner] risk filter: {filtered_count}/{len(targets)} targets rejected"
+                )
+            logger.debug(
+                f"[LiveStrategyRunner] risk_passed: safe_targets={len(safe_targets)}"
+            )
+
+            signal_count = 0
             for target in safe_targets:
                 signal = self._target_to_order(target)
-                if signal:
-                    await self._dispatch_signal(signal)
-                    estimated_price = Decimal(str(kline.get("close", "0")))
-                    self._apply_signal_to_context(signal, estimated_price)
+                if signal is None:
+                    logger.debug(
+                        f"[LiveStrategyRunner] _target_to_order returned None for "
+                        f"target {target.symbol} (diff=0, no action needed)"
+                    )
+                    continue
+                logger.info(
+                    f"[LiveStrategyRunner] signal generated: "
+                    f"{signal.signal_name} {signal.side} qty={signal.quantity} "
+                    f"symbol={self.symbol}"
+                )
+                await self._dispatch_signal(signal)
+                estimated_price = Decimal(str(kline.get("close", "0")))
+                self._apply_signal_to_context(signal, estimated_price)
+                signal_count += 1
+
+            if signal_count == 0 and (insights or targets):
+                logger.debug(
+                    f"[LiveStrategyRunner] no signals dispatched this bar "
+                    f"(insights={len(insights)} targets={len(targets)} safe={len(safe_targets)})"
+                )
         except Exception as e:
             logger.error(f"[LiveStrategyRunner] on_kline error: {e}", exc_info=True)
 
@@ -149,12 +189,46 @@ class LiveStrategyRunner:
                 f"[LiveStrategyRunner] unknown timeframe {self.timeframe}, defaulting to 1h"
             )
 
-        for source_name in DataSourceRegistry.list_registered():
+        registered = DataSourceRegistry.list_registered()
+        logger.info(
+            f"[LiveStrategyRunner] _subscribe_kline: "
+            f"symbol={self.symbol} tf={self.timeframe} "
+            f"registered_sources={registered}"
+        )
+        if not registered:
+            logger.error(
+                "[LiveStrategyRunner] NO data sources registered! "
+                "K-line subscription will be empty. "
+                "Check that a DataSource (e.g. BinanceDataSource) is properly registered."
+            )
+
+        subscribed_count = 0
+        for source_name in registered:
+            # Trigger lazy loading if not yet loaded
             if not DataSourceRegistry.is_loaded(source_name):
-                continue
+                logger.info(
+                    f"[LiveStrategyRunner] source '{source_name}' not yet loaded, triggering lazy load via get()"
+                )
 
             ds = DataSourceRegistry.get(source_name)
-            if not ds.is_connected() or DataType.KLINE not in ds.supported_data_types:
+
+            if not DataSourceRegistry.is_loaded(source_name):
+                logger.error(
+                    f"[LiveStrategyRunner] source '{source_name}' failed to load (get() returned but not in registry instances)"
+                )
+                continue
+
+            if not ds.is_connected():
+                logger.warning(
+                    f"[LiveStrategyRunner] source '{source_name}' NOT connected — skipping"
+                )
+                continue
+
+            if DataType.KLINE not in ds.supported_data_types:
+                logger.warning(
+                    f"[LiveStrategyRunner] source '{source_name}' does not support KLINE "
+                    f"(supported: {ds.supported_data_types}) — skipping"
+                )
                 continue
 
             try:
@@ -169,10 +243,22 @@ class LiveStrategyRunner:
                     f"[LiveStrategyRunner] subscribed {source_name} kline "
                     f"{self.symbol} @{self.timeframe}"
                 )
+                subscribed_count += 1
             except Exception as e:
                 logger.warning(
-                    f"[LiveStrategyRunner] failed to subscribe {source_name}: {e}"
+                    f"[LiveStrategyRunner] failed to subscribe {source_name}: {e}",
+                    exc_info=True,
                 )
+
+        if subscribed_count == 0:
+            logger.error(
+                f"[LiveStrategyRunner] SUBSCRIPTION FAILED: 0 sources subscribed for "
+                f"{self.symbol}@{self.timeframe}. Live trading will NOT receive kline data."
+            )
+        else:
+            logger.info(
+                f"[LiveStrategyRunner] subscription complete: {subscribed_count} source(s) active"
+            )
 
     async def _unsubscribe_kline(self) -> None:
         """取消 K 线订阅"""
@@ -203,6 +289,10 @@ class LiveStrategyRunner:
     async def _dispatch_signal(self, signal: "OrderSignal") -> None:
         """分发策略信号到 Redis Stream"""
         if not self._dispatcher:
+            logger.error(
+                "[LiveStrategyRunner] _dispatcher is None! Signal will be dropped. "
+                "This means SignalDispatcher was not initialized in start()."
+            )
             return
 
         try:
@@ -217,6 +307,11 @@ class LiveStrategyRunner:
                 logger.info(
                     f"[LiveStrategyRunner] signal dispatched: {signal.signal_name} "
                     f"msg_id={msg_id}"
+                )
+            else:
+                logger.warning(
+                    f"[LiveStrategyRunner] signal REJECTED or dropped by risk check: "
+                    f"{signal.signal_name} {signal.side} {signal.quantity} {self.symbol}"
                 )
         except Exception as e:
             logger.error(

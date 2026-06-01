@@ -98,6 +98,7 @@ class _LLMAgent(BaseAgent):
 
     async def handle(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         text = message.payload.get("text", "")
+        self._current_user_id = message.user_id or ""
         logger.info(
             "[%s] Handling message with intent: %s, payload keys: %s， %s",
             self.name,

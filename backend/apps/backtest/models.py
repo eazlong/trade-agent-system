@@ -206,37 +206,3 @@ class GridSearchJob(models.Model):
         return f"GridSearchJob({self.symbol}/{self.timeframe} status={self.status})"
 
 
-class GridSearchSchedule(models.Model):
-    """周期性网格搜索任务配置"""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=64)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="grid_search_schedules",
-    )
-    strategy = models.ForeignKey(
-        "trading.Strategy",
-        on_delete=models.CASCADE,
-        related_name="strategy_grid_schedules",
-    )
-    symbol = models.CharField(max_length=32)
-    timeframe = models.CharField(max_length=8)
-    lookback_days = models.IntegerField(default=30)
-    search_config = models.JSONField(default=dict)
-    cron_schedule = models.CharField(max_length=32)
-    is_active = models.BooleanField(default=True)
-    last_run_at = models.DateTimeField(null=True, blank=True)
-    next_run_at = models.DateTimeField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "grid_search_schedules"
-        ordering = ["-created_at"]
-
-    def __str__(self):
-        return f"GridSearchSchedule({self.name} {self.symbol}/{self.timeframe})"

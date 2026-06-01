@@ -9,8 +9,23 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from .base import BaseTool, ToolResult
+from asgiref.sync import sync_to_async
+from django.contrib.auth import get_user_model
+from django.db import close_old_connections
 
 logger = logging.getLogger(__name__)
+
+
+@sync_to_async
+def _get_user(uid: str):
+    """在 sync 线程中安全获取 User。"""
+    close_old_connections()
+    User = get_user_model()
+    try:
+        import uuid
+        return User.objects.get(id=uuid.UUID(str(uid)))
+    except (ValueError, User.DoesNotExist):
+        return User.objects.filter(username=uid).first()
 
 # 条件描述映射
 _CONDITION_MAP = {
@@ -72,20 +87,7 @@ class ListSignalMonitorTool(BaseTool):
             return ToolResult(success=False, error="需要用户上下文")
 
         try:
-            from asgiref.sync import sync_to_async
-            from django.contrib.auth import get_user_model
             from apps.signal_monitor.models import SignalMonitor
-
-            User = get_user_model()
-
-            @sync_to_async
-            def _get_user(uid: str):
-                try:
-                    import uuid
-
-                    return User.objects.get(id=uuid.UUID(str(uid)))
-                except (ValueError, User.DoesNotExist):
-                    return User.objects.filter(username=uid).first()
 
             user = await _get_user(user_id)
             if not user:
@@ -93,6 +95,7 @@ class ListSignalMonitorTool(BaseTool):
 
             @sync_to_async
             def _list_monitors():
+                close_old_connections()
                 qs = SignalMonitor.objects.filter(user=user).order_by("-created_at")
                 if status_filter != "all":
                     qs = qs.filter(status=status_filter)
@@ -213,20 +216,7 @@ class DeleteSignalMonitorTool(BaseTool):
             )
 
         try:
-            from asgiref.sync import sync_to_async
-            from django.contrib.auth import get_user_model
             from apps.signal_monitor.models import SignalMonitor
-
-            User = get_user_model()
-
-            @sync_to_async
-            def _get_user(uid: str):
-                try:
-                    import uuid
-
-                    return User.objects.get(id=uuid.UUID(str(uid)))
-                except (ValueError, User.DoesNotExist):
-                    return User.objects.filter(username=uid).first()
 
             user = await _get_user(user_id)
             if not user:
@@ -237,6 +227,7 @@ class DeleteSignalMonitorTool(BaseTool):
 
                 @sync_to_async
                 def _delete_one():
+                    close_old_connections()
                     try:
                         m = SignalMonitor.objects.get(id=monitor_id, user=user)
                         info = f"{m.name} ({m.symbol} {_STATUS_LABELS.get(m.status, m.status)})"
@@ -260,6 +251,7 @@ class DeleteSignalMonitorTool(BaseTool):
             # 按交易对或全部删除
             @sync_to_async
             def _delete_batch():
+                close_old_connections()
                 qs = SignalMonitor.objects.filter(user=user, status="active")
                 if not delete_all and symbol:
                     qs = qs.filter(symbol=symbol)
@@ -417,20 +409,6 @@ class AddSignalMonitorTool(BaseTool):
             )
 
         try:
-            from django.contrib.auth import get_user_model
-            from asgiref.sync import sync_to_async
-
-            User = get_user_model()
-
-            @sync_to_async
-            def _get_user(uid: str):
-                try:
-                    import uuid
-
-                    return User.objects.get(id=uuid.UUID(str(uid)))
-                except (ValueError, User.DoesNotExist):
-                    return User.objects.filter(username=uid).first()
-
             user = await _get_user(user_id)
             if not user:
                 return ToolResult(
@@ -442,7 +420,6 @@ class AddSignalMonitorTool(BaseTool):
             frame_status = "unknown"
             try:
                 from apps.agent.frame_manager import FrameManager
-                from asgiref.sync import sync_to_async
 
                 @sync_to_async
                 def _get_frame_status():
@@ -491,6 +468,7 @@ class AddSignalMonitorTool(BaseTool):
 
             @sync_to_async
             def _create_monitor():
+                close_old_connections()
                 return SignalMonitor.objects.create(
                     user=user,
                     name=name,

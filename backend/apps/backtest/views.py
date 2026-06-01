@@ -6,6 +6,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.core.paginator import Paginator
+from django.db import models
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -49,8 +50,10 @@ def _build_grouped_response(request):
     from collections import defaultdict
 
     user = request.user
-    # 只查当前用户的回测
-    results = BacktestResult.objects.filter(user=user).select_related("strategy")
+    # 查当前用户的回测 + 无用户的回测（Agent 渠道创建的历史数据）
+    results = BacktestResult.objects.filter(
+        models.Q(user=user) | models.Q(user__isnull=True)
+    ).select_related("strategy")
 
     # 按 grid_search_id 分组
     grid_map = defaultdict(list)
@@ -118,9 +121,9 @@ def _build_grouped_response(request):
             "result": BacktestResultSerializer(r).data,
         })
 
-    # 按 created_at 倒序
+    # 按 created_at 倒序（统一转为字符串避免 datetime vs str 比较错误）
     groups.sort(
-        key=lambda g: g.get("created_at") or g.get("result", {}).get("created_at") or "",
+        key=lambda g: str(g.get("created_at") or g.get("result", {}).get("created_at") or ""),
         reverse=True,
     )
 

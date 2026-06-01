@@ -231,28 +231,6 @@ class SupervisorAgent(BaseAgent):
 
         self._system_prompt = PromptLoader.load("supervisor")
 
-    async def _execute_tool_call(self, tc) -> str:
-        """执行工具调用，自动注入 user_id 上下文。"""
-        try:
-            if tc.name == "load_skill":
-                from apps.agent.tools.load_skill import LoadSkillTool
-
-                skill_name = tc.arguments.get("skill_name", "")
-                tool = LoadSkillTool(agent_name=self.name)
-                result = await tool.execute(skill_name=skill_name)
-            else:
-                # 注入 user_id（如果工具支持）
-                if self._current_user_id and "user_id" not in tc.arguments:
-                    tc.arguments["user_id"] = self._current_user_id
-                result = await self.run_tool(tc.name, **tc.arguments)
-
-            if result.success:
-                return str(result.data)
-            return f"Error: {result.error}"
-        except Exception as e:
-            logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
-            return f"Error: {e}"
-
     def _build_system_prompt_with_skills(self) -> str:
         """动态构建 system prompt，注入 always 技能内容。"""
         return self._build_skills_section(self._system_prompt)
