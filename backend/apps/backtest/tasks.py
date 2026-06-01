@@ -53,36 +53,21 @@ def run_backtest_task(
     Returns:
         回测统计结果
     """
-    from apps.agent.task_tracker import TaskTracker, tracker_context
-    from apps.strategy_engine.registry import StrategyRegistry
     from apps.strategy_engine.backtest_mode import _resolve_strategy_name
+    from apps.strategy_engine.registry import StrategyRegistry
     from apps.strategy_engine.runner import StrategyRunner
-
-    # Ensure strategy path is set before discovery
-    if not StrategyRegistry._strategy_path:
-        StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
-
-    # Re-discover strategies to include any added after worker startup
-    StrategyRegistry.discover()
-
-    # Resolve strategy name to canonical registered name
-    strategy_name = _resolve_strategy_name(strategy_name)
-
-    # Setup tracker for progress monitoring
-    tracker = TaskTracker(
-        task_id=self.request.id, user_id=user_id or "", task_type="backtest"
-    )
-    token = tracker_context.set(tracker)
-    tracker.start(f"开始回测：{symbol} {timeframe}")
 
     logger.info(
         f"[BacktestTask] running: strategy={strategy_name} symbol={symbol} "
         f"tf={timeframe} exchange={exchange}"
     )
 
-    # Create placeholder BacktestResult so the UI shows the task immediately.
-    # If result_id was already provided (e.g. from the REST create endpoint),
-    # skip creating a duplicate.
+    if not StrategyRegistry._strategy_path:
+        StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
+
+    StrategyRegistry.discover()
+    strategy_name = _resolve_strategy_name(strategy_name)
+
     if not result_id:
         try:
             from apps.strategy_engine.backtest_mode import create_empty_result
@@ -114,63 +99,49 @@ def run_backtest_task(
                 "[BacktestTask] failed to create placeholder result", exc_info=True
             )
 
+    self.update_state(
+        state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
+    )
+    ohlcv_data = _fetch_ohlcv_sync(
+        symbol, timeframe, exchange, start_date=start_date, end_date=end_date
+    )
+    if not ohlcv_data:
+        raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+
+    logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
+
+    self.update_state(
+        state="STARTED",
+        meta={"step": "running_backtest", "bars": len(ohlcv_data)},
+    )
+    runner = StrategyRunner()
+
+    loop = asyncio.new_event_loop()
     try:
-        # 1. 获取历史 OHLCV 数据
-        tracker.milestone("正在获取历史K线数据...", progress=0.1)
-        self.update_state(
-            state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
-        )
-        ohlcv_data = _fetch_ohlcv_sync(
-            symbol, timeframe, exchange, start_date=start_date, end_date=end_date
-        )
-        if not ohlcv_data:
-            tracker.fail(f"未能获取 {symbol} {timeframe} 的历史K线数据")
-            raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
-
-        tracker.milestone(f"已获取 {len(ohlcv_data)} 条K线数据，开始回测", progress=0.3)
-        logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
-
-        # 2. 执行回测
-        tracker.milestone("正在执行策略回测...", progress=0.5)
-        self.update_state(
-            state="STARTED",
-            meta={"step": "running_backtest", "bars": len(ohlcv_data)},
-        )
-        runner = StrategyRunner()
-
-        loop = asyncio.new_event_loop()
-        try:
-            stats = loop.run_until_complete(
-                runner.run_backtest(
-                    strategy_name=strategy_name,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    ohlcv_data=ohlcv_data,
-                    initial_capital=Decimal(str(initial_capital)),
-                    parameters=parameters,
-                    strategy_id=strategy_id,
-                    commission_rate=Decimal(str(commission_rate)),
-                    result_id=result_id,
-                    benchmark=benchmark,
-                )
+        stats = loop.run_until_complete(
+            runner.run_backtest(
+                strategy_name=strategy_name,
+                symbol=symbol,
+                timeframe=timeframe,
+                ohlcv_data=ohlcv_data,
+                initial_capital=Decimal(str(initial_capital)),
+                parameters=parameters,
+                strategy_id=strategy_id,
+                commission_rate=Decimal(str(commission_rate)),
+                result_id=result_id,
+                benchmark=benchmark,
             )
-        finally:
-            _close_async_resources(loop)
-            loop.close()
-
-        total_trades = stats.get("total_trades", 0)
-        tracker.complete(f"回测完成：{total_trades} 笔交易")
-        logger.info(
-            f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
-            f"trades={total_trades}"
         )
-        return stats
-    except Exception as e:
-        tracker.fail(str(e))
-        raise
     finally:
-        tracker.stop()
-        tracker_context.reset(token)
+        _close_async_resources(loop)
+        loop.close()
+
+    total_trades = stats.get("total_trades", 0)
+    logger.info(
+        f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
+        f"trades={total_trades}"
+    )
+    return stats
 
 
 def _fetch_ohlcv_sync(
@@ -229,7 +200,6 @@ def _fetch_ohlcv_sync(
         result = []
         for candle in ohlcv:
             ts_ms = int(candle[0])
-            # Filter by end_date
             if end_ms is not None and ts_ms > end_ms:
                 continue
             result.append(
@@ -302,6 +272,10 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         logger.error(f"[GridSearchTask] job {job_id} not found")
         return {"error": "job not found"}
 
+    # Fall back to job's user_id if not provided (e.g. called via Agent tool)
+    if not user_id and job.user_id:
+        user_id = str(job.user_id)
+
     if user_id and str(job.user_id) != user_id:
         logger.error(
             f"[GridSearchTask] user mismatch: job={job.user_id} requested={user_id}"
@@ -351,59 +325,62 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         loop = asyncio.new_event_loop()
         start_time = timezone.now().timestamp()
 
-        for idx, params in enumerate(combinations):
-            try:
-                job.refresh_from_db()
-                if job.status == "cancelled":
-                    tracker.milestone("任务已被取消", progress=0.0)
-                    return {"cancelled": True, "completed": idx}
-            except Exception:
-                pass
+        try:
+            for idx, params in enumerate(combinations):
+                try:
+                    job.refresh_from_db()
+                    if job.status == "cancelled":
+                        tracker.milestone("任务已被取消", progress=0.0)
+                        return {"cancelled": True, "completed": idx}
+                except Exception:
+                    pass
 
-            combo_label = ", ".join(f"{k}={v}" for k, v in params.items())
-            progress = 0.2 + 0.7 * ((idx + 1) / max(len(combinations), 1))
-            tracker.milestone(
-                f"执行组合 [{idx + 1}/{len(combinations)}]: {combo_label}",
-                progress=progress,
-            )
-
-            try:
-                stats = loop.run_until_complete(
-                    runner.run_backtest(
-                        strategy_name=strategy_name,
-                        symbol=job.symbol,
-                        timeframe=job.timeframe,
-                        ohlcv_data=ohlcv_data,
-                        initial_capital=Decimal(str(job.initial_capital)),
-                        parameters=params,
-                        strategy_id=str(job.strategy_id),
-                        commission_rate=Decimal(str(job.commission_rate)),
-                        benchmark="",
-                    )
-                )
-                result_id = stats.get("result_id")
-                if result_id:
-                    BacktestResult.objects.filter(id=result_id).update(
-                        grid_search_id=job.id, is_grid_search=True
-                    )
-                    results.append(
-                        {"result_id": result_id, "params": params, **stats}
-                    )
-            except SoftTimeLimitExceeded:
-                raise
-            except Exception as e:
-                job.error_log = job.error_log + [
-                    {"combination_index": idx, "params": params, "error": str(e)}
-                ]
-                job.save(update_fields=["error_log"])
-                logger.warning(
-                    f"[GridSearchTask] combination {idx} failed: {e}"
+                combo_label = ", ".join(f"{k}={v}" for k, v in params.items())
+                progress = 0.2 + 0.7 * ((idx + 1) / max(len(combinations), 1))
+                tracker.milestone(
+                    f"执行组合 [{idx + 1}/{len(combinations)}]: {combo_label}",
+                    progress=progress,
                 )
 
-            job.completed_combinations = idx + 1
-            job.save(update_fields=["completed_combinations"])
+                try:
+                    stats = loop.run_until_complete(
+                        runner.run_backtest(
+                            strategy_name=strategy_name,
+                            symbol=job.symbol,
+                            timeframe=job.timeframe,
+                            ohlcv_data=ohlcv_data,
+                            initial_capital=Decimal(str(job.initial_capital)),
+                            parameters=params,
+                            strategy_id=str(job.strategy_id),
+                            commission_rate=Decimal(str(job.commission_rate)),
+                            benchmark="",
+                            user_id=str(job.user_id) if job.user_id else None,
+                        )
+                    )
+                    result_id = stats.get("result_id")
+                    if result_id:
+                        BacktestResult.objects.filter(id=result_id).update(
+                            grid_search_id=job.id, is_grid_search=True
+                        )
+                        results.append(
+                            {"result_id": result_id, "params": params, **stats}
+                        )
+                except SoftTimeLimitExceeded:
+                    raise
+                except Exception as e:
+                    job.error_log = job.error_log + [
+                        {"combination_index": idx, "params": params, "error": str(e)}
+                    ]
+                    job.save(update_fields=["error_log"])
+                    logger.warning(
+                        f"[GridSearchTask] combination {idx} failed: {e}"
+                    )
 
-        loop.close()
+                job.completed_combinations = idx + 1
+                job.save(update_fields=["completed_combinations"])
+        finally:
+            _close_async_resources(loop)
+            loop.close()
 
         # 排序并标记最优结果
         sort_key = job.sort_by or "sharpe_ratio"
@@ -455,73 +432,3 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         tracker.stop()
         tracker_context.reset(token)
 
-
-@app.task
-def scan_grid_search_schedules():
-    """扫描活跃的 GridSearchSchedule 并自动提交网格搜索任务。"""
-    from datetime import date, timedelta
-    from django.utils import timezone
-
-    from apps.backtest.models import GridSearchJob, GridSearchSchedule
-
-    now = timezone.now()
-    for schedule in GridSearchSchedule.objects.filter(is_active=True):
-        if not _should_run_schedule(schedule, now):
-            continue
-
-        job = GridSearchJob.objects.create(
-            strategy=schedule.strategy,
-            symbol=schedule.symbol,
-            timeframe=schedule.timeframe,
-            start_date=(date.today() - timedelta(days=schedule.lookback_days)).isoformat(),
-            end_date=date.today().isoformat(),
-            initial_capital=0,
-            search_config=schedule.search_config,
-            sort_by=schedule.search_config.get("sort_by", "sharpe_ratio"),
-            source="cron",
-            user_id=schedule.user_id,
-        )
-
-        task = run_grid_search_task.apply_async(
-            kwargs={"job_id": str(job.id), "user_id": str(schedule.user_id)},
-            queue='grid_search',
-        )
-        job.celery_task_id = task.id
-        job.save(update_fields=["celery_task_id"])
-
-        schedule.last_run_at = now
-        schedule.save(update_fields=["last_run_at"])
-
-
-def _should_run_schedule(schedule, now) -> bool:
-    """简单的 cron 匹配：解析 5-field cron 表达式并检查当前时间是否匹配。"""
-    try:
-        parts = schedule.cron_schedule.split()
-        if len(parts) != 5:
-            return False
-        minute, hour, dom, month, dow = parts
-
-        def _match(field, value):
-            if field == "*":
-                return True
-            if "," in field:
-                return str(value) in field.split(",")
-            if "-" in field:
-                lo, hi = map(int, field.split("-"))
-                return lo <= value <= hi
-            if "/" in field:
-                base, step = field.split("/")
-                if base == "*":
-                    return value % int(step) == 0
-                return (value - int(base)) % int(step) == 0
-            return str(value) == field
-
-        return (
-            _match(minute, now.minute)
-            and _match(hour, now.hour)
-            and _match(dom, now.day)
-            and _match(month, now.month)
-            and _match(dow, now.weekday())
-        )
-    except Exception:
-        return False
