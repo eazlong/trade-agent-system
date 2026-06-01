@@ -166,6 +166,39 @@ class TaskTracker:
         else:
             logger.debug("[TaskTracker] milestone throttled: %s", message)
 
+    def tool_call(self, tool_name: str, arguments: dict) -> None:
+        """Push tool execution notification (no throttle, always immediate).
+
+        Args:
+            tool_name: Tool name (e.g., "get_kline_data")
+            arguments: Tool arguments dict (user_id will be filtered out)
+        """
+        # Filter out internal args
+        display_args = {
+            k: v for k, v in arguments.items()
+            if k not in ("user_id", "agent_name")
+        }
+
+        # Format args: key=value, key=value
+        args_str = ", ".join(
+            f"{k}={repr(v)[:50]}"  # Truncate long values
+            for k, v in display_args.items()
+        )
+
+        # Build notification text
+        text = f"🔧 执行工具：{tool_name}（{args_str}）"
+
+        # Push immediately (no throttle check)
+        self._notify(text)
+
+        # Update last_alive (existing behavior)
+        self.alive()
+
+        logger.debug(
+            "[TaskTracker] tool_call pushed: %s(%s)",
+            tool_name, args_str
+        )
+
     def alive(self) -> None:
         """Update last_alive timestamp (call after long tool executions)."""
         self._save_redis("running", {
