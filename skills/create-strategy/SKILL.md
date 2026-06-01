@@ -386,6 +386,20 @@ class {StrategyName}Strategy(BaseStrategy):
     def get_watch_signals(self) -> list[dict]:
         """返回最小周期信号配置，由 LiveStrategyRunner 注册到 SignalMonitor 做初筛。
 
+        **重要**：此方法由 agent 在阶段3根据策略入场条件自动推导生成，
+        不需要用户手动配置。推导规则见上方"Watch Signals 推导规则"章节。
+
+        示例（RSI超卖策略）：
+        return [
+            {
+                "interval": "1h",
+                "indicator_type": "rsi",
+                "indicator_params": {"period": 14},
+                "condition": {"operator": "lt", "left": {"field": "rsi"}, "right": {"value": 30}},
+                "trigger_type": "continuous",
+            }
+        ]
+
         每个 dict 包含:
             interval: str         — K线周期 (如 "15m", "1h")
             indicator_type: str   — 指标类型 (donchian/bollinger/rsi/price_watch/...)
@@ -408,7 +422,7 @@ class {StrategyName}Strategy(BaseStrategy):
             {"operator": "lt", "left": {"field": "rsi"},
              "right": {"value": 30}}
         """
-        return []
+        return []  # agent 将根据推导规则填充实际内容
 ```
 
 ### 关键 API 参考
