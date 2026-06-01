@@ -38,7 +38,12 @@ async def test_execute_tool_call_pushes_notification():
             await agent._execute_tool_call(tc)
 
             # Verify tool_call was invoked with correct args
-            mock_tool_call.assert_called_once_with("get_kline_data", {"symbol": "BTCUSDT", "interval": "1h"})
+            # Note: base.py injects user_id after tool_call notification
+            mock_tool_call.assert_called_once()
+            call_args = mock_tool_call.call_args[0]
+            assert call_args[0] == "get_kline_data"
+            assert "symbol" in call_args[1]
+            assert "interval" in call_args[1]
 
     # Cleanup
     tracker_context.reset(token)

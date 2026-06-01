@@ -117,6 +117,12 @@ class BaseAgent(ABC):
         自动注入 user_id（如果工具支持）。
         """
         try:
+            # Push tool call notification
+            from .task_tracker import tracker_context
+            tracker = tracker_context.get(None)
+            if tracker is not None:
+                tracker.tool_call(tc.name, tc.arguments)
+
             if tc.name == "load_skill":
                 from apps.agent.tools.load_skill import LoadSkillTool
 
