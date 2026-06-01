@@ -112,6 +112,10 @@ class SignalDispatcher:
                     f"[SignalDispatcher] signal rejected by RiskGuard: {reason}"
                 )
                 return None
+        else:
+            logger.warning(
+                "[SignalDispatcher] RiskGuard not available — dispatching signal without risk check"
+            )
 
         return await self.dispatch(
             signal, symbol, exchange_account_id, user_id, live_session_id

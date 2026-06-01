@@ -67,11 +67,6 @@ app.conf.beat_schedule = {
         'task': 'apps.signal_monitor.tasks.clean_expired_monitors',
         'schedule': crontab(minute=15),
     },
-    # Scan for active GridSearchSchedule and submit jobs every 6 hours
-    'scan-grid-search-schedules': {
-        'task': 'apps.backtest.tasks.scan_grid_search_schedules',
-        'schedule': crontab(hour='*/6'),
-    },
 }
 
 # 使用数据库调度器，支持动态添加/删除定时任务

@@ -396,7 +396,13 @@ class BaseDataSource(ABC):
         logger.debug(f"[DataSource] triggering {len(callbacks)} callbacks for {data_type}")
         for callback in callbacks:
             try:
-                callback(data)
+                import asyncio
+                import inspect
+                if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(getattr(callback, '__call__', None)):
+                    # Async callback — schedule without blocking
+                    asyncio.create_task(callback(data))
+                else:
+                    callback(data)
             except Exception as e:
                 print(f"Error in callback for {data_type}: {e}")
 

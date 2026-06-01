@@ -40,6 +40,7 @@ class StrategyRunner:
         commission_rate: Decimal = Decimal("0.001"),
         result_id: str | None = None,
         benchmark: str = "",
+        user_id: str | None = None,
     ) -> dict:
         """
         用历史数据回放策略。

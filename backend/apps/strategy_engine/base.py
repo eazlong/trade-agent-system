@@ -235,12 +235,12 @@ class StrategyContext:
         )
 
     def close_position(
-        self, price: Decimal | None = None, **kwargs
+        self, price: Decimal | None = None, signal_name: str = "close", **kwargs
     ) -> OrderSignal | None:
         """平仓信号（卖出全部持仓）"""
         if self._position <= 0:
             return None
-        return self.sell(self._position, price=price, signal_name="close", **kwargs)
+        return self.sell(self._position, price=price, signal_name=signal_name, **kwargs)
 
 
 class BaseStrategy(ABC):

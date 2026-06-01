@@ -158,3 +158,65 @@ class BadReturnStrategy(BaseStrategy):
             )
         finally:
             Path(path).unlink()
+
+    def test_decimal_float_type_warning_static(self):
+        """测试静态扫描：检测到 Decimal 与 float 字面量直接运算"""
+        content = """
+from decimal import Decimal
+from apps.strategy_engine.base import BaseStrategy, StrategyContext
+
+class DecimalFloatStrategy(BaseStrategy):
+    name = "decimal_float"
+
+    def on_bar(self, kline, history):
+        price = kline["close"] * 0.95  # Decimal × float — should be flagged
+        return self.ctx.buy(quantity=Decimal("0.01"), signal_name="entry")
+"""
+        path = self._write_strategy_file(content)
+        try:
+            tester = StrategyTester()
+            result = tester.test_strategy_file(path)
+            # 静态扫描应产出 warning
+            self.assertTrue(
+                any("Decimal" in w and "float" in w for w in result["warnings"]),
+                f"未检测到 Decimal × float 误用，warnings: {result['warnings']}",
+            )
+        finally:
+            Path(path).unlink()
+
+    def test_decimal_float_type_warning_runtime(self):
+        """测试运行时：on_bar 中 Decimal 与 float 混合运算抛出 TypeError 时错误信息被增强"""
+        content = """
+from decimal import Decimal
+from apps.strategy_engine.base import BaseStrategy, StrategyContext
+
+class DecimalTypeErrorStrategy(BaseStrategy):
+    name = "decimal_type_error"
+    params_schema = {"quantity": {"type": "number", "default": 0.01}}
+
+    def __init__(self, context: StrategyContext):
+        super().__init__(context)
+        self.quantity = Decimal(str(context.params.get("quantity", 0.01)))
+
+    def on_bar(self, kline, history):
+        if len(history) < 10:
+            return None
+        # Decimal × float — 在 kline 值为 Decimal 时触发 TypeError
+        price = kline["close"] * 0.5  # type: ignore
+        return self.ctx.buy(quantity=self.quantity, signal_name="entry")
+"""
+        path = self._write_strategy_file(content)
+        try:
+            tester = StrategyTester(kline_count=20)
+            result = tester.test_strategy_file(path)
+            self.assertFalse(result["success"])
+            # 运行时错误信息应包含 Decimal 混用提示
+            self.assertTrue(
+                any(
+                    "Decimal" in e and ("float" in e.lower() or "TypeError" in e or "类型" in e)
+                    for e in result["errors"]
+                ),
+                f"错误信息未包含 Decimal 混用提示: {result['errors']}",
+            )
+        finally:
+            Path(path).unlink()
