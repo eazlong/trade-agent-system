@@ -131,3 +131,26 @@ class TestTaskTrackerFormat:
 
         now = time.time()
         assert _format_duration(now) == "0秒"
+
+
+class TestTaskTrackerToolCall:
+    """Tests for tool_call notification feature."""
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_tool_call_basic(self):
+        """Test basic tool_call notification with arguments."""
+        tracker = _make_tracker(channel="telegram")
+        tracker.start("任务启动")
+
+        # Mock _notify to capture notification text
+        with patch.object(tracker, '_notify') as mock_notify:
+            tracker.tool_call("get_kline_data", {"symbol": "BTCUSDT", "interval": "1h"})
+
+            # Verify _notify was called
+            mock_notify.assert_called_once()
+
+            # Verify notification format
+            notification_text = mock_notify.call_args[0][0]
+            assert "🔧 执行工具：get_kline_data" in notification_text
+            assert "symbol='BTCUSDT'" in notification_text
+            assert "interval='1h'" in notification_text
