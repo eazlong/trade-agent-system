@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 tracker_context: ContextVar[TaskTracker | None] = ContextVar("tracker", default=None)
 
 # ---------------------------------------------------------------------------
-# Notification bridge — Celery worker sends via Redis pubsub, ASGI consumer pushes to Telegram
+# Notification bridge — Celery worker sends via Redis pubsub, ASGI consumer routes to active channel
 # ---------------------------------------------------------------------------
 _PROGRESS_CHANNEL = "task:progress:notifications"
 
@@ -82,13 +82,13 @@ def _format_duration(start_ts: float) -> str:
 
 
 class TaskTracker:
-    """Track long-running task progress and notify users via Telegram."""
+    """Track long-running task progress and notify users via their active channel (Telegram/Lark)."""
 
     def __init__(
         self,
         task_id: str,
         user_id: str,
-        channel: str = "telegram",
+        channel: str = "",
         task_type: str = "agent",
         heartbeat_interval: int = 60,
         original_task: dict | None = None,
@@ -97,7 +97,6 @@ class TaskTracker:
     ):
         self.task_id = task_id
         self.user_id = user_id
-        self.channel = channel
         self.task_type = task_type
         self.heartbeat_interval = heartbeat_interval
         self.original_task = original_task
@@ -107,6 +106,12 @@ class TaskTracker:
         self._start_ts: float = 0
         self._milestones: list[dict] = []
         self._redis_key = f"task:progress:{task_id}"
+
+        # Auto-detect channel if not explicitly specified
+        if channel:
+            self.channel = channel
+        else:
+            self.channel = self._resolve_channel()
 
     # ------------------------------------------------------------------
     # Public API
@@ -167,11 +172,18 @@ class TaskTracker:
             "last_alive": datetime.now(timezone.utc).isoformat(),
         })
 
+    # ── Notification length limits (safe across all channels) ──
+    _MAX_COMPLETE_LENGTH = 3500  # Telegram safe (4096 limit minus formatting)
+    _MAX_ERROR_LENGTH = 2000
+
     def complete(self, result: str) -> None:
         """Mark task completed: push final result, update Redis, trigger async archive."""
         elapsed = _format_duration(self._start_ts)
         short_id = self.task_id[:8]
-        self._notify(f"✅ 任务 #{short_id} 完成\n耗时：{elapsed}\n结果：{result[:300]}")
+        text = f"✅ 任务 #{short_id} 完成\n耗时：{elapsed}\n结果：{result[:self._MAX_COMPLETE_LENGTH]}"
+        if len(result) > self._MAX_COMPLETE_LENGTH:
+            text += f"\n\n…（内容过长，共 {len(result)} 字，请在 Web 端查看完整详情）"
+        self._notify(text)
         self._save_redis(
             "completed",
             {
@@ -187,7 +199,10 @@ class TaskTracker:
     def fail(self, error: str) -> None:
         """Mark task failed: push error, update Redis, archive."""
         short_id = self.task_id[:8]
-        self._notify(f"❌ 任务 #{short_id} 失败\n错误：{error[:300]}")
+        text = f"❌ 任务 #{short_id} 失败\n错误：{error[:self._MAX_ERROR_LENGTH]}"
+        if len(error) > self._MAX_ERROR_LENGTH:
+            text += "\n…（错误信息已截断）"
+        self._notify(text)
         self._save_redis(
             "failed",
             {
@@ -211,6 +226,18 @@ class TaskTracker:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _resolve_channel(self) -> str:
+        """Auto-detect user's active channel from DB."""
+        try:
+            from apps.channel.channel_resolver import get_user_active_channel
+
+            target = get_user_active_channel(self.user_id)
+            if target:
+                return target.channel_type
+        except Exception:
+            pass
+        return "telegram"
 
     def _save_redis(self, status: str, data: dict) -> None:
         """Write progress to Redis Hash with TTL."""

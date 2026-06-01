@@ -18,6 +18,47 @@ from .base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 
+async def _resolve_django_user_id(channel_user_id: str | None) -> str | None:
+    """将渠道 user_id（Telegram/Facebook 等）映射为 Django User UUID。
+
+    渠道层传入的 user_id 可能是 Telegram 数字 ID、Feishu open_id 等，
+    而 BacktestResult.user 是 ForeignKey → 期望 Django User 的 UUID 主键。
+    直接传入渠道 ID 会导致 FK 约束错误。
+    """
+    if not channel_user_id:
+        return None
+    try:
+        from asgiref.sync import sync_to_async
+        from apps.authentication.models import User as AuthUser
+
+        user = await sync_to_async(
+            lambda: AuthUser.objects.filter(telegram_id=channel_user_id).first()
+        )()
+        if user:
+            return str(user.id)
+        user = await sync_to_async(
+            lambda: AuthUser.objects.filter(feishu_open_id=channel_user_id).first()
+        )()
+        if user:
+            return str(user.id)
+        user = await sync_to_async(
+            lambda: AuthUser.objects.filter(username=channel_user_id).first()
+        )()
+        if user:
+            return str(user.id)
+        logger.warning(
+            "Cannot resolve channel user_id '%s' to Django User — "
+            "backtest will be created without user association",
+            channel_user_id,
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "Error resolving channel user_id '%s': %s", channel_user_id, exc
+        )
+        return None
+
+
 class SubmitBacktestTool(BaseTool):
     """
     提交回测任务到 Celery 队列，立即返回任务 ID。
@@ -172,6 +213,14 @@ class SubmitBacktestTool(BaseTool):
 
                 gs_user_id = kwargs.get("user_id", "")
 
+                # Ensure user_id is set on the job so the task can fall back to it
+                # for notification routing
+                if not gs_user_id:
+                    logger.warning(
+                        "[SubmitBacktestTool] user_id not provided in kwargs, "
+                        "notification may not be delivered"
+                    )
+
                 create_job = sync_to_async(GridSearchJob.objects.create)
                 job = await create_job(
                     strategy=gs_strategy,
@@ -191,10 +240,10 @@ class SubmitBacktestTool(BaseTool):
                 )
 
                 gs_task = run_grid_search.apply_async(
-                    kwargs={"job_id": str(job.id), "user_id": gs_user_id},
+                    kwargs={"job_id": str(job.id), "user_id": gs_user_id if gs_user_id else None},
                     queue='grid_search',
                 )
-                await sync_to_async(lambda: job.__class__.objects.filter(id=job.id).update(celery_task_id=gs_task.id))(job)
+                await sync_to_async(lambda _j: job.__class__.objects.filter(id=job.id).update(celery_task_id=gs_task.id))(job)
 
                 return ToolResult(
                     success=True,
@@ -210,6 +259,11 @@ class SubmitBacktestTool(BaseTool):
                     },
                 )
 
+            # Resolve channel user_id (e.g. Telegram "123456") to Django User UUID.
+            # If not found, leave user_id empty — the backtest result will still be
+            # created but won't appear in the web UI until backfilled.
+            django_user_id = await _resolve_django_user_id(kwargs.get("user_id"))
+
             result_id = await create_empty_result_async(
                 strategy_id=strategy_id,
                 symbol=symbol,
@@ -218,6 +272,7 @@ class SubmitBacktestTool(BaseTool):
                 end_date=end_date,
                 initial_capital=Decimal(str(initial_capital)),
                 parameters=parameters,
+                user_id=django_user_id,
             )
             if not result_id:
                 return ToolResult(
@@ -225,23 +280,27 @@ class SubmitBacktestTool(BaseTool):
                     error="创建回测占位记录失败",
                 )
 
-            task = run_backtest_task.apply_async(
-                kwargs={
-                    "strategy_name": strategy_name,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "initial_capital": initial_capital,
-                    "commission_rate": kwargs.get("commission_rate", 0.001),
-                    "parameters": parameters,
-                    "strategy_id": strategy_id,
-                    "exchange": kwargs.get("exchange", "binance"),
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "result_id": result_id,
-                    "benchmark": kwargs.get("benchmark", ""),
-                    "user_id": kwargs.get("user_id"),
-                }
-            )
+            backtest_kwargs = {
+                "strategy_name": strategy_name,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "initial_capital": initial_capital,
+                "commission_rate": kwargs.get("commission_rate", 0.001),
+                "parameters": parameters,
+                "strategy_id": strategy_id,
+                "exchange": kwargs.get("exchange", "binance"),
+                "start_date": start_date,
+                "end_date": end_date,
+                "result_id": result_id,
+                "benchmark": kwargs.get("benchmark", ""),
+            }
+            # Only set user_id if explicitly provided; otherwise let Supervisor
+            # inject it. Setting None here would block Supervisor auto-injection.
+            user_id = kwargs.get("user_id")
+            if user_id:
+                backtest_kwargs["user_id"] = user_id
+
+            task = run_backtest_task.apply_async(kwargs=backtest_kwargs)
             logger.info(
                 "[SubmitBacktestTool] submitted task_id=%s result_id=%s strategy=%s symbol=%s tf=%s",
                 task.id,
