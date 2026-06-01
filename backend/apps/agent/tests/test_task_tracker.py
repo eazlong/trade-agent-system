@@ -154,3 +154,64 @@ class TestTaskTrackerToolCall:
             assert "🔧 执行工具：get_kline_data" in notification_text
             assert "symbol='BTCUSDT'" in notification_text
             assert "interval='1h'" in notification_text
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_tool_call_filters_internal_args(self):
+        """Test user_id and agent_name are filtered out."""
+        tracker = _make_tracker()
+        tracker.start()
+
+        with patch.object(tracker, '_notify') as mock_notify:
+            tracker.tool_call("resolve_user", {
+                "user_id": "secret-123",
+                "agent_name": "supervisor",
+                "query": "John"
+            })
+
+            notification_text = mock_notify.call_args[0][0]
+
+            # Verify sensitive args NOT in notification
+            assert "user_id" not in notification_text
+            assert "agent_name" not in notification_text
+            assert "secret-123" not in notification_text
+            assert "supervisor" not in notification_text
+
+            # Verify non-sensitive args ARE in notification
+            assert "query='John'" in notification_text
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_tool_call_truncates_long_values(self):
+        """Test long parameter values are truncated to 50 chars."""
+        tracker = _make_tracker()
+        tracker.start()
+
+        long_query = "a" * 100  # 100 characters
+
+        with patch.object(tracker, '_notify') as mock_notify:
+            tracker.tool_call("search", {"query": long_query})
+
+            notification_text = mock_notify.call_args[0][0]
+
+            # Verify value truncated to repr(v)[:50] -> 'aaaaaaaa...' (50 chars total, includes opening quote)
+            # repr("a"*100) = "'aaaa...'" (102 chars: 2 quotes + 100 a's)
+            # repr(v)[:50] = first 50 chars: ' + 49 a's (no closing quote)
+            assert len(notification_text) < 150  # Ensure not too long
+            assert "query=" in notification_text
+            # Check truncated value has 49 a's after opening quote
+            assert "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in notification_text[:100]
+
+    @pytest.mark.usefixtures("_mock_deps")
+    def test_tool_call_without_tracker_context(self):
+        """Test tool_call when tracker not in context (should not raise)."""
+        # Clear context
+        tracker_context.set(None)
+
+        tracker = _make_tracker()
+        tracker.start()
+
+        # Should not raise even though context is None
+        with patch.object(tracker, '_notify') as mock_notify:
+            tracker.tool_call("get_kline_data", {"symbol": "BTC"})
+
+            # Notification should still be sent (tracker exists)
+            mock_notify.assert_called_once()
