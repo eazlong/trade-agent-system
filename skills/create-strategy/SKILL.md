@@ -84,7 +84,38 @@ when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易�
 
 ### 阶段 3：生成策略代码
 
-确认后，生成策略 Python 文件。
+确认后，按以下步骤生成策略 Python 文件：
+
+#### 3.1 分析入场条件
+
+从用户确认的需求中提取：
+- **主要指标**：如 RSI、MACD、布林带、EMA 等
+- **触发条件**：如"RSI < 30"、"价格突破布林带上轨"、"EMA 上穿 EMA_slow"
+- **K线周期**：如 1h、4h、15m
+
+#### 3.2 推导 watch signals
+
+根据推导规则（见下方"Watch Signals 推导规则"章节），将入场条件映射为最小周期信号：
+
+1. **简化条件** — 复合条件拆解为单指标条件（如"EMA向上 且 RSI<30" → 只取"RSI<30"）
+2. **选择周期** — 使用策略的最小K线周期作为 interval
+3. **映射格式** — 转换为标准 watch signal 格式：
+   ```python
+   {
+       "interval": "1h",
+       "indicator_type": "rsi",
+       "indicator_params": {"period": 14},
+       "condition": {"operator": "lt", "left": {"field": "rsi"}, "right": {"value": 30}},
+       "trigger_type": "continuous"
+   }
+   ```
+
+#### 3.3 生成完整代码
+
+生成包含以下部分的策略代码：
+- `on_bar` 实现
+- `get_watch_signals` 实现（基于 3.2 推导结果）
+- `on_start`、`on_stop` 等生命周期方法
 
 **输出路径**：`~/.tradelogx/strategies/{strategy_name}.py`
 
