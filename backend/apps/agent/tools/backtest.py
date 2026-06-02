@@ -245,6 +245,20 @@ class SubmitBacktestTool(BaseTool):
                 )
                 await sync_to_async(lambda _j: job.__class__.objects.filter(id=job.id).update(celery_task_id=gs_task.id))(job)
 
+                # Immediately record submission so get_task_result can
+                # distinguish "never submitted" from "genuinely pending"
+                from apps.agent.task_tracker import TaskTracker
+                TaskTracker.record_submitted(
+                    task_id=gs_task.id,
+                    user_id=gs_user_id if gs_user_id else "",
+                    task_type="grid_search",
+                    metadata={
+                        "strategy_name": strategy_name,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    },
+                )
+
                 return ToolResult(
                     success=True,
                     data={
@@ -309,6 +323,22 @@ class SubmitBacktestTool(BaseTool):
                 symbol,
                 timeframe,
             )
+
+            # Immediately record submission so get_task_result can
+            # distinguish "never submitted" from "genuinely pending"
+            from apps.agent.task_tracker import TaskTracker
+            TaskTracker.record_submitted(
+                task_id=task.id,
+                user_id=user_id if user_id else "",
+                task_type="backtest",
+                metadata={
+                    "strategy_name": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "result_id": result_id,
+                },
+            )
+
             return ToolResult(
                 success=True,
                 data={
@@ -338,8 +368,9 @@ class GetTaskResultTool(BaseTool):
     name = "get_task_result"
     description = (
         "查询异步任务（如回测）的当前状态和结果。"
-        "状态为 PENDING/STARTED 时表示任务仍在运行，"
-        "SUCCESS 时返回完整结果，FAILURE 时返回错误信息。"
+        "状态为 submitted/PENDING/STARTED 时表示任务仍在运行，"
+        "SUCCESS 时返回完整结果，FAILURE 时返回错误信息，"
+        "NOT_FOUND 时表示任务 ID 不存在或已过期，需重新提交。"
     )
 
     @property
@@ -360,13 +391,38 @@ class GetTaskResultTool(BaseTool):
             return ToolResult(success=False, error="task_id 为必填项")
 
         try:
+            # Step 1: Check Redis Hash first — this tells us whether the task
+            # was ever submitted. Celery AsyncResult alone returns PENDING for
+            # both "never submitted" and "waiting to start", which is ambiguous.
+            from apps.agent.task_tracker import TaskTracker
+
+            tracker_status = TaskTracker.get_submission_status(task_id)
+
+            # Step 2: Query Celery for complementary state
             from celery_app import app as celery_app
             from celery.result import AsyncResult
 
             result: AsyncResult = celery_app.AsyncResult(task_id)
-            state = result.state
+            celery_state = result.state
 
-            if state == "SUCCESS":
+            # ── Combine Redis + Celery into a definitive status ──
+
+            if tracker_status is None:
+                # Redis Hash has no record of this task → it was NEVER submitted
+                # or the Redis key has expired (24h TTL).
+                return ToolResult(
+                    success=True,
+                    data={
+                        "task_id": task_id,
+                        "status": "NOT_FOUND",
+                        "message": (
+                            "该任务 ID 不存在或已过期（超过 24 小时）。"
+                            "请重新提交任务。"
+                        ),
+                    },
+                )
+
+            if celery_state == "SUCCESS":
                 res_data = result.result
                 # 检测结构化 FAILURE 结果（任务内捕获异常并返回错误详情）
                 if isinstance(res_data, dict) and res_data.get("status") == "FAILURE":
@@ -374,7 +430,6 @@ class GetTaskResultTool(BaseTool):
                     error_type = res_data.get("error_type", "Exception")
                     task_params = res_data.get("task_params", {})
 
-                    # 构建可操作的错误信息，方便 Agent 自动修复
                     error_detail = (
                         f"回测任务失败 [{error_type}]: {error_msg}\n"
                         f"原始任务参数:\n"
@@ -409,8 +464,8 @@ class GetTaskResultTool(BaseTool):
                         "result": res_data,
                     },
                 )
-            elif state == "FAILURE":
-                # Celery 层面未捕获的异常（非任务内 return 的 FAILURE）
+
+            if celery_state == "FAILURE":
                 error_info = str(result.result) if result.result else "未知错误"
                 return ToolResult(
                     success=True,
@@ -421,20 +476,32 @@ class GetTaskResultTool(BaseTool):
                         "note": "此错误为 Celery 层面异常，请检查日志以获取详细信息。",
                     },
                 )
-            else:
-                # PENDING / STARTED / RETRY / REVOKED
-                info: Any = None
-                if state == "STARTED" and result.info:
-                    info = result.info  # 支持任务上报进度（如果有）
+
+            if tracker_status in ("completed", "failed", "zombie"):
+                # Redis already has terminal state; Celery may have lost the result
                 return ToolResult(
                     success=True,
                     data={
                         "task_id": task_id,
-                        "status": state,
-                        "info": info,
-                        "message": f"任务仍在运行中（{state}），请稍后再次查询。",
+                        "status": tracker_status.upper(),
+                        "message": f"任务已结束（{tracker_status}）",
                     },
                 )
+
+            # PENDING / STARTED / RUNNING / SUBMITTED / RETRY
+            info: Any = None
+            if celery_state == "STARTED" and result.info:
+                info = result.info
+            display_state = tracker_status if tracker_status in ("submitted", "running") else celery_state
+            return ToolResult(
+                success=True,
+                data={
+                    "task_id": task_id,
+                    "status": display_state,
+                    "info": info,
+                    "message": f"任务仍在运行中（{display_state}），请稍后再次查询。",
+                },
+            )
         except Exception as e:
             logger.error("[GetTaskResultTool] query failed task_id=%s: %s", task_id, e)
             return ToolResult(success=False, error=f"查询任务状态失败: {e}")

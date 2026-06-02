@@ -215,3 +215,69 @@ class TestTaskTrackerToolCall:
 
             # Notification should still be sent (tracker exists)
             mock_notify.assert_called_once()
+
+
+class TestRecordSubmitted:
+    """Tests for submission reliability: record_submitted + get_submission_status."""
+
+    def _make_mock_redis(self, data: dict | None = None):
+        mock_r = MagicMock()
+        mock_r.pipeline.return_value = MagicMock()
+        if data is not None:
+            mock_r.exists.return_value = True
+            mock_r.hget.return_value = data.get("status", "submitted")
+        else:
+            mock_r.exists.return_value = False
+        return mock_r
+
+    def test_record_submitted_writes_redis(self):
+        task_id = "test-submitted-task-001"
+        mock_r = self._make_mock_redis()
+
+        with patch(REDIS_PATCH, return_value=mock_r):
+            TaskTracker.record_submitted(
+                task_id=task_id,
+                user_id="user1",
+                task_type="backtest",
+                metadata={"symbol": "BTC/USDT"},
+            )
+
+        # Verify hset was called with submitted status
+        mock_r.pipeline.return_value.hset.assert_called()
+        call_args = mock_r.pipeline.return_value.hset.call_args
+        assert call_args[0][0] == f"task:progress:{task_id}"
+
+    def test_get_submission_status_returns_none_for_unknown(self):
+        mock_r = self._make_mock_redis(data=None)
+
+        with patch(REDIS_PATCH, return_value=mock_r):
+            status = TaskTracker.get_submission_status("nonexistent-task")
+            assert status is None
+
+    def test_get_submission_status_returns_status(self):
+        mock_r = self._make_mock_redis(data={"status": "submitted"})
+
+        with patch(REDIS_PATCH, return_value=mock_r):
+            status = TaskTracker.get_submission_status("existing-task")
+            assert status == "submitted"
+
+    def test_redis_failure_is_graceful_record(self):
+        """record_submitted must not raise on Redis failure."""
+        mock_r = MagicMock()
+        mock_r.pipeline.side_effect = Exception("Connection refused")
+
+        with patch(REDIS_PATCH, return_value=mock_r):
+            # Should not raise
+            TaskTracker.record_submitted(
+                task_id="task-fail",
+                user_id="user1",
+            )
+
+    def test_redis_failure_is_graceful_query(self):
+        """get_submission_status must not raise on Redis failure."""
+        mock_r = MagicMock()
+        mock_r.exists.side_effect = Exception("Connection refused")
+
+        with patch(REDIS_PATCH, return_value=mock_r):
+            status = TaskTracker.get_submission_status("task-fail")
+            assert status is None

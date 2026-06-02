@@ -256,6 +256,87 @@ class TaskTracker:
         """Get tracker from current context (for use in nested helper functions)."""
         return tracker_context.get()
 
+    @staticmethod
+    def record_submitted(
+        task_id: str,
+        user_id: str = "",
+        task_type: str = "celery",
+        metadata: dict | None = None,
+    ) -> None:
+        """Write a submission record to Redis Hash immediately after apply_async.
+
+        This allows get_task_result to distinguish "never submitted" from
+        "submitted but not yet started" — Celery AsyncResult returns PENDING
+        for both cases.
+
+        Called from submit_backtest / submit_grid_search right after
+        apply_async succeeds.
+        """
+        import redis
+        from django.conf import settings
+
+        url = settings.REDIS_URL
+        if url.rsplit("/", 1)[-1].isdigit():
+            url = url.rsplit("/", 1)[0] + "/3"
+
+        data: dict[str, Any] = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "task_type": task_type,
+            "status": "submitted",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if metadata:
+            data["metadata"] = json.dumps(metadata, ensure_ascii=False)
+
+        try:
+            r = redis.from_url(url, decode_responses=True)
+            pipe = r.pipeline()
+            pipe.hset(f"task:progress:{task_id}", mapping=data)
+            pipe.expire(f"task:progress:{task_id}", 86400)  # 24h TTL
+            pipe.execute()
+            logger.info(
+                "[TaskTracker] recorded submission for task %s (type=%s)",
+                task_id[:8],
+                task_type,
+            )
+        except Exception:
+            logger.warning(
+                "[TaskTracker] failed to record submission for %s",
+                task_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def get_submission_status(task_id: str) -> str | None:
+        """Check Redis Hash for task submission status.
+
+        Returns:
+            'submitted' | 'running' | 'completed' | 'failed' | 'zombie' |
+            'zombie_retrying' | 'dlq' | None (key not found)
+        """
+        import redis
+        from django.conf import settings
+
+        url = settings.REDIS_URL
+        if url.rsplit("/", 1)[-1].isdigit():
+            url = url.rsplit("/", 1)[0] + "/3"
+
+        try:
+            r = redis.from_url(url, decode_responses=True)
+            key = f"task:progress:{task_id}"
+            if not r.exists(key):
+                return None
+            return r.hget(key, "status") or "unknown"
+        except Exception:
+            logger.warning(
+                "[TaskTracker] failed to read submission status for %s",
+                task_id,
+                exc_info=True,
+            )
+            return None
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

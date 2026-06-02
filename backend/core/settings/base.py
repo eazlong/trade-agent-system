@@ -113,6 +113,14 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TIMEZONE = "UTC"
 
+# ── Reliability: prevent task loss ──
+CELERY_TASK_ACKS_LATE = True  # Ack AFTER task completes — if worker crashes, task is re-delivered
+CELERY_TASK_REJECT_ON_WORKER_LOST = True  # Re-queue if worker process is killed
+CELERY_RESULT_EXPIRES = 86400  # Keep results for 24h (seconds)
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "visibility_timeout": 3600,  # Re-deliver unacked messages after 1h
+}
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
