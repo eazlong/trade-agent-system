@@ -56,92 +56,124 @@ def run_backtest_task(
     from apps.strategy_engine.backtest_mode import _resolve_strategy_name
     from apps.strategy_engine.registry import StrategyRegistry
     from apps.strategy_engine.runner import StrategyRunner
+    from apps.agent.task_tracker import TaskTracker, tracker_context
 
-    logger.info(
-        f"[BacktestTask] running: strategy={strategy_name} symbol={symbol} "
-        f"tf={timeframe} exchange={exchange}"
+    tracker = TaskTracker(
+        task_id=self.request.id, user_id=str(user_id or ""), task_type="backtest"
+    )
+    token = tracker_context.set(tracker)
+    tracker.start(
+        f"开始回测：{strategy_name} {symbol} {timeframe}",
     )
 
-    if not StrategyRegistry._strategy_path:
-        StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
+    try:
+        logger.info(
+            f"[BacktestTask] running: strategy={strategy_name} symbol={symbol} "
+            f"tf={timeframe} exchange={exchange}"
+        )
 
-    StrategyRegistry.discover()
-    strategy_name = _resolve_strategy_name(strategy_name)
+        if not StrategyRegistry._strategy_path:
+            StrategyRegistry.set_strategy_path('/root/.tradelogx/strategies')
 
-    if not result_id:
+        StrategyRegistry.discover()
+        strategy_name = _resolve_strategy_name(strategy_name)
+
+        if not result_id:
+            try:
+                from apps.strategy_engine.backtest_mode import create_empty_result
+                from apps.strategy_engine.backtest_mode import (
+                    _resolve_strategy_id as _resolve_sid,
+                )
+                import asyncio as _aio
+
+                _sid = strategy_id or _aio.run(_resolve_sid(strategy_name))
+                if _sid:
+                    _s = start_date or (date.today() - timedelta(days=30)).isoformat()
+                    _e = end_date or date.today().isoformat()
+                    result_id = create_empty_result(
+                        strategy_id=_sid,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        start_date=_s,
+                        end_date=_e,
+                        initial_capital=initial_capital,
+                        parameters=parameters or {},
+                        user_id=user_id,
+                    )
+                    strategy_id = _sid
+                    logger.info(
+                        f"[BacktestTask] created placeholder result_id=%s", result_id
+                    )
+            except Exception:
+                logger.warning(
+                    "[BacktestTask] failed to create placeholder result", exc_info=True
+                )
+
+        self.update_state(
+            state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
+        )
+        tracker.milestone("正在获取历史K线数据...", progress=0.1)
+        ohlcv_data = _fetch_ohlcv_sync(
+            symbol, timeframe, exchange, start_date=start_date, end_date=end_date
+        )
+        if not ohlcv_data:
+            tracker.fail(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+            raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+
+        logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
+        tracker.milestone(
+            f"已获取 {len(ohlcv_data)} 条K线数据，正在执行回测...", progress=0.3
+        )
+
+        self.update_state(
+            state="STARTED",
+            meta={"step": "running_backtest", "bars": len(ohlcv_data)},
+        )
+        runner = StrategyRunner()
+
+        loop = asyncio.new_event_loop()
         try:
-            from apps.strategy_engine.backtest_mode import create_empty_result
-            from apps.strategy_engine.backtest_mode import (
-                _resolve_strategy_id as _resolve_sid,
-            )
-            import asyncio as _aio
-
-            _sid = strategy_id or _aio.run(_resolve_sid(strategy_name))
-            if _sid:
-                _s = start_date or (date.today() - timedelta(days=30)).isoformat()
-                _e = end_date or date.today().isoformat()
-                result_id = create_empty_result(
-                    strategy_id=_sid,
+            stats = loop.run_until_complete(
+                runner.run_backtest(
+                    strategy_name=strategy_name,
                     symbol=symbol,
                     timeframe=timeframe,
-                    start_date=_s,
-                    end_date=_e,
-                    initial_capital=initial_capital,
-                    parameters=parameters or {},
-                    user_id=user_id,
+                    ohlcv_data=ohlcv_data,
+                    initial_capital=Decimal(str(initial_capital)),
+                    parameters=parameters,
+                    strategy_id=strategy_id,
+                    commission_rate=Decimal(str(commission_rate)),
+                    result_id=result_id,
+                    benchmark=benchmark,
                 )
-                strategy_id = _sid
-                logger.info(
-                    f"[BacktestTask] created placeholder result_id=%s", result_id
-                )
-        except Exception:
-            logger.warning(
-                "[BacktestTask] failed to create placeholder result", exc_info=True
             )
+        finally:
+            _close_async_resources(loop)
+            loop.close()
 
-    self.update_state(
-        state="STARTED", meta={"step": "fetching_ohlcv", "symbol": symbol}
-    )
-    ohlcv_data = _fetch_ohlcv_sync(
-        symbol, timeframe, exchange, start_date=start_date, end_date=end_date
-    )
-    if not ohlcv_data:
-        raise ValueError(f"未能获取 {symbol} {timeframe} 的历史K线数据")
+        total_trades = stats.get("total_trades", 0)
+        total_return = stats.get("total_return_pct", 0)
+        sharpe = stats.get("sharpe_ratio", 0) or 0
+        win_rate = stats.get("win_rate", 0) or 0
 
-    logger.info(f"[BacktestTask] OHLCV data fetched: {len(ohlcv_data)} bars")
-
-    self.update_state(
-        state="STARTED",
-        meta={"step": "running_backtest", "bars": len(ohlcv_data)},
-    )
-    runner = StrategyRunner()
-
-    loop = asyncio.new_event_loop()
-    try:
-        stats = loop.run_until_complete(
-            runner.run_backtest(
-                strategy_name=strategy_name,
-                symbol=symbol,
-                timeframe=timeframe,
-                ohlcv_data=ohlcv_data,
-                initial_capital=Decimal(str(initial_capital)),
-                parameters=parameters,
-                strategy_id=strategy_id,
-                commission_rate=Decimal(str(commission_rate)),
-                result_id=result_id,
-                benchmark=benchmark,
-            )
+        logger.info(
+            f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
+            f"trades={total_trades}"
         )
+        tracker.complete(
+            f"{strategy_name} {symbol} {timeframe} 回测完成\n"
+            f"交易 {total_trades} 笔 | "
+            f"收益率 {total_return:.2f}% | "
+            f"夏普 {sharpe:.2f} | "
+            f"胜率 {win_rate:.1%}"
+        )
+        return stats
+    except Exception:
+        tracker.fail(f"回测失败: {strategy_name} {symbol} {timeframe}")
+        raise
     finally:
-        _close_async_resources(loop)
-        loop.close()
-
-    total_trades = stats.get("total_trades", 0)
-    logger.info(
-        f"[BacktestTask] backtest complete: result_id={stats.get('result_id')} "
-        f"trades={total_trades}"
-    )
-    return stats
+        tracker.stop()
+        tracker_context.reset(token)
 
 
 def _fetch_ohlcv_sync(
