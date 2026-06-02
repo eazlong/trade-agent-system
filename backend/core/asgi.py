@@ -75,10 +75,10 @@ async def _listen_progress_notifications():
 
 async def _route_notification(user_id: str, text: str):
     """Route a notification to the user's active channel (Telegram or Lark)."""
-    from asgiref.sync import sync_to_async
+    from channels.db import database_sync_to_async
     from apps.channel.channel_resolver import get_user_active_channel
 
-    target = await sync_to_async(get_user_active_channel)(user_id)
+    target = await database_sync_to_async(get_user_active_channel)(user_id)
 
     if target is None:
         # Fallback: try Telegram in-memory instance (legacy behavior)
