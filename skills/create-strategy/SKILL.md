@@ -114,7 +114,7 @@ when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易�
 
 生成包含以下部分的策略代码：
 - `on_bar` 实现
-- `get_watch_signals` 实现（基于 3.2 推导结果）
+- `get_watch_signals` 实现（基于 3.2 推导结果）— **必须实现，禁止返回 `[]`**（见下方 CRITICAL 检查）
 - `on_start`、`on_stop` 等生命周期方法
 
 **输出路径**：`~/.tradelogx/strategies/{strategy_name}.py`
@@ -422,7 +422,7 @@ class {StrategyName}Strategy(BaseStrategy):
             {"operator": "lt", "left": {"field": "rsi"},
              "right": {"value": 30}}
         """
-        return []  # agent 将根据推导规则填充实际内容
+        return []  # ⚠️ CRITICAL：agent 必须替换此行为实际 watch signal 列表，禁止保留 return []
 ```
 
 ### 关键 API 参考
@@ -584,6 +584,17 @@ lower = float(bb["lower"][-1])
 2. 用 `[-1]` 取最新元素
 3. 用 `float()` 转为 Python 原生标量
 4. 之后才能安全使用 `== 0`、`is None`、`< >` 等比较运算
+
+### get_watch_signals — CRITICAL：必须实现，禁止返回空列表
+
+**每次创建策略都必须实现 `get_watch_signals`，禁止返回 `[]` 或 `pass`。**
+
+Agent 在阶段 3 生成代码后，必须自查：
+1. `get_watch_signals` 方法体是否只有 `return []`？→ **必须重写**
+2. 方法体内是否有至少一个有效 watch signal dict？
+3. 每个 dict 是否包含 `interval`、`indicator_type`、`indicator_params`、`condition`、`trigger_type` 五个字段？
+
+**自查失败 = 代码不合格，不能交付用户。**
 
 ### get_watch_signals 格式要求
 
