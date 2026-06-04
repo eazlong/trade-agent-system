@@ -141,14 +141,31 @@ def execute_recurring_agent_task(
     )
 
     try:
-        supervisor = SupervisorAgent.get_instance()
+        # 重置所有单例，防止跨任务复用绑定到旧事件循环的组件
+        # 这是 "Event loop is closed" 的根本原因：Celery worker 复用进程，
+        # 单例对象存活，内部 async 组件引用了已关闭的旧事件循环
+        SupervisorAgent._instance = None
+        from apps.agent.llm_client import LLMClient
+        LLMClient._instance = None
+        from apps.agent.frame_manager import FrameManager
+        FrameManager._instance = None
+
         loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            result: AgentResult = loop.run_until_complete(
-                supervisor._route_to_agent(agent_name, msg)
-            )
+            supervisor = SupervisorAgent.get_instance()
+            if agent_name == "supervisor":
+                # supervisor 不在 AgentRegistry 中，直接调用 handle 走正常路由
+                result: AgentResult = loop.run_until_complete(
+                    supervisor.handle(msg)
+                )
+            else:
+                result: AgentResult = loop.run_until_complete(
+                    supervisor._route_to_agent(agent_name, msg)
+                )
         finally:
             loop.close()
+            asyncio.set_event_loop(None)
 
         if result.success:
             logger.info(
