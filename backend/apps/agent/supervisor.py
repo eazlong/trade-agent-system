@@ -461,6 +461,16 @@ class SupervisorAgent(BaseAgent):
             context=conversation_history[-5:] if conversation_history else None,
         )
 
+        # 多步骤工作流
+        if isinstance(parsed, dict) and parsed.get("_workflow_plan"):
+            logger.info(
+                "[%s] Multi-step workflow detected: %s",
+                self.name, parsed.get("summary", ""),
+            )
+            return await self._execute_workflow(
+                parsed["_workflow_plan"], message, on_tool_result=on_tool_result
+            )
+
         # LLM 直接返回自由对话（节省一次 LLM 调用）
         if isinstance(parsed, dict) and parsed.get("_free_chat"):
             response_text = parsed.get("response")
