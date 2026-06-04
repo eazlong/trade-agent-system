@@ -624,6 +624,114 @@ class SupervisorAgent(BaseAgent):
             logger.error("Routing to %s failed: %s", agent_name, e)
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
 
+    async def _execute_workflow(
+        self,
+        workflow_plan: dict,
+        message: AgentMessage,
+        on_tool_result=None,
+    ) -> AgentResult:
+        """Execute a multi-step workflow plan sequentially.
+
+        Each step is dispatched via _route_to_agent. Previous step's result
+        is injected into the next step's payload as previous_agent_response.
+
+        Args:
+            workflow_plan: {"summary": str, "steps": [{"agent": str, "message": str}]}
+            message: Original AgentMessage (for task_id, user_id)
+            on_tool_result: Optional callback for tool results
+
+        Returns:
+            AgentResult with success=True if all steps completed,
+            or success=False if any step failed.
+        """
+        steps = workflow_plan.get("steps", [])
+        if not steps:
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                error="工作流计划为空",
+            )
+
+        step_results: list[dict] = []
+
+        for idx, step in enumerate(steps):
+            agent_name = step.get("agent", "")
+            step_message = step.get("message", "")
+
+            if not agent_name:
+                return AgentResult(
+                    task_id=message.task_id,
+                    success=False,
+                    error=f"步骤 {idx + 1} 缺少 agent 字段",
+                )
+
+            # Build step message with previous context
+            step_msg = AgentMessage(
+                task_id=message.task_id,
+                sender="supervisor",
+                recipient=agent_name,
+                payload={"text": step_message, "scheduled": True},
+                user_id=message.user_id,
+            )
+
+            # Inject previous step's result
+            if step_results:
+                prev = step_results[-1]
+                step_msg.payload["previous_agent_response"] = prev.get("data", "")
+                step_msg.payload["previous_agent_name"] = prev.get("agent", "")
+                logger.info(
+                    "[%s] Workflow step %d/%d: injecting context %s -> %s",
+                    self.name, idx + 1, len(steps),
+                    prev.get("agent", "?"), agent_name,
+                )
+
+            logger.info(
+                "[%s] Workflow step %d/%d: dispatching to %s",
+                self.name, idx + 1, len(steps), agent_name,
+            )
+
+            # Dispatch via _route_to_agent
+            result = await self._route_to_agent(agent_name, step_msg, on_tool_result=on_tool_result)
+
+            if result.success:
+                content = ""
+                if isinstance(result.data, dict):
+                    content = result.data.get("content", str(result.data))
+                else:
+                    content = str(result.data)
+
+                step_results.append({
+                    "agent": agent_name,
+                    "data": content,
+                    "step": idx + 1,
+                })
+            else:
+                # Step failed — fail fast
+                return AgentResult(
+                    task_id=message.task_id,
+                    success=False,
+                    error=f"工作流步骤 {idx + 1} ({agent_name}) 失败: {result.error}",
+                    data={"completed_steps": step_results},
+                )
+
+        # All steps completed
+        summary_lines = [
+            f"工作流完成 ({len(step_results)}/{len(steps)} 步)",
+        ]
+        for sr in step_results:
+            summary_lines.append(
+                f"\n--- 步骤 {sr['step']}: {sr['agent']} ---\n{sr['data'][:500]}"
+            )
+
+        return AgentResult(
+            task_id=message.task_id,
+            success=True,
+            data={
+                "workflow_summary": "\n".join(summary_lines),
+                "step_results": step_results,
+            },
+        )
+
     def _load_skills_for_context(self, skill_names: list[str]) -> str:
         """
         Load full content for a list of skill names.
@@ -766,7 +874,7 @@ class SupervisorAgent(BaseAgent):
 
             # 工作流计划：多 Agent 顺序任务
             if data.get("_workflow_plan"):
-                return data["_workflow_plan"]
+                return data
 
             # 框架意图
             if data.get("intent") and data["intent"] in frame_intents:
