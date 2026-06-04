@@ -141,7 +141,7 @@ def execute_recurring_agent_task(
     )
 
     try:
-        # 重置所有单例，防止跨任务复用绑定到旧事件循环的组件
+        # 重置所有单例和缓存实例，防止跨任务复用绑定到旧事件循环的组件
         # 这是 "Event loop is closed" 的根本原因：Celery worker 复用进程，
         # 单例对象存活，内部 async 组件引用了已关闭的旧事件循环
         SupervisorAgent._instance = None
@@ -149,6 +149,15 @@ def execute_recurring_agent_task(
         LLMClient._instance = None
         from apps.agent.frame_manager import FrameManager
         FrameManager._instance = None
+        from apps.agent.registry import AgentRegistry
+        AgentRegistry._registry.clear()  # 清除已实例化的 Agent（含旧 loop 绑定）
+        from apps.agent.supervisor import IntentRouter
+        IntentRouter._instance = None
+
+        # 清除 Redis 连接池缓存（aioredis 客户端绑定到旧 loop）
+        import os
+        from apps.memory.redis_client import _CLIENTS
+        _CLIENTS.pop(os.getpid(), None)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
