@@ -727,7 +727,10 @@ class SupervisorAgent(BaseAgent):
             f"User message: {text}\n\n"
             "Analyze the user's intent and determine which agent should handle it "
             "based on each agent's overview/role description.\n\n"
-            "Reply with a JSON object:\n"
+            "If the user request clearly requires multiple agents to work in sequence "
+            "(e.g., 'research then implement', '研究并实现', '先调研再回测'), reply with:\n"
+            '{"_workflow_plan": {"summary": "一句话概括", "steps": [{"agent": "<agent1>", "message": "<step1 prompt>"}, {"agent": "<agent2>", "message": "<step2 prompt>"}]}}\n\n'
+            "Otherwise, reply with a JSON object:\n"
             '- If one agent matches: {"agent": "<agent_name>"} (can be "supervisor" for your own tools)\n'
             '- If it matches a framework intent: {"intent": "<frame_intent>"}\n'
             '- If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
@@ -760,6 +763,10 @@ class SupervisorAgent(BaseAgent):
             # 自由对话：LLM 直接返回回复内容
             if data.get("_free_chat"):
                 return {"_free_chat": True, "response": data.get("response", "")}
+
+            # 工作流计划：多 Agent 顺序任务
+            if data.get("_workflow_plan"):
+                return data["_workflow_plan"]
 
             # 框架意图
             if data.get("intent") and data["intent"] in frame_intents:
