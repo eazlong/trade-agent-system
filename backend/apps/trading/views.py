@@ -422,6 +422,31 @@ def live_session_stop(request, pk):
     return Response({"status": session.status, "message": "Session stopped"})
 
 
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def live_session_delete(request, pk):
+    """
+    删除实盘会话。
+    仅允许删除已停止(stopped)、异常(error)或待启动(pending)状态的会话。
+    """
+    try:
+        session = LiveSession.objects.get(pk=pk, user=request.user)
+    except LiveSession.DoesNotExist:
+        return Response({"error": "Live session not found"}, status=404)
+
+    if session.status in ("running", "paused"):
+        return Response(
+            {"error": f"Session is {session.status}, stop it first before deleting"},
+            status=400,
+        )
+
+    session.delete()
+    return Response(
+        {"message": "Session deleted", "id": str(pk)},
+        status=status.HTTP_200_OK,
+    )
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_promote(request, pk):

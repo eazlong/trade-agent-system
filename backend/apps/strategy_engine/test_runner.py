@@ -63,13 +63,16 @@ class StrategyTester:
         # 1.5) 静态分析 — 扫描 Decimal 类型误用
         type_warnings = self._scan_type_misuse(path)
 
+        # 1.6) 静态分析 — 扫描不存在的 StrategyContext 属性
+        ctx_attr_warnings = self._scan_context_attrs(path)
+
         strategy_cls, load_error = self._load_strategy_module(path)
         if load_error:
-            return {"success": False, "strategy_name": None, "errors": [f"加载失败: {load_error}"], "stats": None, "warnings": type_warnings}
+            return {"success": False, "strategy_name": None, "errors": [f"加载失败: {load_error}"], "stats": None, "warnings": type_warnings + ctx_attr_warnings}
 
         validate_errors = self._validate_strategy_class(strategy_cls)
         if validate_errors:
-            return {"success": False, "strategy_name": getattr(strategy_cls, "name", None), "errors": validate_errors, "stats": None, "warnings": type_warnings}
+            return {"success": False, "strategy_name": getattr(strategy_cls, "name", None), "errors": validate_errors, "stats": None, "warnings": type_warnings + ctx_attr_warnings}
 
         strategy_name = getattr(strategy_cls, "name", "unnamed")
 
@@ -82,9 +85,9 @@ class StrategyTester:
             all_warnings.insert(0, reg_warning)
 
         if run_result["errors"]:
-            return {"success": False, "strategy_name": strategy_name, "errors": run_result["errors"], "stats": run_result.get("stats"), "warnings": type_warnings + all_warnings}
+            return {"success": False, "strategy_name": strategy_name, "errors": run_result["errors"], "stats": run_result.get("stats"), "warnings": type_warnings + ctx_attr_warnings + all_warnings}
 
-        return {"success": True, "strategy_name": strategy_name, "errors": [], "stats": run_result["stats"], "warnings": type_warnings + all_warnings}
+        return {"success": True, "strategy_name": strategy_name, "errors": [], "stats": run_result["stats"], "warnings": type_warnings + ctx_attr_warnings + all_warnings}
 
     def _check_syntax(self, path: Path) -> tuple[bool, str | None]:
         """验证 Python 语法"""
@@ -153,6 +156,35 @@ class StrategyTester:
 
         return warnings
 
+    def _scan_context_attrs(self, path: Path) -> list[str]:
+        """静态扫描策略源码中使用了不存在的 StrategyContext 属性"""
+        warnings: list[str] = []
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+
+        # 不存在的属性 → 推荐替代方案
+        INVALID_CTX_ATTRS: dict[str, str] = {
+            "portfolio_value": "self.ctx.to_portfolio_context().total_capital",
+            "equity": "self.ctx.to_portfolio_context().total_capital",
+            "cash": "self.ctx.balance",
+            "account_value": "self.ctx.to_portfolio_context().total_capital",
+            "total_capital": "self.ctx.to_portfolio_context().total_capital",
+        }
+
+        for i, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for attr, replacement in INVALID_CTX_ATTRS.items():
+                if f"self.ctx.{attr}" in stripped:
+                    warnings.append(
+                        f"第 {i} 行: 使用了不存在的属性 self.ctx.{attr}，"
+                        f"将抛出 AttributeError。应改用 {replacement}。"
+                    )
+                    break  # 一行只能匹配一个无效属性
+
+        return warnings
+
     def _load_strategy_module(self, path: Path) -> tuple[type | None, str | None]:
         """动态加载策略模块"""
         try:
@@ -218,6 +250,8 @@ class StrategyTester:
 
         klines = _generate_mock_klines(self.kline_count)
         signals_count = buy_count = sell_count = 0
+        buy_skipped_no_funds = 0  # 买入信号因资金不足被跳过
+        buy_skipped_zero_qty = 0   # 买入信号 quantity 为 0
         position = Decimal("0")
         balance = self.initial_capital
         try:
@@ -249,11 +283,18 @@ class StrategyTester:
                 break
             signals_count += 1
             if signal.side == "buy":
-                cost = signal.quantity * Decimal(str(kline["close"]))
+                qty = signal.quantity
+                if qty <= Decimal("0"):
+                    buy_skipped_zero_qty += 1
+                    buy_count += 1
+                    continue
+                cost = qty * Decimal(str(kline["close"]))
                 commission = cost * Decimal("0.001")
                 if cost + commission <= balance:
                     balance -= cost + commission
-                    position += signal.quantity
+                    position += qty
+                else:
+                    buy_skipped_no_funds += 1
                 buy_count += 1
             elif signal.side == "sell":
                 sell_qty = min(signal.quantity, position)
@@ -284,6 +325,33 @@ class StrategyTester:
                 f"策略生成了 {signals_count} 个信号，但无实际成交。"
                 "检查资金是否充足、信号 side 是否正确。"
             )
+
+        # 仓位计算验证 — quantity 为零或负
+        if buy_skipped_zero_qty > 0:
+            warnings.append(
+                f"仓位计算错误：{buy_skipped_zero_qty} 个买入信号的 quantity ≤ 0，被跳过。"
+                "请检查仓位计算公式是否正确（qty = total_capital * position_pct / price）。"
+            )
+
+        # 仓位计算验证 — 资金不足
+        if buy_skipped_no_funds > 0:
+            warnings.append(
+                f"仓位计算错误：{buy_skipped_no_funds} 个买入信号因资金不足被跳过"
+                f"（初始资金 {self.initial_capital}，可用余额 {float(balance):.2f}）。"
+                "请检查：1) 是否手动计算了过大的 quantity；"
+                "2) 是否直接使用 balance（可用余额）替代 total_capital（总资金）；"
+                "3) 推荐使用 PctCapitalPortfolio 自动计算开仓量。"
+            )
+
+        # 仓位计算验证 — 资金几乎未使用（可能 quantity 计算过小）
+        if buy_count > 0 and buy_skipped_no_funds == 0 and buy_skipped_zero_qty == 0:
+            used_capital = self.initial_capital - balance
+            if used_capital > 0 and used_capital < self.initial_capital * Decimal("0.01"):
+                warnings.append(
+                    f"仓位计算可能过小：在 {buy_count} 次买入中仅使用了 "
+                    f"{float(used_capital):.2f} 资金（初始资金 {self.initial_capital}）。"
+                    "请检查 quantity 计算是否因 Decimal 类型混用或数值错误导致过小。"
+                )
 
         final_equity = balance + position * Decimal(str(klines[-1]["close"]))
         total_return = float(((final_equity - self.initial_capital) / self.initial_capital) * 100)

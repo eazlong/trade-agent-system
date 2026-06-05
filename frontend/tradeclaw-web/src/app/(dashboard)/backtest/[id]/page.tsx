@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import DashboardShell from "@/components/layout/DashboardShell";
@@ -61,57 +61,197 @@ export default function BacktestDetailPage() {
   const [tfCache, setTfCache] = useState<Record<string, CachedTimeframeData>>({});
   const [tfLoading, setTfLoading] = useState(false);
 
-  // ── Lazy-loaded full OHLCV data ──
-  const [fullOhlcv, setFullOhlcv] = useState<OHLCVPoint[]>([]);
-  const [fullIndicators, setFullIndicators] = useState<IndicatorData>({});
+  // ── Lazy-load window management ──
+  // When total bars exceed the initial window, show a subset and load more on scroll.
+  const INITIAL_WINDOW = 300;
+  const BATCH_SIZE = 200;
 
-  /** Load more OHLCV bars from server (lazy loading)
-   * Backend stores oldest-first (index 0 = oldest, index n = newest).
-   * Initial data is slice [:200] = oldest 200 bars.
-   * Lazy load slice [loadedCount:nextEnd] = newer bars.
-   * Both are oldest-first, so we append (not prepend/reverse).
-   */
+  const [windowStart, setWindowStart] = useState(0);
+  const [windowEnd, setWindowEnd] = useState(INITIAL_WINDOW);
+  // Track whether the window was initialised from detail
+  const windowInitialised = useRef(false);
+
+  // ── Server-fetched earlier OHLCV (before backtest start_date) ──
+  const [preOhlcv, setPreOhlcv] = useState<OHLCVPoint[]>([]);
+  const [hasMoreEarlierData, setHasMoreEarlierData] = useState(true);
+  const fetchingEarlierRef = useRef(false);
+
+  // ── Server-fetched later OHLCV (after backtest end_date) ──
+  const [postOhlcv, setPostOhlcv] = useState<OHLCVPoint[]>([]);
+  const [hasMoreLaterData, setHasMoreLaterData] = useState(true);
+  const fetchingLaterRef = useRef(false);
+
+  // Initialise window to show the RIGHTMOST bars (newest data) when detail loads
+  useEffect(() => {
+    if (!detail || windowInitialised.current) return;
+    const total = detail.ohlcv_data.length;
+    if (total > INITIAL_WINDOW) {
+      setWindowStart(total - INITIAL_WINDOW);
+      setWindowEnd(total);
+    } else {
+      setWindowStart(0);
+      setWindowEnd(total);
+    }
+    windowInitialised.current = true;
+  }, [detail]);
+
+  /** Expand the visible window or fetch earlier data from server */
   const loadMoreOhlcv = useCallback(
-    (start: number, end: number) => {
-      backtestApi.getOHLCVRange(id, start, end).then((res) => {
-        setFullOhlcv((prev) => {
-          // Initialize empty if needed
-          if (prev.length === 0) {
-            // Start with initial detail data, will be merged in currentData
-            return res.ohlcv_data;
-          }
-          // Backend returns oldest-first slice, append to existing oldest-first data
-          if (res.start >= prev.length) {
-            return [...prev, ...res.ohlcv_data];
-          }
-          return prev;
-        });
-        setFullIndicators((prev) => {
-          if (Object.keys(prev).length === 0) {
-            return res.indicator_data;
-          }
-          const merged: Record<string, unknown> = { ...prev };
-          for (const [key, value] of Object.entries(res.indicator_data)) {
-            const existing = merged[key];
-            if (Array.isArray(value)) {
-              merged[key] = Array.isArray(existing) ? [...existing, ...value] : value;
-            } else if (typeof value === "object" && value !== null) {
-              const obj: Record<string, unknown> = (existing as Record<string, unknown>) ?? {};
-              for (const [k2, v2] of Object.entries(value)) {
-                const arr = v2 as unknown[];
-                const existingArr = obj[k2] as unknown[];
-                obj[k2] = Array.isArray(arr)
-                  ? Array.isArray(existingArr) ? [...existingArr, ...arr] : arr
-                  : v2;
+    (direction: "earlier" | "later") => {
+      if (!detail) return;
+      const total = detail.ohlcv_data.length;
+
+      if (direction === "earlier") {
+        if (windowStart > 0) {
+          // Expand window into existing backtest data
+          setWindowStart((prev) => {
+            const next = Math.max(0, prev - BATCH_SIZE);
+            return next < prev ? next : prev;
+          });
+        } else if (hasMoreEarlierData && !fetchingEarlierRef.current) {
+          // Fetch earlier bars from server (before backtest start_date)
+          fetchingEarlierRef.current = true;
+          // Use the earliest already-fetched bar's timestamp as cursor,
+          // or the chart's first visible bar timestamp on first call
+          const cursor = preOhlcv.length > 0
+            ? preOhlcv[0].timestamp
+            : detail.ohlcv_data[0]?.timestamp ?? detail.start_date;
+          backtestApi
+            .fetchEarlierOhlcv(id, BATCH_SIZE, cursor, detail.timeframe, detail.symbol)
+            .then((res) => {
+              const newBars = res.ohlcv_data ?? [];
+              // Deduplicate: remove bars whose timestamp already exists in
+              // backtest data or pre-fetched data
+              const existingTs = new Set([
+                ...detail.ohlcv_data.map((b) => b.timestamp),
+                ...preOhlcv.map((b) => b.timestamp),
+              ]);
+              const filtered = newBars.filter((b) => !existingTs.has(b.timestamp));
+              setPreOhlcv((prev) => [...filtered, ...prev]);
+              if ((res.count ?? 0) < BATCH_SIZE) {
+                setHasMoreEarlierData(false);
               }
-              merged[key] = obj;
-            }
-          }
-          return merged as IndicatorData;
-        });
-      });
+            })
+            .catch(() => {
+              setHasMoreEarlierData(false);
+            })
+            .finally(() => {
+              fetchingEarlierRef.current = false;
+            });
+        }
+      } else {
+        // "later" direction
+        if (windowEnd < total) {
+          // Expand window into existing backtest data
+          setWindowEnd((prev) => {
+            const next = Math.min(total, prev + BATCH_SIZE);
+            return next > prev ? next : prev;
+          });
+        } else if (hasMoreLaterData && !fetchingLaterRef.current) {
+          // Fetch later bars from server (after backtest end_date)
+          fetchingLaterRef.current = true;
+          // Use the latest already-fetched bar's timestamp as cursor,
+          // or the chart's last visible bar timestamp on first call
+          const cursor = postOhlcv.length > 0
+            ? postOhlcv[postOhlcv.length - 1].timestamp
+            : detail.ohlcv_data[detail.ohlcv_data.length - 1]?.timestamp ?? detail.end_date;
+          backtestApi
+            .fetchLaterOhlcv(id, BATCH_SIZE, cursor, detail.timeframe, detail.symbol)
+            .then((res) => {
+              const newBars = res.ohlcv_data ?? [];
+              // Deduplicate boundary bars against both backtest data and already-fetched bars
+              const existingTs = new Set([
+                ...detail.ohlcv_data.map((b) => b.timestamp),
+                ...postOhlcv.map((b) => b.timestamp),
+              ]);
+              const filtered = newBars.filter((b) => !existingTs.has(b.timestamp));
+              setPostOhlcv((prev) => [...prev, ...filtered]);
+              if ((res.count ?? 0) < BATCH_SIZE) {
+                setHasMoreLaterData(false);
+              }
+            })
+            .catch(() => {
+              setHasMoreLaterData(false);
+            })
+            .finally(() => {
+              fetchingLaterRef.current = false;
+            });
+        }
+      }
     },
-    [id]
+    [detail, windowStart, windowEnd, hasMoreEarlierData, hasMoreLaterData, id, preOhlcv, postOhlcv]
+  );
+
+  /** Ensure OHLCV data is ascending (oldest first) */
+  function ensureAscending(data: OHLCVPoint[]): OHLCVPoint[] {
+    if (data.length < 2) return data;
+    const first = new Date(data[0].timestamp).getTime();
+    const last = new Date(data[data.length - 1].timestamp).getTime();
+    return first > last ? [...data].reverse() : data;
+  }
+
+  /** Prepend `pad` null elements to every indicator array */
+  const padIndicators = useCallback(
+    (indicators: IndicatorData, pad: number): IndicatorData => {
+      if (pad <= 0) return indicators;
+      const result: Record<string, unknown> = {};
+      const nulls: (null)[] = Array(pad).fill(null);
+      for (const [key, value] of Object.entries(indicators)) {
+        if (Array.isArray(value)) {
+          result[key] = [...nulls, ...value];
+        } else if (typeof value === "object" && value !== null) {
+          const obj: Record<string, unknown> = {};
+          for (const [k2, v2] of Object.entries(value)) {
+            obj[k2] = Array.isArray(v2) ? [...nulls, ...v2] : v2;
+          }
+          result[key] = obj;
+        }
+      }
+      return result as IndicatorData;
+    },
+    []
+  );
+
+  /** Append `pad` null elements to every indicator array */
+  const padIndicatorsPost = useCallback(
+    (indicators: IndicatorData, pad: number): IndicatorData => {
+      if (pad <= 0) return indicators;
+      const result: Record<string, unknown> = {};
+      const nulls: (null)[] = Array(pad).fill(null);
+      for (const [key, value] of Object.entries(indicators)) {
+        if (Array.isArray(value)) {
+          result[key] = [...value, ...nulls];
+        } else if (typeof value === "object" && value !== null) {
+          const obj: Record<string, unknown> = {};
+          for (const [k2, v2] of Object.entries(value)) {
+            obj[k2] = Array.isArray(v2) ? [...v2, ...nulls] : v2;
+          }
+          result[key] = obj;
+        }
+      }
+      return result as IndicatorData;
+    },
+    []
+  );
+
+  /** Slice indicator arrays to match OHLCV window */
+  const sliceIndicators = useCallback(
+    (indicators: IndicatorData, start: number, end: number): IndicatorData => {
+      const result: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(indicators)) {
+        if (Array.isArray(value)) {
+          result[key] = value.slice(start, end);
+        } else if (typeof value === "object" && value !== null) {
+          const obj: Record<string, unknown> = {};
+          for (const [k2, v2] of Object.entries(value)) {
+            obj[k2] = Array.isArray(v2) ? v2.slice(start, end) : v2;
+          }
+          result[key] = obj;
+        }
+      }
+      return result as IndicatorData;
+    },
+    []
   );
 
   /** Resample data for target timeframe, using cache if available */
@@ -154,101 +294,37 @@ export default function BacktestDetailPage() {
     }
   }, [detail, activeTf]);
 
-  /** Merge two indicator data objects */
-  const mergeIndicators = useCallback((a: IndicatorData, b: IndicatorData): IndicatorData => {
-    const merged: Record<string, unknown> = { ...a };
-    for (const [key, value] of Object.entries(b)) {
-      if (Array.isArray(value)) {
-        const existing = merged[key];
-        merged[key] = Array.isArray(existing) ? [...existing, ...value] : value;
-      } else if (typeof value === "object" && value !== null) {
-        const existingObj: Record<string, unknown> = (merged[key] as Record<string, unknown>) ?? {};
-        for (const [k2, v2] of Object.entries(value)) {
-          if (Array.isArray(v2)) {
-            const existing2 = existingObj[k2];
-            existingObj[k2] = Array.isArray(existing2) ? [...existing2, ...v2] : v2;
-          }
-        }
-        merged[key] = existingObj;
-      }
-    }
-    return merged as IndicatorData;
-  }, []);
-
-  /** Sort indicator arrays to match sorted OHLCV order */
-  const sortIndicators = useCallback((indicators: IndicatorData, sortIndices: number[]): IndicatorData => {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(indicators)) {
-      if (Array.isArray(value)) {
-        result[key] = sortIndices.map(i => value[i]);
-      } else if (typeof value === "object" && value !== null) {
-        const obj: Record<string, unknown> = {};
-        for (const [k2, v2] of Object.entries(value)) {
-          if (Array.isArray(v2)) {
-            obj[k2] = sortIndices.map(i => v2[i]);
-          } else {
-            obj[k2] = v2;
-          }
-        }
-        result[key] = obj;
-      } else {
-        result[key] = value;
-      }
-    }
-    return result as IndicatorData;
-  }, []);
-
-  /** Current OHLCV + indicators for the active timeframe */
+  /** Current OHLCV + indicators for the active timeframe (windowed + pre data) */
   const currentData = useMemo((): { ohlcv: OHLCVPoint[]; indicators: IndicatorData } => {
     if (!activeTf || !detail) return { ohlcv: [], indicators: {} };
-    // Base timeframe: merge initial data with lazy-loaded data
+    // Base timeframe: windowed view into full data + preOhlcv
     if (activeTf === detail.timeframe) {
-      const initialBars = detail.ohlcv_data ?? [];
-      let ohlcv = fullOhlcv.length > 0
-        ? [...initialBars, ...fullOhlcv]
-        : initialBars;
-      let indicators = detail.indicator_data;
+      const allBars = detail.ohlcv_data ?? [];
+      const allIndicators = detail.indicator_data ?? {};
+      const total = allBars.length;
 
-      // Merge indicators if lazy-loaded
-      if (Object.keys(fullIndicators).length > 0) {
-        indicators = mergeIndicators(detail.indicator_data, fullIndicators);
+      if (total <= INITIAL_WINDOW && preOhlcv.length === 0 && postOhlcv.length === 0) {
+        return { ohlcv: allBars, indicators: allIndicators };
       }
 
-      // Sort by timestamp to ensure ascending order (oldest-first)
-      // Create sort indices to sync indicators with sorted OHLCV
-      const indexed = ohlcv.map((p, i) => ({
-        ts: new Date(p.timestamp).getTime(),
-        idx: i,
-      }));
-      indexed.sort((a, b) => a.ts - b.ts);
-      const sortIndices = indexed.map(x => x.idx);
-      ohlcv = sortIndices.map(i => ohlcv[i]);
+      const start = windowStart;
+      const end = Math.min(windowEnd, total);
+      // Ensure ascending so preOhlcv (asc) + slicedBars + postOhlcv are monotonic
+      const slicedBars = ensureAscending(allBars.slice(start, end));
+      const ohlcv = [...preOhlcv, ...slicedBars, ...postOhlcv];
 
-      // Sync indicators to sorted order
-      indicators = sortIndicators(indicators, sortIndices);
-
-      // Deduplicate by timestamp to keep OHLCV and indicators in sync
-      const seenTs = new Set<number>();
-      const keepIndices: number[] = [];
-      const dedupedOhlcv: OHLCVPoint[] = [];
-      for (let i = 0; i < ohlcv.length; i++) {
-        const ts = new Date(ohlcv[i].timestamp).getTime();
-        if (!seenTs.has(ts)) {
-          seenTs.add(ts);
-          keepIndices.push(i);
-          dedupedOhlcv.push(ohlcv[i]);
-        }
-      }
-      if (keepIndices.length < ohlcv.length) {
-        ohlcv = dedupedOhlcv;
-        indicators = sortIndicators(indicators, keepIndices);
-      }
+      // Pad indicator arrays: preOhlcv → null, windowed indicators, postOhlcv → null
+      const prePad = preOhlcv.length;
+      const postPad = postOhlcv.length;
+      const slicedIndicators = sliceIndicators(allIndicators, start, end);
+      let indicators = padIndicators(slicedIndicators, prePad);
+      indicators = padIndicatorsPost(indicators, postPad);
 
       return { ohlcv, indicators };
     }
     // Resampled timeframe: use cache
     return tfCache[activeTf] ?? { ohlcv: [], indicators: {} };
-  }, [activeTf, detail, tfCache, fullOhlcv, fullIndicators, mergeIndicators, sortIndicators]);
+  }, [activeTf, detail, tfCache, windowStart, windowEnd, sliceIndicators, preOhlcv, postOhlcv]);
 
   // Determine which timeframes to show (only >= base timeframe)
   const availableTimeframes = useMemo(() => {
@@ -661,7 +737,10 @@ export default function BacktestDetailPage() {
                 timeframe={activeTf ?? undefined}
                 availableTimeframes={[...availableTimeframes]}
                 onTimeframeChange={switchTimeframe}
-                totalBars={detail.ohlcv_total ?? currentData.ohlcv.length}
+                totalBars={preOhlcv.length + detail.ohlcv_data.length + postOhlcv.length}
+                loadedStart={preOhlcv.length + windowStart}
+                hasMoreEarlier={hasMoreEarlierData}
+                hasMoreLater={hasMoreLaterData}
                 onLoadMore={activeTf === detail.timeframe ? loadMoreOhlcv : undefined}
               />
             )}

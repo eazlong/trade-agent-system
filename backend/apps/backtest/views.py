@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import logging
 
@@ -154,6 +154,113 @@ def result_detail_full(request, pk):
     """Returns summary + equity_curve + drawdown_curve (no trades)."""
     result = BacktestResult.objects.get(pk=pk)
     return Response(BacktestDetailSerializer(result).data)
+
+
+TIMEFRAME_SECONDS: dict[str, int] = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900,
+    "30m": 1800, "1h": 3600, "4h": 14400,
+    "1d": 86400, "1w": 604800,
+}
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def result_earlier_ohlcv(request, pk):
+    """返回回测起点之前的更早 K 线（无指标/交易标记）。
+
+    Query params:
+      limit: int (default 200, max 1000) — 期望 K 线根数
+      cursor: str (required) — 已加载的最早 K 线时间戳（ISO 格式），
+              首次调用传 result.start_date，后续调用传 preOhlcv 第一条的时间戳
+      timeframe: str (optional) — K 线周期，默认使用回测结果的 timeframe
+      symbol: str (optional) — 交易对，默认使用回测结果的 symbol
+    """
+    try:
+        result = BacktestResult.objects.get(pk=pk)
+    except BacktestResult.DoesNotExist:
+        return Response({"error": "Backtest result not found"}, status=404)
+
+    limit = min(int(request.query_params.get("limit", 200)), 1000)
+    cursor = request.query_params.get("cursor", "")
+    if not cursor:
+        return Response({"error": "cursor parameter is required"}, status=400)
+
+    timeframe = request.query_params.get("timeframe", result.timeframe)
+    symbol = request.query_params.get("symbol", result.symbol)
+
+    tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 3600)
+
+    try:
+        end_dt = datetime.fromisoformat(cursor) - timedelta(seconds=1)
+    except (ValueError, TypeError):
+        return Response({"error": f"Invalid cursor: {cursor}"}, status=400)
+
+    # Bounded range: fetch `limit` bars worth of time + 1 day buffer backwards
+    start_dt = end_dt - timedelta(seconds=tf_seconds * limit + 86400)
+
+    from .tasks import _fetch_ohlcv_sync
+
+    # Use a large CCXT page size for fast fetching, then trim to requested count
+    ohlcv = _fetch_ohlcv_sync(
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=1000,  # CCXT page size — large to minimise round-trips
+        start_date=start_dt.isoformat(),
+        end_date=end_dt.isoformat(),
+    )
+    # Return only the last `limit` bars (closest to cursor)
+    ohlcv = ohlcv[-limit:]
+    # _fetch_ohlcv_sync returns ascending (oldest first)
+    return Response({"ohlcv_data": ohlcv, "count": len(ohlcv)})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def result_later_ohlcv(request, pk):
+    """返回回测终点之后的更晚 K 线（无指标/交易标记）。
+
+    Query params:
+      limit: int (default 200, max 1000) — 期望 K 线根数
+      cursor: str (required) — 已加载的最晚 K 线时间戳（ISO 格式），
+              首次调用传 result.end_date，后续调用传 postOhlcv 最后一条的时间戳
+      timeframe: str (optional) — K 线周期，默认使用回测结果的 timeframe
+      symbol: str (optional) — 交易对，默认使用回测结果的 symbol
+    """
+    try:
+        result = BacktestResult.objects.get(pk=pk)
+    except BacktestResult.DoesNotExist:
+        return Response({"error": "Backtest result not found"}, status=404)
+
+    limit = min(int(request.query_params.get("limit", 200)), 1000)
+    cursor = request.query_params.get("cursor", "")
+    if not cursor:
+        return Response({"error": "cursor parameter is required"}, status=400)
+
+    timeframe = request.query_params.get("timeframe", result.timeframe)
+    symbol = request.query_params.get("symbol", result.symbol)
+
+    tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 3600)
+
+    try:
+        start_dt = datetime.fromisoformat(cursor) + timedelta(seconds=1)
+    except (ValueError, TypeError):
+        return Response({"error": f"Invalid cursor: {cursor}"}, status=400)
+
+    # Bounded range: fetch `limit` bars worth of time + 1 day buffer
+    end_dt = start_dt + timedelta(seconds=tf_seconds * limit + 86400)
+
+    from .tasks import _fetch_ohlcv_sync
+
+    ohlcv = _fetch_ohlcv_sync(
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=1000,
+        start_date=start_dt.isoformat(),
+        end_date=end_dt.isoformat(),
+    )
+    # Return only the first `limit` bars (closest to cursor)
+    ohlcv = ohlcv[:limit]
+    return Response({"ohlcv_data": ohlcv, "count": len(ohlcv)})
 
 
 @api_view(["GET"])

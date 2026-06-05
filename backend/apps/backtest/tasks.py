@@ -219,18 +219,39 @@ def _fetch_ohlcv_sync(
 
         ex = exchange_class(options)
         try:
-            ohlcv = await ex.fetch_ohlcv(
-                symbol_normalized, timeframe, since=since_ms, limit=limit
-            )
+            # 分页获取全部历史数据（CCXT 每次最多返回 limit 根）
+            all_candles: list = []
+            batch_since = since_ms
+            while True:
+                ohlcv = await ex.fetch_ohlcv(
+                    symbol_normalized, timeframe, since=batch_since, limit=limit
+                )
+                if not ohlcv:
+                    break
+                raw_count = len(ohlcv)
+                # Filter batch by end_ms to avoid fetching beyond the target range
+                if end_ms is not None:
+                    ohlcv = [c for c in ohlcv if c[0] <= end_ms]
+                all_candles.extend(ohlcv)
+                if raw_count < limit:
+                    # Reached present (exchange had fewer bars than requested)
+                    break
+                if not ohlcv:
+                    # All bars in this batch were beyond end_ms
+                    break
+                # 下一批从最后一根 K 线的时间戳+1ms 开始
+                batch_since = ohlcv[-1][0] + 1
+                if end_ms is not None and batch_since > end_ms:
+                    break
         finally:
             await ex.close()
 
-        if not ohlcv:
+        if not all_candles:
             logger.warning(f"[BacktestTask] no OHLCV data for {symbol_normalized}")
             return []
 
         result = []
-        for candle in ohlcv:
+        for candle in all_candles:
             ts_ms = int(candle[0])
             if end_ms is not None and ts_ms > end_ms:
                 continue

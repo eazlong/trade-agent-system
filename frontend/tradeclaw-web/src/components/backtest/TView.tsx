@@ -32,7 +32,13 @@ interface TViewProps {
   availableTimeframes?: string[];
   onTimeframeChange?: (tf: string) => void;
   totalBars?: number;
-  onLoadMore?: (start: number, end: number) => void;
+  /** First bar index (in the full dataset) of the currently loaded ohlcv data */
+  loadedStart?: number;
+  /** Whether more earlier bars may be available from the server */
+  hasMoreEarlier?: boolean;
+  /** Whether more later bars may be available from the server */
+  hasMoreLater?: boolean;
+  onLoadMore?: (direction: "earlier" | "later") => void;
 }
 
 interface IndicatorLegend {
@@ -101,6 +107,8 @@ function buildTradeMarkers(
   if (!ohlcv.length || !trades.length) return [];
 
   const times = ohlcv.map((p) => toUTCTime(p.timestamp));
+  const minTime = times[0];
+  const maxTime = times[times.length - 1];
 
   // Find closest OHLCV bar for a given timestamp
   const findClosestTime = (targetTs: UTCTimestamp): Time => {
@@ -117,31 +125,48 @@ function buildTradeMarkers(
   };
 
   const markers: SeriesMarker<Time>[] = [];
+  const seenEntry = new Set<string>();
+  const seenExit = new Set<string>();
 
   for (const t of trades) {
     const isLong = t.side === "long";
+    const isEntry = t.trade_type === "open" || t.trade_type === "add";
 
-    // Entry marker: green for long, red for short
-    const entryTime = toUTCTime(t.entry_time);
-    markers.push({
-      time: findClosestTime(entryTime),
-      position: (isLong ? "belowBar" : "aboveBar") as SeriesMarkerPosition,
-      color: isLong ? "#00e676" : "#ff5252",
-      shape: (isLong ? "arrowUp" : "arrowDown") as SeriesMarkerShape,
-      text: `入场 ${isLong ? "多" : "空"}`,
-    });
+    // Entry marker: only for open/add trades, within OHLCV time range
+    if (isEntry) {
+      const entryTime = toUTCTime(t.entry_time);
+      if (entryTime >= minTime && entryTime <= maxTime) {
+        const entryKey = `${t.id}|entry`;
+        if (!seenEntry.has(entryKey)) {
+          seenEntry.add(entryKey);
+          markers.push({
+            time: findClosestTime(entryTime),
+            position: (isLong ? "belowBar" : "aboveBar") as SeriesMarkerPosition,
+            color: isLong ? "#00e676" : "#ff5252",
+            shape: (isLong ? "arrowUp" : "arrowDown") as SeriesMarkerShape,
+            text: `入场 ${isLong ? "多" : "空"}`,
+          });
+        }
+      }
+    }
 
-    // Exit marker: always red, with arrow pointing opposite to entry
+    // Exit marker: only if within OHLCV time range
     if (t.exit_time) {
       const exitTime = toUTCTime(t.exit_time);
-      const pnl = t.pnl ? Number(t.pnl) : 0;
-      markers.push({
-        time: findClosestTime(exitTime),
-        position: (isLong ? "aboveBar" : "belowBar") as SeriesMarkerPosition,
-        color: "#ff5252", // 出场标示显示为红色
-        shape: (isLong ? "arrowDown" : "arrowUp") as SeriesMarkerShape,
-        text: pnl >= 0 ? `出场 +${pnl.toFixed(0)}` : `出场 ${pnl.toFixed(0)}`,
-      });
+      if (exitTime >= minTime && exitTime <= maxTime) {
+        const exitKey = `${t.id}|exit`;
+        if (!seenExit.has(exitKey)) {
+          seenExit.add(exitKey);
+          const pnl = t.pnl ? Number(t.pnl) : 0;
+          markers.push({
+            time: findClosestTime(exitTime),
+            position: (isLong ? "aboveBar" : "belowBar") as SeriesMarkerPosition,
+            color: "#ff5252", // 出场标示显示为红色
+            shape: (isLong ? "arrowDown" : "arrowUp") as SeriesMarkerShape,
+            text: pnl >= 0 ? `出场 +${pnl.toFixed(0)}` : `出场 ${pnl.toFixed(0)}`,
+          });
+        }
+      }
     }
   }
 
@@ -163,6 +188,9 @@ export default function TView({
   availableTimeframes = ["1m", "5m", "15m", "1h", "4h", "1d"],
   onTimeframeChange,
   totalBars: totalBarsProp,
+  loadedStart: loadedStartProp = 0,
+  hasMoreEarlier = false,
+  hasMoreLater = false,
   onLoadMore,
 }: TViewProps) {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
@@ -171,8 +199,7 @@ export default function TView({
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
-  // Track last requested range to prevent duplicate lazy-load requests
-  const requestedEndRef = useRef(0);
+  // Prevent concurrent lazy-load requests
   const isLoadingRef = useRef(false);
   const normalizedDataRef = useRef<OHLCVPoint[]>([]);
   const hoverInfoRef = useRef<any>(null);
@@ -186,6 +213,9 @@ export default function TView({
   const ohlcvRef = useRef(ohlcv);
   const onLoadMoreRef = useRef(onLoadMore);
   const totalBarsRef = useRef(totalBars);
+  const loadedStartRef = useRef(loadedStartProp);
+  const hasMoreEarlierRef = useRef(hasMoreEarlier);
+  const hasMoreLaterRef = useRef(hasMoreLater);
 
   useEffect(() => {
     timeframeRef.current = timeframe;
@@ -199,6 +229,15 @@ export default function TView({
   useEffect(() => {
     totalBarsRef.current = totalBars;
   }, [totalBars]);
+  useEffect(() => {
+    loadedStartRef.current = loadedStartProp;
+  }, [loadedStartProp]);
+  useEffect(() => {
+    hasMoreEarlierRef.current = hasMoreEarlier;
+  }, [hasMoreEarlier]);
+  useEffect(() => {
+    hasMoreLaterRef.current = hasMoreLater;
+  }, [hasMoreLater]);
 
   // ── Crosshair handler for HoverInfo ───────────────────────────────────
 
@@ -254,9 +293,8 @@ export default function TView({
   useEffect(() => {
     if (!chartContainerRef.current || !ohlcv?.length) return;
 
-    // Initialize refs: reset loading lock and requested end to current data length
+    // Reset loading lock on chart rebuild
     isLoadingRef.current = false;
-    requestedEndRef.current = ohlcv.length;
 
     // Destroy previous chart
     if (chartRef.current) {
@@ -463,79 +501,82 @@ export default function TView({
       rsiSeries.setData(rsiData);
     }
 
-    // ── Lazy loading on scroll to edge ─────────────────────────────────────
+    // ── Lazy loading on scroll to edge (logical range) ─────────────────────
+    // Logical range reports floating-point bar indices into the loaded data,
+    // so `from < N` / `to > count - N` directly measures bar-distance from the
+    // edge — independent of bar interval and timestamp parsing.
 
-    const handleVisibleRangeChange = (range: { from: Time; to: Time } | null) => {
-      if (!range) return;
+    const handleLogicalRangeChange = (
+      logicalRange: { from: number; to: number } | null
+    ) => {
+      if (!logicalRange) return;
+
+      // Save the current time range so the viewport can be restored after the
+      // chart rebuilds (new bars are prepended/appended off-screen).
+      const tr = chart.timeScale().getVisibleRange();
+      if (tr) visibleRangeRef.current = tr;
+
       const total = totalBarsRef.current;
       const loadCb = onLoadMoreRef.current;
       if (!total || !loadCb) return;
       if (isLoadingRef.current) return;
 
-      const normalizedData = ensureAscending(ohlcvRef.current);
-      const loadedCount = normalizedData.length;
-      if (loadedCount >= total) return;
+      const loadedCount = normalizedDataRef.current.length;
+      const moreEarlier = hasMoreEarlierRef.current;
 
-      // Calculate bar interval from adjacent timestamps
-      let barInterval = 60;
-      if (normalizedData.length >= 2) {
-        const t0 = toUTCTime(normalizedData[0].timestamp);
-        const t1 = toUTCTime(normalizedData[1].timestamp);
-        barInterval = Math.abs(t1 - t0) || 60;
-      }
-      const timeThreshold = barInterval * 100;
+      const moreLater = hasMoreLaterRef.current;
 
-      const oldestLoadedTs = toUTCTime(normalizedData[0].timestamp);
-      const newestLoadedTs = toUTCTime(normalizedData[normalizedData.length - 1].timestamp);
+      // Don't block when server may have earlier/later data even if in-memory bars are all loaded
+      if (!loadedCount || (loadedCount >= total && !moreEarlier && !moreLater)) return;
 
-      const fromTs = typeof range.from === "number" ? (range.from as number)
-          : typeof range.from === "string" ? Math.floor(new Date(range.from).getTime() / 1000)
-          : 0;
-      const toTs = typeof range.to === "number" ? (range.to as number)
-          : typeof range.to === "string" ? Math.floor(new Date(range.to).getTime() / 1000)
-          : 0;
+      const loadedStart = loadedStartRef.current;
+      const loadedEnd = loadedStart + loadedCount;
+      const EDGE_BARS = 10; // trigger when within ~10 bars of an edge
 
-      // Right edge: user scrolls toward newer data → load more recent bars
-      const needLaterData = toTs >= newestLoadedTs - timeThreshold;
-      // Left edge: user scrolls toward older data (reserved for bidirectional loading)
-      void (fromTs <= oldestLoadedTs + timeThreshold);
-
-      if (needLaterData && loadedCount < total) {
-        const nextEnd = Math.min(loadedCount + 200, total);
-        if (nextEnd > loadedCount && nextEnd > requestedEndRef.current) {
-          requestedEndRef.current = nextEnd;
-          isLoadingRef.current = true;
-          loadCb(loadedCount, nextEnd);
-          // Safety: reset loading lock after 10s in case data never arrives
-          setTimeout(() => {
-            isLoadingRef.current = false;
-          }, 10000);
-        }
+      // Left edge: earlier bars exist in-memory (loadedStart>0) or via server (moreEarlier)
+      if ((loadedStart > 0 || moreEarlier) && logicalRange.from < EDGE_BARS) {
+        isLoadingRef.current = true;
+        loadCb("earlier");
+        setTimeout(() => {
+          isLoadingRef.current = false;
+        }, 10000);
+        return;
       }
 
-      visibleRangeRef.current = range;
+      // Right edge: later bars exist in-memory (loadedEnd<total) or via server (moreLater)
+      if ((loadedEnd < total || moreLater) && logicalRange.to > loadedCount - EDGE_BARS) {
+        isLoadingRef.current = true;
+        loadCb("later");
+        setTimeout(() => {
+          isLoadingRef.current = false;
+        }, 10000);
+      }
     };
 
     chart
       .timeScale()
-      .subscribeVisibleTimeRangeChange(handleVisibleRangeChange);
+      .subscribeVisibleLogicalRangeChange(handleLogicalRangeChange);
 
     // Hover info crosshair subscription
     chart.subscribeCrosshairMove(handleCrosshairMove);
 
-    // Only fit content if all data is already loaded; otherwise show the
-    // rightmost ~100 bars so the user can scroll right to trigger lazy loads.
-    const total = totalBarsRef.current;
-    if (!total || data.length >= total) {
-      chart.timeScale().fitContent();
+    // Restore visible range after lazy-load, or set initial view
+    const prevRange = visibleRangeRef.current;
+    if (prevRange) {
+      chart.timeScale().setVisibleRange(prevRange);
     } else {
-      // Show roughly the newest 100 bars, leaving scroll room on right
-      const visibleBars = Math.min(100, data.length);
-      const fromIdx = data.length - visibleBars;
-      chart.timeScale().setVisibleRange({
-        from: toUTCTime(data[fromIdx].timestamp),
-        to: toUTCTime(data[data.length - 1].timestamp),
-      });
+      const total = totalBarsRef.current;
+      if (!total || data.length >= total) {
+        chart.timeScale().fitContent();
+      } else {
+        // Show the rightmost bars so the user can scroll both ways
+        const visibleBars = Math.min(100, data.length);
+        const fromIdx = data.length - visibleBars;
+        chart.timeScale().setVisibleRange({
+          from: toUTCTime(data[fromIdx].timestamp),
+          to: toUTCTime(data[data.length - 1].timestamp),
+        });
+      }
     }
 
     // Auto-resize
@@ -556,7 +597,7 @@ export default function TView({
       try {
         chart
           .timeScale()
-          .unsubscribeVisibleTimeRangeChange(handleVisibleRangeChange);
+          .unsubscribeVisibleLogicalRangeChange(handleLogicalRangeChange);
       } catch {}
       chart.remove();
       chartRef.current = null;

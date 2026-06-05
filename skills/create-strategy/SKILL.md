@@ -240,8 +240,21 @@ test_strategy(
 )
 ```
 
+`test_strategy` 会自动执行以下验证：
+
+| 验证项 | 检测内容 |
+|-------|---------|
+| 语法检查 | Python 语法是否正确 |
+| 静态分析 | Decimal 类型混用（如 `Decimal * 0.01`） |
+| 静态分析 | 使用了不存在的 `StrategyContext` 属性（`portfolio_value`/`equity`/`cash` 等） |
+| 结构验证 | 策略类是否有 `name`、`on_bar` 等必需属性 |
+| 注册检查 | 是否使用了 `@register_strategy()` 装饰器 |
+| 模拟回测 | 用 200 根模拟 K 线运行策略 |
+| 零交易检测 | `on_bar` 是否全部返回 None（常见于 buy/sell 未 return） |
+| **仓位验证** | buy 信号的 `quantity ≤ 0`、**资金不足跳过**、**资金使用率过低** |
+
 如果测试失败（返回 data 中 `success: false`），根据错误信息修正代码：
-1. 分析错误类型（语法错误 / 加载失败 / 运行时错误）
+1. 分析错误类型（语法错误 / 加载失败 / 运行时错误 / 仓位计算错误）
 2. 修改策略代码文件
 3. 重新调用 `test_strategy` 测试
 4. 重复直到测试通过
@@ -250,6 +263,7 @@ test_strategy(
 - strategy_name（供回测使用）
 - 文件路径
 - 模拟运行统计（信号数、买卖次数、模拟收益率）
+- 如有 warning，说明修复建议
 
 ## 代码质量要求
 
@@ -268,7 +282,7 @@ def on_bar(self, kline: dict, history: list[dict]) -> OrderSignal | None:
 - **禁止在 on_bar 中调用 `ctx.history()`** — history 直接作为参数传入
 - `ctx`（StrategyContext）通过 `self.ctx` 访问
 
-### 两个常见陷阱（CRITICAL — 90% 的零交易 bug 由此引起）
+### 四个常见陷阱（CRITICAL — 95% 的回测 bug 由此引起）
 
 #### 陷阱 1：调用了 `ctx.buy()` 但没有 `return`
 
@@ -310,6 +324,70 @@ class MyStrategy(BaseStrategy):  # ✅ 已注册
     name = "my_strategy"
 ```
 
+#### 陷阱 3：EMA/ATR 对全部 history 计算 → 不同回测长度信号不一致
+
+**错误写法（1年回测6笔，2年回测4笔）：**
+```python
+def on_bar(self, kline, history):
+    ema_array = ema(history, period=50)  # ❌ 全部历史！长度不同=EMA值不同
+    ema_val = float(ema_array[-1])
+    if current_price > ema_val:  # 这条判断在1年/2年回测中结果不一致
+        ...
+```
+
+**正确写法：**
+```python
+def on_bar(self, kline, history):
+    # ✅ 取最近 period*5 根 K 线，确保回测长度无关
+    _lookback = min(self.ema_period * 5, len(history))
+    _recent = history[-_lookback:]
+    ema_array = ema(_recent, period=self.ema_period)
+    ema_val = float(ema_array[-1])
+    if current_price > ema_val:  # 同一日历日期，EMA 值一致
+        ...
+```
+
+**规则**：EMA 和 ATR 必须使用 `history[-period*5:]` 而非全部 `history`。
+
+#### 陷阱 4：同时使用 PctCapitalPortfolio 和手动 quantity 计算
+
+**错误写法（手动算了 quantity，但被 PctCapitalPortfolio 静默覆盖）：**
+```python
+def __init__(self, context):
+    super().__init__(context)
+    self.portfolio = PctCapitalPortfolio()  # ← 设置了 Portfolio
+
+def on_bar(self, kline, history):
+    if buy_condition:
+        qty = total_capital * 0.1 / price  # ❌ 费心算了 quantity...
+        return self.ctx.buy(quantity=qty)   # ❌ 但被 PctCapitalPortfolio 覆盖！
+```
+
+**正确写法 A（推荐）— 不设置 portfolio，手动计算直接生效：**
+```python
+def __init__(self, context):
+    super().__init__(context)
+    # 不设置 self.portfolio，使用默认 SingleAssetPortfolio
+
+def on_bar(self, kline, history):
+    if buy_condition:
+        qty = total_capital * 0.1 / price
+        return self.ctx.buy(quantity=qty)  # ✅ 直接生效
+```
+
+**正确写法 B — 使用 PctCapitalPortfolio，不手动计算：**
+```python
+def __init__(self, context):
+    super().__init__(context)
+    self.portfolio = PctCapitalPortfolio()
+
+def on_bar(self, kline, history):
+    if buy_condition:
+        return self.ctx.buy(quantity=Decimal("1"))  # ✅ 任意正数占位，Portfolio 接管
+```
+
+**规则**：`self.portfolio = PctCapitalPortfolio()` 和手动计算 quantity **二选一**，不能同时使用。
+
 ### 文件模板结构
 
 ```python
@@ -339,10 +417,14 @@ class {StrategyName}Strategy(BaseStrategy):
     params_schema = {
         # 可调参数
         # "param_name": {"type": "number"/"integer"/"string", "default": value},
+        "position_pct": {"type": "number", "default": 0.1},
     }
 
     def __init__(self, context: StrategyContext):
         super().__init__(context)
+        # 注意：不要设置 self.portfolio = PctCapitalPortfolio()！
+        # 使用默认的 SingleAssetPortfolio，on_bar 返回的 quantity 直接生效。
+        # 如需使用 PctCapitalPortfolio，见下方"仓位计算 CRITICAL 说明"。
         self.bb_period = context.params.get("bb_period", 20)
         self.min_bars = self.bb_period + 5
 
@@ -360,20 +442,39 @@ class {StrategyName}Strategy(BaseStrategy):
         if len(history) < self.min_bars:
             return None
 
-        # 计算指标
-        # closes = [bar["close"] for bar in history]
+        # ═══ 指标计算 CRITICAL ═══
+        # 路径依赖型指标（EMA/ATR）必须使用有限回溯窗口，禁止对全部 history 计算！
+        # 原因：EMA 对全部 history 计算时，不同回测长度（1年 vs 2年）会在同一
+        # 日历日期产生不同的 EMA 值，导致交易信号不一致。
+        # 规则：取最近 period*5 根 K 线，确保指数衰减后初始种子权重 < 0.005%。
+        # 非路径依赖型指标无需此限制（SMA、RSI 等窗口固定）。
+        #
+        # _lookback = min(self.bb_period * 5, len(history))  # 示例：对 EMA period=20
+        # _recent = history[-_lookback:]
+        # ema_array = ema(_recent, period=self.bb_period)
+        # ema_val = float(ema_array[-1])
 
-        # 访问上下文用 self.ctx
-        # self.ctx.position  # 当前持仓
-        # self.ctx.balance   # 当前余额
+        # 访问上下文用 self.ctx（仅以下属性存在，禁止使用 portfolio_value/equity/cash）
+        # self.ctx.position           # 当前持仓量 (Decimal)
+        # self.ctx.balance            # 可用余额/现金 (Decimal)，≠ 总资金！
+        # self.ctx.to_portfolio_context().total_capital  # 总资金 = balance + 持仓市值
 
         # ⚠️ 必须 return 信号，不能仅调用！
-        # 买入前检查：self.ctx.position == 0
-        # 卖出前检查：self.ctx.position > 0
 
-        # ✅ 正确：return self.ctx.buy(quantity=..., signal_name="entry")
-        # ✅ 正确：return self.ctx.sell(quantity=..., signal_name="exit")
-        # ✅ 正确：return self.ctx.close_position(signal_name="take_profit")
+        # ✅ 买入示例（手动计算仓位）：
+        # if self.ctx.position == 0 and buy_condition:
+        #     total_capital = self.ctx.to_portfolio_context().total_capital
+        #     price = Decimal(str(kline["close"]))
+        #     position_pct = Decimal(str(self.ctx.params.get("position_pct", 0.1)))
+        #     qty = (total_capital * position_pct / price).quantize(Decimal("0.0001"))
+        #     return self.ctx.buy(quantity=qty, signal_name="entry")
+
+        # ✅ 卖出示例：
+        # if self.ctx.position > 0 and sell_condition:
+        #     return self.ctx.sell(quantity=self.ctx.position, signal_name="exit")
+
+        # ✅ 平仓：卖出全部持仓
+        # return self.ctx.close_position(signal_name="take_profit")
 
         return None
 
@@ -429,17 +530,169 @@ class {StrategyName}Strategy(BaseStrategy):
 
 #### StrategyContext（通过 self.ctx 访问）
 
-| 方法/属性 | 说明 |
-|------|------|
-| `self.ctx.position` | 当前持仓量 |
-| `self.ctx.balance` | 当前余额 |
-| `self.ctx.buy(quantity, signal_name)` | 发买入信号 — **必须 return** |
-| `self.ctx.sell(quantity, signal_name)` | 发卖出信号 — **必须 return** |
-| `self.ctx.close_position(signal_name)` | 平仓信号 — **必须 return** |
-| `self.ctx.params` | 策略参数字典 |
+| 方法/属性 | 类型 | 说明 |
+|------|------|------|
+| `self.ctx.symbol` | `str` | 当前交易品种（如 `"BTCUSDT"`） |
+| `self.ctx.timeframe` | `str` | K 线周期（如 `"1h"`） |
+| `self.ctx.mode` | `str` | 运行模式：`"backtest"` 或 `"live"` |
+| `self.ctx.params` | `dict` | 策略参数字典 |
+| `self.ctx.balance` | `Decimal` | 当前可用余额（未占用资金） |
+| `self.ctx.position` | `Decimal` | 当前主标的持仓量 |
+| `self.ctx.positions` | `dict[str, Decimal]` | 所有标的的持仓量 |
+| `self.ctx.current_prices` | `dict[str, Decimal]` | 各标的当前价格 |
+| `self.ctx.buy(quantity, signal_name)` | `OrderSignal` | 发买入信号 — **必须 return** |
+| `self.ctx.sell(quantity, signal_name)` | `OrderSignal` | 发卖出信号 — **必须 return** |
+| `self.ctx.close_position(signal_name)` | `OrderSignal` | 平仓信号 — **必须 return** |
+| `self.ctx.to_portfolio_context()` | `PortfolioContext` | 获取多标的组合上下文（含 `total_capital`） |
+| `self.ctx.set_position(symbol, value)` | `None` | 设置某标的持仓量 |
+| `self.ctx.set_price(symbol, value)` | `None` | 设置某标的当前价格 |
 
 > ⚠️ 以上所有发信号的方法**必须作为 `on_bar` 的返回值返回**，不能仅调用而不 return。
 > 引擎通过 `on_bar` 的返回值判断是否有信号，调用但不 return = 0 交易。
+
+##### 正确计算仓位的方法
+
+> **CRITICAL：仓位计算与 Portfolio 模型的关系**
+>
+> 回测引擎的 `construct_portfolio()` 会根据 `self.portfolio` 的类型决定如何处理 `on_bar` 返回的 quantity：
+>
+> | self.portfolio 类型 | on_bar 返回的 quantity | 实际开仓量来源 |
+> |---------------------|-----------------------|---------------|
+> | `SingleAssetPortfolio`（默认） | **直接生效** | `on_bar` 计算的值 |
+> | `PctCapitalPortfolio` | **被覆盖/忽略** | `PctCapitalPortfolio.allocate()` 重新计算 |
+> | 其他自定义 Portfolio | **被覆盖/忽略** | 各自 allocate() 计算 |
+>
+> **因此，如果你在 `__init__` 中设置了 `self.portfolio = PctCapitalPortfolio()`，就不要在 `on_bar` 中手动计算 quantity——两者会冲突，PctCapitalPortfolio 的计算结果会覆盖你手动计算的值。**
+>
+> **默认推荐**：不设置 `self.portfolio`（使用 `SingleAssetPortfolio`），在 `on_bar` 中手动计算仓位。简单、可控、不会出现"计算了但没生效"的问题。
+
+**方法 1：手动计算（推荐，默认使用）**
+
+不设置 `self.portfolio`，在 `on_bar` 中直接计算数量，引擎直接使用你返回的 quantity：
+
+```python
+def on_bar(self, kline, history):
+    if self.ctx.position == 0 and buy_condition:
+        # 通过 to_portfolio_context() 获取总资金
+        portfolio_ctx = self.ctx.to_portfolio_context()
+        total_capital = portfolio_ctx.total_capital
+        # total_capital = balance + sum(position_i × price_i)
+
+        price = Decimal(str(kline["close"]))
+        position_pct = Decimal(str(self.ctx.params.get("position_pct", 0.1)))
+
+        # 计算买入数量 = 总资金 × 百分比 / 当前价格
+        allocated = total_capital * position_pct
+        qty = (allocated / price).quantize(Decimal("0.0001"))
+
+        # ✅ 返回的 quantity 直接生效，不会被覆盖
+        return self.ctx.buy(quantity=qty, signal_name="entry")
+```
+
+**方法 2：使用 PctCapitalPortfolio（高级，需要正确理解）**
+
+⚠️ **如果选择此方法，`on_bar` 中不能手动计算 quantity，只能发方向信号。开仓量完全由 PctCapitalPortfolio 根据 `position_pct` 参数自动计算。**
+
+```python
+from apps.strategy_engine.portfolio import PctCapitalPortfolio
+
+@register_strategy()
+class MyStrategy(BaseStrategy):
+    params_schema = {
+        "position_pct": {"type": "number", "default": 0.1},
+    }
+
+    def __init__(self, context: StrategyContext):
+        super().__init__(context)
+        self.portfolio = PctCapitalPortfolio()  # ← 设置后 on_bar 的 quantity 会被覆盖
+
+    def on_bar(self, kline, history):
+        if self.ctx.position == 0 and buy_condition:
+            # ⚠️ 这里传的 quantity 会被 PctCapitalPortfolio 覆盖！
+            # 只需传任意正数占位，实际数量由 PctCapitalPortfolio 计算
+            return self.ctx.buy(
+                quantity=Decimal("1"),
+                signal_name="entry"
+            )
+```
+
+**两种方法的区别**：
+
+| 对比维度 | 方法 1（手动计算） | 方法 2（PctCapitalPortfolio） |
+|---------|-------------------|------------------------------|
+| `self.portfolio` 设置 | 不设置（默认） | `PctCapitalPortfolio()` |
+| on_bar 的 quantity | **你计算的**，直接生效 | **被覆盖**，Portfolio 重新计算 |
+| 仓位控制 | 你完全控制 | Portfolio 控制 |
+| 多标的支持 | 需手动处理 | 自动分配 |
+| 推荐场景 | 单品种、简单策略 | 多品种、组合策略 |
+
+**方法 3：固定数量（最简单场景）**
+
+```python
+def on_bar(self, kline, history):
+    if self.ctx.position == 0 and buy_condition:
+        qty = Decimal(str(self.ctx.params.get("quantity", 0.01)))
+        return self.ctx.buy(quantity=qty, signal_name="entry")
+```
+
+**关键公式**：
+- `总资金(total_capital) = 可用余额(balance) + 持仓市值(position × price)`
+- `买入数量 = 总资金 × position_pct / 当前价格`
+- `可用余额(balance)` ≠ 总资金，`balance` 是未被占用的现金部分
+
+##### 指标回溯窗口 CRITICAL — 路径依赖型指标必须用有限窗口
+
+> **这是"2年回测比1年交易少"的根本原因。** 路径依赖型指标（EMA、ATR 等）对全部 `history` 计算时，不同回测起始日期会产生不同的指标值，导致同一日历日期信号不一致。
+
+**路径依赖型指标** — 必须使用有限回溯窗口（`period * 5`）：
+
+| 指标 | 原因 | 修复方式 |
+|------|------|---------|
+| **EMA** | 种子值 = SMA(first N bars)，依赖全量历史 | `history[-period*5:]` |
+| **ATR** | Wilder 平滑依赖历史 ATR 值 | `history[-period*5:]` |
+
+**非路径依赖型指标** — 无需限制：
+
+| 指标 | 原因 |
+|------|------|
+| **SMA** | 固定窗口，天然路径无关 |
+| **RSI** | 固定窗口 mean-based |
+| **Bollinger** | 固定窗口 SMA + std |
+| **MACD** | 基于 EMA（理论上也依赖路径），但周期短、收敛快 |
+| **Donchian** | 固定窗口 max/min |
+
+**正确写法**：
+
+```python
+def on_bar(self, kline: dict, history: list[dict]):
+    if len(history) < self.min_bars:
+        return None
+
+    # ✅ EMA: 使用有限回溯窗口，确保不同回测长度信号一致
+    _ema_lookback = min(self.ema_period * 5, len(history))
+    _ema_history = history[-_ema_lookback:]
+    ema_array = ema(_ema_history, period=self.ema_period)
+    if len(ema_array) == 0:
+        return None
+    ema_val = float(ema_array[-1])
+
+    # ✅ ATR: 同理
+    _atr_lookback = min(self.atr_period * 5, len(history))
+    _atr_history = history[-_atr_lookback:]
+    atr_array = atr(_atr_history, period=self.atr_period)
+    if len(atr_array) == 0:
+        return None
+    atr_val = float(atr_array[-1])
+
+    # ❌ 错误：EMA 对全部 history 计算
+    # ema_array = ema(history, period=200)  # 不要这样写！
+
+    # ✅ 非路径依赖型指标可用全部 history，也可用小窗口
+    rsi_array = rsi(history, period=14)
+    rsi_val = float(rsi_array[-1])
+```
+
+**为什么 `period * 5`？** EMA 指数衰减权重：`(1 - 2/(period+1))^n`。当 `n = period*5` 时，初始种子权重 ≈ `e^(-10)` ≈ 0.005%，可忽略不计。
 
 #### BaseStrategy 便捷方法
 
@@ -532,6 +785,8 @@ self.ctx.close_position()
 - 使用 `Decimal` 处理数量和价格
 - 信号命名规范：`entry`、`exit`、`stop_loss`、`take_profit` 等
 - 包含 docstring 描述策略逻辑
+- **路径依赖型指标（EMA/ATR）必须使用有限回溯窗口** — 取 `history[-period*5:]`，禁止对全部 history 计算。见"指标回溯窗口 CRITICAL"章节
+- **禁止同时使用 PctCapitalPortfolio 和手动 quantity 计算** — 要么不设 `self.portfolio`（手动计算），要么设 `self.portfolio = PctCapitalPortfolio()`（不手动计算 quantity）。见"正确计算仓位的方法"章节
 
 ### 指标返回值处理（CRITICAL）
 

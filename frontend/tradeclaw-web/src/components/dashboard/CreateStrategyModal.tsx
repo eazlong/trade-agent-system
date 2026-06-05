@@ -102,6 +102,13 @@ export default function CreateStrategyModal({ open, onClose, onCreated }: ModalP
             <option>BTC/USDT</option>
             <option>ETH/USDT</option>
             <option>SOL/USDT</option>
+            <option>DOGE/USDT</option>
+            <option>BNB/USDT</option>
+            <option>XRP/USDT</option>
+            <option>ADA/USDT</option>
+            <option>AVAX/USDT</option>
+            <option>MATIC/USDT</option>
+            <option>LINK/USDT</option>
           </select>
         </div>
 

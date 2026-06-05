@@ -7,7 +7,7 @@ import {
   type CreateSessionPayload,
 } from "@/lib/api";
 
-export type SessionAction = "start" | "pause" | "resume" | "stop" | "promote";
+export type SessionAction = "start" | "pause" | "resume" | "stop" | "promote" | "delete";
 
 export function useLiveSessions(pollingInterval = 10000) {
   const [sessions, setSessions] = useState<LiveSession[]>([]);
@@ -48,6 +48,9 @@ export function useLiveSessions(pollingInterval = 10000) {
             break;
           case "promote":
             await liveSessionApi.promote(id);
+            break;
+          case "delete":
+            await liveSessionApi.delete(id);
             break;
         }
         // Refresh after action
@@ -98,6 +101,7 @@ export function useLiveSessions(pollingInterval = 10000) {
     resume: (id: string) => void doAction(id, "resume"),
     stop: (id: string) => void doAction(id, "stop"),
     promote: (id: string) => void doAction(id, "promote"),
+    remove: (id: string) => void doAction(id, "delete"),
     create: createSession,
   };
 }

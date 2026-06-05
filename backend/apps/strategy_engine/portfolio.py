@@ -109,6 +109,58 @@ class EqualWeightPortfolio(BasePortfolioModel):
         return targets
 
 
+class PctCapitalPortfolio(BasePortfolioModel):
+    """按总资金百分比开仓 — 每次用 total_capital * position_pct 买入。
+
+    用法：策略的 params_schema 中设置 position_pct（如 0.1 表示 10%），
+    引擎根据当前价格和分配资金自动计算买入数量。
+    """
+
+    def allocate(
+        self,
+        insights: list["Insight"],
+        context: "StrategyContext",
+    ) -> list["PortfolioTarget"]:
+        pct = Decimal(
+            str(
+                context.params.get(
+                    "position_pct", context.params.get("position_size_pct", 0.1)
+                )
+            )
+        )
+        if not (Decimal("0") < pct <= Decimal("1")):
+            return []
+
+        portfolio_ctx = context.to_portfolio_context()
+        targets = []
+        for ins in insights:
+            if ins.direction != "buy":
+                # 卖出：清仓
+                if ins.direction == "sell" and context.position > Decimal("0"):
+                    targets.append(
+                        _make_target(ins.symbol, Decimal("0"), ins.signal_name)
+                    )
+                continue
+
+            price = portfolio_ctx.get_price(ins.symbol)
+            if price is None or price <= Decimal("0"):
+                continue
+
+            allocated = portfolio_ctx.total_capital * pct
+            qty = (allocated / price).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
+            )
+            if qty <= Decimal("0"):
+                continue
+
+            target_qty = context.position + qty
+            targets.append(
+                _make_target(ins.symbol, target_qty, ins.signal_name, float(pct))
+            )
+
+        return targets
+
+
 class ConfidenceWeightedPortfolio(BasePortfolioModel):
     """按 confidence 加权分配 — weight_i = conf_i / sum(conf)。"""
 

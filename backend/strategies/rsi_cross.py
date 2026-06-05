@@ -26,6 +26,7 @@ class RsiCrossStrategy(BaseStrategy):
         "oversold": {"type": "number", "default": 30},
         "overbought": {"type": "number", "default": 70},
         "quantity": {"type": "number", "default": 0.01},
+        "position_pct": {"type": "number", "default": 0.1},
     }
 
     def __init__(self, context: StrategyContext):
@@ -34,6 +35,11 @@ class RsiCrossStrategy(BaseStrategy):
         self.oversold = context.params.get("oversold", 30)
         self.overbought = context.params.get("overbought", 70)
         self.quantity = Decimal(str(context.params.get("quantity", 0.01)))
+
+        # 使用百分比开仓模型（默认 10% 资金）
+        from .portfolio import PctCapitalPortfolio
+
+        self.portfolio = PctCapitalPortfolio()
 
     def on_bar(self, kline: dict, history: list[dict]):
         # 需要足够的数据才能计算 RSI

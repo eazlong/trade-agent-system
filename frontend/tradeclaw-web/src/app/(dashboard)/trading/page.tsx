@@ -330,6 +330,7 @@ function SessionMiniCard({
   onResume,
   onStop,
   onPromote,
+  onDelete,
   actionLoading,
 }: {
   session: LiveSession;
@@ -338,6 +339,7 @@ function SessionMiniCard({
   onResume: () => void;
   onStop: () => void;
   onPromote: () => void;
+  onDelete: () => void;
   actionLoading: boolean;
 }) {
   const statusInfo = sessionStatusBadge(session.status);
@@ -411,14 +413,34 @@ function SessionMiniCard({
           </div>
         )}
         {session.status === "pending" && (
-          <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
-            启动
-          </button>
+          <div className="flex gap-1.5">
+            <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              启动
+            </button>
+            <button onClick={onDelete} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-red-dim/50 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed ml-auto">
+              删除
+            </button>
+          </div>
+        )}
+        {session.status === "error" && (
+          <div className="flex gap-1.5">
+            <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              重试
+            </button>
+            <button onClick={onDelete} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-red-dim/50 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed ml-auto">
+              删除
+            </button>
+          </div>
         )}
         {session.status === "stopped" && (
-          <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
-            重新启动
-          </button>
+          <div className="flex gap-1.5">
+            <button onClick={onStart} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-green-dim/50 text-green hover:bg-green-dim disabled:opacity-40 disabled:cursor-not-allowed">
+              重新启动
+            </button>
+            <button onClick={onDelete} disabled={actionLoading} className="px-2 py-1 rounded text-[9px] font-semibold bg-red-dim/50 text-red hover:bg-red-dim disabled:opacity-40 disabled:cursor-not-allowed ml-auto">
+              删除
+            </button>
+          </div>
         )}
       </div>
     </div>
@@ -447,6 +469,7 @@ export default function TradingPage() {
     resume: resumeSession,
     stop: stopSession,
     promote: promoteSession,
+    remove: removeSession,
   } = useLiveSessions();
 
   const [activeSection, setActiveSection] = useState<"all" | "live" | "paper">("all");
@@ -575,6 +598,7 @@ export default function TradingPage() {
                   onResume={() => resumeSession(session.id)}
                   onStop={() => stopSession(session.id)}
                   onPromote={() => promoteSession(session.id)}
+                  onDelete={() => removeSession(session.id)}
                   actionLoading={sessionActionLoading}
                 />
               ))}

@@ -71,6 +71,7 @@ export default function TradeLog({ backtestId }: TradeLogProps) {
   const fmtTime = (v: string | null) =>
     v
       ? new Date(v).toLocaleDateString("zh-CN", {
+          year: "numeric",
           month: "2-digit",
           day: "2-digit",
           hour: "2-digit",

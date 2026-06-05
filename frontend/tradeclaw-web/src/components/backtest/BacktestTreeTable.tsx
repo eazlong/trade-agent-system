@@ -36,12 +36,17 @@ const renderParams = (params: Record<string, unknown>) => {
 
 const renderChildRow = (r: BacktestResult) => (
   <tr key={r.id} className="border-b border-[rgba(255,255,255,0.04)]">
-    <td colSpan={11} className="p-0">
+    <td colSpan={12} className="p-0">
       <div className="ml-[30px] bg-bg2/50 rounded-md my-1 border border-[rgba(255,255,255,0.07)]">
         <div className="flex gap-4 p-3">
           <div className="flex-1 min-w-0">
             <div className="text-[11px] font-bold text-green mb-2 font-mono">
               📋 策略参数
+              {r.start_date && r.end_date && (
+                <span className="text-text3 ml-3 font-normal">
+                  {fmtDate(r.start_date)} ~ {fmtDate(r.end_date)}
+                </span>
+              )}
             </div>
             <div className="flex flex-wrap gap-1.5">
               {r.parameters &&
@@ -118,6 +123,7 @@ export default function BacktestTreeTable({ groups, initialExpanded }: BacktestT
             <th className="text-left py-2.5 px-4 font-semibold">策略</th>
             <th className="text-left py-2.5 px-4 font-semibold">品种</th>
             <th className="text-left py-2.5 px-4 font-semibold">周期</th>
+            <th className="text-left py-2.5 px-4 font-semibold">回测周期</th>
             <th className="text-right py-2.5 px-4 font-semibold">收益率</th>
             <th className="text-right py-2.5 px-4 font-semibold">夏普</th>
             <th className="text-right py-2.5 px-4 font-semibold">回撤</th>
@@ -158,6 +164,11 @@ export default function BacktestTreeTable({ groups, initialExpanded }: BacktestT
                 <td className="py-2 px-4 text-text font-semibold">{r.strategy_name}</td>
                 <td className="py-2 px-4 text-text font-semibold">{r.symbol}</td>
                 <td className="py-2 px-4 text-text2">{r.timeframe}</td>
+                <td className="py-2 px-4 text-text2 text-[11px]">
+                  {r.start_date && r.end_date
+                    ? `${fmtDate(r.start_date)} ~ ${fmtDate(r.end_date)}`
+                    : "—"}
+                </td>
                 <td className={`py-2 px-4 text-right font-semibold ${r.total_return_pct >= 0 ? "text-green" : "text-red"}`}>
                   {fmtPct(r.total_return_pct)}
                 </td>
@@ -217,6 +228,7 @@ function GroupRow({
         </td>
         <td className="py-2 px-4 text-text2">{group.symbol}</td>
         <td className="py-2 px-4 text-text2">{group.timeframe}</td>
+        <td className="py-2 px-4 text-text3 text-[11px]">—</td>
         <td className="py-2 px-4 text-right text-green">{fmtPct(group.best_return_pct)}</td>
         <td className="py-2 px-4 text-right text-text">{fmtNum(group.best_sharpe)}</td>
         <td className="py-2 px-4 text-right text-text2">
@@ -237,7 +249,7 @@ function GroupRow({
 
       {!isExpanded && (
         <tr className={`border-b ${borderColor} ${bg}`}>
-          <td colSpan={11} className="py-1.5 px-4 text-xs text-text3 font-mono pl-[40px]">
+          <td colSpan={12} className="py-1.5 px-4 text-xs text-text3 font-mono pl-[40px]">
             最佳收益: <span className="text-green">{fmtPct(group.best_return_pct)}</span>
             {" | "}
             最佳夏普: <span className="text-green">{fmtNum(group.best_sharpe)}</span>

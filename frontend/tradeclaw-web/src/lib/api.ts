@@ -441,6 +441,11 @@ export const liveSessionApi = {
       `/api/trading/sessions/${id}/promote/`,
       "POST"
     ),
+  delete: (id: string) =>
+    request<{ message: string; id: string }>(
+      `/api/trading/sessions/${id}/delete/`,
+      "DELETE"
+    ),
 };
 
 // ── Backtest API ──
@@ -614,10 +619,20 @@ export const backtestApi = {
     request<BacktestResult>(`/api/backtest/results/${id}/`),
   getFullDetail: (id: string) =>
     request<BacktestDetail>(`/api/backtest/results/${id}/detail/`),
-  getOHLCVRange: (id: string, start: number, end: number) =>
-    request<OHLCVRangeResponse>(
-      `/api/backtest/results/${id}/ohlcv/?start=${start}&end=${end}`
-    ),
+  fetchEarlierOhlcv: (id: string, limit = 200, cursor?: string, timeframe?: string, symbol?: string): Promise<{ ohlcv_data: OHLCVPoint[]; count: number }> => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    if (timeframe) query.set("timeframe", timeframe);
+    if (symbol) query.set("symbol", symbol);
+    return request(`/api/backtest/results/${id}/earlier-ohlcv/?${query.toString()}`);
+  },
+  fetchLaterOhlcv: (id: string, limit = 200, cursor?: string, timeframe?: string, symbol?: string): Promise<{ ohlcv_data: OHLCVPoint[]; count: number }> => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    if (timeframe) query.set("timeframe", timeframe);
+    if (symbol) query.set("symbol", symbol);
+    return request(`/api/backtest/results/${id}/later-ohlcv/?${query.toString()}`);
+  },
   getTrades: (
     id: string,
     params?: { page?: number; page_size?: number; sort?: string }

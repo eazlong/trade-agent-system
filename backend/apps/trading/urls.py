@@ -17,4 +17,5 @@ urlpatterns = [
     path("sessions/<uuid:pk>/resume/", views.live_session_resume),
     path("sessions/<uuid:pk>/stop/", views.live_session_stop),
     path("sessions/<uuid:pk>/promote/", views.live_session_promote),
+    path("sessions/<uuid:pk>/delete/", views.live_session_delete),
 ]
