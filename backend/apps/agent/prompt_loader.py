@@ -77,7 +77,8 @@ class PromptLoader:
     def list_agents(cls, version: str = "v1") -> list[dict[str, Any]]:
         """扫描 Prompt 目录，返回所有带 frontmatter 的 Agent 配置。
 
-        每个 Agent 字典额外包含 overview 字段（prompt body 前 5 行），
+        优先使用 frontmatter（--- 之间）中声明的属性（name、tools、overview 等）。
+        仅当 frontmatter 中没有 overview 时，fallback 到提取 body 前 5 行作为概述，
         供 Supervisor 的 LLM 意图识别使用。
         """
         version_dir = PROMPT_BASE / version
@@ -91,10 +92,9 @@ class PromptLoader:
             text = f.read_text(encoding="utf-8")
             meta, body = _parse_frontmatter(text)
             if meta and "name" in meta:
-                # 提取 body 前 5 行作为概述
-                overview_lines = [line for line in body.splitlines() if line.strip()][
-                    :5
-                ]
-                meta["overview"] = "\n".join(overview_lines)
+                # frontmatter 中没有 overview 时，fallback 到 body 前 5 行
+                if "overview" not in meta:
+                    overview_lines = [line for line in body.splitlines() if line.strip()][:5]
+                    meta["overview"] = "\n".join(overview_lines)
                 agents.append(meta)
         return agents
