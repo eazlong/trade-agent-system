@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
 from decimal import Decimal
 from typing import Optional
@@ -18,6 +19,8 @@ import httpx
 from django.conf import settings
 
 from .base import BaseExchangeAdapter, OrderRequest, OrderResponse, Position
+
+logger = logging.getLogger(__name__)
 
 # Futures API base URL
 _BASE_URL = "https://fapi.binance.com"
@@ -38,6 +41,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         if testnet:
             self.BASE_URL = "https://demo-fapi.binance.com"
         self._client: Optional[httpx.AsyncClient] = None
+        self._time_offset: int = 0  # ms: local_time = server_time + offset
 
     async def connect(self) -> None:
         headers = {"X-MBX-APIKEY": self._api_key}
@@ -48,6 +52,37 @@ class BinanceAdapter(BaseExchangeAdapter):
             timeout=self.TIMEOUT,
             proxy=proxy if proxy else None,
         )
+        # Sync clock with Binance server to avoid timestamp drift errors
+        await self._sync_time()
+
+    async def _sync_time(self) -> None:
+        """Fetch server time and compute local clock offset.
+
+        Stores offset so that _sign() can produce server-aligned timestamps.
+        Falls back gracefully on failure (offset remains 0).
+        """
+        try:
+            # Use a temporary sync client since self._client may not be fully
+            # initialized for base_url-relative paths yet.
+            resp = await self._client.get("/fapi/v1/time")
+            if resp.status_code == 200:
+                server_ts = resp.json().get("serverTime", 0)
+                local_ts = int(time.time() * 1000)
+                self._time_offset = local_ts - server_ts
+                drift_s = abs(self._time_offset) / 1000
+                if drift_s > 3:
+                    logger.warning(
+                        f"Binance clock drift: {drift_s:.1f}s "
+                        f"(offset={self._time_offset}ms), will auto-correct"
+                    )
+                else:
+                    logger.info(f"Binance clock synced (drift={drift_s:.2f}s)")
+            else:
+                logger.warning(
+                    f"Binance time sync failed: HTTP {resp.status_code}"
+                )
+        except Exception as e:
+            logger.warning(f"Binance time sync failed: {e}")
 
     async def disconnect(self) -> None:
         if self._client:
@@ -59,9 +94,10 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         返回已签名的 query string，可直接拼接在 URL 后。
         避免 httpx 重排 params 导致签名失效。
+        使用 _time_offset 校正本地时钟偏差，确保 timestamp 落在 recvWindow 内。
         """
         params = dict(params)
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) - self._time_offset
         params["recvWindow"] = 5000
         query = urlencode(sorted(params.items()))
         signature = hmac.new(
@@ -149,10 +185,6 @@ class BinanceAdapter(BaseExchangeAdapter):
         /fapi/v2/balance 返回格式: [{asset, balance, walletBalance, ...}]
         Demo 环境使用 v2 端点。
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         client = self._ensure_connected()
 
         query = self._sign({})

@@ -169,3 +169,35 @@ class TestBinanceAdapterL1(unittest.TestCase):
         adapter = BinanceAdapter("test_key", "test_secret")
         # _client is None by default
         asyncio.run(adapter.disconnect())  # should not raise
+
+    @patch("apps.trading.adapters.binance.time")
+    @patch("httpx.AsyncClient")
+    def test_binance_sync_time_corrects_offset(self, mock_client_cls, mock_time):
+        """connect() 应计算本地与服务器的时间偏差"""
+        mock_time.time.return_value = 1000.0  # local = 1000000ms
+        adapter = BinanceAdapter("test_key", "test_secret")
+        mock_client = AsyncMock()
+        mock_time_resp = MagicMock()
+        mock_time_resp.status_code = 200
+        mock_time_resp.json.return_value = {"serverTime": 1005000}  # server 5s ahead
+        mock_client.get.return_value = mock_time_resp
+        mock_client_cls.return_value = mock_client
+
+        asyncio.run(adapter.connect())
+
+        # offset = local - server = 1000000 - 1005000 = -5000
+        self.assertEqual(adapter._time_offset, -5000)
+        # Verify _sign uses corrected timestamp
+        qs = adapter._sign({})
+        self.assertIn("timestamp=1005000", qs)  # corrected to server time
+
+    @patch("httpx.AsyncClient")
+    def test_binance_sync_time_graceful_failure(self, mock_client_cls):
+        """connect() 应在时间同步失败时正常降级"""
+        adapter = BinanceAdapter("test_key", "test_secret")
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = Exception("timeout")
+        mock_client_cls.return_value = mock_client
+
+        asyncio.run(adapter.connect())  # should not raise
+        self.assertEqual(adapter._time_offset, 0)  # offset remains 0
