@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from .base import BaseTool, ToolResult
@@ -24,6 +25,12 @@ async def _resolve_django_user_id(channel_user_id: str | None) -> str | None:
     渠道层传入的 user_id 可能是 Telegram 数字 ID、Feishu open_id 等，
     而 BacktestResult.user 是 ForeignKey → 期望 Django User 的 UUID 主键。
     直接传入渠道 ID 会导致 FK 约束错误。
+
+    查找顺序：
+    1. User.id（UUID 主键）— 适配 Web 用户
+    2. telegram_id — 适配 Telegram 用户
+    3. feishu_open_id — 适配飞书用户
+    4. username — 兼容模式
     """
     if not channel_user_id:
         return None
@@ -31,20 +38,39 @@ async def _resolve_django_user_id(channel_user_id: str | None) -> str | None:
         from asgiref.sync import sync_to_async
         from apps.authentication.models import User as AuthUser
 
+        # 优先：尝试按 Django User UUID 主键查找（Web 用户场景）
+        try:
+            user_uuid = uuid.UUID(channel_user_id)
+            user = await sync_to_async(
+                lambda: AuthUser.objects.filter(id=user_uuid).first()
+            )()
+            if user:
+                logger.info(
+                    "Resolved user_id '%s' via User.id (UUID primary key)",
+                    channel_user_id,
+                )
+                return str(user.id)
+        except (ValueError, AttributeError):
+            pass  # 不是有效 UUID，继续走渠道 ID 查找逻辑
+
+        # 渠道 ID 查找
         user = await sync_to_async(
             lambda: AuthUser.objects.filter(telegram_id=channel_user_id).first()
         )()
         if user:
+            logger.info("Resolved user_id '%s' via telegram_id", channel_user_id)
             return str(user.id)
         user = await sync_to_async(
             lambda: AuthUser.objects.filter(feishu_open_id=channel_user_id).first()
         )()
         if user:
+            logger.info("Resolved user_id '%s' via feishu_open_id", channel_user_id)
             return str(user.id)
         user = await sync_to_async(
             lambda: AuthUser.objects.filter(username=channel_user_id).first()
         )()
         if user:
+            logger.info("Resolved user_id '%s' via username", channel_user_id)
             return str(user.id)
         logger.warning(
             "Cannot resolve channel user_id '%s' to Django User — "
@@ -274,9 +300,16 @@ class SubmitBacktestTool(BaseTool):
                 )
 
             # Resolve channel user_id (e.g. Telegram "123456") to Django User UUID.
-            # If not found, leave user_id empty — the backtest result will still be
-            # created but won't appear in the web UI until backfilled.
-            django_user_id = await _resolve_django_user_id(kwargs.get("user_id"))
+            raw_user_id = kwargs.get("user_id")
+            logger.info(
+                "[SubmitBacktestTool] user_id: raw=%s, type=%s",
+                raw_user_id, type(raw_user_id).__name__,
+            )
+            django_user_id = await _resolve_django_user_id(raw_user_id)
+            logger.info(
+                "[SubmitBacktestTool] resolved django_user_id=%s for create_empty_result",
+                django_user_id,
+            )
 
             result_id = await create_empty_result_async(
                 strategy_id=strategy_id,
