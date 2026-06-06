@@ -108,6 +108,8 @@ def execute_recurring_agent_task(
     message: str,
     user_id: str = "",
     task_name: str = "",
+    workflow_steps: list = None,
+    workflow_summary: str = "",
 ) -> dict:
     """
     周期性执行 Agent 任务（Celery beat 调度）。
@@ -119,6 +121,8 @@ def execute_recurring_agent_task(
         message: 任务消息内容
         user_id: 用户 ID（可选）
         task_name: 定时任务名称
+        workflow_steps: workflow 步骤列表（可选，由 supervisor 预先分解）
+        workflow_summary: workflow 一句话概括（可选）
 
     Returns:
         Agent 执行结果
@@ -159,19 +163,29 @@ def execute_recurring_agent_task(
         from apps.memory.redis_client import _CLIENTS
         _CLIENTS.pop(os.getpid(), None)
 
+        # 清除 SessionManager 的 Redis 连接缓存（绑定到旧 loop 的客户端）
+        from apps.agent.session_manager import _session_manager
+        _session_manager._redis = None
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             supervisor = SupervisorAgent.get_instance()
-            if agent_name == "supervisor":
-                # supervisor 不在 AgentRegistry 中，直接调用 handle 走正常路由
+
+            if workflow_steps:
+                # Pre-decomposed workflow: execute directly without re-parsing.
+                # The supervisor already split the workflow when submitting the task,
+                # so we skip _parse_intent and call _execute_workflow directly.
+                workflow_plan = {
+                    "summary": workflow_summary or task_name,
+                    "steps": workflow_steps,
+                }
                 result: AgentResult = loop.run_until_complete(
-                    supervisor.handle(msg)
+                    supervisor._execute_workflow(workflow_plan, msg)
                 )
             else:
-                result: AgentResult = loop.run_until_complete(
-                    supervisor._route_to_agent(agent_name, msg)
-                )
+                # No workflow: normal single-agent or supervisor routing
+                result: AgentResult = loop.run_until_complete(supervisor.handle(msg))
         finally:
             loop.close()
             asyncio.set_event_loop(None)
