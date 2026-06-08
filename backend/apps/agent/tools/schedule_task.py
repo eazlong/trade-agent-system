@@ -457,17 +457,14 @@ class ListScheduledTasksTool(BaseTool):
     async def execute(self, **kwargs) -> ToolResult:
         try:
             from django_celery_beat.models import PeriodicTask
+            from apps.agent.models import ScheduledOneTimeTask
 
+            # Periodic tasks (existing logic)
             tasks = await sync_to_async(list)(
                 PeriodicTask.objects.filter(enabled=True).select_related(
                     "crontab", "interval"
                 )
             )
-            if not tasks:
-                return ToolResult(
-                    success=True,
-                    data="当前没有已注册的周期定时任务。",
-                )
 
             import json as _json
 
@@ -487,6 +484,33 @@ class ListScheduledTasksTool(BaseTool):
                 agent = kws.get("agent_name", "N/A")
                 lines.append(
                     f"- **{task.name}** | Agent: {agent} | Schedule: {schedule_desc} | Enabled: {task.enabled}"
+                )
+
+            # One-time tasks
+            one_time = await sync_to_async(list)(
+                ScheduledOneTimeTask.objects.filter(
+                    status__in=["pending", "running", "completed", "failed", "missed"]
+                ).order_by("run_at")
+            )
+            if one_time:
+                lines.append(f"\n共 {len(one_time)} 个一次性任务：")
+                for task in one_time:
+                    status_icon = {
+                        "pending": "⏳",
+                        "running": "🔄",
+                        "completed": "✅",
+                        "failed": "❌",
+                        "missed": "⚠️",
+                    }.get(task.status, "")
+                    lines.append(
+                        f"- {status_icon} **{task.task_name}** | Agent: {task.agent_name} | "
+                        f"Run at: {task.run_at.isoformat()} | Status: {task.status}"
+                    )
+
+            if not tasks and not one_time:
+                return ToolResult(
+                    success=True,
+                    data="当前没有已注册的定时任务。",
                 )
 
             return ToolResult(success=True, data="\n".join(lines))

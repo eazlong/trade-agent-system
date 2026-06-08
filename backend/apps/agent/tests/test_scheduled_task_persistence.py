@@ -410,3 +410,29 @@ class TestGetTaskResultDBUUID(TransactionTestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.data["status"], "COMPLETED")
         self.assertIn("analysis done", result.data["result"])
+
+
+class TestListScheduledTasksAPI(TestCase):
+    """Test that API returns both periodic and one-time tasks."""
+
+    @patch("rest_framework.permissions.IsAuthenticated.has_permission", return_value=True)
+    def test_api_returns_one_time_tasks(self, mock_auth):
+        """Should include one-time tasks with source='one_time'."""
+        from apps.agent.models import ScheduledOneTimeTask
+        from rest_framework.test import APIRequestFactory
+
+        run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        ScheduledOneTimeTask.objects.create(
+            task_name="api_test", agent_name="analyst",
+            message="test", run_at=run_at, status="pending",
+        )
+
+        from apps.agent.views import list_scheduled_tasks
+
+        request = APIRequestFactory().get("/api/agent/tasks/scheduled/")
+        response = list_scheduled_tasks(request)
+        self.assertEqual(response.status_code, 200)
+        one_time_tasks = [t for t in response.data["tasks"] if t.get("source") == "one_time"]
+        self.assertEqual(len(one_time_tasks), 1)
+        self.assertEqual(one_time_tasks[0]["agent_name"], "analyst")
+        self.assertEqual(one_time_tasks[0]["status"], "pending")

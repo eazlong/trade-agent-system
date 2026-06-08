@@ -6,10 +6,12 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 
 from apps.agent.base import AgentMessage, AgentResult
 from apps.agent.supervisor import SupervisorAgent
 from apps.agent.frame_manager import FrameManager
+from apps.agent.models import WorkflowHistory
 
 
 @api_view(["POST"])
@@ -246,6 +248,34 @@ def list_scheduled_tasks(request: Request) -> Response:
             }
         )
 
+    # 3. 一次性定时任务（ScheduledOneTimeTask）
+    from apps.agent.models import ScheduledOneTimeTask
+
+    one_time_tasks = (
+        ScheduledOneTimeTask.objects.all()
+        .order_by("-run_at")
+    )
+    for task in one_time_tasks:
+        results.append(
+            {
+                "id": str(task.id),
+                "name": task.task_name,
+                "agent_name": task.agent_name,
+                "message": task.message,
+                "schedule": task.run_at.isoformat(),
+                "enabled": task.status not in ("revoked", "missed"),
+                "last_run_at": task.executed_at.isoformat() if task.executed_at else None,
+                "total_run_count": 1 if task.status in ("completed", "failed") else 0,
+                "expires": None,
+                "start_time": task.run_at.isoformat(),
+                "source": "one_time",
+                "status": task.status,
+                "celery_task_id": task.celery_task_id or None,
+                "result": task.result or None,
+                "error": task.error or None,
+            }
+        )
+
     return Response({"tasks": results})
 
 
@@ -308,3 +338,72 @@ def _format_celery_schedule(schedule) -> str:
         else:
             return f"每 {int(secs / 3600)} 小时"
     return str(schedule)
+
+
+# ── Workflow History API ──
+
+class WorkflowHistoryPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_workflow_history(request: Request) -> Response:
+    """列出当前用户的工作流执行历史"""
+    status_filter = request.query_params.get("status")
+
+    qs = WorkflowHistory.objects.filter(user=request.user).order_by("-created_at")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
+    paginator = WorkflowHistoryPagination()
+    page = paginator.paginate_queryset(qs, request)
+
+    items = [
+        {
+            "id": str(h.id),
+            "workflow_id": h.workflow_id,
+            "summary": h.summary,
+            "status": h.status,
+            "total_steps": h.total_steps,
+            "completed_steps": h.completed_steps,
+            "elapsed_seconds": round(h.elapsed_seconds, 1),
+            "error": h.error,
+            "created_at": h.created_at.isoformat(),
+            "completed_at": h.completed_at.isoformat() if h.completed_at else None,
+        }
+        for h in page
+    ]
+
+    return Response({
+        "count": paginator.page.paginator.count,
+        "num_pages": paginator.page.paginator.num_pages,
+        "current_page": paginator.page.number,
+        "items": items,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_workflow_history(request: Request, workflow_id: str) -> Response:
+    """获取单个工作流执行的详细信息"""
+    try:
+        h = WorkflowHistory.objects.get(user=request.user, workflow_id=workflow_id)
+    except WorkflowHistory.DoesNotExist:
+        return Response({"error": "工作流记录不存在"}, status=404)
+
+    return Response({
+        "id": str(h.id),
+        "workflow_id": h.workflow_id,
+        "summary": h.summary,
+        "status": h.status,
+        "total_steps": h.total_steps,
+        "completed_steps": h.completed_steps,
+        "step_results": h.step_results,
+        "elapsed_seconds": round(h.elapsed_seconds, 1),
+        "error": h.error,
+        "created_at": h.created_at.isoformat(),
+        "completed_at": h.completed_at.isoformat() if h.completed_at else None,
+    })
