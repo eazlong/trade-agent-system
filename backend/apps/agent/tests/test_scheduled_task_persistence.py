@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -356,3 +357,56 @@ class TestStartupRecoveryCheck(TestCase):
         task = ScheduledOneTimeTask.objects.get(task_name="zombie")
         self.assertEqual(task.status, "pending")
         mock_task.apply_async.assert_called()
+
+
+class TestGetTaskResultDBUUID(TransactionTestCase):
+    """Test GetTaskResultTool recognizes DB UUID for one-time tasks."""
+
+    def test_query_pending_one_time_task(self):
+        """Should return SCHEDULED status for a DB UUID."""
+        from apps.agent.tools.backtest import GetTaskResultTool
+        from apps.agent.models import ScheduledOneTimeTask
+        from django.db import connection
+
+        run_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        task = ScheduledOneTimeTask.objects.create(
+            task_name="query_test", agent_name="analyst",
+            message="test", run_at=run_at, status="pending",
+        )
+        task_id = str(task.id)
+        connection.close()
+
+        tool = GetTaskResultTool()
+        result = asyncio.get_event_loop().run_until_complete(
+            tool.execute(task_id=task_id)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["status"], "SCHEDULED")
+        self.assertEqual(result.data["source"], "one_time")
+
+    def test_query_completed_one_time_task(self):
+        """Should return completed status with result."""
+        from apps.agent.tools.backtest import GetTaskResultTool
+        from apps.agent.models import ScheduledOneTimeTask
+        from django.db import connection
+
+        run_at = datetime.now(timezone.utc)
+        task = ScheduledOneTimeTask.objects.create(
+            task_name="query_done", agent_name="analyst",
+            message="test", run_at=run_at,
+            status="completed",
+            result='{"status": "SUCCESS", "result": "analysis done"}',
+            executed_at=datetime.now(timezone.utc),
+        )
+        task_id = str(task.id)
+        connection.close()
+
+        tool = GetTaskResultTool()
+        result = asyncio.get_event_loop().run_until_complete(
+            tool.execute(task_id=task_id)
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["status"], "COMPLETED")
+        self.assertIn("analysis done", result.data["result"])

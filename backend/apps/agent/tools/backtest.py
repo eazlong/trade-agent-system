@@ -19,6 +19,23 @@ from .base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 
+async def _get_scheduler_user_id() -> str | None:
+    """Return the Django User UUID for the system_scheduler account."""
+    try:
+        from asgiref.sync import sync_to_async
+        from apps.authentication.models import User as AuthUser
+
+        user = await sync_to_async(
+            lambda: AuthUser.objects.filter(username="system_scheduler").first()
+        )()
+        if user:
+            logger.info("Fallback: using system_scheduler user (%s)", user.id)
+            return str(user.id)
+    except Exception as exc:
+        logger.warning("Error resolving system_scheduler user: %s", exc)
+    return None
+
+
 async def _resolve_django_user_id(channel_user_id: str | None) -> str | None:
     """将渠道 user_id（Telegram/Facebook 等）映射为 Django User UUID。
 
@@ -31,9 +48,11 @@ async def _resolve_django_user_id(channel_user_id: str | None) -> str | None:
     2. telegram_id — 适配 Telegram 用户
     3. feishu_open_id — 适配飞书用户
     4. username — 兼容模式
+    5. system_scheduler — 定时/自动任务的兜底用户
     """
     if not channel_user_id:
-        return None
+        # Fallback: system_scheduler user for scheduled/automated tasks
+        return await _get_scheduler_user_id()
     try:
         from asgiref.sync import sync_to_async
         from apps.authentication.models import User as AuthUser
@@ -424,6 +443,38 @@ class GetTaskResultTool(BaseTool):
             return ToolResult(success=False, error="task_id 为必填项")
 
         try:
+            # Step 0: Check if this is a ScheduledOneTimeTask DB UUID
+            from uuid import UUID
+            try:
+                UUID(task_id)
+                from apps.agent.models import ScheduledOneTimeTask
+                from asgiref.sync import sync_to_async
+
+                one_time_task = await sync_to_async(
+                    lambda: ScheduledOneTimeTask.objects.filter(id=task_id).first()
+                )()
+                if one_time_task:
+                    data = {
+                        "task_id": task_id,
+                        "status": one_time_task.status.upper(),
+                        "source": "one_time",
+                        "task_name": one_time_task.task_name,
+                        "agent_name": one_time_task.agent_name,
+                        "run_at": one_time_task.run_at.isoformat(),
+                        "created_at": one_time_task.created_at.isoformat(),
+                    }
+                    if one_time_task.status == "completed" and one_time_task.result:
+                        data["result"] = one_time_task.result
+                    if one_time_task.error:
+                        data["error"] = one_time_task.error
+                    if one_time_task.executed_at:
+                        data["executed_at"] = one_time_task.executed_at.isoformat()
+                    if one_time_task.status == "pending":
+                        data["status"] = "SCHEDULED"
+                    return ToolResult(success=True, data=data)
+            except ValueError:
+                pass  # Not a UUID, fall through to normal Celery lookup
+
             # Step 1: Check Redis Hash first — this tells us whether the task
             # was ever submitted. Celery AsyncResult alone returns PENDING for
             # both "never submitted" and "waiting to start", which is ambiguous.
