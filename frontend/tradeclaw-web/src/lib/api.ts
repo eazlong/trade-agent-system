@@ -665,7 +665,7 @@ export const backtestApi = {
 // ── Scheduled Task API ──
 
 export interface ScheduledTask {
-  id: number | null;
+  id: number | string | null;
   name: string;
   agent_name: string;
   message: string;
@@ -675,7 +675,13 @@ export interface ScheduledTask {
   total_run_count: number;
   expires: string | null;
   start_time: string | null;
-  source: "static" | "database";
+  source: "static" | "database" | "one_time";
+
+  // one_time 特有字段
+  status?: string;
+  celery_task_id?: string | null;
+  result?: string | null;
+  error?: string | null;
 }
 
 export interface ScheduledTaskListResponse {
@@ -778,4 +784,68 @@ export const channelApi = {
   feishuUrl: () => request<FeishuUrlInitResponse>("/api/channel/auth/lark/url/"),
   feishuRefresh: () => request<{ status: string; expires_at: string }>("/api/channel/auth/lark/refresh/", "POST"),
   feishuRevoke: () => request<void>("/api/channel/auth/lark/revoke/", "DELETE"),
+};
+
+// ── Workflow History API ──
+
+export interface WorkflowHistoryItem {
+  id: string;
+  workflow_id: string;
+  summary: string;
+  status: "completed" | "failed" | "aborted";
+  total_steps: number;
+  completed_steps: number;
+  elapsed_seconds: number;
+  error: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface WorkflowHistoryDetail extends WorkflowHistoryItem {
+  step_results: {
+    agent: string;
+    data: string;
+    step: number;
+    skipped?: boolean;
+    failed?: boolean;
+  }[];
+}
+
+export interface PaginatedWorkflowHistory {
+  count: number;
+  num_pages: number;
+  current_page: number;
+  items: WorkflowHistoryItem[];
+}
+
+export const workflowApi = {
+  list: (params?: { page?: number; status?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.status) query.set("status", params.status);
+    const qs = query.toString();
+    return request<PaginatedWorkflowHistory>(
+      `/api/agent/workflow/history/${qs ? `?${qs}` : ""}`
+    );
+  },
+  getDetail: (workflowId: string) =>
+    request<WorkflowHistoryDetail>(`/api/agent/workflow/history/${workflowId}/`),
+};
+
+// ── Notification API ──
+
+export interface Notification {
+  id: string;
+  channel: "telegram" | "web";
+  message: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+export const notificationApi = {
+  list: () => request<Notification[]>("/api/notify/"),
+  markRead: (id: string) =>
+    request<Record<string, string>>(`/api/notify/${id}/read/`, "POST"),
+  markAllRead: () => request<Record<string, string>>("/api/notify/mark-all-read/", "POST"),
+  unreadCount: () => request<{ unread_count: number }>("/api/notify/unread-count/"),
 };
