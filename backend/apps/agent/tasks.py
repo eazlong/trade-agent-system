@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from celery_app import app
 
 logger = logging.getLogger(__name__)
+_wf_logger = logging.getLogger(f"{__name__}.workflow")
 
 # ---------------------------------------------------------------------------
 # Health check constants
@@ -19,12 +20,32 @@ _HEARTBEAT_INTERVAL = 60  # seconds — push heartbeat if last_hb older than thi
 _ZOMBIE_TIMEOUT = 300  # seconds — mark as zombie if no update for this long
 
 
+def _session_manager_reset() -> None:
+    """Clear session-level Redis connection caches.
+
+    Resets the SessionManager singleton's Redis client and the
+    memory-layer Redis client pool for the current PID.  Must be called
+    with the event loop still running — it invokes async close() via the
+    active loop.
+    """
+    from apps.memory.redis_client import RedisPool
+
+    RedisPool.close_client()
+
+    try:
+        from apps.agent.session_manager import _session_manager
+        _session_manager._redis = None
+    except Exception:
+        pass
+
+
 @app.task(bind=True, acks_late=True, track_started=True)
 def execute_scheduled_agent_task(
     self,
     agent_name: str,
     message: str,
     user_id: str = "",
+    scheduled_task_id: str = "",
 ) -> dict:
     """
     在指定时间执行 Agent 任务（一次性定时任务）。
@@ -36,6 +57,7 @@ def execute_scheduled_agent_task(
         agent_name: 目标 Agent 名称（如 analyst、quant、researcher）
         message: 任务消息内容
         user_id: 用户 ID（可选）
+        scheduled_task_id: ScheduledOneTimeTask DB UUID（可选，用于状态追踪）
 
     Returns:
         Agent 执行结果
@@ -44,10 +66,22 @@ def execute_scheduled_agent_task(
     from apps.agent.supervisor import SupervisorAgent
 
     logger.info(
-        "[execute_scheduled_agent_task] agent=%s user_id=%s",
+        "[execute_scheduled_agent_task] agent=%s user_id=%s task_id=%s",
         agent_name,
         user_id,
+        scheduled_task_id,
     )
+
+    # CAS: pending -> running (idempency guard against duplicate delivery)
+    if scheduled_task_id:
+        cas_rows = _update_task_status(scheduled_task_id, "running")
+        if cas_rows == 0:
+            logger.warning(
+                "[execute_scheduled_agent_task] CAS failed for %s -- "
+                "task not pending, skipping (idempency)",
+                scheduled_task_id,
+            )
+            return {"status": "SKIPPED", "reason": "not_pending"}
 
     msg = AgentMessage(
         sender="scheduler",
@@ -56,14 +90,20 @@ def execute_scheduled_agent_task(
         user_id=user_id,
     )
 
+    task_result = None
+
     try:
-        supervisor = SupervisorAgent.get_instance()
         loop = asyncio.new_event_loop()
         try:
+            supervisor = SupervisorAgent.get_instance()
             result: AgentResult = loop.run_until_complete(
                 supervisor._route_to_agent(agent_name, msg)
             )
         finally:
+            # Close Redis asyncio client before closing the event loop,
+            # otherwise connection.__del__ fires on a closed loop and logs
+            # "RuntimeError: Event loop is closed" warnings.
+            _session_manager_reset()
             loop.close()
 
         if result.success:
@@ -72,7 +112,7 @@ def execute_scheduled_agent_task(
                 agent_name,
                 str(result.data)[:200],
             )
-            return {
+            task_result = {
                 "status": "SUCCESS",
                 "agent_name": agent_name,
                 "result": str(result.data),
@@ -83,7 +123,7 @@ def execute_scheduled_agent_task(
                 agent_name,
                 result.error,
             )
-            return {
+            task_result = {
                 "status": "FAILURE",
                 "agent_name": agent_name,
                 "error": result.error,
@@ -94,11 +134,112 @@ def execute_scheduled_agent_task(
             e,
             exc_info=True,
         )
-        return {
+        task_result = {
             "status": "ERROR",
             "agent_name": agent_name,
             "error": str(e),
         }
+    finally:
+        # Always finalize DB status if scheduled_task_id provided
+        if scheduled_task_id:
+            try:
+                _finalize_task(
+                    scheduled_task_id,
+                    task_result["status"],
+                    result=task_result if task_result["status"] == "SUCCESS" else None,
+                    error=task_result.get("error"),
+                )
+            except Exception:
+                logger.error(
+                    "[execute_scheduled_agent_task] finalize DB failed for %s",
+                    scheduled_task_id,
+                    exc_info=True,
+                )
+
+    return task_result
+
+
+# ---------------------------------------------------------------------------
+# CAS helpers for ScheduledOneTimeTask state machine
+# ---------------------------------------------------------------------------
+
+
+def _update_task_status(
+    scheduled_task_id: str,
+    new_status: str,
+) -> int:
+    """CAS: atomically update task status with a condition.
+
+    Returns the number of rows affected (0 or 1).
+    When transitioning to 'running', also sets executed_at.
+    """
+    from apps.agent.models import ScheduledOneTimeTask
+
+    now = datetime.now(timezone.utc)
+    if new_status == "running":
+        return ScheduledOneTimeTask.objects.filter(
+            id=scheduled_task_id, status="pending"
+        ).update(status="running", executed_at=now)
+    else:
+        return ScheduledOneTimeTask.objects.filter(
+            id=scheduled_task_id,
+        ).exclude(status__in=("completed", "failed", "revoked", "missed")).update(
+            status=new_status
+        )
+
+
+def _finalize_task(
+    scheduled_task_id: str,
+    task_status: str,
+    result: dict | None = None,
+    error: str | None = None,
+) -> None:
+    """Write terminal status to the DB record."""
+    from apps.agent.models import ScheduledOneTimeTask
+
+    now = datetime.now(timezone.utc)
+    if task_status in ("SUCCESS",):
+        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id).update(
+            status="completed",
+            executed_at=now,
+            result=json.dumps(result) if result else "",
+        )
+    else:
+        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id).update(
+            status="failed",
+            executed_at=now,
+            error=error if error else (str(result) if result else "Unknown error"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# System scheduler user resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_scheduler_user_id(user_id: str) -> str:
+    """Return the Django User UUID for scheduled tasks.
+
+    If ``user_id`` is non-empty, pass through unchanged.
+    Otherwise resolve to the ``system_scheduler`` system user so that
+    WorkflowHistory and BacktestResult always have a valid user FK.
+    """
+    if user_id:
+        return user_id
+    try:
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        scheduler = User.objects.get(username="system_scheduler")
+        logger.info("Resolved empty user_id to system_scheduler (%s)", scheduler.id)
+        return str(scheduler.id)
+    except Exception as exc:
+        logger.warning("Could not resolve system_scheduler user: %s — using empty user_id", exc)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Execute recurring agent task
+# ---------------------------------------------------------------------------
 
 
 @app.task(bind=True, acks_late=True, track_started=True)
@@ -130,6 +271,12 @@ def execute_recurring_agent_task(
     from apps.agent.base import AgentMessage, AgentResult
     from apps.agent.supervisor import SupervisorAgent
 
+    is_workflow = bool(workflow_steps)
+    _wf_logger.info(
+        "[TASK] task_name=%s agent=%s user_id=%s workflow=%s steps=%s",
+        task_name, agent_name, user_id, is_workflow, len(workflow_steps) if is_workflow else 0,
+    )
+
     logger.info(
         "[execute_recurring_agent_task] task_name=%s agent=%s user_id=%s",
         task_name,
@@ -137,17 +284,17 @@ def execute_recurring_agent_task(
         user_id,
     )
 
+    resolved_user_id = _resolve_scheduler_user_id(user_id)
+
     msg = AgentMessage(
         sender="scheduler",
         recipient=agent_name,
         payload={"text": message, "scheduled": True, "task_name": task_name},
-        user_id=user_id,
+        user_id=resolved_user_id,
     )
 
     try:
         # 重置所有单例和缓存实例，防止跨任务复用绑定到旧事件循环的组件
-        # 这是 "Event loop is closed" 的根本原因：Celery worker 复用进程，
-        # 单例对象存活，内部 async 组件引用了已关闭的旧事件循环
         SupervisorAgent._instance = None
         from apps.agent.llm_client import LLMClient
         LLMClient._instance = None
@@ -157,15 +304,7 @@ def execute_recurring_agent_task(
         AgentRegistry._registry.clear()  # 清除已实例化的 Agent（含旧 loop 绑定）
         from apps.agent.supervisor import IntentRouter
         IntentRouter._instance = None
-
-        # 清除 Redis 连接池缓存（aioredis 客户端绑定到旧 loop）
-        import os
-        from apps.memory.redis_client import _CLIENTS
-        _CLIENTS.pop(os.getpid(), None)
-
-        # 清除 SessionManager 的 Redis 连接缓存（绑定到旧 loop 的客户端）
-        from apps.agent.session_manager import _session_manager
-        _session_manager._redis = None
+        _session_manager_reset()
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -187,6 +326,10 @@ def execute_recurring_agent_task(
                 # No workflow: normal single-agent or supervisor routing
                 result: AgentResult = loop.run_until_complete(supervisor.handle(msg))
         finally:
+            # Close Redis asyncio client before closing the event loop,
+            # otherwise connection.__del__ fires on a closed loop and logs
+            # "RuntimeError: Event loop is closed" warnings.
+            _session_manager_reset()
             loop.close()
             asyncio.set_event_loop(None)
 
