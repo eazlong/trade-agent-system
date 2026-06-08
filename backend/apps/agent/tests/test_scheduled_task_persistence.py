@@ -436,3 +436,44 @@ class TestListScheduledTasksAPI(TestCase):
         self.assertEqual(len(one_time_tasks), 1)
         self.assertEqual(one_time_tasks[0]["agent_name"], "analyst")
         self.assertEqual(one_time_tasks[0]["status"], "pending")
+
+
+class TestScheduledTaskIntegration(TestCase):
+    """Integration tests for the full scheduled task lifecycle."""
+
+    def test_cas_double_acquire_only_one_wins(self):
+        """Only one CAS should succeed (idempency guard)."""
+        from apps.agent.models import ScheduledOneTimeTask
+        from apps.agent.tasks import _update_task_status
+
+        task = ScheduledOneTimeTask.objects.create(
+            task_name="cas_double", agent_name="analyst",
+            message="test", run_at=datetime.now(timezone.utc),
+            status="pending",
+        )
+        r1 = _update_task_status(str(task.id), "running")
+        r2 = _update_task_status(str(task.id), "running")
+        self.assertEqual(r1 + r2, 1)
+        self.assertEqual(r1, 1)
+        self.assertEqual(r2, 0)
+
+
+class TestRunAtParsingTimezone(TestCase):
+    """Test _parse_run_at timezone handling."""
+
+    def test_tomorrow_uses_utc(self):
+        """tomorrow HH:MM should produce a UTC datetime."""
+        from apps.agent.tools.schedule_task import SubmitScheduledTaskTool
+
+        tool = SubmitScheduledTaskTool()
+        result = tool._parse_run_at("tomorrow 09:00")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.tzinfo, timezone.utc)
+        expected = datetime.now(timezone.utc).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        expected += timedelta(days=1)
+        self.assertAlmostEqual(
+            (result - expected).total_seconds(), 0, delta=2
+        )
