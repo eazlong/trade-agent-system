@@ -81,7 +81,7 @@ def execute_scheduled_agent_task(
                 "task not pending, skipping (idempency)",
                 scheduled_task_id,
             )
-            return {"status": "SKIPPED", "reason": "not_pending"}
+            return {"status": "SKIPPED", "agent_name": agent_name, "reason": "not_pending"}
 
     msg = AgentMessage(
         sender="scheduler",
@@ -142,12 +142,13 @@ def execute_scheduled_agent_task(
     finally:
         # Always finalize DB status if scheduled_task_id provided
         if scheduled_task_id:
+            status = task_result.get("status", "ERROR") if task_result else "ERROR"
             try:
                 _finalize_task(
                     scheduled_task_id,
-                    task_result["status"],
-                    result=task_result if task_result["status"] == "SUCCESS" else None,
-                    error=task_result.get("error"),
+                    status,
+                    result=task_result if status == "SUCCESS" else None,
+                    error=task_result.get("error") if task_result else None,
                 )
             except Exception:
                 logger.error(
@@ -194,18 +195,19 @@ def _finalize_task(
     result: dict | None = None,
     error: str | None = None,
 ) -> None:
-    """Write terminal status to the DB record."""
+    """Write terminal status to the DB record with CAS guard (only update if status is 'running')."""
     from apps.agent.models import ScheduledOneTimeTask
+    import json as _json
 
     now = datetime.now(timezone.utc)
     if task_status in ("SUCCESS",):
-        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id).update(
+        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id, status="running").update(
             status="completed",
             executed_at=now,
-            result=json.dumps(result) if result else "",
+            result=_json.dumps(result) if result else "",
         )
     else:
-        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id).update(
+        ScheduledOneTimeTask.objects.filter(id=scheduled_task_id, status="running").update(
             status="failed",
             executed_at=now,
             error=error if error else (str(result) if result else "Unknown error"),
