@@ -91,3 +91,87 @@ class TaskProgress(models.Model):
 
     def __str__(self):
         return f"TaskProgress({self.task_id[:8]}) {self.status}"
+
+
+class WorkflowHistory(models.Model):
+    """工作流执行历史记录 — 记录每次多步工作流的完整执行过程与结果"""
+
+    STATUS_CHOICES = [
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("aborted", "已中止"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workflow_id = models.CharField(max_length=32, unique=True, db_index=True)
+    user = models.ForeignKey(
+        "authentication.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="workflow_history",
+    )
+    summary = models.TextField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES)
+    total_steps = models.IntegerField(default=0)
+    completed_steps = models.IntegerField(default=0)
+    step_results = models.JSONField(default=list)
+    error = models.TextField(blank=True, default="")
+    elapsed_seconds = models.FloatField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "workflow_history"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "-created_at"], name="wf_hist_user_created_idx"),
+        ]
+
+    def __str__(self):
+        return f"WorkflowHistory({self.workflow_id}) {self.status}"
+
+
+class ScheduledOneTimeTask(models.Model):
+    """One-time scheduled task persisted for crash recovery and status tracking."""
+
+    STATUS_CHOICES = [
+        ("pending", "待执行"),
+        ("running", "执行中"),
+        ("completed", "已完成"),
+        ("failed", "失败"),
+        ("revoked", "已取消"),
+        ("missed", "已错过"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task_name = models.CharField(max_length=255)
+    agent_name = models.CharField(max_length=100)
+    message = models.TextField()
+    user_id = models.CharField(max_length=100, blank=True, default="")
+    run_at = models.DateTimeField(verbose_name="计划执行时间")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    celery_task_id = models.CharField(max_length=255, blank=True, default="")
+    executed_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="实际执行时间"
+    )
+    result = models.TextField(blank=True, default="", verbose_name="执行结果（JSON）")
+    error = models.TextField(blank=True, default="", verbose_name="错误信息")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "scheduled_one_time_task"
+        ordering = ["-run_at"]
+        indexes = [
+            models.Index(
+                fields=["status", "run_at"],
+                name="scheduled_ot_status_run_at_idx",
+            ),
+            models.Index(
+                fields=["celery_task_id"],
+                name="scheduled_ot_celery_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"ScheduledOneTimeTask({str(self.id)[:8]}) {self.task_name} [{self.status}]"
