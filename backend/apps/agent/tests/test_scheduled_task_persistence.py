@@ -260,3 +260,99 @@ class TestCancelScheduledTaskTool(TransactionTestCase):
 
         assert result.success
         assert "CANCELLED" in result.data["status"]
+
+
+class TestStartupRecoveryCheck(TestCase):
+    """Test startup_recovery_check reconciliation logic."""
+
+    def setUp(self):
+        self.now = datetime.now(timezone.utc)
+
+    @patch("apps.agent.tasks._acquire_recovery_lock")
+    @patch("apps.agent.tasks.execute_scheduled_agent_task")
+    @patch("apps.agent.tasks._notify_user")
+    def test_recovery_future_requeued(self, mock_notify, mock_task, mock_lock):
+        """Future pending tasks should be re-queued with eta."""
+        mock_lock.return_value = "worker:12345:1.0"
+        mock_task.apply_async.return_value = MagicMock(id="new-celery-id-future")
+        from apps.agent.tasks import startup_recovery_check
+        from apps.agent.models import ScheduledOneTimeTask
+
+        ScheduledOneTimeTask.objects.create(
+            task_name="future", agent_name="analyst",
+            message="future task", run_at=self.now + timedelta(hours=1),
+            status="pending", celery_task_id="old-celery-id",
+        )
+
+        result = startup_recovery_check()
+        task = ScheduledOneTimeTask.objects.get(task_name="future")
+        self.assertNotEqual(task.celery_task_id, "old-celery-id")
+        self.assertEqual(task.status, "pending")
+        call_kwargs = mock_task.apply_async.call_args[1]
+        self.assertIn("eta", call_kwargs)
+
+    @patch("apps.agent.tasks._acquire_recovery_lock")
+    @patch("apps.agent.tasks.execute_scheduled_agent_task")
+    @patch("apps.agent.tasks._notify_user")
+    def test_recovery_grace_immediate(self, mock_notify, mock_task, mock_lock):
+        """Grace-period tasks should be immediately executed."""
+        mock_lock.return_value = "worker:12345:1.0"
+        mock_task.apply_async.return_value = MagicMock(id="new-celery-id-grace")
+        from apps.agent.tasks import startup_recovery_check
+        from apps.agent.models import ScheduledOneTimeTask
+
+        ScheduledOneTimeTask.objects.create(
+            task_name="grace", agent_name="analyst",
+            message="grace task", run_at=self.now - timedelta(minutes=3),
+            status="pending",
+        )
+
+        result = startup_recovery_check()
+        task = ScheduledOneTimeTask.objects.get(task_name="grace")
+        self.assertEqual(task.status, "pending")
+        mock_task.apply_async.assert_called()
+        call_kwargs = mock_task.apply_async.call_args[1]
+        self.assertNotIn("eta", call_kwargs)
+
+    @patch("apps.agent.tasks._acquire_recovery_lock")
+    @patch("apps.agent.tasks.execute_scheduled_agent_task")
+    @patch("apps.agent.tasks._notify_user")
+    def test_recovery_missed_marked(self, mock_notify, mock_task, mock_lock):
+        """Beyond-grace tasks should be marked missed."""
+        mock_lock.return_value = "worker:12345:1.0"
+        mock_task.apply_async.return_value = MagicMock(id="new-celery-id-missed")
+        from apps.agent.tasks import startup_recovery_check
+        from apps.agent.models import ScheduledOneTimeTask
+
+        ScheduledOneTimeTask.objects.create(
+            task_name="missed", agent_name="analyst",
+            message="missed task", run_at=self.now - timedelta(hours=2),
+            status="pending", user_id="user-123",
+        )
+
+        result = startup_recovery_check()
+        task = ScheduledOneTimeTask.objects.get(task_name="missed")
+        self.assertEqual(task.status, "missed")
+        mock_notify.assert_called()
+
+    @patch("apps.agent.tasks._acquire_recovery_lock")
+    @patch("apps.agent.tasks.execute_scheduled_agent_task")
+    @patch("apps.agent.tasks._notify_user")
+    def test_recovery_zombie_running(self, mock_notify, mock_task, mock_lock):
+        """Stale running tasks should be recovered like pending."""
+        mock_lock.return_value = "worker:12345:1.0"
+        mock_task.apply_async.return_value = MagicMock(id="new-celery-id-zombie")
+        from apps.agent.tasks import startup_recovery_check
+        from apps.agent.models import ScheduledOneTimeTask
+
+        zombie_task = ScheduledOneTimeTask.objects.create(
+            task_name="zombie", agent_name="analyst",
+            message="zombie task", run_at=self.now - timedelta(minutes=15),
+            status="running",
+            celery_task_id="zombie-celery-id",
+        )
+
+        result = startup_recovery_check()
+        task = ScheduledOneTimeTask.objects.get(task_name="zombie")
+        self.assertEqual(task.status, "pending")
+        mock_task.apply_async.assert_called()

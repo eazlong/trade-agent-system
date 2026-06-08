@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from celery_app import app
 
@@ -687,3 +688,191 @@ def check_session_expiry(self) -> dict:
             warned += 1
     
     return {"warned": warned}
+
+
+# ---------------------------------------------------------------------------
+# Startup recovery — reconcile DB vs broker on worker boot
+# ---------------------------------------------------------------------------
+
+SCHEDULED_TASK_GRACE_PERIOD = 1800  # 30 min default, overridden via Django settings
+RECOVERY_LOCK_TTL = 120  # seconds for Redis SETNX lock
+STALE_RUNNING_THRESHOLD = 600  # 10 min — running tasks older than this are "stale"
+
+
+def _get_grace_period() -> int:
+    """Get grace period from Django settings, falling back to module default."""
+    from django.conf import settings
+    return getattr(settings, "SCHEDULED_TASK_GRACE_PERIOD", SCHEDULED_TASK_GRACE_PERIOD)
+
+
+def _notify_user(user_id: str, message: str) -> None:
+    """Send a notification to the user (Telegram/Web)."""
+    try:
+        from apps.agent.task_tracker import _send_notification_redis
+        _send_notification_redis(user_id, message)
+    except Exception:
+        logger.warning(
+            "[startup_recovery_check] failed to notify user %s", user_id,
+            exc_info=True,
+        )
+
+
+def _acquire_recovery_lock() -> str | None:
+    """Try to acquire a distributed lock via Redis SETNX.
+
+    Returns the lock value if acquired, None if another worker holds it.
+    """
+    import redis
+    from django.conf import settings
+
+    url = settings.REDIS_URL
+    if url.rsplit("/", 1)[-1].isdigit():
+        url = url.rsplit("/", 1)[0] + "/5"
+    r = redis.from_url(url, decode_responses=True)
+    lock_key = "recovery:startup_lock"
+    lock_value = f"worker:{os.getpid()}:{time.time()}"
+    acquired = r.set(lock_key, lock_value, nx=True, ex=RECOVERY_LOCK_TTL)
+    return lock_value if acquired else None
+
+
+@app.task(bind=True)
+def startup_recovery_check(self) -> dict:
+    """One-time reconciliation on worker startup.
+
+    Scans DB for pending/running one-time tasks and:
+    - Future tasks: revoke old id -> re-apply_async(eta)
+    - Grace-period expired: immediate apply_async
+    - Beyond grace: mark missed + notify user
+    - Stale running (crash residue): treat as pending for reconciliation
+    Also confirms Beat has loaded all PeriodicTasks.
+    """
+    import redis
+    from django.conf import settings
+    from apps.agent.models import ScheduledOneTimeTask
+    from django_celery_beat.models import PeriodicTask
+
+    # Distributed lock: only one worker performs recovery
+    lock_value = _acquire_recovery_lock()
+    if lock_value is None:
+        logger.info(
+            "[startup_recovery_check] another worker holds lock, skipping"
+        )
+        return {"skipped": True, "reason": "lock_held"}
+
+    logger.info(
+        "[startup_recovery_check] starting recovery (lock=%s)", lock_value
+    )
+    now = datetime.now(timezone.utc)
+    grace_cutoff = now - timedelta(seconds=_get_grace_period())
+    stale_threshold = now - timedelta(seconds=STALE_RUNNING_THRESHOLD)
+
+    stats = {"future": 0, "grace": 0, "missed": 0, "running": 0, "errors": 0}
+
+    # --- Recover stale 'running' tasks (crash residue) ---
+    # Use run_at as staleness indicator: a running task whose scheduled time
+    # is well in the past is almost certainly a crash residue (auto_now on
+    # updated_at would mask true last-activity time).
+    stale_running = ScheduledOneTimeTask.objects.filter(
+        status="running",
+        run_at__lt=stale_threshold,
+    )
+    for task in stale_running:
+        try:
+            task.status = "pending"
+            task.celery_task_id = ""
+            task.save(update_fields=["status", "celery_task_id", "updated_at"])
+            stats["running"] += 1
+            logger.info(
+                "[startup_recovery_check] recovered stale running %s -> pending",
+                task.id,
+            )
+        except Exception:
+            stats["errors"] += 1
+            logger.error(
+                "[startup_recovery_check] failed to recover %s", task.id,
+                exc_info=True,
+            )
+
+    # --- Reconcile pending tasks ---
+    pending_tasks = ScheduledOneTimeTask.objects.filter(status="pending")
+    for task in pending_tasks:
+        try:
+            if task.run_at > now:
+                # Future: revoke old, re-queue with eta
+                if task.celery_task_id:
+                    app.control.revoke(task.celery_task_id)
+                celery_result = execute_scheduled_agent_task.apply_async(
+                    kwargs={
+                        "agent_name": task.agent_name,
+                        "message": task.message,
+                        "user_id": task.user_id,
+                        "scheduled_task_id": str(task.id),
+                    },
+                    eta=task.run_at,
+                )
+                task.celery_task_id = celery_result.id
+                task.save(update_fields=["celery_task_id", "updated_at"])
+                stats["future"] += 1
+                logger.info(
+                    "[startup_recovery_check] re-queued future task %s eta=%s",
+                    task.id, task.run_at.isoformat(),
+                )
+
+            elif task.run_at >= grace_cutoff:
+                # Within grace: immediate execution
+                celery_result = execute_scheduled_agent_task.apply_async(
+                    kwargs={
+                        "agent_name": task.agent_name,
+                        "message": task.message,
+                        "user_id": task.user_id,
+                        "scheduled_task_id": str(task.id),
+                    },
+                )
+                task.celery_task_id = celery_result.id
+                task.save(update_fields=["celery_task_id", "updated_at"])
+                stats["grace"] += 1
+                logger.info(
+                    "[startup_recovery_check] immediate execution for grace task %s",
+                    task.id,
+                )
+
+            else:
+                # Beyond grace: mark missed + notify
+                task.status = "missed"
+                task.error = f"Missed: run_at={task.run_at.isoformat()}, beyond grace period"
+                task.save(update_fields=["status", "error", "updated_at"])
+                stats["missed"] += 1
+                if task.user_id:
+                    _notify_user(
+                        task.user_id,
+                        f"定时任务「{task.task_name}」已错过执行时间（{task.run_at.isoformat()}），"
+                        f"超出宽限窗口，未自动补执行。",
+                    )
+                logger.info(
+                    "[startup_recovery_check] marked task %s as missed", task.id,
+                )
+        except Exception:
+            stats["errors"] += 1
+            logger.error(
+                "[startup_recovery_check] failed to reconcile task %s", task.id,
+                exc_info=True,
+            )
+
+    # --- Confirm Beat has loaded PeriodicTasks ---
+    periodic_count = PeriodicTask.objects.filter(enabled=True).count()
+    try:
+        ping_result = app.control.ping(timeout=5)
+        beat_online = len(ping_result) > 0
+    except Exception:
+        beat_online = False
+
+    logger.info(
+        "[startup_recovery_check] done -- stats=%s, periodic_tasks=%d, beat_online=%s",
+        stats, periodic_count, beat_online,
+    )
+
+    return {
+        "recovered": stats,
+        "periodic_tasks": periodic_count,
+        "beat_online": beat_online,
+    }

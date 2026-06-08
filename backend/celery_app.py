@@ -71,3 +71,19 @@ app.conf.beat_schedule = {
 
 # 使用数据库调度器，支持动态添加/删除定时任务
 app.conf.beat_scheduler = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# ---------------------------------------------------------------------------
+# Worker startup signal — one-time recovery check
+# ---------------------------------------------------------------------------
+
+from celery.signals import worker_ready
+
+
+@worker_ready.connect
+def on_worker_ready(sender=None, **kwargs):
+    """Trigger startup recovery check exactly once on worker boot."""
+    from apps.agent.tasks import startup_recovery_check
+    logger.info("[worker_ready] triggering startup recovery check")
+    # Run synchronously so the worker doesn't proceed without recovery
+    result = startup_recovery_check()
+    logger.info("[worker_ready] recovery result: %s", result)
