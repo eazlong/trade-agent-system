@@ -14,6 +14,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from celery_app import app as celery_app
+from asgiref.sync import sync_to_async
+
 from .base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -109,8 +112,6 @@ class SubmitScheduledTaskTool(BaseTool):
             )
 
         try:
-            from asgiref.sync import sync_to_async
-
             from apps.agent.models import ScheduledOneTimeTask
             from apps.agent.tasks import execute_scheduled_agent_task
 
@@ -262,7 +263,6 @@ class SubmitRecurringTaskTool(BaseTool):
             effective_agent = "supervisor"
 
         try:
-            from asgiref.sync import sync_to_async
             from django_celery_beat.models import CrontabSchedule, PeriodicTask
 
             minute, hour, day_of_month, month_of_year, day_of_week = parts
@@ -366,10 +366,7 @@ class CancelScheduledTaskTool(BaseTool):
             return ToolResult(success=False, error="task_id_or_name 为必填项")
 
         try:
-            from celery_app import app as celery_app
-
             if task_type == "recurring":
-                from asgiref.sync import sync_to_async
                 from django_celery_beat.models import PeriodicTask
 
                 deleted, _ = await sync_to_async(
@@ -394,10 +391,37 @@ class CancelScheduledTaskTool(BaseTool):
                         error=f"未找到周期任务: {task_id_or_name}",
                     )
             else:
-                # 撤销一次性任务
-                celery_app.control.revoke(task_id_or_name, terminate=True)
+                # 撤销一次性任务（按 DB UUID）
+                from apps.agent.models import ScheduledOneTimeTask
+
+                # Fetch celery_task_id first, then CAS update
+                task_info = await sync_to_async(
+                    lambda: ScheduledOneTimeTask.objects.filter(
+                        id=task_id_or_name
+                    ).values("celery_task_id", "status").first()
+                )()
+
+                if not task_info or task_info["status"] not in ("pending", "running"):
+                    return ToolResult(
+                        success=False,
+                        error=f"无法取消任务: {task_id_or_name}（任务已处于终态）",
+                    )
+
+                celery_id = task_info.get("celery_task_id") or ""
+
+                # CAS: pending/running → revoked
+                affected = await sync_to_async(
+                    lambda: ScheduledOneTimeTask.objects.filter(
+                        id=task_id_or_name,
+                        status__in=["pending", "running"],
+                    ).update(status="revoked")
+                )()
+
+                if celery_id:
+                    celery_app.control.revoke(celery_id, terminate=True)
+
                 logger.info(
-                    "[CancelScheduledTaskTool] revoked task_id=%s",
+                    "[CancelScheduledTaskTool] revoked one-time task db_id=%s",
                     task_id_or_name,
                 )
                 return ToolResult(
@@ -432,7 +456,6 @@ class ListScheduledTasksTool(BaseTool):
 
     async def execute(self, **kwargs) -> ToolResult:
         try:
-            from asgiref.sync import sync_to_async
             from django_celery_beat.models import PeriodicTask
 
             tasks = await sync_to_async(list)(

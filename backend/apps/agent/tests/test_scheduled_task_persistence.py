@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+import pytest
 from asgiref.sync import sync_to_async
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from unittest.mock import MagicMock, patch
+
+os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
 
 
 class TestScheduledOneTimeTaskModel(TestCase):
@@ -93,7 +97,6 @@ class TestExecuteScheduledTaskStateMachine(TestCase):
             task_name="cas_race", agent_name="analyst",
             message="test", run_at=run_at,
         )
-        # Simulate concurrent CAS: only one should return 1
         result1 = _update_task_status(str(task.id), "running")
         result2 = _update_task_status(str(task.id), "running")
         self.assertEqual(result1 + result2, 1)
@@ -135,12 +138,9 @@ class TestSubmitScheduledTaskToolPersistence(TestCase):
     @patch("apps.agent.tasks.execute_scheduled_agent_task.apply_async")
     async def test_creates_db_record_and_pushes(self, mock_apply_async):
         """Should create ScheduledOneTimeTask and call apply_async with eta."""
-        from asgiref.sync import sync_to_async
-
         from apps.agent.tools.schedule_task import SubmitScheduledTaskTool
         from apps.agent.models import ScheduledOneTimeTask
         from datetime import datetime, timezone, timedelta
-        from unittest.mock import MagicMock
 
         mock_result = MagicMock()
         mock_result.id = "celery-test-id-123"
@@ -166,3 +166,97 @@ class TestSubmitScheduledTaskToolPersistence(TestCase):
         self.assertIn("scheduled_task_id", call_kwargs["kwargs"])
         self.assertEqual(call_kwargs["kwargs"]["scheduled_task_id"], db_uuid)
         self.assertEqual(result.data["celery_task_id"], "celery-test-id-123")
+
+
+class TestCancelScheduledTaskTool(TransactionTestCase):
+    """Test CancelScheduledTaskTool with real ORM (TransactionTestCase for async DB writes)."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_pending_task(self):
+        """Should revoke a pending task via CAS + Celery revoke."""
+        from apps.agent.models import ScheduledOneTimeTask
+        from apps.agent.tools import schedule_task as st_module
+        from apps.agent.tools.schedule_task import CancelScheduledTaskTool
+
+        task_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        # Create a real pending task in DB
+        run_at = datetime.now(timezone.utc)
+        ScheduledOneTimeTask.objects.create(
+            task_name="cancel_test",
+            agent_name="analyst",
+            message="test",
+            celery_task_id="fake-celery-id",
+            run_at=run_at,
+            status="pending",
+            id=task_uuid,
+        )
+
+        with patch.object(st_module, "celery_app") as mock_celery:
+            tool = CancelScheduledTaskTool()
+            result = await tool.execute(
+                task_id_or_name=task_uuid, task_type="scheduled"
+            )
+            mock_celery.control.revoke.assert_called_once_with(
+                "fake-celery-id", terminate=True
+            )
+
+        assert result.success
+        assert "CANCELLED" in result.data["status"]
+        assert result.data["task_id"] == task_uuid
+        # Verify DB state changed to revoked
+        task = ScheduledOneTimeTask.objects.get(id=task_uuid)
+        self.assertEqual(task.status, "revoked")
+
+    @pytest.mark.asyncio
+    async def test_cancel_already_completed(self):
+        """Should return 'cannot cancel' for terminal tasks."""
+        from apps.agent.models import ScheduledOneTimeTask
+        from apps.agent.tools.schedule_task import CancelScheduledTaskTool
+
+        task_uuid = "00000000-0000-0000-0000-000000000001"
+        run_at = datetime.now(timezone.utc)
+        ScheduledOneTimeTask.objects.create(
+            task_name="cancel_completed",
+            agent_name="analyst",
+            message="test",
+            run_at=run_at,
+            status="completed",
+            id=task_uuid,
+        )
+
+        tool = CancelScheduledTaskTool()
+        result = await tool.execute(
+            task_id_or_name=task_uuid, task_type="scheduled"
+        )
+
+        assert not result.success
+        assert "无法取消" in result.error
+
+    @pytest.mark.asyncio
+    async def test_cancel_task_without_celery_id(self):
+        """Should revoke even if celery_task_id is empty."""
+        from apps.agent.models import ScheduledOneTimeTask
+        from apps.agent.tools import schedule_task as st_module
+        from apps.agent.tools.schedule_task import CancelScheduledTaskTool
+
+        task_uuid = "00000000-0000-0000-0000-000000000002"
+        run_at = datetime.now(timezone.utc)
+        ScheduledOneTimeTask.objects.create(
+            task_name="cancel_no_celery",
+            agent_name="analyst",
+            message="test",
+            run_at=run_at,
+            status="pending",
+            id=task_uuid,
+        )
+
+        with patch.object(st_module, "celery_app") as mock_celery:
+            tool = CancelScheduledTaskTool()
+            result = await tool.execute(
+                task_id_or_name=task_uuid, task_type="scheduled"
+            )
+            # revoke should NOT be called since celery_task_id is empty
+            mock_celery.control.revoke.assert_not_called()
+
+        assert result.success
+        assert "CANCELLED" in result.data["status"]
