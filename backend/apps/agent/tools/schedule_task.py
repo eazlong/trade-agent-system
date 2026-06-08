@@ -109,36 +109,58 @@ class SubmitScheduledTaskTool(BaseTool):
             )
 
         try:
+            from asgiref.sync import sync_to_async
+
+            from apps.agent.models import ScheduledOneTimeTask
             from apps.agent.tasks import execute_scheduled_agent_task
 
             eta = self._parse_run_at(run_at)
 
-            task = execute_scheduled_agent_task.apply_async(
+            # Step 1: Create DB record (pending)
+            task_record = await sync_to_async(ScheduledOneTimeTask.objects.create)(
+                task_name=f"scheduled_{agent_name}",
+                agent_name=agent_name,
+                message=message,
+                user_id=user_id or "",
+                run_at=eta,
+                status="pending",
+            )
+            db_uuid = str(task_record.id)
+
+            # Step 2: Push to Celery with eta + scheduled_task_id
+            celery_result = execute_scheduled_agent_task.apply_async(
                 kwargs={
                     "agent_name": agent_name,
                     "message": message,
                     "user_id": user_id or "",
+                    "scheduled_task_id": db_uuid,
                 },
                 eta=eta,
             )
 
+            # Step 3: Backfill celery_task_id
+            task_record.celery_task_id = celery_result.id
+            await sync_to_async(task_record.save)(update_fields=["celery_task_id", "updated_at"])
+
             eta_str = eta.isoformat()
             logger.info(
-                "[SubmitScheduledTaskTool] scheduled task_id=%s agent=%s eta=%s",
-                task.id,
+                "[SubmitScheduledTaskTool] scheduled db_id=%s celery_id=%s agent=%s eta=%s",
+                db_uuid,
+                celery_result.id,
                 agent_name,
                 eta_str,
             )
             return ToolResult(
                 success=True,
                 data={
-                    "schedule_id": task.id,
-                    "task_id": task.id,
+                    "schedule_id": db_uuid,
+                    "task_id": db_uuid,
+                    "celery_task_id": celery_result.id,
                     "agent_name": agent_name,
                     "run_at": eta_str,
                     "status": "SCHEDULED",
                     "message": (
-                        f"定时任务已提交，schedule_id={task.id}，"
+                        f"定时任务已提交，schedule_id={db_uuid}，"
                         f"将在 {eta_str} 触发 Agent={agent_name}。"
                         f"使用 get_task_result 查询执行状态。"
                     ),
@@ -171,7 +193,7 @@ class SubmitRecurringTaskTool(BaseTool):
             "properties": {
                 "agent_name": {
                     "type": "string",
-                    "description": "目标 Agent 名称，如 analyst、quant、risk_advisor、coach、researcher",
+                    "description": "目标 Agent 名称。多 Agent 协作任务必须设为 'supervisor'",
                 },
                 "message": {
                     "type": "string",
@@ -189,6 +211,22 @@ class SubmitRecurringTaskTool(BaseTool):
                     "type": "string",
                     "description": "用户 ID（可选），用于关联用户上下文",
                 },
+                "steps": {
+                    "type": "array",
+                    "description": "多步骤 workflow 的步骤列表。每项包含 {agent: '<agent名>', message: '<步骤指令>'}。当提供 steps 时，agent_name 应设为 'supervisor'",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string", "description": "负责此步骤的 Agent 名称"},
+                            "message": {"type": "string", "description": "此步骤的执行指令"},
+                        },
+                        "required": ["agent", "message"],
+                    },
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "workflow 的一句话概括，如 '每小时研究高胜率策略并回测优化'",
+                },
             },
             "required": ["agent_name", "message", "cron_expression", "task_name"],
         }
@@ -200,6 +238,8 @@ class SubmitRecurringTaskTool(BaseTool):
         cron_expression: str = "",
         task_name: str = "",
         user_id: str = "",
+        steps: list = None,
+        summary: str = "",
         **kwargs,
     ) -> ToolResult:
         if not agent_name or not message or not cron_expression or not task_name:
@@ -214,6 +254,12 @@ class SubmitRecurringTaskTool(BaseTool):
                 success=False,
                 error=f"cron_expression 需要 5 个字段（分 时 日 月 周），当前: {cron_expression}",
             )
+
+        # Workflow tasks: force agent_name to supervisor so supervisor.handle()
+        # is called on execution, which detects and runs the workflow steps.
+        effective_agent = agent_name
+        if steps and len(steps) > 0:
+            effective_agent = "supervisor"
 
         try:
             from asgiref.sync import sync_to_async
@@ -231,38 +277,44 @@ class SubmitRecurringTaskTool(BaseTool):
 
             import json as _json
 
+            task_kwargs = {
+                "agent_name": effective_agent,
+                "message": message,
+                "user_id": user_id or "",
+                "task_name": task_name,
+            }
+            if steps:
+                task_kwargs["workflow_steps"] = steps
+                task_kwargs["workflow_summary"] = summary
+
             await sync_to_async(PeriodicTask.objects.update_or_create)(
                 name=task_name,
                 defaults={
                     "task": "apps.agent.tasks.execute_recurring_agent_task",
                     "crontab": schedule,
-                    "kwargs": _json.dumps(
-                        {
-                            "agent_name": agent_name,
-                            "message": message,
-                            "user_id": user_id or "",
-                            "task_name": task_name,
-                        }
-                    ),
+                    "kwargs": _json.dumps(task_kwargs),
                 },
             )
 
             logger.info(
-                "[SubmitRecurringTaskTool] registered task_name=%s agent=%s cron=%s",
+                "[SubmitRecurringTaskTool] registered task_name=%s agent=%s cron=%s workflow=%s",
                 task_name,
-                agent_name,
+                effective_agent,
                 cron_expression,
+                "yes(%d steps)" % len(steps) if steps else "no",
             )
             return ToolResult(
                 success=True,
                 data={
                     "task_name": task_name,
-                    "agent_name": agent_name,
+                    "agent_name": effective_agent,
                     "cron_expression": cron_expression,
                     "status": "ACTIVE",
+                    "workflow": bool(steps),
                     "message": (
                         f"周期定时任务已注册，task_name={task_name}，"
-                        f"Agent={agent_name}，cron={cron_expression}。"
+                        f"Agent={effective_agent}，cron={cron_expression}。"
+                        f"{'workflow 包含 %d 个步骤，' % len(steps) if steps else ''}"
                         f"任务已持久化到数据库，celery-beat 将按 crontab 定时周期触发。"
                     ),
                 },

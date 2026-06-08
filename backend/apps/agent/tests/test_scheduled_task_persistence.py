@@ -6,7 +6,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from asgiref.sync import sync_to_async
 from django.test import TestCase
+from unittest.mock import MagicMock, patch
 
 
 class TestScheduledOneTimeTaskModel(TestCase):
@@ -125,3 +127,42 @@ class TestExecuteScheduledTaskStateMachine(TestCase):
         task.refresh_from_db()
         self.assertEqual(task.status, "failed")
         self.assertIn("agent failed", task.error)
+
+
+class TestSubmitScheduledTaskToolPersistence(TestCase):
+    """Test SubmitScheduledTaskTool creates DB record and pushes to Celery."""
+
+    @patch("apps.agent.tasks.execute_scheduled_agent_task.apply_async")
+    async def test_creates_db_record_and_pushes(self, mock_apply_async):
+        """Should create ScheduledOneTimeTask and call apply_async with eta."""
+        from asgiref.sync import sync_to_async
+
+        from apps.agent.tools.schedule_task import SubmitScheduledTaskTool
+        from apps.agent.models import ScheduledOneTimeTask
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import MagicMock
+
+        mock_result = MagicMock()
+        mock_result.id = "celery-test-id-123"
+        mock_apply_async.return_value = mock_result
+
+        tool = SubmitScheduledTaskTool()
+        run_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        result = await tool.execute(
+            agent_name="analyst",
+            message="Analyze BTC",
+            run_at=run_at,
+            user_id="user-456",
+        )
+
+        self.assertTrue(result.success)
+        db_uuid = result.data["schedule_id"]
+        task = await sync_to_async(ScheduledOneTimeTask.objects.get)(id=db_uuid)
+        self.assertEqual(task.status, "pending")
+        self.assertEqual(task.agent_name, "analyst")
+        self.assertEqual(task.celery_task_id, "celery-test-id-123")
+        mock_apply_async.assert_called_once()
+        call_kwargs = mock_apply_async.call_args[1]
+        self.assertIn("scheduled_task_id", call_kwargs["kwargs"])
+        self.assertEqual(call_kwargs["kwargs"]["scheduled_task_id"], db_uuid)
+        self.assertEqual(result.data["celery_task_id"], "celery-test-id-123")
