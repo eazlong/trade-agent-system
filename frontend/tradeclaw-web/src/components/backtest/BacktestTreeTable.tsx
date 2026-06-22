@@ -82,6 +82,15 @@ const renderChildRow = (r: BacktestResult) => (
               ))}
             </div>
           </div>
+          <div className="flex items-start">
+            <Link
+              href={`/backtest/${r.id}`}
+              className="text-green hover:underline cursor-pointer text-[11px] whitespace-nowrap"
+              onClick={(e) => e.stopPropagation()}
+            >
+              详情 →
+            </Link>
+          </div>
         </div>
       </div>
     </td>
