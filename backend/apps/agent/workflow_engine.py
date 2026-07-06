@@ -148,6 +148,7 @@ class WorkflowEngine:
         workflow_plan: dict,
         message: AgentMessage,
         on_tool_result=None,
+        on_workflow_complete=None,
     ) -> AgentResult:
         """Execute a multi-step workflow with conditions, retries, and timeouts.
 
@@ -155,6 +156,8 @@ class WorkflowEngine:
             workflow_plan: {"summary": str, "steps": [WorkflowStep], "variables": dict}
             message: Original AgentMessage (for task_id, user_id)
             on_tool_result: Optional callback for tool results
+            on_workflow_complete: Optional callback(ctx, step_results, message, status, error)
+                                  for persistence/notification. Called on completion, failure, or abort.
 
         Returns:
             AgentResult with aggregated step results
@@ -197,7 +200,8 @@ class WorkflowEngine:
                 steps, ctx, message, on_tool_result, step_results,
             )
             if failed_result is not None:
-                await self._record_workflow(ctx, step_results, message, status="failed")
+                if on_workflow_complete:
+                    await on_workflow_complete(ctx, step_results, message, "failed", "")
                 return failed_result
 
             result = self._workflow_completed(ctx, step_results, steps, message)
@@ -206,7 +210,8 @@ class WorkflowEngine:
                 "info", ctx["workflow_id"], "COMPLETED",
                 steps=len(steps), elapsed=elapsed,
             )
-            await self._record_workflow(ctx, step_results, message, status="completed")
+            if on_workflow_complete:
+                await on_workflow_complete(ctx, step_results, message, "completed", "")
             return result
 
         except Exception as e:
@@ -222,9 +227,8 @@ class WorkflowEngine:
                 error=f"工作流异常: {str(e)}",
                 data={"workflow_id": ctx["workflow_id"], "completed_steps": step_results},
             )
-            await self._record_workflow(
-                ctx, step_results, message, status="aborted", error=str(e),
-            )
+            if on_workflow_complete:
+                await on_workflow_complete(ctx, step_results, message, "aborted", str(e))
             return result
         finally:
             if message.user_id:
@@ -740,123 +744,6 @@ class WorkflowEngine:
             error=f"工作流步骤 {failed_idx + 1} ({agent_name}) 失败: {result.error}",
             data={"workflow_id": ctx["workflow_id"], "completed_steps": step_results},
         )
-
-    async def _record_workflow(
-        self, ctx: WorkflowContext, step_results: list, message: AgentMessage,
-        status: str = "completed", error: str = "",
-    ) -> None:
-        """Persist workflow execution to database and notify the user."""
-        try:
-            from django.db import close_old_connections
-            close_old_connections()
-
-            from asgiref.sync import sync_to_async
-
-            from apps.notify.models import Notification
-
-            elapsed = (
-                ctx["metadata"].get("completed_at", time.time())
-                - ctx["metadata"]["created_at"]
-            )
-            completed_steps = ctx["metadata"].get("completed_steps", 0)
-            total_steps = ctx["metadata"].get("total_steps", len(step_results))
-
-            # Resolve channel user_id to Django User UUID
-            user_id = None
-            if message.user_id:
-                from django.contrib.auth import get_user_model
-                import uuid as _uuid
-
-                User = get_user_model()
-                try:
-                    if message.user_id.isdigit():
-                        try:
-                            user = await User.objects.aget(
-                                telegram_chat_id=int(message.user_id)
-                            )
-                        except User.DoesNotExist:
-                            user = await User.objects.aget(pk=int(message.user_id))
-                    elif _looks_like_uuid(message.user_id):
-                        user = await User.objects.aget(
-                            pk=_uuid.UUID(message.user_id)
-                        )
-                    elif message.user_id.startswith("ou_"):
-                        user = await User.objects.aget(
-                            feishu_open_id=message.user_id
-                        )
-                    else:
-                        user = await User.objects.aget(
-                            telegram_id=message.user_id
-                        )
-                    user_id = user.id
-                except (
-                    User.DoesNotExist, User.MultipleObjectsReturned,
-                    AttributeError, ValueError,
-                ):
-                    user = None
-                    user_id = None
-
-            # Fallback: system_scheduler user for scheduled tasks without user context
-            if not user_id:
-                try:
-                    from django.contrib.auth import get_user_model
-
-                    User = get_user_model()
-                    scheduler = await User.objects.aget(username="system_scheduler")
-                    user_id = scheduler.id
-                except Exception:
-                    pass  # leave user_id as None
-
-            @sync_to_async
-            def _create_history():
-                from django.db import close_old_connections
-                close_old_connections()
-                from .models import WorkflowHistory
-                return WorkflowHistory.objects.create(
-                    workflow_id=ctx["workflow_id"],
-                    user_id=user_id,
-                    summary=ctx.get("summary", ""),
-                    status=status,
-                    total_steps=total_steps,
-                    completed_steps=completed_steps,
-                    step_results=step_results,
-                    error=error,
-                    elapsed_seconds=round(elapsed, 2),
-                )
-
-            @sync_to_async
-            def _create_notification(msg: str):
-                if user_id:
-                    from django.db import close_old_connections
-                    close_old_connections()
-                    return Notification.objects.create(
-                        user_id=user_id,
-                        channel="web",
-                        message=msg,
-                    )
-
-            await _create_history()
-
-            status_label = (
-                "工作流完成" if status == "completed"
-                else "工作流失败" if status == "failed"
-                else "工作流中止"
-            )
-            step_summary = f"{completed_steps}/{total_steps} 步"
-            elapsed_str = f"{elapsed:.0f}s"
-            notif_msg = (
-                f"{status_label}: {ctx.get('summary', '')}\n"
-                f"步骤: {step_summary} · 耗时: {elapsed_str}"
-            )
-            if error and status != "completed":
-                notif_msg += f"\n错误: {error[:200]}"
-
-            await _create_notification(notif_msg)
-
-        except Exception as e:
-            logger.warning(
-                "[%s] Failed to record workflow history: %s", self._agent_name, e,
-            )
 
     def _workflow_completed(self, ctx, step_results, steps, message):
         """Handle workflow completion."""

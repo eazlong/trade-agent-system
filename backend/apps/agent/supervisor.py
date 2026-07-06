@@ -21,8 +21,15 @@ from .workflow_engine import (  # noqa: F401
     WorkflowContext,
     WorkflowEngine,
     WorkflowStep,
+    _looks_like_uuid,
 )
 from .memory_injector import MemoryInjector  # noqa: F401
+from .intent_router import (  # noqa: F401
+    IntentRouter,
+    register_intent,
+    register_frame_intent,
+    register_fallback_rule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,153 +58,6 @@ COMMAND_ALIASES = {
 AVAILABLE_COMMANDS = "\n".join(
     f"  {cmd}" for cmd in sorted(SLASH_COMMANDS.keys())
 )
-
-
-# ------------------------------------------------------------------ #
-#  动态意图注册中心                                                     #
-# ------------------------------------------------------------------ #
-
-
-class IntentRouter:
-    """动态意图路由注册表
-
-    支持运行时注册意图与Agent的映射、框架操作意图、降级规则。
-    SubAgent 可通过装饰器或调用注册方法动态添加意图。
-    """
-
-    _instance: Optional["IntentRouter"] = None
-
-    def __init__(self):
-        # 意图 → Agent 名称
-        self._intent_to_agent: dict[str, str] = {}
-        # Agent 名称 → 意图（反向映射）
-        self._agent_to_intent: dict[str, str] = {}
-        # 框架意图 → (frame_type, action)
-        self._frame_intents: dict[str, tuple[str, str]] = {}
-        # 降级规则列表 [(regex_pattern, intent), ...]
-        self._fallback_rules: list[tuple[str, str]] = []
-
-    @classmethod
-    def get_instance(cls) -> "IntentRouter":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    @classmethod
-    def reset(cls) -> None:
-        """重置单例（主要用于测试）"""
-        cls._instance = None
-
-    # ---- 意图注册 ----
-
-    def register_intent(self, intent: str, agent_name: str) -> None:
-        """注册单个意图到Agent的映射"""
-        self._intent_to_agent[intent] = agent_name
-        self._agent_to_intent[agent_name] = intent
-
-    def register_intents(self, intent_map: dict[str, str]) -> None:
-        """批量注册意图映射 {intent: agent_name}"""
-        for intent, agent in intent_map.items():
-            self.register_intent(intent, agent)
-
-    def unregister_intent(self, intent: str) -> None:
-        """移除意图映射"""
-        agent = self._intent_to_agent.pop(intent, None)
-        if agent and self._agent_to_intent.get(agent) == intent:
-            del self._agent_to_intent[agent]
-
-    # ---- 框架意图注册 ----
-
-    def register_frame_intent(self, intent: str, frame_type: str, action: str) -> None:
-        """注册框架操作意图（如 start_trading, stop_monitor）"""
-        self._frame_intents[intent] = (frame_type, action)
-
-    def unregister_frame_intent(self, intent: str) -> None:
-        self._frame_intents.pop(intent, None)
-
-    # ---- 降级规则注册 ----
-
-    def register_fallback_rule(self, pattern: str, intent: str) -> None:
-        """注册降级规则（正则匹配 → 意图）"""
-        self._fallback_rules.append((pattern, intent))
-
-    def register_fallback_rules(self, rules: list[tuple[str, str]]) -> None:
-        """批量注册降级规则"""
-        for pattern, intent in rules:
-            self.register_fallback_rule(pattern, intent)
-
-    # ---- 查询 ----
-
-    def get_agent_for_intent(self, intent: str) -> str | None:
-        return self._intent_to_agent.get(intent)
-
-    def get_intent_for_agent(self, agent_name: str) -> str | None:
-        return self._agent_to_intent.get(agent_name)
-
-    def get_frame_intent(self, intent: str) -> tuple[str, str] | None:
-        return self._frame_intents.get(intent)
-
-    def is_frame_intent(self, intent: str) -> bool:
-        return intent in self._frame_intents
-
-    def all_intents(self) -> list[str]:
-        return list(self._intent_to_agent.keys())
-
-    def all_frame_intents(self) -> list[str]:
-        return list(self._frame_intents.keys())
-
-    def match_fallback(self, text: str) -> str | None:
-        for pattern, intent in self._fallback_rules:
-            if re.search(pattern, text):
-                return intent
-        return None
-
-    def valid_intents_for_prompt(self) -> list[str]:
-        """返回LLM Prompt中可用的意图列表"""
-        return self.all_intents() + self.all_frame_intents()
-
-
-def register_intent(intent: str, agent_name: str):
-    """装饰器：在函数或类上注册意图映射
-
-    用法:
-        @register_intent('analyze_market', 'analyst')
-        class AnalystAgent(_LLMAgent): ...
-
-        @register_intent('custom_intent', 'my_agent')
-        def some_setup(): ...
-    """
-
-    def decorator(target):
-        IntentRouter.get_instance().register_intent(intent, agent_name)
-        return target
-
-    return decorator
-
-
-def register_frame_intent(intent: str, frame_type: str, action: str):
-    """装饰器：注册框架操作意图"""
-
-    def decorator(target):
-        IntentRouter.get_instance().register_frame_intent(intent, frame_type, action)
-        return target
-
-    return decorator
-
-
-def register_fallback_rule(pattern: str, intent: str):
-    """装饰器：注册降级规则
-
-    用法:
-        @register_fallback_rule(r'(分析|行情).*(BTC|ETH)', 'analyze_market')
-        class AnalystAgent(_LLMAgent): ...
-    """
-
-    def decorator(target):
-        IntentRouter.get_instance().register_fallback_rule(pattern, intent)
-        return target
-
-    return decorator
 
 
 # ------------------------------------------------------------------ #
@@ -766,8 +626,127 @@ class SupervisorAgent(BaseAgent):
         continue to work.
         """
         return await self._workflow_engine.execute_workflow(
-            workflow_plan, message, on_tool_result=on_tool_result,
+            workflow_plan, message,
+            on_tool_result=on_tool_result,
+            on_workflow_complete=self._record_workflow,
         )
+
+    async def _record_workflow(
+        self, ctx: WorkflowContext, step_results: list, message: AgentMessage,
+        status: str = "completed", error: str = "",
+    ) -> None:
+        """Persist workflow execution to database and notify the user."""
+        try:
+            from django.db import close_old_connections
+            close_old_connections()
+
+            from asgiref.sync import sync_to_async
+
+            from apps.notify.models import Notification
+
+            elapsed = (
+                ctx["metadata"].get("completed_at", time.time())
+                - ctx["metadata"]["created_at"]
+            )
+            completed_steps = ctx["metadata"].get("completed_steps", 0)
+            total_steps = ctx["metadata"].get("total_steps", len(step_results))
+
+            # Resolve channel user_id to Django User UUID
+            user_id = None
+            if message.user_id:
+                from django.contrib.auth import get_user_model
+                import uuid as _uuid
+
+                User = get_user_model()
+                try:
+                    if message.user_id.isdigit():
+                        try:
+                            user = await User.objects.aget(
+                                telegram_chat_id=int(message.user_id)
+                            )
+                        except User.DoesNotExist:
+                            user = await User.objects.aget(pk=int(message.user_id))
+                    elif _looks_like_uuid(message.user_id):
+                        user = await User.objects.aget(
+                            pk=_uuid.UUID(message.user_id)
+                        )
+                    elif message.user_id.startswith("ou_"):
+                        user = await User.objects.aget(
+                            feishu_open_id=message.user_id
+                        )
+                    else:
+                        user = await User.objects.aget(
+                            telegram_id=message.user_id
+                        )
+                    user_id = user.id
+                except (
+                    User.DoesNotExist, User.MultipleObjectsReturned,
+                    AttributeError, ValueError,
+                ):
+                    user = None
+                    user_id = None
+
+            # Fallback: system_scheduler user for scheduled tasks without user context
+            if not user_id:
+                try:
+                    from django.contrib.auth import get_user_model
+
+                    User = get_user_model()
+                    scheduler = await User.objects.aget(username="system_scheduler")
+                    user_id = scheduler.id
+                except Exception:
+                    pass  # leave user_id as None
+
+            @sync_to_async
+            def _create_history():
+                from django.db import close_old_connections
+                close_old_connections()
+                from .models import WorkflowHistory
+                return WorkflowHistory.objects.create(
+                    workflow_id=ctx["workflow_id"],
+                    user_id=user_id,
+                    summary=ctx.get("summary", ""),
+                    status=status,
+                    total_steps=total_steps,
+                    completed_steps=completed_steps,
+                    step_results=step_results,
+                    error=error,
+                    elapsed_seconds=round(elapsed, 2),
+                )
+
+            @sync_to_async
+            def _create_notification(msg: str):
+                if user_id:
+                    from django.db import close_old_connections
+                    close_old_connections()
+                    return Notification.objects.create(
+                        user_id=user_id,
+                        channel="web",
+                        message=msg,
+                    )
+
+            await _create_history()
+
+            status_label = (
+                "工作流完成" if status == "completed"
+                else "工作流失败" if status == "failed"
+                else "工作流中止"
+            )
+            step_summary = f"{completed_steps}/{total_steps} 步"
+            elapsed_str = f"{elapsed:.0f}s"
+            notif_msg = (
+                f"{status_label}: {ctx.get('summary', '')}\n"
+                f"步骤: {step_summary} · 耗时: {elapsed_str}"
+            )
+            if error and status != "completed":
+                notif_msg += f"\n错误: {error[:200]}"
+
+            await _create_notification(notif_msg)
+
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to record workflow history: %s", self.name, e,
+            )
 
     # ------------------------------------------------------------------ #
     #  Session helpers                                                     #
