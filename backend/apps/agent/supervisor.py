@@ -31,6 +31,7 @@ from .intent_router import (  # noqa: F401
     register_fallback_rule,
 )
 from .intent_parser import IntentParser  # noqa: F401
+from .user_resolver import resolve_user_id, get_scheduler_user_id  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -662,50 +663,11 @@ class SupervisorAgent(BaseAgent):
             total_steps = ctx["metadata"].get("total_steps", len(step_results))
 
             # Resolve channel user_id to Django User UUID
-            user_id = None
-            if message.user_id:
-                from django.contrib.auth import get_user_model
-                import uuid as _uuid
-
-                User = get_user_model()
-                try:
-                    if message.user_id.isdigit():
-                        try:
-                            user = await User.objects.aget(
-                                telegram_chat_id=int(message.user_id)
-                            )
-                        except User.DoesNotExist:
-                            user = await User.objects.aget(pk=int(message.user_id))
-                    elif _looks_like_uuid(message.user_id):
-                        user = await User.objects.aget(
-                            pk=_uuid.UUID(message.user_id)
-                        )
-                    elif message.user_id.startswith("ou_"):
-                        user = await User.objects.aget(
-                            feishu_open_id=message.user_id
-                        )
-                    else:
-                        user = await User.objects.aget(
-                            telegram_id=message.user_id
-                        )
-                    user_id = user.id
-                except (
-                    User.DoesNotExist, User.MultipleObjectsReturned,
-                    AttributeError, ValueError,
-                ):
-                    user = None
-                    user_id = None
+            user_id = await resolve_user_id(message.user_id)
 
             # Fallback: system_scheduler user for scheduled tasks without user context
             if not user_id:
-                try:
-                    from django.contrib.auth import get_user_model
-
-                    User = get_user_model()
-                    scheduler = await User.objects.aget(username="system_scheduler")
-                    user_id = scheduler.id
-                except Exception:
-                    pass  # leave user_id as None
+                user_id = await get_scheduler_user_id()
 
             @sync_to_async
             def _create_history():
