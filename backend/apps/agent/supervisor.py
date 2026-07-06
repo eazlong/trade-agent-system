@@ -30,6 +30,7 @@ from .intent_router import (  # noqa: F401
     register_frame_intent,
     register_fallback_rule,
 )
+from .intent_parser import IntentParser  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,15 @@ class SupervisorAgent(BaseAgent):
             self._agent_tools = meta["tools"]
 
         self._system_prompt = PromptLoader.load("supervisor")
+
+        # Intent parser delegates LLM-based intent resolution
+        self._intent_parser = IntentParser(
+            llm_client=self._llm,
+            router=self._router,
+            system_prompt=self._system_prompt,
+            agent_tools=getattr(self, "_agent_tools", []),
+            get_skills_summary=self._get_skills_summary,
+        )
 
         # Workflow engine is bound to this supervisor's route_to_agent
         # callable so the engine remains testable in isolation.
@@ -807,135 +817,12 @@ class SupervisorAgent(BaseAgent):
     async def _parse_intent(
         self, text: str, context: list | None = None, exclude_agents: list | None = None
     ) -> str | dict:
-        """
-        调用LLM解析意图，基于 Agent 概述动态识别。
-
-        Returns:
-            str: Agent 名称（如 'quant'）或框架意图（如 'start_trading'）
-            dict: {'_free_chat': True, 'response': '...'} 未识别意图时 LLM 直接返回回复
-        """
-        if not text:
-            return "unknown"
-
-        # 构建 Agent 概述列表（排除已尝试的）
-        agents = PromptLoader.list_agents()
-        if exclude_agents:
-            agents = [a for a in agents if a.get("name") not in exclude_agents]
-
-        agent_descriptions = "\n".join(
-            f"- {a['name']}: {a.get('description', '').replace(chr(10), chr(10) + '  ')}"
-            for a in agents
-            if a.get("name")
-        )
-
-        # 框架意图列表（仍然需要检查）
-        frame_intents = self._router.all_frame_intents()
-        frame_block = ""
-        if frame_intents:
-            frame_block = (
-                f"Framework intents (system actions): {json.dumps(frame_intents)}\n"
-            )
-
-        context_block = ""
-        if context:
-            context_block = (
-                f"Recent routing history (for reference): {json.dumps(context)}\n\n"
-            )
-
-        exclude_block = ""
-        if exclude_agents:
-            exclude_block = (
-                f"Exclude these agents (already tried): {exclude_agents}\n\n"
-            )
-
-        skills_summary = self._get_skills_summary()
-        skills_block = (
-            f"Available agent skills:\n{skills_summary}\n\n" if skills_summary else ""
-        )
-
-        # Supervisor 自身能力（工具声明）
-        supervisor_tools = (
-            self._agent_tools
-            if hasattr(self, "_agent_tools") and self._agent_tools
-            else []
-        )
-        supervisor_block = ""
-        if supervisor_tools:
-            supervisor_block = (
-                f"Your own tools (handle these yourself): {json.dumps(supervisor_tools)}\n"
-                f'If the user request matches these tools, reply: {{"agent": "supervisor"}}\n\n'
-            )
-
-        user_prompt = (
-            f"{context_block}"
-            f"{exclude_block}"
-            f"{skills_block}"
-            f"{frame_block}"
-            f"{supervisor_block}"
-            # f"{workflow_block}"
-            f"Available agents:\n{agent_descriptions}\n\n"
-            f"根据以上信息与流程定义，解析消息: \" {text} \" 中包含的用户意图 \n\n"
-            "if the message is a general inquiry or doesn't clearly match any agent, reply with:\n"
-            '{"_free_chat": true, "response": "your response to user"}\n'
-        )
-
-        logger.debug("Supervisor system prompt: %s", self._system_prompt)
-        logger.debug("Supervisor intent parsing prompt: %s", user_prompt)
-        response = await self._llm.chat(
-            system=self._system_prompt,
-            user=user_prompt,
-            max_tokens=256,
-            temperature=0.1,
-        )
-
-        if is_fallback(response):
-            fallback_text = self._rule_based_intent(text)
-            if fallback_text:
-                return fallback_text
-            return {"_free_chat": True, "response": None}
-
-        try:
-            text = response.strip()
-            fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-            if fence_match:
-                text = fence_match.group(1).strip()
-            else:
-                obj_match = re.search(r"\{[\s\S]*\}", text)
-                if obj_match:
-                    text = obj_match.group(0).strip()
-            data = json.loads(text)
-            logger.info(f"Parsed intent data: {data}")
-
-            # 自由对话：LLM 直接返回回复内容
-            if data.get("_free_chat"):
-                return {"_free_chat": True, "response": data.get("response", "")}
-
-            # 工作流计划：多 Agent 顺序任务（支持 _workflow_plan 包装和裸 steps 两种格式）
-            if data.get("_workflow_plan"):
-                return data
-            if isinstance(data.get("steps"), list) and data["steps"]:
-                return {"_workflow_plan": data}
-
-            # 框架意图
-            if data.get("intent") and data["intent"] in frame_intents:
-                return data["intent"]
-
-            # Agent 路由：返回 agent name
-            agent_name = data.get("agent")
-            if agent_name:
-                return agent_name
-
-            return "unknown"
-        except Exception:
-            logger.warning(f"Intent parse failed, raw: {response[:200]}")
-            fallback_text = self._rule_based_intent(text)
-            if fallback_text:
-                return fallback_text
-            return {"_free_chat": True, "response": None}
+        """Delegate to IntentParser."""
+        return await self._intent_parser.parse(text, context, exclude_agents)
 
     def _rule_based_intent(self, text: str) -> str | None:
-        """规则引擎降级"""
-        return self._router.match_fallback(text)
+        """Delegate to IntentParser."""
+        return self._intent_parser._rule_based_intent(text)
 
     # ------------------------------------------------------------------ #
     #  Frame / self / free-chat execution                                  #
