@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .base import BaseAgent, AgentMessage, AgentResult
 from .llm_client import LLMClient, is_fallback
@@ -13,7 +15,42 @@ from .prompt_loader import PromptLoader
 from .frame_manager import FrameManager
 from .session_manager import get_session_manager, SessionState
 
+# Backward-compatible re-exports (used by tests).
+from .workflow_engine import (  # noqa: F401
+    PAUSE_TTL,
+    WorkflowContext,
+    WorkflowEngine,
+    WorkflowStep,
+)
+from .memory_injector import MemoryInjector  # noqa: F401
+
 logger = logging.getLogger(__name__)
+
+MAX_REROUTE = 2
+# Kept as a module-level alias for backward compatibility (used by tests
+# and the intent registration block below).
+PAUSE_TTL = PAUSE_TTL
+
+# ------------------------------------------------------------------ #
+#  斜杠命令系统                                                         #
+# ------------------------------------------------------------------ #
+
+# 命令名 → 处理方法名
+SLASH_COMMANDS = {
+    "/new": "_handle_new_session",
+    "/cancel": "_handle_cancel",
+}
+
+# 中文别名 → 标准命令
+COMMAND_ALIASES = {
+    "新建会话": "/new",
+    "取消": "/cancel",
+}
+
+# 可用命令列表（用于错误提示）
+AVAILABLE_COMMANDS = "\n".join(
+    f"  {cmd}" for cmd in sorted(SLASH_COMMANDS.keys())
+)
 
 
 # ------------------------------------------------------------------ #
@@ -192,10 +229,6 @@ _router.register_fallback_rules(
 )
 
 
-MAX_REROUTE = 2
-PAUSE_TTL = 300  # 5 minutes
-
-
 class SupervisorAgent(BaseAgent):
     """主管Agent：LLM解析用户意图、路由子Agent、管理框架生命周期"""
 
@@ -231,6 +264,14 @@ class SupervisorAgent(BaseAgent):
 
         self._system_prompt = PromptLoader.load("supervisor")
 
+        # Workflow engine is bound to this supervisor's route_to_agent
+        # callable so the engine remains testable in isolation.
+        self._workflow_engine = WorkflowEngine(
+            llm_client=self._llm,
+            route_to_agent=self._route_to_agent,
+            agent_name=self.name,
+        )
+
     def _build_system_prompt_with_skills(self) -> str:
         """动态构建 system prompt，注入 always 技能内容。"""
         return self._build_skills_section(self._system_prompt)
@@ -241,7 +282,29 @@ class SupervisorAgent(BaseAgent):
             cls._instance = cls()
         return cls._instance
 
+    # ------------------------------------------------------------------ #
+    #  Entry point                                                         #
+    # ------------------------------------------------------------------ #
+
     async def handle(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
+        text = message.payload.get("text", "").strip()
+
+        # ========== 斜杠命令分发 ==========
+        # 中文别名 → 标准命令
+        normalized = COMMAND_ALIASES.get(text, text)
+        if normalized.startswith("/"):
+            cmd = normalized.split()[0].lower()
+            handler_name = SLASH_COMMANDS.get(cmd)
+            if handler_name:
+                handler = getattr(self, handler_name)
+                return await handler(message)
+            # 未识别的斜杠命令
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                error=f"未知命令: {cmd}\n可用命令:\n{AVAILABLE_COMMANDS}",
+            )
+
         session_mgr = get_session_manager()
         session_ctx = await session_mgr.get_session_context(message.user_id)
 
@@ -259,8 +322,75 @@ class SupervisorAgent(BaseAgent):
                     message, session_ctx, session_mgr, on_tool_result
                 )
 
+            if state == SessionState.WORKFLOW_RUNNING.value:
+                return await self._handle_workflow_running(message, session_ctx, session_mgr)
+
         # ========== 正常路由流程 ==========
         return await self._normal_route(message, on_tool_result)
+
+    # ------------------------------------------------------------------ #
+    #  斜杠命令 handlers                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def _handle_new_session(self, message: AgentMessage) -> AgentResult:
+        """新建会话：清除 SessionState + conv_history"""
+        session_mgr = get_session_manager()
+
+        # 检查工作流状态：进行中则拒绝
+        ctx = await session_mgr.get_session_context(message.user_id)
+        if ctx and ctx.get("state") == SessionState.WORKFLOW_RUNNING.value:
+            return AgentResult(
+                task_id=message.task_id,
+                success=False,
+                error="请先发送 /cancel 停止当前工作流，再新建会话。",
+            )
+
+        # 清除会话状态
+        await session_mgr.clear_session_context(message.user_id)
+
+        # 清除对话历史
+        mi = MemoryInjector(message.user_id)
+        await mi.clear_conv_history()
+
+        logger.info("[supervisor] new session created for user=%s", message.user_id)
+        return AgentResult(
+            task_id=message.task_id,
+            success=True,
+            data="✅ 已新建会话，对话历史已清除。",
+        )
+
+    async def _handle_cancel(self, message: AgentMessage) -> AgentResult:
+        """取消当前工作流"""
+        session_mgr = get_session_manager()
+        ctx = await session_mgr.get_session_context(message.user_id)
+
+        # 没有工作流运行
+        if not ctx or ctx.get("state") != SessionState.WORKFLOW_RUNNING.value:
+            return AgentResult(
+                task_id=message.task_id,
+                success=True,
+                data="没有正在执行的工作流。",
+            )
+
+        # 标记任务为 cancelled
+        wf_task_id = ctx.get("task_id")
+        if wf_task_id:
+            from apps.agent.task_tracker import TaskTracker
+            TaskTracker.cancel(wf_task_id)
+
+        # 清除会话状态
+        await session_mgr.clear_session_context(message.user_id)
+
+        logger.info("[supervisor] workflow cancelled for user=%s task=%s", message.user_id, wf_task_id)
+        return AgentResult(
+            task_id=message.task_id,
+            success=True,
+            data="✅ 工作流已取消。",
+        )
+
+    # ------------------------------------------------------------------ #
+    #  会话状态 handlers                                                   #
+    # ------------------------------------------------------------------ #
 
     async def _handle_paused_session(
         self, message: AgentMessage, ctx: dict, session_mgr,
@@ -286,56 +416,6 @@ class SupervisorAgent(BaseAgent):
         # 继续处理当前意图，保持暂停状态
         return await self._normal_route(message, on_tool_result=on_tool_result)
 
-    async def _judge_resume(self, message: AgentMessage, paused_ctx: dict) -> bool:
-        """让 Supervisor 判断当前消息是否属于暂停中的对话的延续"""
-        text = message.payload.get("text", "")
-        pause_context = paused_ctx.get("pause_context", "")
-
-        prompt = (
-            f"用户有一个暂停中的对话（正在和 {paused_ctx['active_agent']} 交互）：\n"
-            f"暂停上下文：{pause_context}\n\n"
-            f"用户当前消息：{text}\n\n"
-            f"判断这条消息是否属于暂停中的对话的延续。只回答 true 或 false。"
-        )
-        resp = await self._llm.chat(
-            system="你是一个意图判断助手，只回答 true 或 false。",
-            user=prompt,
-            max_tokens=10,
-            temperature=0.0,
-        )
-        return resp.strip().lower().startswith("true")
-
-    async def _archive_paused_session(
-        self, user_id: str, ctx: dict, session_mgr
-    ) -> None:
-        """超时后总结暂停会话的记忆，存入 L3，关闭会话"""
-        agent_name = ctx.get("active_agent", "")
-        pause_context = ctx.get("pause_context", "")
-
-        if not pause_context:
-            await session_mgr.clear_session_context(user_id)
-            return
-
-        # LLM 做一句话总结
-        summary = await self._llm.chat(
-            system="总结以下对话上下文为一句话。",
-            user=pause_context,
-            max_tokens=100,
-            temperature=0.1,
-        )
-
-        # 存入 L3 长期记忆
-        from apps.memory.manager import MemoryManager
-
-        mm = MemoryManager(agent_type="supervisor", user_id=user_id)
-        await mm.write_l3(
-            content=f"[历史对话摘要-{agent_name}] {summary}",
-            memory_type="conversation_summary",
-        )
-
-        await session_mgr.clear_session_context(user_id)
-        logger.info("[%s] Paused session archived for user %s", self.name, user_id)
-
     async def _handle_multi_turn(
         self, message: AgentMessage, ctx: dict, session_mgr,
         on_tool_result=None,
@@ -346,35 +426,31 @@ class SupervisorAgent(BaseAgent):
             await session_mgr.clear_session_context(message.user_id)
             return await self._normal_route(message, on_tool_result=on_tool_result)
 
-        # 初始化 MemoryManager
-        mm = None
-        if message.user_id:
-            from apps.memory.manager import MemoryManager
-
-            mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
+        # 初始化 MemoryInjector
+        mi = MemoryInjector(message.user_id)
 
         result = await self._route_to_agent(agent_name, message, on_tool_result=on_tool_result)
 
-        # 写入统一对话历史
-        if mm and result.success and not result.need_reroute:
-            user_text = message.payload.get("text", "")[:500]
-            agent_text = str(result.data)[:500] if result.data else ""
-            conversation_history = await mm.get_conv_history(max_turns=5)
-            updated = conversation_history[-4:] + [
-                {
-                    "role": "user",
-                    "agent": agent_name,
-                    "text": user_text,
-                    "ts": int(time.time()),
-                },
-                {
-                    "role": "agent",
-                    "agent": agent_name,
-                    "text": agent_text,
-                    "ts": int(time.time()),
-                },
-            ]
-            await mm.save_conv_history(updated[-5:])
+        # 写入统一对话历史（原子追加，防止并发覆盖）
+        if mi.available and result.success and not result.need_reroute:
+            user_text = message.payload.get("text", "")
+            agent_text = str(result.data) if result.data else ""
+            await mi.append_conv_history(
+                [
+                    {
+                        "role": "user",
+                        "agent": agent_name,
+                        "text": user_text,
+                        "ts": int(time.time()),
+                    },
+                    {
+                        "role": "agent",
+                        "agent": agent_name,
+                        "text": agent_text,
+                        "ts": int(time.time()),
+                    },
+                ]
+            )
 
         # SubAgent 拒收
         if result.need_reroute:
@@ -398,7 +474,15 @@ class SupervisorAgent(BaseAgent):
             # 新流程：parsed 直接是 agent name 或 frame intent
             new_agent = str(new_parsed)
             if new_agent and new_agent != "free_chat" and new_agent != agent_name:
-                return await self._route_to_agent(new_agent, message, on_tool_result=on_tool_result)
+                reroute_result = await self._route_to_agent(new_agent, message, on_tool_result=on_tool_result)
+                # 新Agent接受 → 更新 session 到新的 active_agent
+                if not reroute_result.need_reroute:
+                    await session_mgr.set_session_context(
+                        message.user_id,
+                        SessionState.MULTI_TURN,
+                        new_agent,
+                    )
+                return reroute_result
 
             # 无法路由，走 free_chat
             return await self._free_chat(message, on_tool_result=on_tool_result)
@@ -438,6 +522,32 @@ class SupervisorAgent(BaseAgent):
             pause_context=pause_context,
         )
 
+    async def _handle_workflow_running(
+        self, message: AgentMessage, ctx: dict, session_mgr,
+    ) -> AgentResult:
+        """处理工作流执行中收到的新消息"""
+        text = message.payload.get("text", "")
+
+        # 特殊命令：取消当前工作流
+        if text.strip().lower() in ("取消", "cancel", "停止工作流"):
+            await session_mgr.clear_session_context(message.user_id)
+            return AgentResult(
+                task_id=message.task_id,
+                success=True,
+                data="当前工作流已取消",
+            )
+
+        # 其他消息：回复工作流状态
+        return AgentResult(
+            task_id=message.task_id,
+            success=True,
+            data="工作流正在执行中，请稍后发送新请求。发送「取消」可停止当前工作流。",
+        )
+
+    # ------------------------------------------------------------------ #
+    #  正常路由流程                                                         #
+    # ------------------------------------------------------------------ #
+
     async def _normal_route(self, message: AgentMessage, on_tool_result=None) -> AgentResult:
         """正常路由流程：意图解析 → 路由 → 结果"""
         logger.info(
@@ -448,28 +558,29 @@ class SupervisorAgent(BaseAgent):
         )
 
         session_mgr = get_session_manager()
-        mm = None
+        mi = MemoryInjector(message.user_id)
         conversation_history: list = []
-        if message.user_id:
-            from apps.memory.manager import MemoryManager
-
-            mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            conversation_history = await mm.get_conv_history(max_turns=5)
+        if mi.available:
+            conversation_history = await mi.get_conv_history()
 
         parsed = message.intent or await self._parse_intent(
             message.payload.get("text", ""),
             context=conversation_history[-5:] if conversation_history else None,
         )
 
-        # 多步骤工作流
-        if isinstance(parsed, dict) and parsed.get("_workflow_plan"):
-            logger.info(
-                "[%s] Multi-step workflow detected: %s",
-                self.name, parsed.get("summary", ""),
-            )
-            return await self._execute_workflow(
-                parsed["_workflow_plan"], message, on_tool_result=on_tool_result
-            )
+        # 多步骤工作流：支持 {"_workflow_plan": {...}} 和裸 {"summary", "steps"} 两种格式
+        if isinstance(parsed, dict):
+            workflow_plan = parsed.get("_workflow_plan")
+            if not workflow_plan and isinstance(parsed.get("steps"), list) and parsed["steps"]:
+                workflow_plan = parsed
+            if workflow_plan:
+                logger.info(
+                    "[%s] Multi-step workflow detected: %s",
+                    self.name, workflow_plan.get("summary", ""),
+                )
+                return await self._workflow_engine.execute_workflow(
+                    workflow_plan, message, on_tool_result=on_tool_result,
+                )
 
         # LLM 直接返回自由对话（节省一次 LLM 调用）
         if isinstance(parsed, dict) and parsed.get("_free_chat"):
@@ -510,25 +621,27 @@ class SupervisorAgent(BaseAgent):
                 # 无法重路由，转自由对话
                 return await self._free_chat(message, on_tool_result=on_tool_result)
 
-            # 路由成功时写入统一对话历史
-            if mm and result.success and not result.need_reroute:
+            # 路由成功时写入统一对话历史（原子追加，防止并发覆盖）
+            if mi.available and result.success and not result.need_reroute:
                 user_text = message.payload.get("text", "")[:500]
                 agent_text = str(result.data)[:500] if result.data else ""
-                updated = conversation_history[-4:] + [
-                    {
-                        "role": "user",
-                        "agent": agent_name,
-                        "text": user_text,
-                        "ts": int(time.time()),
-                    },
-                    {
-                        "role": "agent",
-                        "agent": agent_name,
-                        "text": agent_text,
-                        "ts": int(time.time()),
-                    },
-                ]
-                await mm.save_conv_history(updated[-5:])
+                await mi.append_conv_history(
+                    [
+                        {
+                            "role": "user",
+                            "agent": agent_name,
+                            "text": user_text,
+                            "ts": int(time.time()),
+                        },
+                        {
+                            "role": "agent",
+                            "agent": agent_name,
+                            "text": agent_text,
+                            "ts": int(time.time()),
+                        },
+                    ],
+                    keep_turns=20,
+                )
 
                 # 检查响应是否要求开始多轮对话
                 if hasattr(result.data, "get") and result.data.get(
@@ -600,15 +713,18 @@ class SupervisorAgent(BaseAgent):
         self, agent_name: str, message: AgentMessage, on_tool_result=None,
     ) -> AgentResult:
         """懒加载并调用子Agent，自动注入跨Agent上下文。"""
+        # Supervisor 不走自动发现流程，直接由 supervisor 自身处理
+        if agent_name == "supervisor":
+            return await self._self_execute(message, on_tool_result=on_tool_result)
+
         from .registry import AgentRegistry
 
         # 注入跨agent上下文：如果上一轮是其他agent回复了用户，
         # 将其回复内容注入到当前消息的payload中，供目标agent参考。
         if message.user_id:
             try:
-                from apps.memory.manager import MemoryManager
-                mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-                conv = await mm.get_conv_history(max_turns=5)
+                mi = MemoryInjector(message.user_id)
+                conv = await mi.get_conv_history()
                 if len(conv) >= 1:
                     last_agent_entry = conv[-1]
                     if last_agent_entry.get("role") == "agent":
@@ -634,143 +750,79 @@ class SupervisorAgent(BaseAgent):
             logger.error("Routing to %s failed: %s", agent_name, e)
             return AgentResult(task_id=message.task_id, success=False, error=str(e))
 
+    # ------------------------------------------------------------------ #
+    #  Backward-compatible workflow shim                                   #
+    # ------------------------------------------------------------------ #
+
     async def _execute_workflow(
         self,
         workflow_plan: dict,
         message: AgentMessage,
         on_tool_result=None,
     ) -> AgentResult:
-        """Execute a multi-step workflow plan sequentially.
+        """Backward-compatible shim delegating to WorkflowEngine.
 
-        Each step is dispatched via _route_to_agent. Previous step's result
-        is injected into the next step's payload as previous_agent_response.
-
-        Args:
-            workflow_plan: {"summary": str, "steps": [{"agent": str, "message": str}]}
-            message: Original AgentMessage (for task_id, user_id)
-            on_tool_result: Optional callback for tool results
-
-        Returns:
-            AgentResult with success=True if all steps completed,
-            or success=False if any step failed.
+        Retained so existing tests that patch ``supervisor._execute_workflow``
+        continue to work.
         """
-        steps = workflow_plan.get("steps", [])
-        if not steps:
-            return AgentResult(
-                task_id=message.task_id,
-                success=False,
-                error="工作流计划为空",
-            )
-
-        step_results: list[dict] = []
-
-        for idx, step in enumerate(steps):
-            agent_name = step.get("agent", "")
-            step_message = step.get("message", "")
-
-            if not agent_name:
-                return AgentResult(
-                    task_id=message.task_id,
-                    success=False,
-                    error=f"步骤 {idx + 1} 缺少 agent 字段",
-                )
-
-            # Build step message with previous context
-            step_msg = AgentMessage(
-                task_id=message.task_id,
-                sender="supervisor",
-                recipient=agent_name,
-                payload={"text": step_message, "scheduled": True},
-                user_id=message.user_id,
-            )
-
-            # Inject previous step's result
-            if step_results:
-                prev = step_results[-1]
-                step_msg.payload["previous_agent_response"] = prev.get("data", "")
-                step_msg.payload["previous_agent_name"] = prev.get("agent", "")
-                logger.info(
-                    "[%s] Workflow step %d/%d: injecting context %s -> %s",
-                    self.name, idx + 1, len(steps),
-                    prev.get("agent", "?"), agent_name,
-                )
-
-            logger.info(
-                "[%s] Workflow step %d/%d: dispatching to %s",
-                self.name, idx + 1, len(steps), agent_name,
-            )
-
-            # Dispatch via _route_to_agent
-            result = await self._route_to_agent(agent_name, step_msg, on_tool_result=on_tool_result)
-
-            if result.success:
-                content = ""
-                if isinstance(result.data, dict):
-                    content = result.data.get("content", str(result.data))
-                else:
-                    content = str(result.data)
-
-                step_results.append({
-                    "agent": agent_name,
-                    "data": content,
-                    "step": idx + 1,
-                })
-            else:
-                # Step failed — fail fast
-                return AgentResult(
-                    task_id=message.task_id,
-                    success=False,
-                    error=f"工作流步骤 {idx + 1} ({agent_name}) 失败: {result.error}",
-                    data={"completed_steps": step_results},
-                )
-
-        # All steps completed
-        summary_lines = [
-            f"工作流完成 ({len(step_results)}/{len(steps)} 步)",
-        ]
-        for sr in step_results:
-            summary_lines.append(
-                f"\n--- 步骤 {sr['step']}: {sr['agent']} ---\n{sr['data'][:500]}"
-            )
-
-        return AgentResult(
-            task_id=message.task_id,
-            success=True,
-            data={
-                "workflow_summary": "\n".join(summary_lines),
-                "step_results": step_results,
-            },
+        return await self._workflow_engine.execute_workflow(
+            workflow_plan, message, on_tool_result=on_tool_result,
         )
-
-    def _load_skills_for_context(self, skill_names: list[str]) -> str:
-        """
-        Load full content for a list of skill names.
-
-        Resolves references recursively and strips frontmatter.
-        """
-        if not skill_names:
-            return ""
-        loader = self._get_skills_loader()
-        resolved = loader.resolve_references(skill_names)
-        return loader.load_skills_content(resolved)
-
-    def _get_skills_summary(self) -> str:
-        """Get the skills inventory XML block for progressive loading."""
-        # Rebuild summary on demand in case skills were added
-        return self._get_skills_loader().build_summary()
-
-    async def handle_text(self, text: str) -> str:
-        """Channel收到自然语言文本的便捷入口"""
-        msg = AgentMessage(
-            sender="user", recipient="supervisor", payload={"text": text}
-        )
-        result = await self.handle(msg)
-        if result.success:
-            return str(result.data)
-        return f"[错误] {result.error}"
 
     # ------------------------------------------------------------------ #
-    #  内部方法                                                           #
+    #  Session helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    async def _judge_resume(self, message: AgentMessage, paused_ctx: dict) -> bool:
+        """让 Supervisor 判断当前消息是否属于暂停中的对话的延续"""
+        text = message.payload.get("text", "")
+        pause_context = paused_ctx.get("pause_context", "")
+
+        prompt = (
+            f"用户有一个暂停中的对话（正在和 {paused_ctx['active_agent']} 交互）：\n"
+            f"暂停上下文：{pause_context}\n\n"
+            f"用户当前消息：{text}\n\n"
+            f"判断这条消息是否属于暂停中的对话的延续。只回答 true 或 false。"
+        )
+        resp = await self._llm.chat(
+            system="你是一个意图判断助手，只回答 true 或 false。",
+            user=prompt,
+            max_tokens=10,
+            temperature=0.0,
+        )
+        return resp.strip().lower().startswith("true")
+
+    async def _archive_paused_session(
+        self, user_id: str, ctx: dict, session_mgr
+    ) -> None:
+        """超时后总结暂停会话的记忆，存入 L3，关闭会话"""
+        agent_name = ctx.get("active_agent", "")
+        pause_context = ctx.get("pause_context", "")
+
+        if not pause_context:
+            await session_mgr.clear_session_context(user_id)
+            return
+
+        # LLM 做一句话总结
+        summary = await self._llm.chat(
+            system="总结以下对话上下文为一句话。",
+            user=pause_context,
+            max_tokens=100,
+            temperature=0.1,
+        )
+
+        # 存入 L3 长期记忆
+        mi = MemoryInjector(user_id)
+        await mi.write_l3(
+            content=f"[历史对话摘要-{agent_name}] {summary}",
+            memory_type="conversation_summary",
+        )
+
+        await session_mgr.clear_session_context(user_id)
+        logger.info("[%s] Paused session archived for user %s", self.name, user_id)
+
+    # ------------------------------------------------------------------ #
+    #  Intent parsing                                                      #
     # ------------------------------------------------------------------ #
 
     async def _parse_intent(
@@ -792,7 +844,7 @@ class SupervisorAgent(BaseAgent):
             agents = [a for a in agents if a.get("name") not in exclude_agents]
 
         agent_descriptions = "\n".join(
-            f"- {a['name']}: {a.get('overview', '').replace(chr(10), chr(10) + '  ')}"
+            f"- {a['name']}: {a.get('description', '').replace(chr(10), chr(10) + '  ')}"
             for a in agents
             if a.get("name")
         )
@@ -841,25 +893,22 @@ class SupervisorAgent(BaseAgent):
             f"{skills_block}"
             f"{frame_block}"
             f"{supervisor_block}"
+            # f"{workflow_block}"
             f"Available agents:\n{agent_descriptions}\n\n"
-            f"User message: {text}\n\n"
-            "Analyze the user's intent and determine which agent should handle it "
-            "based on each agent's overview/role description.\n\n"
-            "If the user request clearly requires multiple agents to work in sequence "
-            "(e.g., 'research then implement', '研究并实现', '先调研再回测'), reply with:\n"
-            '{"_workflow_plan": {"summary": "一句话概括", "steps": [{"agent": "<agent1>", "message": "<step1 prompt>"}, {"agent": "<agent2>", "message": "<step2 prompt>"}]}}\n\n'
-            "Otherwise, reply with a JSON object:\n"
-            '- If one agent matches: {"agent": "<agent_name>"} (can be "supervisor" for your own tools)\n'
-            '- If it matches a framework intent: {"intent": "<frame_intent>"}\n'
-            '- If none matches: {"_free_chat": true, "response": "<your reply to the user>"}'
+            f"根据以上信息与流程定义，解析消息: \" {text} \" 中包含的用户意图 \n\n"
+            "if the message is a general inquiry or doesn't clearly match any agent, reply with:\n"
+            '{"_free_chat": true, "response": "your response to user"}\n'
         )
-        logger.debug("Supervisor intent parsing prompt: %s", user_prompt[:500])
+
+        logger.debug("Supervisor system prompt: %s", self._system_prompt)
+        logger.debug("Supervisor intent parsing prompt: %s", user_prompt)
         response = await self._llm.chat(
             system=self._system_prompt,
             user=user_prompt,
             max_tokens=256,
             temperature=0.1,
         )
+
         if is_fallback(response):
             fallback_text = self._rule_based_intent(text)
             if fallback_text:
@@ -876,15 +925,17 @@ class SupervisorAgent(BaseAgent):
                 if obj_match:
                     text = obj_match.group(0).strip()
             data = json.loads(text)
-            logger.debug(f"Parsed intent data: {data}")
+            logger.info(f"Parsed intent data: {data}")
 
             # 自由对话：LLM 直接返回回复内容
             if data.get("_free_chat"):
                 return {"_free_chat": True, "response": data.get("response", "")}
 
-            # 工作流计划：多 Agent 顺序任务
+            # 工作流计划：多 Agent 顺序任务（支持 _workflow_plan 包装和裸 steps 两种格式）
             if data.get("_workflow_plan"):
                 return data
+            if isinstance(data.get("steps"), list) and data["steps"]:
+                return {"_workflow_plan": data}
 
             # 框架意图
             if data.get("intent") and data["intent"] in frame_intents:
@@ -907,6 +958,10 @@ class SupervisorAgent(BaseAgent):
         """规则引擎降级"""
         return self._router.match_fallback(text)
 
+    # ------------------------------------------------------------------ #
+    #  Frame / self / free-chat execution                                  #
+    # ------------------------------------------------------------------ #
+
     async def _handle_frame(self, intent: str, message: AgentMessage) -> AgentResult:
         frame_action = self._router.get_frame_intent(intent)
         if not frame_action:
@@ -923,11 +978,9 @@ class SupervisorAgent(BaseAgent):
             else:
                 await self._frame.stop(frame_type)
             if message.user_id:
-                from apps.memory.manager import MemoryManager
-
-                mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
+                mi = MemoryInjector(message.user_id)
                 state = "running" if action == "start" else "stopped"
-                await mm.write_l2(
+                await mi.write_l2(
                     content=f"{frame_type}:{state}",
                     memory_type="frame_state",
                     importance=2,
@@ -966,13 +1019,10 @@ class SupervisorAgent(BaseAgent):
         self._current_user_id = message.user_id or ""
         text = message.payload.get("text", "")
 
-        mm = None
+        mi = MemoryInjector(message.user_id)
         conversation_history: list = []
-        if message.user_id:
-            from apps.memory.manager import MemoryManager
-
-            mm = MemoryManager(agent_type="supervisor", user_id=message.user_id)
-            conversation_history = (await mm.get_conv_history(max_turns=5))[-5:]
+        if mi.available:
+            conversation_history = (await mi.get_conv_history())[-5:]
 
         if conversation_history:
             history_block = "\n".join(
@@ -998,26 +1048,58 @@ class SupervisorAgent(BaseAgent):
                 error="LLM暂时不可用，请稍后再试",
             )
 
-        if mm:
-            updated = conversation_history[-4:] + [
-                {
-                    "role": "user",
-                    "agent": "supervisor",
-                    "text": text[:500],
-                    "ts": int(time.time()),
-                },
-                {
-                    "role": "agent",
-                    "agent": "supervisor",
-                    "text": content[:500],
-                    "ts": int(time.time()),
-                },
-            ]
-            await mm.save_conv_history(updated[-5:])
-            await mm.write_l2(
+        if mi.available:
+            await mi.append_conv_history(
+                [
+                    {
+                        "role": "user",
+                        "agent": "supervisor",
+                        "text": text,
+                        "ts": int(time.time()),
+                    },
+                    {
+                        "role": "agent",
+                        "agent": "supervisor",
+                        "text": content,
+                        "ts": int(time.time()),
+                    },
+                ]
+            )
+            await mi.write_l2(
                 content=f"user: {text}\nassistant: {content}",
                 memory_type="conversation",
                 importance=1,
             )
 
         return AgentResult(task_id=message.task_id, success=True, data=content)
+
+    # ------------------------------------------------------------------ #
+    #  Skills helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _load_skills_for_context(self, skill_names: list[str]) -> str:
+        """
+        Load full content for a list of skill names.
+
+        Resolves references recursively and strips frontmatter.
+        """
+        if not skill_names:
+            return ""
+        loader = self._get_skills_loader()
+        resolved = loader.resolve_references(skill_names)
+        return loader.load_skills_content(resolved)
+
+    def _get_skills_summary(self) -> str:
+        """Get the skills inventory XML block for progressive loading."""
+        # Rebuild summary on demand in case skills were added
+        return self._get_skills_loader().build_summary()
+
+    async def handle_text(self, text: str) -> str:
+        """Channel收到自然语言文本的便捷入口"""
+        msg = AgentMessage(
+            sender="user", recipient="supervisor", payload={"text": text}
+        )
+        result = await self.handle(msg)
+        if result.success:
+            return str(result.data)
+        return f"[错误] {result.error}"
