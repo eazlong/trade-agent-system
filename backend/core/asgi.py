@@ -41,51 +41,80 @@ async def _listen_progress_notifications():
     if url.rsplit("/", 1)[-1].isdigit():
         url = url.rsplit("/", 1)[0] + "/3"
 
-    pubsub = None
-    try:
-        r = aioredis.from_url(url, decode_responses=True)
-        pubsub = r.pubsub()
-        await pubsub.subscribe(_PROGRESS_CHANNEL)
-        logger.info('[ASGI] Progress notification listener started')
+    reconnect_delay = 1  # 初始重连延迟（秒）
+    max_reconnect_delay = 60  # 最大重连延迟
 
-        async for message in pubsub.listen():
-            if message["type"] != "message":
-                continue
-            try:
-                data = json.loads(message["data"])
-                text = data.get("text", "")
-                user_id = data.get("user_id", "")
-                if not text:
+    while True:
+        pubsub = None
+        try:
+            r = aioredis.from_url(url, decode_responses=True)
+            pubsub = r.pubsub()
+            await pubsub.subscribe(_PROGRESS_CHANNEL)
+            logger.info('[ASGI] Progress notification listener started')
+            reconnect_delay = 1  # 连接成功，重置延迟
+
+            async for message in pubsub.listen():
+                if message["type"] != "message":
                     continue
-                await _route_notification(user_id, text)
-            except Exception:
-                logger.warning("[ASGI] failed to process progress notification", exc_info=True)
-    except (asyncio.CancelledError, GeneratorExit, RuntimeError):
-        pass
-    except Exception:
-        logger.error("[ASGI] progress listener crashed", exc_info=True)
-    finally:
-        if pubsub:
-            try:
-                await pubsub.unsubscribe(_PROGRESS_CHANNEL)
-                await pubsub.aclose()
-            except Exception:
-                pass
+                try:
+                    data = json.loads(message["data"])
+                    text = data.get("text", "")
+                    user_id = data.get("user_id", "")
+                    if not text:
+                        continue
+                    await _route_notification(user_id, text)
+                except Exception:
+                    logger.warning("[ASGI] failed to process progress notification", exc_info=True)
+        except (asyncio.CancelledError, GeneratorExit, RuntimeError):
+            break
+        except Exception:
+            logger.error("[ASGI] progress listener crashed, reconnecting in %ds", reconnect_delay, exc_info=True)
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)  # 指数退避
+        finally:
+            if pubsub:
+                try:
+                    await pubsub.unsubscribe(_PROGRESS_CHANNEL)
+                    await pubsub.aclose()
+                except Exception:
+                    pass
 
 
 async def _route_notification(user_id: str, text: str):
-    """Route a notification to the user's active channel (Telegram or Lark)."""
+    """Route a notification to the user's active channel (Telegram, Lark, or WebSocket)."""
     from channels.db import database_sync_to_async
     from apps.channel.channel_resolver import get_user_active_channel
+
+    # Web 兜底：所有任务完成通知都先尝试推到 chat_ws group。
+    # ChatConsumer 已加入 user_{user_id}；group_send 命中即发，否则回落到 ws_pending。
+    # 与 telegram/lark 分支独立 — 多通道不互斥。
+    from channels.layers import get_channel_layer
+    from apps.agent import ws_pending
+
+    payload = {"type": "task_notification", "data": text}
+    try:
+        layer = get_channel_layer()
+        if layer is not None:
+            await layer.group_send(
+                f"user_{user_id}",
+                {"type": "task_notification", "text": text},
+            )
+    except Exception:
+        logger.warning(
+            "[ASGI] group_send failed for user %s", user_id, exc_info=True
+        )
+
+    # 离线兜底：用户没连 ws 时也存一份，重连 drain。group_send 失败也要执行。
+    try:
+        await ws_pending.store(user_id, payload)
+    except Exception:
+        logger.warning(
+            "[ASGI] ws_pending.store failed for user %s", user_id, exc_info=True
+        )
 
     target = await database_sync_to_async(get_user_active_channel)(user_id)
 
     if target is None:
-        # Fallback: try Telegram in-memory instance (legacy behavior)
-        if _telegram_channel and _telegram_channel._app:
-            await _telegram_channel.send_message(text)
-        else:
-            logger.debug("[ASGI] no active channel for user %s, dropping: %s", user_id, text[:50])
         return
 
     if target.channel_type == "telegram":

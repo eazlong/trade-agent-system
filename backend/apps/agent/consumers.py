@@ -59,6 +59,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.user_id = str(user.id)
         logger.info("[ChatWS] User %s connected", self.user_id)
 
+        # 加入 user_{user_id} group — 接收 Celery 任务完成通知（_route_notification 推送）
+        await self.channel_layer.group_add(
+            f"user_{self.user_id}", self.channel_name
+        )
+
         await self.send(text_data=json.dumps({"type": "status", "status": "connected"}))
 
         # 投递断线期间缓存的待发消息
@@ -70,7 +75,26 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         user_id = getattr(self, "user_id", "unknown")
+        # 退出 user_{user_id} group
+        if user_id != "unknown" and hasattr(self, "channel_layer"):
+            try:
+                await self.channel_layer.group_discard(
+                    f"user_{user_id}", self.channel_name
+                )
+            except Exception:
+                pass
         logger.info("[ChatWS] User %s disconnected (code=%s)", user_id, close_code)
+
+    async def task_notification(self, event):
+        """Celery / Stream 任务完成通知 — 透传到 ws。
+
+        event = {"type": "task_notification", "text": "..."}
+        前端识别 {"type": "task_notification", "data": "..."}（后续 PR 加 UI 渲染）。
+        """
+        await self._safe_send({
+            "type": "task_notification",
+            "data": event["text"],
+        })
 
     async def receive(self, text_data):
         try:
