@@ -6,6 +6,7 @@ from typing import Optional
 
 from asgiref.sync import sync_to_async
 from django.conf import settings
+from django.db import close_old_connections
 import redis
 
 logger = logging.getLogger(__name__)
@@ -525,6 +526,9 @@ class FrameManager:
             from apps.signal_monitor.engine import SignalMonitorEngine
 
             engine = SignalMonitorEngine.get_instance()
+            # 长跑回调：pgbouncer/PG 空闲关闭连接后，下一次 ORM 操作会抛
+            # "connection already closed"，先关闭旧连接让 Django 重建即可恢复。
+            close_old_connections()
             klines = engine._load_klines_for_monitors(
                 [type("_M", (), {"symbol": symbol, "interval": "1h"})()]
             ).get(symbol, [])
