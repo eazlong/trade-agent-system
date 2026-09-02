@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+from apps.common.registry import Registry
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,33 +48,41 @@ class BaseTool(ABC):
 
 
 class ToolRegistry:
-    """全局工具注册表，支持动态注册"""
+    """全局工具注册表，支持动态注册。
 
-    _tools: dict[str, BaseTool] = {}
+    内部使用泛型 Registry[BaseTool] 后端。
+    """
+
+    _backend: Registry[BaseTool] = Registry("ToolRegistry")
 
     @classmethod
     def register(cls, tool: BaseTool) -> None:
-        cls._tools[tool.name] = tool
+        cls._backend.register(tool.name, tool, overwrite=True)
         logger.debug(f"[ToolRegistry] registered: {tool.name}")
 
     @classmethod
     def unregister(cls, name: str) -> None:
-        cls._tools.pop(name, None)
+        cls._backend.unregister(name)
 
     @classmethod
     def get(cls, name: str) -> BaseTool | None:
-        return cls._tools.get(name)
+        return cls._backend.get(name)
 
     @classmethod
     def all(cls) -> list[BaseTool]:
-        return list(cls._tools.values())
+        return cls._backend.all()
 
     @classmethod
     def schemas(cls) -> list[dict]:
         """返回所有工具的schema列表，直接用于LLM tools参数"""
-        return [t.schema for t in cls._tools.values()]
+        return [t.schema for t in cls._backend]
 
     @classmethod
     def get_all_schemas(cls) -> list[dict]:
         """schemas()的别名，语义更清晰"""
         return cls.schemas()
+
+    @classmethod
+    def reset(cls) -> None:
+        """清空所有已注册工具。用于测试隔离。"""
+        cls._backend.reset()

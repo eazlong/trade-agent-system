@@ -96,7 +96,16 @@ export default function ChatWindow() {
         const statusMsg = msg as StatusMessage;
         if (statusMsg.status === "connected") {
           setWsConnected(true);
-          setIsProcessing(false);
+          // 连接（重）建立：若仍有 "sending" 占位（断线前发出、后端可能
+          // 通过 ws_pending 补投的回复），不能盲目复位 isProcessing，
+          // 否则会提前解除发送锁定并让占位永远转圈（"不响应"）。
+          setMessages((prev) => {
+            const hasPending = prev.some(
+              (m) => m.role === "assistant" && m.status === "sending"
+            );
+            if (!hasPending) setIsProcessing(false);
+            return prev;
+          });
         } else if (statusMsg.status === "processing") {
           setIsProcessing(true);
         }
@@ -106,11 +115,11 @@ export default function ChatWindow() {
 
         setMessages((prev) => {
           const updated = [...prev];
-          // 找到最后一个 sending 状态的用户消息对应的 assistant 占位
+          // 找到最后一个 sending 状态的 assistant 占位
           const lastSendingIdx = updated.findLastIndex(
             (m) => m.role === "assistant" && m.status === "sending"
           );
-          if (lastSendingIdx !== -1) {
+          const resolved: ChatMessage = (() => {
             if (chatMsg.status === "done") {
               const rawData = chatMsg.data;
               const contentStr =
@@ -121,7 +130,7 @@ export default function ChatWindow() {
                     : rawData != null
                       ? JSON.stringify(rawData)
                       : "";
-              updated[lastSendingIdx] = {
+              return {
                 id: chatMsg.task_id || `msg-${Date.now()}`,
                 role: "assistant",
                 content: contentStr,
@@ -129,16 +138,23 @@ export default function ChatWindow() {
                 status: "done",
                 task_id: chatMsg.task_id,
               };
-            } else {
-              updated[lastSendingIdx] = {
-                id: chatMsg.task_id || `msg-${Date.now()}`,
-                role: "assistant",
-                content: chatMsg.error || "未知错误",
-                timestamp: new Date().toISOString(),
-                status: "error",
-                task_id: chatMsg.task_id,
-              };
             }
+            return {
+              id: chatMsg.task_id || `msg-${Date.now()}`,
+              role: "assistant",
+              content: chatMsg.error || "未知错误",
+              timestamp: new Date().toISOString(),
+              status: "error",
+              task_id: chatMsg.task_id,
+            };
+          })();
+
+          if (lastSendingIdx !== -1) {
+            updated[lastSendingIdx] = resolved;
+          } else {
+            // 没有匹配的占位（如重连后占位已被清理/多条消息交错）——
+            // 绝不能静默丢弃响应，否则用户看到的就是"不响应"。
+            updated.push(resolved);
           }
           return updated;
         });
@@ -155,6 +171,15 @@ export default function ChatWindow() {
               content: msg.error || "未知错误",
               status: "error",
             };
+          } else {
+            // 同理：没有占位时也把错误展示出来，而不是丢掉
+            updated.push({
+              id: `err-${Date.now()}`,
+              role: "assistant",
+              content: msg.error || "未知错误",
+              timestamp: new Date().toISOString(),
+              status: "error",
+            });
           }
           return updated;
         });

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import asyncio
+import json
 import logging
 from decimal import Decimal
 from enum import Enum
@@ -31,7 +33,15 @@ class FrameManager:
         self._data_feed_refs = 0  # 引用计数：trading+assist共享数据源
         self._riskguard = None
         self._order_executor = None
-        self._strategy_runner = None
+        self._order_consumer_task: asyncio.Task | None = None
+        # 多策略并发：live_session_id → StrategyRunner
+        self._strategy_runners: dict[str, object] = {}
+        self._need_restart = False  # 进程重启后底层组件需重建（OrderExecutor 无法跨进程复用）
+        # 限制 K 线回调触发的信号检查并发数：
+        # 该检查内部会走 ccxt 同步网络调用（fetch_ohlcv），
+        # 在 thread_sensitive=False 线程池上并发执行时，若不限流，
+        # 会瞬时堆积大量 ccxt 实例把 512M 容器内存打爆（OOM）。
+        self._kline_check_sem = asyncio.Semaphore(2)
 
         # 从 Redis 恢复持久化的框架状态
         self._restore_frame_states()
@@ -66,6 +76,46 @@ class FrameManager:
         except Exception as e:
             logger.warning("[FrameManager] persist state failed: %s", e)
 
+    def _persist_live_session(
+        self,
+        live_session_id: str,
+        strategy_name: str,
+        symbol: str,
+        timeframe: str,
+        parameters: dict,
+        exchange_account_id: str,
+        user_id: str,
+        initial_balance: str,
+    ) -> None:
+        """将LiveSession运行信息持久化到Redis"""
+        try:
+            r = self._get_redis()
+            key = f"frame:live_session:{live_session_id}"
+            r.hset(key, mapping={
+                "strategy_name": strategy_name,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "parameters": json.dumps(parameters or {}),
+                "exchange_account_id": exchange_account_id,
+                "user_id": user_id,
+                "initial_balance": initial_balance,
+                "status": "running",
+            })
+            r.expire(key, 86400)  # 24小时TTL
+            logger.debug("[FrameManager] persisted live session %s", live_session_id)
+        except Exception as e:
+            logger.warning("[FrameManager] failed to persist live session: %s", e)
+
+    def _remove_live_session(self, live_session_id: str) -> None:
+        """从Redis移除LiveSession状态"""
+        try:
+            r = self._get_redis()
+            key = f"frame:live_session:{live_session_id}"
+            r.delete(key)
+            logger.debug("[FrameManager] removed live session %s", live_session_id)
+        except Exception as e:
+            logger.warning("[FrameManager] failed to remove live session: %s", e)
+
     def _restore_frame_states(self) -> None:
         """从 Redis 恢复框架状态。"""
         try:
@@ -94,6 +144,9 @@ class FrameManager:
 
             if order_exec == "1":
                 # OrderExecutor 无法跨进程复用，标记需要重建
+                # 保留 _trading_state/_assist_state 原始值（反映退出时状态），
+                # 通过 _need_restart 告诉 restore_and_restart_frames() 真正重建底层组件。
+                self._need_restart = True
                 self._risk_guard_refs = 0
                 self._data_feed_refs = 0
             elif order_exec == "0" and (
@@ -121,20 +174,26 @@ class FrameManager:
 
     async def restore_and_restart_frames(self) -> None:
         """系统启动时调用：检查持久化状态并自动重启运行中的框架。"""
-        # 如果框架标记为 running，但底层组件未初始化，需要重启
-        need_restart_trading = (
-            self._trading_state == FrameState.RUNNING and self._risk_guard_refs == 0
-        )
-        need_restart_assist = (
-            self._assist_state == FrameState.RUNNING and self._risk_guard_refs == 0
-        )
+        # _need_restart=True 表示进程重启（OrderExecutor 等底层组件无法跨进程复用），
+        # 需要强制重建；否则只在"状态 running 但组件未初始化"时重启。
+        if self._need_restart:
+            need_restart_trading = self._trading_state == FrameState.RUNNING
+            need_restart_assist = self._assist_state == FrameState.RUNNING
+        else:
+            need_restart_trading = (
+                self._trading_state == FrameState.RUNNING and self._risk_guard_refs == 0
+            )
+            need_restart_assist = (
+                self._assist_state == FrameState.RUNNING and self._risk_guard_refs == 0
+            )
 
         if need_restart_trading:
             logger.info(
-                "[FrameManager] trading frame was running before restart, auto-restarting..."
+                "[FrameManager] trading frame was running before restart, auto-restarting... (force=%s)",
+                self._need_restart,
             )
             try:
-                await self.start_trading_frame(mode="live")
+                await self.start_trading_frame(mode="live", force=self._need_restart)
                 logger.info("[FrameManager] trading frame auto-restarted")
             except Exception as e:
                 logger.error("[FrameManager] trading frame auto-restart failed: %s", e)
@@ -142,7 +201,8 @@ class FrameManager:
 
         if need_restart_assist:
             logger.info(
-                "[FrameManager] assist frame was running before restart, auto-restarting..."
+                "[FrameManager] assist frame was running before restart, auto-restarting... (force=%s)",
+                self._need_restart,
             )
             try:
                 await self.start_assist_frame()
@@ -150,6 +210,65 @@ class FrameManager:
             except Exception as e:
                 logger.error("[FrameManager] assist frame auto-restart failed: %s", e)
                 self._assist_state = FrameState.STOPPED
+
+        # 恢复LiveSession（必须在 DataFeed 真正连接之后，已在 start_trading_frame 内完成）
+        await self._restore_live_sessions()
+
+    async def _restore_live_sessions(self) -> None:
+        """从Redis恢复运行的LiveSession"""
+        try:
+            r = self._get_redis()
+            pattern = "frame:live_session:*"
+            keys = r.keys(pattern)
+
+            logger.info("[FrameManager] found %d live session keys in Redis", len(keys))
+
+            for key in keys:
+                key_str = key if isinstance(key, str) else key.decode()
+                session_data = r.hgetall(key)
+                if not session_data:
+                    continue
+
+                # 处理bytes类型的值
+                if isinstance(session_data, dict):
+                    decoded_data = {}
+                    for k, v in session_data.items():
+                        k_str = k if isinstance(k, str) else k.decode()
+                        v_str = v if isinstance(v, str) else v.decode()
+                        decoded_data[k_str] = v_str
+                    session_data = decoded_data
+
+                if session_data.get("status") == "running":
+                    live_session_id = key_str.split(":")[-1]
+
+                    logger.info(
+                        "[FrameManager] restoring live session: %s (%s %s)",
+                        live_session_id,
+                        session_data.get("strategy_name"),
+                        session_data.get("symbol"),
+                    )
+
+                    try:
+                        await self.start_strategy_runner(
+                            strategy_name=session_data.get("strategy_name"),
+                            symbol=session_data.get("symbol"),
+                            timeframe=session_data.get("timeframe"),
+                            parameters=json.loads(session_data.get("parameters", "{}")),
+                            exchange_account_id=session_data.get("exchange_account_id"),
+                            user_id=session_data.get("user_id") or None,
+                            live_session_id=live_session_id,
+                            initial_balance=Decimal(session_data.get("initial_balance", "0")),
+                        )
+                        logger.info("[FrameManager] live session %s restored", live_session_id)
+                    except Exception as e:
+                        logger.error(
+                            "[FrameManager] failed to restore live session %s: %s",
+                            live_session_id, e
+                        )
+                        # 标记为恢复失败
+                        r.hset(key_str, "status", "restore_failed")
+        except Exception as e:
+            logger.warning("[FrameManager] failed to restore live sessions: %s", e)
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -188,12 +307,18 @@ class FrameManager:
 
     # --- Trading Frame ---
 
-    async def start_trading_frame(self, mode: str = "live") -> None:
-        """mode: 'live' | 'paper'"""
-        if self._trading_state == FrameState.RUNNING:
+    async def start_trading_frame(self, mode: str = "live", force: bool = False) -> None:
+        """mode: 'live' | 'paper'
+        force=True: 跳过状态检查，强制重建底层组件（进程重启恢复场景使用）。
+        """
+        if not force and self._trading_state == FrameState.RUNNING:
             logger.warning("[FrameManager] trading frame already running")
             return
         self._trading_state = FrameState.STARTING
+        # force 模式下重置引用计数，确保底层组件干净重建
+        if force:
+            self._risk_guard_refs = 0
+            self._data_feed_refs = 0
         try:
             await self._start_data_feed()
             await self._start_risk_guard()
@@ -284,17 +409,24 @@ class FrameManager:
         live_session_id: str | None = None,
         initial_balance: Decimal = Decimal("0"),
     ) -> None:
-        """启动策略运行器，在交易框架启动后调用。"""
+        """启动策略运行器，在交易框架启动后调用。
+        支持多策略并发：每个 live_session_id 独立维护一个 StrategyRunner。
+        """
         from apps.strategy_engine.runner import StrategyRunner
 
-        if self._strategy_runner is not None:
-            logger.warning(
-                "[FrameManager] strategy runner already exists, stopping first"
-            )
-            await self.stop_strategy_runner()
+        session_key = live_session_id or ""
 
-        self._strategy_runner = StrategyRunner()
-        await self._strategy_runner.start_live(
+        # 同一 live会话重复启动：先停旧的再重启
+        existing = self._strategy_runners.get(session_key)
+        if existing is not None:
+            logger.warning(
+                "[FrameManager] strategy runner already exists for session %s, stopping first",
+                session_key,
+            )
+            await self.stop_strategy_runner(live_session_id=live_session_id)
+
+        runner = StrategyRunner()
+        await runner.start_live(
             strategy_name=strategy_name,
             symbol=symbol,
             timeframe=timeframe,
@@ -304,19 +436,61 @@ class FrameManager:
             live_session_id=live_session_id,
             initial_balance=initial_balance,
         )
+        self._strategy_runners[session_key] = runner
         logger.info(
-            "[FrameManager] strategy runner started: %s %s %s",
+            "[FrameManager] strategy runner started: %s %s %s (session=%s, total=%d)",
             strategy_name,
             symbol,
             timeframe,
+            session_key,
+            len(self._strategy_runners),
+        )
+        # 持久化LiveSession运行信息
+        self._persist_live_session(
+            live_session_id=session_key,
+            strategy_name=strategy_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            parameters=parameters,
+            exchange_account_id=exchange_account_id,
+            user_id=user_id or "",
+            initial_balance=str(initial_balance),
         )
 
-    async def stop_strategy_runner(self) -> None:
-        """停止策略运行器。"""
-        if self._strategy_runner is not None:
-            await self._strategy_runner.stop_live()
-            self._strategy_runner = None
-            logger.info("[FrameManager] strategy runner stopped")
+    async def stop_strategy_runner(self, live_session_id: str | None = None) -> None:
+        """停止策略运行器。
+        live_session_id 为 None 时停止所有；指定时只停对应会话。
+        """
+        if live_session_id is None:
+            # 停止所有
+            session_keys = list(self._strategy_runners.keys())
+        else:
+            session_keys = [live_session_id or ""]
+
+        for key in session_keys:
+            runner = self._strategy_runners.get(key)
+            if runner is None:
+                continue
+            try:
+                # 清理持久化状态
+                rm_key = key
+                if hasattr(runner, '_live_runner') and runner._live_runner:
+                    rm_key = runner._live_runner.live_session_id or key
+
+                await runner.stop_live()
+
+                # 清理Redis持久化状态
+                if rm_key:
+                    self._remove_live_session(rm_key)
+            except Exception as e:
+                logger.error("[FrameManager] failed to stop runner %s: %s", key, e)
+            finally:
+                self._strategy_runners.pop(key, None)
+                logger.info(
+                    "[FrameManager] strategy runner stopped: session=%s (remaining=%d)",
+                    key,
+                    len(self._strategy_runners),
+                )
 
     # --- Internal lifecycle methods (to be implemented) ---
 
@@ -443,15 +617,24 @@ class FrameManager:
         self._persist_frame_state()
         logger.info("[FrameManager] data feed stopped")
 
-    async def _get_active_signal_monitors(self) -> list:
-        """获取活跃的信号监控列表。"""
+    async def _get_active_signal_monitors(self, user_ids: set[str] | None = None) -> list:
+        """获取活跃的信号监控列表。
+        user_ids: 限定用户集合；None 表示不过滤（向后兼容），空集合表示返回空。
+        """
         try:
             from apps.signal_monitor.models import SignalMonitor
             from django.utils import timezone
 
+            if user_ids is not None and len(user_ids) == 0:
+                return []
+
             @sync_to_async
             def _query():
-                monitors = list(SignalMonitor.objects.filter(status="active"))
+                close_old_connections()
+                qs = SignalMonitor.objects.filter(status="active")
+                if user_ids is not None:
+                    qs = qs.filter(user_id__in=list(user_ids))
+                monitors = list(qs)
                 now = timezone.now()
                 return [m for m in monitors if not m.expires_at or m.expires_at > now]
 
@@ -511,7 +694,9 @@ class FrameManager:
                 data_type=DataType.KLINE,
                 interval=interval,
                 market_type=MarketType.SPOT,
-                callback=lambda data, sym=symbol: self._on_kline_data(data, sym),
+                callback=lambda data, sym=symbol: asyncio.get_event_loop().create_task(
+                    self._on_kline_data(data, sym)
+                ),
             )
             logger.info(
                 "[FrameManager] subscribed %s kline %s @%s for signal monitor",
@@ -520,20 +705,32 @@ class FrameManager:
                 interval.value,
             )
 
-    def _on_kline_data(self, kline: dict, symbol: str) -> None:
+    async def _on_kline_data(self, kline: dict, symbol: str) -> None:
         """K 线数据回调：触发信号检查。"""
         try:
             from apps.signal_monitor.engine import SignalMonitorEngine
 
             engine = SignalMonitorEngine.get_instance()
-            # 长跑回调：pgbouncer/PG 空闲关闭连接后，下一次 ORM 操作会抛
-            # "connection already closed"，先关闭旧连接让 Django 重建即可恢复。
-            close_old_connections()
-            klines = engine._load_klines_for_monitors(
-                [type("_M", (), {"symbol": symbol, "interval": "1h"})()]
-            ).get(symbol, [])
-            if len(klines) >= 2:
-                engine.check_signals_for_kline(symbol, klines)
+
+            # thread_sensitive=False：把检查（内含阻塞 ccxt 网络调用）放到
+            # 通用线程池执行，避免占住 asgiref 的共享单线程——
+            # 否则该线程被 Binance API 阻塞时，所有 thread-sensitive 的
+            # sync_to_async（如 ChatConsumer 的 token 校验）会排队挂起，
+            # 导致聊天 WebSocket 握手永远无法完成（对话"不响应"）。
+            # close_old_connections：长跑回调中，pgbouncer/PG 会因空闲关闭
+            # 服务端连接，下一次 ORM 操作会抛 "connection already closed"，
+            # 先关旧连接让 Django 重建即可恢复。
+            @sync_to_async(thread_sensitive=False)
+            def run_check():
+                close_old_connections()
+                klines = engine._load_klines_for_monitors(
+                    [type("_M", (), {"symbol": symbol, "interval": "1h"})()]
+                ).get(symbol, [])
+                if len(klines) >= 2:
+                    engine.check_signals_for_kline(symbol, klines)
+
+            async with self._kline_check_sem:
+                await run_check()
         except Exception as e:
             logger.warning("[FrameManager] kline callback error: %s", e)
 
@@ -556,10 +753,28 @@ class FrameManager:
         self._persist_frame_state()
 
     async def _start_order_consumer(self, mode: str) -> None:
-        logger.info(f"[FrameManager] order consumer starting (mode={mode})...")
-        # TODO: 启动Redis Stream消费者
+        if self._order_consumer_task and not self._order_consumer_task.done():
+            logger.warning("[FrameManager] order consumer already running")
+            return
+        from apps.agent.bus import ensure_groups
+        from apps.trading.order_consumer import start_order_consumer
+
+        await ensure_groups()
+        self._order_consumer_task = asyncio.create_task(
+            start_order_consumer(),
+            name="order_consumer",
+        )
+        logger.info(f"[FrameManager] order consumer started (mode={mode})")
 
     async def _stop_order_consumer(self) -> None:
+        task = self._order_consumer_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception) as e:
+                logger.debug(f"[FrameManager] order consumer cancel: {e}")
+        self._order_consumer_task = None
         logger.info("[FrameManager] order consumer stopped")
 
     async def _start_signal_monitor(self) -> None:

@@ -12,6 +12,7 @@ OrderExecutor - 订单执行器
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from decimal import Decimal
@@ -20,9 +21,9 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from apps.trading.models import Order
 
-from asgiref.sync import sync_to_async
 from django.conf import settings
 
+from apps.core.db_utils import db_async
 from .adapters import ADAPTER_MAP, BaseExchangeAdapter, OrderRequest
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class OrderExecutor:
         price: Optional[Decimal],
         exchange_account_id: str,
         user_id: Optional[str] = None,
+        is_close_position: bool = False,
     ) -> dict:
         """
         下单主流程。
@@ -117,6 +119,7 @@ class OrderExecutor:
             price: 价格（市价单可为空）
             exchange_account_id: ExchangeAccount UUID
             user_id: User UUID（供 RiskGuard 风控校验）
+            is_close_position: 平仓信号，跳过 RiskGuard 风控检查
 
         Returns:
             包含 exchange_order_id 和 order_id 的字典
@@ -126,7 +129,7 @@ class OrderExecutor:
             ValueError: 交易所适配器不存在
             PermissionError: RiskGuard 拒绝下单
         """
-        logger.info(f"[OrderExecutor] submit: {exchange} {symbol} {side} {order_type} qty={quantity}")
+        logger.info(f"[SF-07][OrderExecutor] submit: {exchange} {symbol} {side} {order_type} qty={quantity} close={is_close_position}")
         uid = user_id  # 保留引用供 finally 使用
         if not self._running:
             raise RuntimeError("OrderExecutor is not running")
@@ -135,7 +138,7 @@ class OrderExecutor:
         if not adapter:
             raise ValueError(f"Exchange adapter not found: {exchange}")
 
-        # 1. RiskGuard 前置校验
+        # 1. RiskGuard 前置校验（平仓跳过）
         request = OrderRequest(
             exchange=exchange,
             symbol=symbol,
@@ -144,26 +147,58 @@ class OrderExecutor:
             quantity=quantity,
             price=price,
         )
-        if self._riskguard:
-            approved, reason = await self._riskguard.pre_trade_check(request, user_id)
+        if is_close_position:
+            logger.info(f"[SF-07a][OrderExecutor] close position — skipping RiskGuard")
+        elif self._riskguard:
+            # 诊断：检查方法类型
+            import inspect
+            method = self._riskguard.pre_trade_check
+            logger.info(f"[SF-07a][OrderExecutor] pre_trade_check method: {method}, iscoroutinefunction={inspect.iscoroutinefunction(method)}")
+
+            logger.info(f"[SF-07a][OrderExecutor] riskguard instance: {type(self._riskguard).__name__} id={id(self._riskguard)}")
+            logger.info(f"[SF-07a][OrderExecutor] calling pre_trade_check...")
+            try:
+                approved, reason = await self._riskguard.pre_trade_check(request, user_id)
+                logger.info(f"[SF-07a][OrderExecutor] pre_trade_check returned: approved={approved}")
+            except Exception as e:
+                logger.error(f"[SF-07a][OrderExecutor] pre_trade_check exception: {type(e).__name__}: {e}")
+                raise
             if not approved:
+                logger.warning(f"[SF-04][OrderExecutor] RiskGuard拒绝下单: {reason}")
                 raise PermissionError(f"RiskGuard拒绝下单: {reason}")
 
         # 2. 持久化订单 (status=pending)
-        order = await self._persist_order(
-            exchange_account_id=exchange_account_id,
-            user_id=user_id,
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            quantity=quantity,
-            price=price,
-            status="pending",
-        )
+        logger.info(f"[SF-07b][OrderExecutor] persisting order...")
+        try:
+            order = await asyncio.wait_for(
+                self._persist_order(
+                    exchange_account_id=exchange_account_id,
+                    user_id=user_id,
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    quantity=quantity,
+                    price=price,
+                    status="pending",
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[SF-07b][OrderExecutor] _persist_order timeout (30s)")
+            raise TimeoutError("Order persistence timeout")
+        logger.info(f"[SF-07c][OrderExecutor] order persisted: id={order.id}")
 
         # 3. 发送到交易所
         try:
-            response = await adapter.place_order(request)
+            logger.info(f"[SF-07d][OrderExecutor] calling adapter.place_order...")
+            try:
+                response = await asyncio.wait_for(
+                    adapter.place_order(request),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[SF-07d][OrderExecutor] adapter.place_order timeout (15s)")
+                raise TimeoutError("Exchange API timeout")
             await self._update_order(
                 order_id=str(order.id),
                 status="submitted",
@@ -172,7 +207,7 @@ class OrderExecutor:
             if self._riskguard:
                 await self._riskguard.record_order_success(uid)
             logger.info(
-                f"Order submitted: order_id={order.id} "
+                f"[SF-08][OrderExecutor] submitted: order_id={order.id} "
                 f"exchange_order_id={response.exchange_order_id}"
             )
             return {
@@ -188,7 +223,7 @@ class OrderExecutor:
             )
             if self._riskguard:
                 await self._riskguard.record_order_failure(uid)
-            logger.error(f"Order failed: order_id={order.id} - {e}")
+            logger.error(f"[SF-09][OrderExecutor] failed: order_id={order.id} - {e}")
             raise
 
     async def cancel_order(
@@ -242,7 +277,7 @@ class OrderExecutor:
         """从 DB 加载已激活的交易所账号，解密并连接适配器"""
         from apps.exchange.models import ExchangeAccount
 
-        accounts = await sync_to_async(
+        accounts = await db_async(
             lambda: list(ExchangeAccount.objects.filter(is_active=True))
         )()
 
@@ -308,7 +343,7 @@ class OrderExecutor:
         """异步写入 orders 表"""
         from apps.trading.models import Order
 
-        @sync_to_async
+        @db_async
         def _create():
             kwargs_create = {
                 "exchange_account_id": exchange_account_id,
@@ -330,7 +365,7 @@ class OrderExecutor:
         """异步更新订单"""
         from apps.trading.models import Order
 
-        @sync_to_async
+        @db_async
         def _update():
             Order.objects.filter(id=order_id).update(**kwargs)
 

@@ -315,7 +315,7 @@ class BinanceDataSource(BaseDataSource):
 
             # 触发回调
             logger.info(f"[DataSource] kline: {kline.get('symbol')} close={kline.get('close')} vol={kline.get('volume')}")
-            self._trigger_callbacks(DataType.KLINE, kline)
+            self._trigger_precise_callbacks(DataType.KLINE, kline)
 
         elif event_type == "trade" or event_type == "aggTrade":
             # 成交数据
@@ -333,7 +333,7 @@ class BinanceDataSource(BaseDataSource):
                 receive_time,
             )
 
-            self._trigger_callbacks(DataType.TRADE, trade)
+            self._trigger_precise_callbacks(DataType.TRADE, trade)
 
         elif event_type == "24hrTicker" or event_type == "24hrMiniTicker":
             # 行情快照
@@ -351,7 +351,7 @@ class BinanceDataSource(BaseDataSource):
                 receive_time,
             )
 
-            self._trigger_callbacks(DataType.TICKER, ticker)
+            self._trigger_precise_callbacks(DataType.TICKER, ticker)
 
     async def _resubscribe_all(self) -> None:
         """重新发送所有订阅"""
@@ -580,9 +580,13 @@ class BinanceDataSource(BaseDataSource):
         callback: Optional[Callable] = None,
     ) -> bool:
         """订阅数据"""
-        # 注册回调
+        # 注册回调（精确注册：按 data_type + symbol + interval 路由）
+        # 注意：normalize_kline 后 kline["symbol"] 是 binance 原始格式 (DOGEUSDT)，
+        # 所以注册时也要用同一种格式，否则 _trigger_precise_callbacks 键不匹配。
         if callback:
-            self.register_callback(data_type, callback)
+            interval_str = interval.value if interval else None
+            cb_symbol = symbol.replace("/", "") if symbol else symbol
+            self.register_callback(data_type, callback, symbol=cb_symbol, interval=interval_str)
 
         # 生成订阅键
         sub_key = f"{symbol}:{data_type.value}:{interval.value if interval else 'none'}:{market_type.value}"
@@ -616,11 +620,18 @@ class BinanceDataSource(BaseDataSource):
         data_type: DataType,
         interval: Optional[KlineInterval] = None,
         market_type: MarketType = MarketType.SPOT,
+        callback: Optional[Callable] = None,
     ) -> bool:
-        """取消订阅"""
+        """取消订阅。可传 callback 精确注销该回调（不传则只停 WS 流）。"""
         sub_key = f"{symbol}:{data_type.value}:{interval.value if interval else 'none'}:{market_type.value}"
+        # 与 subscribe 保持一致：register_callback 用 binance 原始格式
+        cb_symbol = symbol.replace("/", "") if symbol else symbol
 
         if sub_key not in self._subscriptions:
+            # 即使 WS 没订阅，也清理精确回调（避免幽灵回调）
+            if callback:
+                interval_str = interval.value if interval else None
+                self.unregister_callback(data_type, callback, symbol=cb_symbol, interval=interval_str)
             return False
 
         # 标记为非活跃
@@ -650,6 +661,11 @@ class BinanceDataSource(BaseDataSource):
 
         # 移除订阅
         del self._subscriptions[sub_key]
+
+        # 清理精确回调
+        if callback:
+            interval_str = interval.value if interval else None
+            self.unregister_callback(data_type, callback, symbol=cb_symbol, interval=interval_str)
 
         return True
 

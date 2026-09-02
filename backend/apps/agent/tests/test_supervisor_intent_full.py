@@ -121,6 +121,12 @@ class MockMemoryManager:
     async def save_conv_history(self, history):
         self._l1["conv_history"] = history
 
+    async def append_conv_history(self, entries, keep_turns=10):
+        current = self._l1.get("conv_history", [])
+        updated = (current + entries)[-keep_turns:]
+        self._l1["conv_history"] = updated
+        return updated
+
 
 def llm_agent(name):
     return json.dumps({"agent": name})
@@ -628,7 +634,7 @@ class TestSupervisorIntentSwitching(unittest.TestCase):
         self.assertTrue(result.success)
 
     def test_session_state_transitions(self):
-        """Verify state transition: MULTI_TURN → PAUSED after rejection + reroute."""
+        """Verify state transition: MULTI_TURN → MULTI_TURN(new agent) after rejection + reroute."""
         sup, sm = self._setup()
         mock_quant = make_rejecting_agent(suggestion="coach")
         mock_coach = make_accepting_agent()
@@ -649,10 +655,11 @@ class TestSupervisorIntentSwitching(unittest.TestCase):
                 sup.handle(AgentMessage(payload={"text": "制定计划"}, user_id="u1"))
             )
 
-        # Session should be PAUSED after rejection
+        # Session should transition to MULTI_TURN with the new agent after successful reroute
         ctx = sm._store.get("u1")
         self.assertIsNotNone(ctx)
-        self.assertEqual(ctx["state"], SessionState.PAUSED.value)
+        self.assertEqual(ctx["state"], SessionState.MULTI_TURN.value)
+        self.assertEqual(ctx["active_agent"], "coach")
 
 
 # ------------------------------------------------------------------ #

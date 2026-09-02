@@ -189,7 +189,7 @@ export default function LogsPage() {
         <div className="px-4 py-2.5 border-b border-[rgba(255,255,255,0.07)] flex items-center gap-4 text-[9px] text-text3 uppercase tracking-wider font-semibold">
           <span className="w-24">时间</span>
           <span className="w-14">级别</span>
-          <span className="w-24">Agent</span>
+          <span className="w-24">模块</span>
           <span className="flex-1">消息</span>
         </div>
 

@@ -30,7 +30,26 @@ class _LLMAgent(BaseAgent):
     def _build_system_prompt(self) -> str:
         """动态构建 system prompt，注入技能内容。"""
         system_prompt = PromptLoader.load(self.prompt_name) if self.prompt_name else ""
-        system_prompt += '\n\n 收到用户消息后，先判断是否属于你的职责范围。如果不属于你的职责，必须**只**返回以下 JSON 格式，不加任何其他内容：\n {"rejected": true, "reason": "简短原因", "suggested_agent": "coach" 或 "risk_advisor"} \n 如果属于你的职责，正常回答，不要包含 rejected 字段。'
+        system_prompt += """\n\n## Notifications
+When you need to proactively notify the user about important events, results, or reminders, use the `notify_user` tool.
+
+Examples:
+- Completing a long-running task (backtest finished, analysis ready)
+- Alerting about a significant market event
+- Delivering a summary of completed work
+- Reminding the user about a scheduled task or deadline
+
+Keep notifications concise and actionable. Do NOT use `notify_user` for conversational responses — those go in your normal reply.
+
+## Response Style \n\n **Reject** requests outside your scope immediately and **Must** provide a clear reason and suggestion in the following JSON format:
+            ```json
+            {
+                "rejected": true,
+                "reason": "Out of scope: {your explanation}",
+            }
+            ```
+            \n\n"""
+
         return self._build_skills_section(system_prompt)
 
     def _get_tools_schema(self) -> list[dict]:
@@ -56,10 +75,22 @@ class _LLMAgent(BaseAgent):
                         "[%s] tool %s not found in registry", self.name, tool_name
                     )
 
+            # Always include notify_user for all agents
+            if "notify_user" not in seen:
+                notify_tool = ToolRegistry.get("notify_user")
+                if notify_tool:
+                    schemas.append(notify_tool.schema)
+
             return schemas
 
         # 回退：未声明工具列表时返回全部
-        return ToolRegistry.get_all_schemas()
+        schemas = ToolRegistry.get_all_schemas()
+        # Ensure notify_user is always available
+        if not any(s["function"]["name"] == "notify_user" for s in schemas):
+            notify_tool = ToolRegistry.get("notify_user")
+            if notify_tool:
+                schemas.append(notify_tool.schema)
+        return schemas
 
     def _get_memory_manager(self, message: AgentMessage):
         from apps.memory.manager import MemoryManager
@@ -76,7 +107,7 @@ class _LLMAgent(BaseAgent):
         mem = self._get_memory_manager(message)
 
         # 获取最近的对话记录
-        recent_conv = await mem.get_conv_history(max_turns=max_turns * 2)
+        recent_conv = await mem.get_conv_history()
 
         logger.debug(
             "[%s] Retrieved recent conversation from memory: %s", self.name, recent_conv
@@ -115,8 +146,19 @@ class _LLMAgent(BaseAgent):
         memories = await mem.retrieve(query=text, top_k=5)
         system = self._build_system_prompt()
         if memories:
-            mem_lines = "\n".join(f"- [{m['source']}] {m['content']}" for m in memories)
-            system = f"{system}\n\n### 相关记忆\n{mem_lines}"
+            # 通道 C 已注入的文本（跨 agent 上下文），用于跨通道子串去重
+            prev_response = message.payload.get("previous_agent_response", "")
+            # 过滤掉已被通道 C 覆盖的记忆条目
+            filtered = []
+            for m in memories:
+                content = m.get("content", "")
+                if prev_response and content and content in prev_response:
+                    continue
+                filtered.append(m)
+
+            if filtered:
+                mem_lines = "\n".join(f"- [{m['source']}] {m['content']}" for m in filtered)
+                system = f"{system}\n\n### 相关记忆\n{mem_lines}"
 
         logger.debug("[%s] Final system prompt:\n%s", self.name, system)
 
@@ -182,26 +224,23 @@ class _LLMAgent(BaseAgent):
             "agent_name": self.name,
         }
 
-        # 写入记忆
-        mem.write_l1(message.task_id, f"Q:{text[:200]}|A:{content[:200]}")
+        # 写入记忆：Q/A 摘要持久化到 conv_history（短期）+ WorkingMemory（语义召回）
+        # L1 进程内缓存已删除（历史遗留），不再单独写
 
-        # 更新对话历史到L1记忆
-        conv_history = await mem.get_conv_history(max_turns=10)
-
-        # 添加用户消息
-        conv_history.append(
-            {"role": "user", "text": text[:200], "ts": int(time.time())}
+        # 原子追加对话历史（使用 conv_lock 防止并发覆盖）
+        await mem.append_conv_history(
+            [
+                {"role": "user", "text": text, "ts": int(time.time())},
+                {"role": "assistant", "text": content, "ts": int(time.time())},
+            ]
         )
-        # 添加助手回复
-        conv_history.append(
-            {"role": "assistant", "text": content[:200], "ts": int(time.time())}
-        )
-        # 限制对话历史长度
-        await mem.save_conv_history(conv_history[-20:])  # 保留最近10轮对话
 
+        # 写入 L2 语义记忆：仅写提炼后的要点，与通道 C（近期原文）职责分离
+        # 不再写入原始对话原文，避免与 get_conv_history 双重召回
         await mem.write_l2(
-            content=f"user: {text}\nassistant: {content}",
+            content=f"Q: {text} → A: {content}",
             memory_type="conversation",
+            shared=False,  # 对话要点不共享，避免跨 agent 冗余召回
         )
         return AgentResult(task_id=message.task_id, success=True, data=response_data)
 

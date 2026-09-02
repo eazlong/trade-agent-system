@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 import numpy as np
 
-from apps.strategy_engine.indicators import atr
+from apps.strategy_engine.indicators import atr, horizontal_key_levels
 
 
 class TestAtr:
@@ -92,3 +93,68 @@ class TestAtr:
         result_np = atr(self.highs, self.lows, self.closes, period=7)
         result_list = atr(self.highs_list, self.lows_list, self.closes_list, period=7)
         assert abs(result_np[-1] - result_list[-1]) < 1e-10
+
+
+class TestHorizontalKeyLevels:
+    def _history(self):
+        lows = [100, 102, 99, 101, 103, 100, 104, 106, 99, 105,
+                107, 100, 108, 110, 99, 109, 111, 100, 112, 114]
+        highs = [110, 112, 115, 113, 111, 116, 114, 112, 115, 113,
+                 111, 116, 114, 112, 115, 113, 111, 116, 114, 112]
+        return [
+            {
+                "timestamp": f"2026-01-01T00:{i:02d}:00Z",
+                "open": (high + low) / 2,
+                "high": high,
+                "low": low,
+                "close": (high + low) / 2,
+                "volume": 1000,
+            }
+            for i, (high, low) in enumerate(zip(highs, lows))
+        ]
+
+    def test_returns_levels_from_local_pivots(self):
+        result = horizontal_key_levels(
+            self._history(), current_price=106, atr_period=3, max_levels=20
+        )
+
+        assert result["levels"]
+        assert result["supports"]
+        assert result["resistances"]
+        assert result["levels"][0]["touches"] >= 3
+
+    def test_consecutive_hits_count_as_one_touch_cluster(self):
+        history = self._history()
+        history[8]["low"] = 99
+        history[9]["low"] = 99
+        history[10]["low"] = 99
+
+        result = horizontal_key_levels(
+            history, current_price=106, atr_period=3, min_gap_bars=3
+        )
+        low_level = min(result["levels"], key=lambda level: level["price"])
+
+        assert low_level["touches"] == 3
+
+    def test_dynamic_tolerance_is_clamped(self):
+        result = horizontal_key_levels(self._history(), atr_period=3)
+
+        assert 0.001 <= result["tolerance_pct"] <= 0.01
+
+    def test_without_current_price_does_not_classify(self):
+        result = horizontal_key_levels(self._history(), atr_period=3)
+
+        assert result["levels"]
+        assert result["supports"] == []
+        assert result["resistances"] == []
+
+    def test_invalid_kline_raises(self):
+        history = self._history()
+        del history[0]["low"]
+
+        with pytest.raises(ValueError):
+            horizontal_key_levels(history, atr_period=3)
+
+    def test_insufficient_klines_raises(self):
+        with pytest.raises(ValueError):
+            horizontal_key_levels(self._history()[:5], atr_period=14)

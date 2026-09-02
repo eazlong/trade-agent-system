@@ -50,7 +50,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
             except Exception:
                 return None
 
-        user = await sync_to_async(_get_user)(token_list[0])
+        # thread_sensitive=False：避免排在 asgiref 的共享单线程后面。
+        # 该单线程会被 FrameManager K 线回调里的阻塞 ccxt 网络调用占住，
+        # 导致这里排队挂起、握手永远无法完成（对话"不响应"）。
+        user = await sync_to_async(_get_user, thread_sensitive=False)(token_list[0])
         if not user:
             await self.close(code=4001)
             return
@@ -175,16 +178,35 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 })
 
             if result.success:
+                content = (
+                    result.data.get("content", str(result.data))
+                    if isinstance(result.data, dict)
+                    else result.data
+                )
                 await self._safe_send({
                     "type": "chat_response",
-                    "data": (
-                        result.data.get("content", str(result.data))
-                        if isinstance(result.data, dict)
-                        else result.data
-                    ),
+                    "data": content,
                     "task_id": result.task_id,
                     "status": "done",
                 })
+
+                # 多通道扇出：web 已由 chat_response 送达，这里把回复同时推送到
+                # 主通道（MAIN_CHANNEL，默认飞书）。例如回测后「已安排 5 分钟后
+                # 自动查询结果」需要飞书与 web 端同时收到。
+                try:
+                    from apps.agent.reply_fanout import fan_out_reply
+
+                    await fan_out_reply(
+                        self.user_id,
+                        content if isinstance(content, str) else str(content),
+                        origin="web",
+                    )
+                except Exception:
+                    logger.warning(
+                        "[ChatWS] fan_out_reply failed for user %s",
+                        self.user_id,
+                        exc_info=True,
+                    )
             else:
                 await self._safe_send({
                     "type": "chat_response",

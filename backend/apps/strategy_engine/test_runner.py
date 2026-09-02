@@ -42,6 +42,21 @@ def _generate_mock_klines(n: int = 100) -> list[dict]:
     return klines
 
 
+def _run_coro_blocking(coro):
+    """在同步上下文中运行协程；若已处于事件循环内（如 async 工具调用），
+    则在独立线程中运行，避免 'asyncio.run() cannot be called from a
+    running event loop'。BacktestEngine.run() 为纯内存计算，子线程运行安全。"""
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
 class StrategyTester:
     """策略验证器：加载策略文件 → 验证语法 → 运行模拟回测"""
 
@@ -79,10 +94,15 @@ class StrategyTester:
         # 检查策略注册
         reg_warning = self._check_registration(strategy_cls)
 
+        # 检查get_watch_signals是否返回空列表（实盘信号触发的重要警告）
+        signal_warning = self._check_signal_configuration(strategy_cls)
+
         run_result = self._run_mock_backtest(strategy_cls)
         all_warnings = run_result.get("warnings", [])
         if reg_warning:
             all_warnings.insert(0, reg_warning)
+        if signal_warning:
+            all_warnings.insert(0, signal_warning)
 
         if run_result["errors"]:
             return {"success": False, "strategy_name": strategy_name, "errors": run_result["errors"], "stats": run_result.get("stats"), "warnings": type_warnings + ctx_attr_warnings + all_warnings}
@@ -216,6 +236,61 @@ class StrategyTester:
             errors.append("策略类缺少 'name' 属性或为空")
         if not hasattr(strategy_cls, "on_bar"):
             errors.append("策略类缺少 'on_bar' 方法")
+
+        # 验证 description 是否符合 4 字段模板
+        from apps.strategy_engine.registry import StrategyRegistry
+        try:
+            StrategyRegistry.validate_description(strategy_cls)
+        except ValueError as e:
+            errors.append(str(e))
+
+        # 验证 get_watch_signals 方法（实盘信号触发必需）
+        if hasattr(strategy_cls, "get_watch_signals"):
+            try:
+                from apps.strategy_engine.base import StrategyContext
+                from decimal import Decimal
+
+                # 创建临时context验证返回值
+                context = StrategyContext(
+                    symbol="BTC/USDT", timeframe="1h", mode="paper",
+                    params={}, balance=Decimal("10000"), position=Decimal("0"),
+                )
+                strategy = strategy_cls(context)
+                signals = strategy.get_watch_signals()
+
+                if not isinstance(signals, list):
+                    errors.append(
+                        f"get_watch_signals() 返回类型错误：应为 list[dict]，实际返回 {type(signals).__name__}"
+                    )
+                elif len(signals) > 0:
+                    # 验证每个信号的结构
+                    for i, signal in enumerate(signals):
+                        if not isinstance(signal, dict):
+                            errors.append(
+                                f"get_watch_signals()[{i}] 类型错误：应为 dict，实际为 {type(signal).__name__}"
+                            )
+                            continue
+
+                        # 检查必需字段
+                        required_fields = ["interval", "indicator_type", "condition"]
+                        missing_fields = [f for f in required_fields if f not in signal]
+                        if missing_fields:
+                            errors.append(
+                                f"get_watch_signals()[{i}] 缺少必需字段：{', '.join(missing_fields)}"
+                            )
+
+                        # 验证condition结构
+                        if "condition" in signal:
+                            cond = signal["condition"]
+                            if not isinstance(cond, dict):
+                                errors.append(f"get_watch_signals()[{i}].condition 应为 dict")
+                            elif "operator" not in cond:
+                                errors.append(f"get_watch_signals()[{i}].condition 缺少 'operator' 字段")
+
+            except Exception as e:
+                errors.append(f"get_watch_signals() 调用失败：{e}")
+        # else: 不强制要求，因为BaseStrategy有默认空实现
+
         return errors
 
     def _check_registration(self, strategy_cls: type) -> str | None:
@@ -235,130 +310,121 @@ class StrategyTester:
             )
         return None
 
+    def _check_signal_configuration(self, strategy_cls: type) -> str | None:
+        """检查策略是否定义了有效的信号配置（用于实盘信号触发）"""
+        from apps.strategy_engine.base import StrategyContext, BaseStrategy
+        from decimal import Decimal
+
+        # 检查是否覆盖了get_watch_signals方法
+        if strategy_cls.get_watch_signals is BaseStrategy.get_watch_signals:
+            return (
+                "策略使用默认的 get_watch_signals()（返回空列表），"
+                "实盘信号无法触发策略验证。"
+                "如需启用信号预筛选，请覆盖该方法返回有效的信号配置。"
+            )
+
+        # 已覆盖方法，但返回空列表
+        try:
+            context = StrategyContext(
+                symbol="BTC/USDT", timeframe="1h", mode="paper",
+                params={}, balance=Decimal("10000"), position=Decimal("0"),
+            )
+            strategy = strategy_cls(context)
+            signals = strategy.get_watch_signals()
+
+            if isinstance(signals, list) and len(signals) == 0:
+                return (
+                    "get_watch_signals() 已覆盖但返回空列表，"
+                    "实盘信号无法触发策略验证。"
+                    "请返回有效的信号配置或移除该方法覆盖（使用默认实现）。"
+                )
+        except Exception:
+            # 调用失败已在_validate_strategy_class中报错，这里不重复
+            pass
+
+        return None
+
     def _run_mock_backtest(self, strategy_cls: type) -> dict[str, Any]:
-        """用模拟 K 线数据运行策略"""
-        from apps.strategy_engine.base import OrderSignal, StrategyContext
-        errors: list[str] = []
+        """用模拟 K 线数据通过真实 BacktestEngine 运行策略。
+
+        复用 BacktestEngine 确保验证逻辑与真实回测完全一致（仓位计算、
+        ctx.balance/position/price 状态同步、portfolio/risk 五步管线）。
+        BacktestEngine.run() 为纯内存计算，不写数据库、不连交易所，因此
+        验证流程不会污染任何真实数据。
+        """
+        from apps.strategy_engine.backtest_mode import BacktestEngine
+        from apps.strategy_engine.base import StrategyContext
+
         warnings: list[str] = []
         schema: dict = getattr(strategy_cls, "params_schema", {})
         params = {key: val.get("default") if isinstance(val, dict) else val for key, val in schema.items()}
-        context = StrategyContext(symbol="BTC/USDT", timeframe="1h", mode="backtest", params=params, balance=self.initial_capital, position=Decimal("0"))
+        context = StrategyContext(
+            symbol="BTC/USDT", timeframe="1h", mode="backtest",
+            params=params, balance=self.initial_capital, position=Decimal("0"),
+        )
         try:
             strategy = strategy_cls(context)
         except Exception as e:
             return {"stats": None, "errors": [f"策略实例化失败: {e}"], "warnings": []}
 
         klines = _generate_mock_klines(self.kline_count)
-        signals_count = buy_count = sell_count = 0
-        buy_skipped_no_funds = 0  # 买入信号因资金不足被跳过
-        buy_skipped_zero_qty = 0   # 买入信号 quantity 为 0
-        position = Decimal("0")
-        balance = self.initial_capital
-        try:
-            strategy.on_start()
-        except Exception as e:
-            errors.append(f"on_start 调用失败: {e}")
-
-        for i, kline in enumerate(klines):
-            history = klines[: i + 1]
-            try:
-                signal = strategy.on_bar(kline, history)
-            except Exception as e:
-                err_msg = str(e)
-                enriched = err_msg
-                # 自动识别 Decimal 类型混用错误
-                if "TypeError" in type(e).__name__:
-                    if "Decimal" in err_msg or "unsupported operand" in err_msg.lower():
-                        enriched = (
-                            f"{err_msg}\n"
-                            f"  → 可能是 Decimal 与 float/str 混用导致的类型错误。"
-                            f"确保所有数值运算都使用 Decimal 类型（float 需用 Decimal(str(value)) 转换）。"
-                        )
-                errors.append(f"on_bar 第 {i + 1} 根 K 线时出错: {enriched}")
-                break
-            if signal is None:
-                continue
-            if not isinstance(signal, OrderSignal):
-                errors.append(f"on_bar 返回了非 OrderSignal 类型: {type(signal).__name__}")
-                break
-            signals_count += 1
-            if signal.side == "buy":
-                qty = signal.quantity
-                if qty <= Decimal("0"):
-                    buy_skipped_zero_qty += 1
-                    buy_count += 1
-                    continue
-                cost = qty * Decimal(str(kline["close"]))
-                commission = cost * Decimal("0.001")
-                if cost + commission <= balance:
-                    balance -= cost + commission
-                    position += qty
-                else:
-                    buy_skipped_no_funds += 1
-                buy_count += 1
-            elif signal.side == "sell":
-                sell_qty = min(signal.quantity, position)
-                balance += sell_qty * Decimal(str(kline["close"])) * Decimal("0.999")
-                position -= sell_qty
-                sell_count += 1
+        engine = BacktestEngine(
+            strategy=strategy,
+            ohlcv_data=klines,
+            initial_capital=self.initial_capital,
+            symbol="BTC/USDT",
+            timeframe="1h",
+        )
 
         try:
-            strategy.on_stop()
+            stats = _run_coro_blocking(engine.run())
         except Exception as e:
-            warnings.append(f"on_stop 调用失败: {e}")
+            return {"stats": None, "errors": [self._enrich_runtime_error(e)], "warnings": warnings}
 
-        if errors:
-            return {"stats": None, "errors": errors, "warnings": warnings}
+        trades = stats.get("trades", []) or []
+        buy_count = sum(1 for t in trades if t.get("trade_type") in ("open", "add"))
+        sell_count = sum(1 for t in trades if t.get("trade_type") == "close")
+        signals_count = buy_count + sell_count
 
-        # 零交易检测 — on_bar 从未返回有效信号
-        if signals_count == 0:
-            errors.append(
-                "零交易：on_bar 在所有 K 线上均返回 None。"
-                "请确保 on_bar 在满足条件时返回 ctx.buy() / ctx.sell() / ctx.close_position() 的返回值，"
-                "而不是仅调用这些方法后返回 None。"
-            )
-            return {"stats": None, "errors": errors, "warnings": warnings}
-
-        # 有信号但未成交（买入资金不足或卖出无持仓）
-        if buy_count == 0 and sell_count == 0:
+        # 零交易检测 — 降级为 warning（随机模拟数据上零信号不代表策略有缺陷）
+        if not trades:
             warnings.append(
-                f"策略生成了 {signals_count} 个信号，但无实际成交。"
-                "检查资金是否充足、信号 side 是否正确。"
+                "零交易：在模拟 K 线上策略未产生任何成交。"
+                "若策略依赖特定行情（趋势/突破），这可能是随机模拟数据所致；"
+                "请确认 on_bar/generate_insights 在满足条件时返回 "
+                "ctx.buy()/ctx.sell()/ctx.close_position() 的返回值（而非仅调用后返回 None）。"
             )
 
-        # 仓位计算验证 — quantity 为零或负
-        if buy_skipped_zero_qty > 0:
-            warnings.append(
-                f"仓位计算错误：{buy_skipped_zero_qty} 个买入信号的 quantity ≤ 0，被跳过。"
-                "请检查仓位计算公式是否正确（qty = total_capital * position_pct / price）。"
-            )
-
-        # 仓位计算验证 — 资金不足
-        if buy_skipped_no_funds > 0:
-            warnings.append(
-                f"仓位计算错误：{buy_skipped_no_funds} 个买入信号因资金不足被跳过"
-                f"（初始资金 {self.initial_capital}，可用余额 {float(balance):.2f}）。"
-                "请检查：1) 是否手动计算了过大的 quantity；"
-                "2) 是否直接使用 balance（可用余额）替代 total_capital（总资金）；"
-                "3) 推荐使用 PctCapitalPortfolio 自动计算开仓量。"
-            )
-
-        # 仓位计算验证 — 资金几乎未使用（可能 quantity 计算过小）
-        if buy_count > 0 and buy_skipped_no_funds == 0 and buy_skipped_zero_qty == 0:
-            used_capital = self.initial_capital - balance
-            if used_capital > 0 and used_capital < self.initial_capital * Decimal("0.01"):
-                warnings.append(
-                    f"仓位计算可能过小：在 {buy_count} 次买入中仅使用了 "
-                    f"{float(used_capital):.2f} 资金（初始资金 {self.initial_capital}）。"
-                    "请检查 quantity 计算是否因 Decimal 类型混用或数值错误导致过小。"
-                )
-
-        final_equity = balance + position * Decimal(str(klines[-1]["close"]))
-        total_return = float(((final_equity - self.initial_capital) / self.initial_capital) * 100)
-        stats = {
-            "total_bars": len(klines), "signals_count": signals_count,
-            "buy_count": buy_count, "sell_count": sell_count,
-            "final_balance": float(balance), "final_position": float(position),
-            "final_equity": float(final_equity), "total_return_pct": round(total_return, 2),
+        stats_out = {
+            "total_bars": len(klines),
+            "signals_count": signals_count,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "final_balance": float(context.balance),
+            "final_position": float(context.position),
+            "final_equity": stats.get("final_equity"),
+            "total_return_pct": stats.get("total_return_pct"),
+            "total_trades": stats.get("total_trades"),
         }
-        return {"stats": stats, "errors": [], "warnings": warnings}
+        return {"stats": stats_out, "errors": [], "warnings": warnings}
+
+    @staticmethod
+    def _enrich_runtime_error(e: Exception) -> str:
+        """将回测运行期异常翻译为对策略作者友好的提示。"""
+        err_msg = str(e)
+        # 非 OrderSignal 返回值：generate_insights 会访问 signal.side → AttributeError
+        if isinstance(e, AttributeError) and "side" in err_msg:
+            return (
+                f"on_bar 返回了非 OrderSignal 类型（{err_msg}）。"
+                "on_bar 必须返回 ctx.buy()/ctx.sell()/ctx.close_position() 的结果或 None。"
+            )
+        # Decimal 与 float/str 混用
+        if isinstance(e, TypeError) and (
+            "Decimal" in err_msg or "unsupported operand" in err_msg.lower()
+        ):
+            return (
+                f"{err_msg}\n"
+                "  → 可能是 Decimal 与 float/str 混用导致的类型错误。"
+                "确保所有数值运算都使用 Decimal 类型（float 需用 Decimal(str(value)) 转换）。"
+            )
+        return f"回测运行出错: {err_msg}"

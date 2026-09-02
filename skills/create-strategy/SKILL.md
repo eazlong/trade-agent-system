@@ -2,6 +2,7 @@
 name: create-strategy
 description: 创建量化交易策略 — 通过对话了解需求，生成继承自 BaseStrategy 的策略代码文件
 when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易策略"时激活
+autonomous: false
 ---
 
 # 创建策略技能
@@ -10,16 +11,31 @@ when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易�
 
 ## 核心原则
 
+> 以下原则在 `autonomous: false` 时适用。autonomous 模式见下一节。
+
 1. **先对话，后编码** — 必须通过提问确认需求，不能直接生成代码
 2. **确认后再生成** — 需求不完整时持续追问，完整后给出总结并确认
 3. **自动生成策略名** — 根据策略逻辑自动生成 `{indicator1}_{indicator2}_strategy` 格式的名称，无需用户确认
 4. **输出到统一策略目录** — 生成到 `~/.tradelogx/strategies/` 目录
 
+## Autonomous 模式
+
+由 frontmatter 的 `autonomous` 字段控制（默认 `false`）。
+
+| 阶段 | 默认行为 | `autonomous: true` |
+|------|----------|-------------------|
+| 0. 检查相似策略 | 询问是否使用 | 告知已存在，**流程结束** |
+| 1. 需求收集 | 对话逐轮收集 | **跳过**，从初始消息推断，缺失用默认值（symbol=BTC/USDT, timeframe=1d, exchange=binance, 止损=2%, 止盈=5%, 仓位=10%, 不做空, 指标参数=行业标准值） |
+| 2. 确认需求 | 汇总后等确认 | **跳过**，直接阶段 3 |
+| 3. 生成代码 | 同默认 | 同默认 |
+| 4. 测试策略 | 同默认 | 同默认 |
+| 完成/失败 | 通知用户 | 通知用户 |
+
+**不跨越 skill 边界自动触发其他 skill。**
+
 ## 策略命名规则
 
-**格式**：`{核心指标1}_{核心指标2}_strategy`
-
-由 agent 根据策略使用的指标自动生成，示例：
+**格式**：`{核心指标1}_{核心指标2}_strategy`，由 agent 根据策略使用的指标自动生成：
 
 | 策略逻辑 | strategy_name |
 |---------|---------------|
@@ -28,49 +44,62 @@ when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易�
 | MACD 交叉 + ATR 止损 | `macd_atr_strategy` |
 | 双均线交叉 | `ma_cross_strategy` |
 | 仅 RSI 超买超卖 | `rsi_strategy` |
-| 仅布林带回归 | `bollinger_strategy` |
 
-**命名优先级**：
-1. 取策略中最重要的 1-2 个指标， `_` 连接
-2. 辅以策略类型（如 `breakout`、`regression`、`cross`）
-3. 最后加 `_strategy` 后缀
-4. 全部小写，英文
+**命名优先级**：取最重要的 1-2 个指标用 `_` 连接 → 辅以策略类型（`breakout`/`regression`/`cross`）→ 加 `_strategy` 后缀 → 全部小写英文。
 
 ## 工作流程
 
+### 阶段 0：检查是否已存在相似策略
+
+在开始需求收集前，先检查系统中是否已有匹配的策略：
+
+1. **获取所有策略列表**：调用工具 `list_strategies()`（即 `StrategyRegistry.list_registered_with_descriptions()`），返回所有策略的 name + description。
+
+2. **LLM 语义匹配**：将用户意图和策略列表传给 LLM，判断是否已存在相似策略：
+
+   ```
+   用户意图：{用户的描述，如 "RSI 均值回归策略"}
+   
+   已有策略：
+   {策略列表 JSON}
+   
+   请判断是否有匹配的策略。
+   返回 JSON 格式：{"name": "策略名", "score": 0-100}
+   如果没有匹配的（score < 80），返回 {"name": null, "reason": "原因"}
+   ```
+
+3. **判断结果**：
+   - 如果 `score >= 80`，告知用户：
+     > 已找到相似策略：{name}
+     > {description}
+     > 
+     > 是否直接使用此策略？如需创建新版本，请继续。
+     
+     <!-- autonomous=true: 告知用户已存在相似策略后直接结束流程，不询问 -->
+   - 如果 `score < 80` 或 `name = null`，进入阶段 1 需求收集。
+
 ### 阶段 1：需求收集（对话轮次）
+
+<!-- autonomous=true: 跳过本阶段，从用户初始消息推断需求，缺失参数用"Autonomous 模式"章节中的默认值填充，然后直接进入阶段 3 -->
 
 通过提问收集以下信息，每轮聚焦 1-2 个维度：
 
-#### 1.1 策略基本信息
-- 核心策略逻辑（一句话描述）→ agent 自动推导 strategy_name
-- 交易品种（单品种如 BTCUSDT，或多品种）
-- 交易周期（如 1h、4h、1d）
-
-#### 1.2 交易逻辑
-- **入场条件**：什么情况下买入？（指标条件、价格条件等）
-- **出场条件**：什么情况下卖出？（止盈/止损/信号反转）
-- **仓位管理**：每次开多少仓位？（固定数量/百分比/动态计算）
-- **是否对冲/做空**：仅做多还是多空都做？
-
-#### 1.3 技术指标
-- 使用哪些指标？（如 RSI、MACD、MA、布林带、ATR 等）
-- 指标参数？（周期、阈值等）
-
-#### 1.4 风控规则
-- 止损比例？
-- 止盈比例？
-- 单日最大亏损限制？
+- **1.1 基本信息**：核心策略逻辑（一句话，agent 据此推导 strategy_name）、交易品种（单/多品种）、交易周期（1h/4h/1d）
+- **1.2 交易逻辑**：入场条件、出场条件（止盈/止损/信号反转）、仓位管理（固定数量/百分比/动态）、是否做空
+- **1.3 技术指标**：使用哪些指标（RSI/MACD/MA/布林带/ATR）及其参数（周期、阈值）
+- **1.4 风控规则**：止损比例、止盈比例、单日最大亏损限制
 
 ### 阶段 2：确认需求
 
-在生成代码前，总结用户需求并明确确认：
+<!-- autonomous=true: 跳过本阶段，直接进入阶段 3 生成代码 -->
+
+生成代码前，总结需求并明确确认。**必须等待用户确认后才能生成代码。**
 
 ```
 我理解你的策略需求如下：
 
 - **策略名称**：`xxx_strategy`（自动生成）
-- **交易品种**：`BTCUSDT`（或 `BTCUSDT, ETHUSDT`）
+- **交易品种**：`BTCUSDT`
 - **交易周期**：`1h`
 - **入场逻辑**：...
 - **出场逻辑**：...
@@ -80,46 +109,31 @@ when_to_use: 用户要求"创建策略"、"编写策略"、"新建一个交易�
 请确认是否正确，我将开始生成策略代码。
 ```
 
-**必须等待用户确认后才能生成代码。**
-
 ### 阶段 3：生成策略代码
 
-确认后，按以下步骤生成策略 Python 文件：
-
-#### 3.1 分析入场条件
-
-从用户确认的需求中提取：
-- **主要指标**：如 RSI、MACD、布林带、EMA 等
-- **触发条件**：如"RSI < 30"、"价格突破布林带上轨"、"EMA 上穿 EMA_slow"
-- **K线周期**：如 1h、4h、15m
-
-#### 3.2 推导 watch signals
-
-根据推导规则（见下方"Watch Signals 推导规则"章节），将入场条件映射为最小周期信号：
-
-1. **简化条件** — 复合条件拆解为单指标条件（如"EMA向上 且 RSI<30" → 只取"RSI<30"）
-2. **选择周期** — 使用策略的最小K线周期作为 interval
-3. **映射格式** — 转换为标准 watch signal 格式：
+1. **先生成 description**（必须，注册时会校验）— 按 4 字段模板填写策略描述：
    ```python
-   {
-       "interval": "1h",
-       "indicator_type": "rsi",
-       "indicator_params": {"period": 14},
-       "condition": {"operator": "lt", "left": {"field": "rsi"}, "right": {"value": 30}},
-       "trigger_type": "continuous"
-   }
+   description = """策略类型：{均值回归/趋势跟踪/突破/动量/套利}
+   核心指标：{RSI/MACD/布林带/均线/ATR/...，只写指标名，不写具体参数值}
+   适用场景：{震荡行情/趋势行情/高波动/低波动/...}
+   入场逻辑：{一句话概括买入条件，不含具体参数值}"""
+   ```
+   **示例**：
+   ```python
+   description = """策略类型：均值回归
+   核心指标：RSI
+   适用场景：震荡行情，不适合单边趋势
+   入场逻辑：RSI 跌破超卖阈值且出现反转信号时买入"""
    ```
 
-#### 3.3 生成完整代码
+2. **分析入场条件** — 从确认的需求中提取主要指标、触发条件、K 线周期
 
-生成包含以下部分的策略代码：
-- `on_bar` 实现
-- `get_watch_signals` 实现（基于 3.2 推导结果）— **必须实现，禁止返回 `[]`**（见下方 CRITICAL 检查）
-- `on_start`、`on_stop` 等生命周期方法
+3. **推导 watch signals** — 按 **`references/watch-signals.md`** 的规则，将入场条件映射为最小周期信号（**必须实现，禁止返回 `[]`**）
 
-**输出路径**：`~/.tradelogx/strategies/{strategy_name}.py`
+4. **生成完整代码** — 复制 **`references/strategy-template.md`** 模板，按需填充；API 细节查 **`references/api-reference.md`**。代码须含 `description`、`on_bar`、`get_watch_signals`、`on_start`、`on_stop`
 
-调用 `write_file` 工具：
+**输出路径**：`~/.tradelogx/strategies/{strategy_name}.py`，调用 `write_file`：
+
 ```
 write_file(
     file_path="~/.tradelogx/strategies/{strategy_name}.py",
@@ -128,110 +142,11 @@ write_file(
 )
 ```
 
-策略创建成功后，告知用户：
-- strategy_name（供回测使用）
-- 文件路径
-
-## Watch Signals 推导规则
-
-Agent 在阶段3生成代码时，需要将策略入场条件推导为 watch signals。以下是推导规则：
-
-### 1. 简化原则
-
-**只保留单指标条件**，复合条件在 `on_bar()` 中完整验证：
-
-| 入场条件 | watch signal | on_bar 验证 |
-|---------|-------------|------------|
-| RSI < 30 且 EMA向上 | RSI < 30 | RSI < 30 && EMA_slope > 0 |
-| 价格突破布林带上轨 且 MACD金叉 | 价格突破布林带上轨 | price > bb_upper && macd > signal |
-| EMA_fast 上穿 EMA_slow | EMA_fast 上穿 EMA_slow | 完整条件（单指标已足够） |
-
-### 2. 指标类型映射
-
-将策略中使用的指标映射为 `indicator_type`：
-
-| 策略指标 | indicator_type | indicator_params |
-|---------|---------------|-----------------|
-| RSI | `"rsi"` | `{"period": 14}` |
-| EMA | `"ema"` | `{"period": 20}` |
-| 布林带 | `"bollinger"` | `{"period": 20, "std_dev": 2.0}` |
-| MACD | `"macd"` | `{"fast": 12, "slow": 26, "signal_period": 9}` |
-| 唐奇安通道 | `"donchian"` | `{"period": 20}` |
-| ATR | `"atr"` | `{"period": 14}` |
-
-### 3. 条件运算符映射
-
-将入场条件转换为 `condition` 格式：
-
-| 条件描述 | operator | left | right |
-|---------|---------|------|-------|
-| RSI < 30 | `"lt"` | `{"field": "rsi"}` | `{"value": 30}` |
-| RSI > 70 | `"gt"` | `{"field": "rsi"}` | `{"value": 70}` |
-| 价格上穿布林带上轨 | `"cross_above"` | `{"field": "price"}` | `{"field": "upper"}` |
-| EMA 下穿 EMA_slow | `"cross_below"` | `{"field": "ema"}` | `{"field": "ema_slow"}` |
-| 价格 > 50000 | `"gt"` | `{"field": "price"}` | `{"value": 50000}` |
-
-### 4. 周期选择规则
-
-使用策略的**最小K线周期**作为 `interval`：
-
-- 策略使用 4h + 1d → watch signal 使用 `"4h"`
-- 策略仅使用 1h → watch signal 使用 `"1h"`
-- 多时间框架策略 → 使用最小周期（如 15m + 1h → `"15m"`）
-
-### 5. trigger_type 选择
-
-- **持续信号**（如 RSI < 30）→ `"continuous"`
-- **突破信号**（如 价格上穿布林带）→ `"once"`（首次触发后移除）
-
-### 6. 多条件策略示例
-
-**策略入场条件**：4h EMA向上 且 15m 价格突破唐奇安通道上轨
-
-**推导过程**：
-1. 简化：只保留最小周期条件"15m 价格突破唐奇安上轨"
-2. 映射：
-   - indicator_type: `"donchian"`
-   - indicator_params: `{"period": 20}`
-   - condition: `{"operator": "cross_above", "left": {"field": "price"}, "right": {"field": "upper"}}`
-3. 周期：`"15m"`（最小周期）
-4. trigger_type: `"continuous"`
-
-**生成的 watch signal**：
-```python
-def get_watch_signals(self) -> list[dict]:
-    return [
-        {
-            "interval": "15m",
-            "indicator_type": "donchian",
-            "indicator_params": {"period": 20},
-            "condition": {
-                "operator": "cross_above",
-                "left": {"field": "price"},
-                "right": {"field": "upper"},
-            },
-            "trigger_type": "continuous",
-        }
-    ]
-```
-
-**`on_bar()` 中完整验证**：
-```python
-# 4h EMA 向上（在 on_bar 中验证）
-ema_4h = ema(higher_tf_history, period=20)
-ema_slope = ema_4h[-1] - ema_4h[-2]
-
-# 15m 价格突破唐奇安（watch signal 已触发）
-donchian_result = donchian(history, period=20)
-upper = float(donchian_result["upper"][-1])
-
-if ema_slope > 0 and kline["close"] > upper:
-    return self.ctx.buy(quantity=qty, signal_name="entry")
-```
+生成后**逐条核对下方"生成代码必查清单"，在输出中列出每条的 ✓/✗ 结果**，全部通过后才能进入阶段 4。
 
 ### 阶段 4：测试策略
 
-策略代码写入后，**必须**调用 `test_strategy` 工具验证策略能正确运行：
+代码写入后，**必须**调用 `test_strategy` 验证：
 
 ```
 test_strategy(
@@ -240,624 +155,58 @@ test_strategy(
 )
 ```
 
-`test_strategy` 会自动执行以下验证：
+`test_strategy` 自动验证：语法检查、静态分析（Decimal 混用、不存在的 ctx 属性如 `portfolio_value`/`equity`/`cash`）、结构验证、`@register_strategy()` 注册检查、200 根模拟 K 线回测、零交易检测、仓位验证（quantity ≤ 0 / 资金不足 / 使用率过低）。
 
-| 验证项 | 检测内容 |
-|-------|---------|
-| 语法检查 | Python 语法是否正确 |
-| 静态分析 | Decimal 类型混用（如 `Decimal * 0.01`） |
-| 静态分析 | 使用了不存在的 `StrategyContext` 属性（`portfolio_value`/`equity`/`cash` 等） |
-| 结构验证 | 策略类是否有 `name`、`on_bar` 等必需属性 |
-| 注册检查 | 是否使用了 `@register_strategy()` 装饰器 |
-| 模拟回测 | 用 200 根模拟 K 线运行策略 |
-| 零交易检测 | `on_bar` 是否全部返回 None（常见于 buy/sell 未 return） |
-| **仓位验证** | buy 信号的 `quantity ≤ 0`、**资金不足跳过**、**资金使用率过低** |
+测试失败（`success: false`）时：分析错误类型 → 修改代码 → 重新 `test_strategy` → 重复直到通过。
 
-如果测试失败（返回 data 中 `success: false`），根据错误信息修正代码：
-1. 分析错误类型（语法错误 / 加载失败 / 运行时错误 / 仓位计算错误）
-2. 修改策略代码文件
-3. 重新调用 `test_strategy` 测试
-4. 重复直到测试通过
+通过后告知用户：strategy_name（供回测使用）、文件路径、模拟运行统计（信号数/买卖次数/收益率）、warning 修复建议。
 
-测试通过后，告知用户：
-- strategy_name（供回测使用）
-- 文件路径
-- 模拟运行统计（信号数、买卖次数、模拟收益率）
-- 如有 warning，说明修复建议
+## 导入路径（必须遵守）
 
-## 代码质量要求
-
-### on_bar 签名（最关键）
-
-> `test_strategy` 工具会自动检测策略代码的问题，包括语法错误、加载失败、运行时异常等。
-
-**必须严格遵守以下签名，禁止任何变体：**
+**所有策略必须使用以下精确导入，禁止任何变体：**
 
 ```python
-def on_bar(self, kline: dict, history: list[dict]) -> OrderSignal | None:
-```
-
-- `kline`：当前 K 线 {open, high, low, close, volume, timestamp}
-- `history`：历史 K 线列表（含当前 K 线），由回测引擎传入，**不是 StrategyContext**
-- **禁止在 on_bar 中调用 `ctx.history()`** — history 直接作为参数传入
-- `ctx`（StrategyContext）通过 `self.ctx` 访问
-
-### 四个常见陷阱（CRITICAL — 95% 的回测 bug 由此引起）
-
-#### 陷阱 1：调用了 `ctx.buy()` 但没有 `return`
-
-**错误写法（产生 0 交易）：**
-```python
-def on_bar(self, kline, history):
-    if should_buy:
-        self.ctx.buy(quantity=qty, signal_name="entry")  # ❌ 生成信号但丢弃了
-        return None  # ❌ 引擎收到 None，认为无信号
-```
-
-**正确写法：**
-```python
-def on_bar(self, kline, history):
-    if should_buy:
-        return self.ctx.buy(quantity=qty, signal_name="entry")  # ✅ 返回信号
-    return None
-```
-
-**规则**：`self.ctx.buy()` / `self.ctx.sell()` / `self.ctx.close_position()` **必须作为返回值返回**，不能仅调用而不 return。
-
-#### 陷阱 2：缺少 `@register_strategy()` 装饰器
-
-**错误写法：**
-```python
-from apps.strategy_engine.base import BaseStrategy
-
-class MyStrategy(BaseStrategy):  # ❌ 未注册，回测引擎找不到
-    name = "my_strategy"
-```
-
-**正确写法：**
-```python
-from apps.strategy_engine.base import BaseStrategy
-from apps.strategy_engine.registry import register_strategy
-
-@register_strategy()
-class MyStrategy(BaseStrategy):  # ✅ 已注册
-    name = "my_strategy"
-```
-
-#### 陷阱 3：EMA/ATR 对全部 history 计算 → 不同回测长度信号不一致
-
-**错误写法（1年回测6笔，2年回测4笔）：**
-```python
-def on_bar(self, kline, history):
-    ema_array = ema(history, period=50)  # ❌ 全部历史！长度不同=EMA值不同
-    ema_val = float(ema_array[-1])
-    if current_price > ema_val:  # 这条判断在1年/2年回测中结果不一致
-        ...
-```
-
-**正确写法：**
-```python
-def on_bar(self, kline, history):
-    # ✅ 取最近 period*5 根 K 线，确保回测长度无关
-    _lookback = min(self.ema_period * 5, len(history))
-    _recent = history[-_lookback:]
-    ema_array = ema(_recent, period=self.ema_period)
-    ema_val = float(ema_array[-1])
-    if current_price > ema_val:  # 同一日历日期，EMA 值一致
-        ...
-```
-
-**规则**：EMA 和 ATR 必须使用 `history[-period*5:]` 而非全部 `history`。
-
-#### 陷阱 4：同时使用 PctCapitalPortfolio 和手动 quantity 计算
-
-**错误写法（手动算了 quantity，但被 PctCapitalPortfolio 静默覆盖）：**
-```python
-def __init__(self, context):
-    super().__init__(context)
-    self.portfolio = PctCapitalPortfolio()  # ← 设置了 Portfolio
-
-def on_bar(self, kline, history):
-    if buy_condition:
-        qty = total_capital * 0.1 / price  # ❌ 费心算了 quantity...
-        return self.ctx.buy(quantity=qty)   # ❌ 但被 PctCapitalPortfolio 覆盖！
-```
-
-**正确写法 A（推荐）— 不设置 portfolio，手动计算直接生效：**
-```python
-def __init__(self, context):
-    super().__init__(context)
-    # 不设置 self.portfolio，使用默认 SingleAssetPortfolio
-
-def on_bar(self, kline, history):
-    if buy_condition:
-        qty = total_capital * 0.1 / price
-        return self.ctx.buy(quantity=qty)  # ✅ 直接生效
-```
-
-**正确写法 B — 使用 PctCapitalPortfolio，不手动计算：**
-```python
-def __init__(self, context):
-    super().__init__(context)
-    self.portfolio = PctCapitalPortfolio()
-
-def on_bar(self, kline, history):
-    if buy_condition:
-        return self.ctx.buy(quantity=Decimal("1"))  # ✅ 任意正数占位，Portfolio 接管
-```
-
-**规则**：`self.portfolio = PctCapitalPortfolio()` 和手动计算 quantity **二选一**，不能同时使用。
-
-### 文件模板结构
-
-```python
-"""
-{策略名称} - {一句话描述}
-
-策略逻辑：
-- {入场条件}
-- {出场条件}
-
-风控：{风控规则}
-"""
-
-from decimal import Decimal
-
 from apps.strategy_engine.base import BaseStrategy, StrategyContext
 from apps.strategy_engine.indicators import rsi, sma, ema, macd, bollinger, atr, stoch
 from apps.strategy_engine.registry import register_strategy
-
-
-@register_strategy()
-class {StrategyName}Strategy(BaseStrategy):
-    """{策略描述}"""
-
-    name = "{strategy_name}"
-    description = "{一句话描述}"
-    params_schema = {
-        # 可调参数
-        # "param_name": {"type": "number"/"integer"/"string", "default": value},
-        "position_pct": {"type": "number", "default": 0.1},
-    }
-
-    def __init__(self, context: StrategyContext):
-        super().__init__(context)
-        # 注意：不要设置 self.portfolio = PctCapitalPortfolio()！
-        # 使用默认的 SingleAssetPortfolio，on_bar 返回的 quantity 直接生效。
-        # 如需使用 PctCapitalPortfolio，见下方"仓位计算 CRITICAL 说明"。
-        self.bb_period = context.params.get("bb_period", 20)
-        self.min_bars = self.bb_period + 5
-
-    def on_bar(self, kline: dict, history: list[dict]):
-        """
-        每根 K 线完成时调用。
-
-        Args:
-            kline: 当前 K 线 {open, high, low, close, volume, timestamp}
-            history: 历史 K 线列表（含当前 K 线）
-
-        Returns:
-            OrderSignal 或 None
-        """
-        if len(history) < self.min_bars:
-            return None
-
-        # ═══ 指标计算 CRITICAL ═══
-        # 路径依赖型指标（EMA/ATR）必须使用有限回溯窗口，禁止对全部 history 计算！
-        # 原因：EMA 对全部 history 计算时，不同回测长度（1年 vs 2年）会在同一
-        # 日历日期产生不同的 EMA 值，导致交易信号不一致。
-        # 规则：取最近 period*5 根 K 线，确保指数衰减后初始种子权重 < 0.005%。
-        # 非路径依赖型指标无需此限制（SMA、RSI 等窗口固定）。
-        #
-        # _lookback = min(self.bb_period * 5, len(history))  # 示例：对 EMA period=20
-        # _recent = history[-_lookback:]
-        # ema_array = ema(_recent, period=self.bb_period)
-        # ema_val = float(ema_array[-1])
-
-        # 访问上下文用 self.ctx（仅以下属性存在，禁止使用 portfolio_value/equity/cash）
-        # self.ctx.position           # 当前持仓量 (Decimal)
-        # self.ctx.balance            # 可用余额/现金 (Decimal)，≠ 总资金！
-        # self.ctx.to_portfolio_context().total_capital  # 总资金 = balance + 持仓市值
-
-        # ⚠️ 必须 return 信号，不能仅调用！
-
-        # ✅ 买入示例（手动计算仓位）：
-        # if self.ctx.position == 0 and buy_condition:
-        #     total_capital = self.ctx.to_portfolio_context().total_capital
-        #     price = Decimal(str(kline["close"]))
-        #     position_pct = Decimal(str(self.ctx.params.get("position_pct", 0.1)))
-        #     qty = (total_capital * position_pct / price).quantize(Decimal("0.0001"))
-        #     return self.ctx.buy(quantity=qty, signal_name="entry")
-
-        # ✅ 卖出示例：
-        # if self.ctx.position > 0 and sell_condition:
-        #     return self.ctx.sell(quantity=self.ctx.position, signal_name="exit")
-
-        # ✅ 平仓：卖出全部持仓
-        # return self.ctx.close_position(signal_name="take_profit")
-
-        return None
-
-    def on_start(self) -> None:
-        """策略启动时调用（初始化指标状态等）"""
-
-    def on_stop(self) -> None:
-        """策略停止时调用"""
-
-    def get_watch_signals(self) -> list[dict]:
-        """返回最小周期信号配置，由 LiveStrategyRunner 注册到 SignalMonitor 做初筛。
-
-        **重要**：此方法由 agent 在阶段3根据策略入场条件自动推导生成，
-        不需要用户手动配置。推导规则见上方"Watch Signals 推导规则"章节。
-
-        示例（RSI超卖策略）：
-        return [
-            {
-                "interval": "1h",
-                "indicator_type": "rsi",
-                "indicator_params": {"period": 14},
-                "condition": {"operator": "lt", "left": {"field": "rsi"}, "right": {"value": 30}},
-                "trigger_type": "continuous",
-            }
-        ]
-
-        每个 dict 包含:
-            interval: str         — K线周期 (如 "15m", "1h")
-            indicator_type: str   — 指标类型 (donchian/bollinger/rsi/price_watch/...)
-            indicator_params: dict — 指标参数 (如 {"period": 20})
-            condition: dict       — 触发条件，格式见下方说明
-            trigger_type: str     — "once"(单次) 或 "continuous"(持续)
-
-        默认返回 []。子类覆盖此方法启用两阶段信号检测：
-        1. SignalMonitor 按最小周期检测单指标条件（轻量初筛）
-        2. 触发后运行完整 on_bar() 验证多指标组合条件
-
-        条件格式示例:
-            # 价格上穿唐奇安通道上轨
-            {"operator": "cross_above", "left": {"field": "price"},
-             "right": {"field": "upper"}}
-            # 价格大于指定值
-            {"operator": "gt", "left": {"field": "price"},
-             "right": {"value": 50000}}
-            # RSI 小于阈值
-            {"operator": "lt", "left": {"field": "rsi"},
-             "right": {"value": 30}}
-        """
-        return []  # ⚠️ CRITICAL：agent 必须替换此行为实际 watch signal 列表，禁止保留 return []
 ```
 
-### 关键 API 参考
+**禁止**（会导致 `No module named`）：`tradelogx.*`、不带 `apps.` 前缀的 `strategy_engine.*`、任何其他路径。不确定时一律用上方模板。
 
-#### StrategyContext（通过 self.ctx 访问）
+## 生成代码必查清单（95% 回测 bug 由此引起）
 
-| 方法/属性 | 类型 | 说明 |
-|------|------|------|
-| `self.ctx.symbol` | `str` | 当前交易品种（如 `"BTCUSDT"`） |
-| `self.ctx.timeframe` | `str` | K 线周期（如 `"1h"`） |
-| `self.ctx.mode` | `str` | 运行模式：`"backtest"` 或 `"live"` |
-| `self.ctx.params` | `dict` | 策略参数字典 |
-| `self.ctx.balance` | `Decimal` | 当前可用余额（未占用资金） |
-| `self.ctx.position` | `Decimal` | 当前主标的持仓量 |
-| `self.ctx.positions` | `dict[str, Decimal]` | 所有标的的持仓量 |
-| `self.ctx.current_prices` | `dict[str, Decimal]` | 各标的当前价格 |
-| `self.ctx.buy(quantity, signal_name)` | `OrderSignal` | 发买入信号 — **必须 return** |
-| `self.ctx.sell(quantity, signal_name)` | `OrderSignal` | 发卖出信号 — **必须 return** |
-| `self.ctx.close_position(signal_name)` | `OrderSignal` | 平仓信号 — **必须 return** |
-| `self.ctx.to_portfolio_context()` | `PortfolioContext` | 获取多标的组合上下文（含 `total_capital`） |
-| `self.ctx.set_position(symbol, value)` | `None` | 设置某标的持仓量 |
-| `self.ctx.set_price(symbol, value)` | `None` | 设置某标的当前价格 |
+逐条核对，任一不满足 = 代码不合格：
 
-> ⚠️ 以上所有发信号的方法**必须作为 `on_bar` 的返回值返回**，不能仅调用而不 return。
-> 引擎通过 `on_bar` 的返回值判断是否有信号，调用但不 return = 0 交易。
+1. **on_bar 签名** 必须是 `def on_bar(self, kline: dict, history: list[dict]) -> OrderSignal | None`。`history` 是参数传入的历史 K 线列表（含当前），**禁止在 on_bar 内调用 `ctx.history()`**。
 
-##### 正确计算仓位的方法
+2. **必须 return 信号** — `self.ctx.buy()` / `sell()` / `close_position()` 必须作为返回值返回，仅调用不 return = 0 交易。
+   ```python
+   if should_buy:
+       return self.ctx.buy(quantity=qty, signal_name="entry")  # ✅ 不能漏掉 return
+   ```
 
-> **CRITICAL：仓位计算与 Portfolio 模型的关系**
->
-> 回测引擎的 `construct_portfolio()` 会根据 `self.portfolio` 的类型决定如何处理 `on_bar` 返回的 quantity：
->
-> | self.portfolio 类型 | on_bar 返回的 quantity | 实际开仓量来源 |
-> |---------------------|-----------------------|---------------|
-> | `SingleAssetPortfolio`（默认） | **直接生效** | `on_bar` 计算的值 |
-> | `PctCapitalPortfolio` | **被覆盖/忽略** | `PctCapitalPortfolio.allocate()` 重新计算 |
-> | 其他自定义 Portfolio | **被覆盖/忽略** | 各自 allocate() 计算 |
->
-> **因此，如果你在 `__init__` 中设置了 `self.portfolio = PctCapitalPortfolio()`，就不要在 `on_bar` 中手动计算 quantity——两者会冲突，PctCapitalPortfolio 的计算结果会覆盖你手动计算的值。**
->
-> **默认推荐**：不设置 `self.portfolio`（使用 `SingleAssetPortfolio`），在 `on_bar` 中手动计算仓位。简单、可控、不会出现"计算了但没生效"的问题。
+3. **必须有 `@register_strategy()` 装饰器** — 否则回测引擎找不到策略。
 
-**方法 1：手动计算（推荐，默认使用）**
+4. **路径依赖指标**（EMA/ATR）必须用有限回溯窗口 `history[-period*5:]`，禁止对全部 `history` 计算 — 否则不同回测长度信号不一致（1年6笔、2年4笔）。SMA/RSI/Bollinger/Donchian 无此限制。详见 `references/api-reference.md`。
+   ```python
+   _lookback = min(self.ema_period * 5, len(history))
+   ema_array = ema(history[-_lookback:], period=self.ema_period)
+   ```
 
-不设置 `self.portfolio`，在 `on_bar` 中直接计算数量，引擎直接使用你返回的 quantity：
+5. **Portfolio 与手动 quantity 二选一** — 设了 `self.portfolio = PctCapitalPortfolio()` 就不要手动算 quantity（会被静默覆盖）；默认不设 portfolio、手动计算直接生效。详见 `references/api-reference.md`。
 
-```python
-def on_bar(self, kline, history):
-    if self.ctx.position == 0 and buy_condition:
-        # 通过 to_portfolio_context() 获取总资金
-        portfolio_ctx = self.ctx.to_portfolio_context()
-        total_capital = portfolio_ctx.total_capital
-        # total_capital = balance + sum(position_i × price_i)
+6. **指标返回 np.ndarray，必须 `float(arr[-1])`** 取值后才能比较，直接与标量比较会抛 `ValueError`。先 `len(arr)==0` 检查空数组。
 
-        price = Decimal(str(kline["close"]))
-        position_pct = Decimal(str(self.ctx.params.get("position_pct", 0.1)))
+7. **`get_watch_signals` 必须实现**，禁止保留 `return []`。每个 dict 含 `interval`/`indicator_type`/`indicator_params`/`condition`/`trigger_type` 五字段。规则见 `references/watch-signals.md`。
 
-        # 计算买入数量 = 总资金 × 百分比 / 当前价格
-        allocated = total_capital * position_pct
-        qty = (allocated / price).quantize(Decimal("0.0001"))
+其余约定：参数从 `self.ctx.params` 读取、`params_schema` 定义可调参数、指标计算前检查 `len(history)`、买入前查 `position == 0`、卖出前查 `position > 0`、用 `Decimal` 处理数量价格、信号命名用 `entry`/`exit`/`stop_loss`/`take_profit`、含 docstring。
 
-        # ✅ 返回的 quantity 直接生效，不会被覆盖
-        return self.ctx.buy(quantity=qty, signal_name="entry")
-```
+## 参考文件
 
-**方法 2：使用 PctCapitalPortfolio（高级，需要正确理解）**
+阶段 3 生成代码时按需读取：
 
-⚠️ **如果选择此方法，`on_bar` 中不能手动计算 quantity，只能发方向信号。开仓量完全由 PctCapitalPortfolio 根据 `position_pct` 参数自动计算。**
-
-```python
-from apps.strategy_engine.portfolio import PctCapitalPortfolio
-
-@register_strategy()
-class MyStrategy(BaseStrategy):
-    params_schema = {
-        "position_pct": {"type": "number", "default": 0.1},
-    }
-
-    def __init__(self, context: StrategyContext):
-        super().__init__(context)
-        self.portfolio = PctCapitalPortfolio()  # ← 设置后 on_bar 的 quantity 会被覆盖
-
-    def on_bar(self, kline, history):
-        if self.ctx.position == 0 and buy_condition:
-            # ⚠️ 这里传的 quantity 会被 PctCapitalPortfolio 覆盖！
-            # 只需传任意正数占位，实际数量由 PctCapitalPortfolio 计算
-            return self.ctx.buy(
-                quantity=Decimal("1"),
-                signal_name="entry"
-            )
-```
-
-**两种方法的区别**：
-
-| 对比维度 | 方法 1（手动计算） | 方法 2（PctCapitalPortfolio） |
-|---------|-------------------|------------------------------|
-| `self.portfolio` 设置 | 不设置（默认） | `PctCapitalPortfolio()` |
-| on_bar 的 quantity | **你计算的**，直接生效 | **被覆盖**，Portfolio 重新计算 |
-| 仓位控制 | 你完全控制 | Portfolio 控制 |
-| 多标的支持 | 需手动处理 | 自动分配 |
-| 推荐场景 | 单品种、简单策略 | 多品种、组合策略 |
-
-**方法 3：固定数量（最简单场景）**
-
-```python
-def on_bar(self, kline, history):
-    if self.ctx.position == 0 and buy_condition:
-        qty = Decimal(str(self.ctx.params.get("quantity", 0.01)))
-        return self.ctx.buy(quantity=qty, signal_name="entry")
-```
-
-**关键公式**：
-- `总资金(total_capital) = 可用余额(balance) + 持仓市值(position × price)`
-- `买入数量 = 总资金 × position_pct / 当前价格`
-- `可用余额(balance)` ≠ 总资金，`balance` 是未被占用的现金部分
-
-##### 指标回溯窗口 CRITICAL — 路径依赖型指标必须用有限窗口
-
-> **这是"2年回测比1年交易少"的根本原因。** 路径依赖型指标（EMA、ATR 等）对全部 `history` 计算时，不同回测起始日期会产生不同的指标值，导致同一日历日期信号不一致。
-
-**路径依赖型指标** — 必须使用有限回溯窗口（`period * 5`）：
-
-| 指标 | 原因 | 修复方式 |
-|------|------|---------|
-| **EMA** | 种子值 = SMA(first N bars)，依赖全量历史 | `history[-period*5:]` |
-| **ATR** | Wilder 平滑依赖历史 ATR 值 | `history[-period*5:]` |
-
-**非路径依赖型指标** — 无需限制：
-
-| 指标 | 原因 |
-|------|------|
-| **SMA** | 固定窗口，天然路径无关 |
-| **RSI** | 固定窗口 mean-based |
-| **Bollinger** | 固定窗口 SMA + std |
-| **MACD** | 基于 EMA（理论上也依赖路径），但周期短、收敛快 |
-| **Donchian** | 固定窗口 max/min |
-
-**正确写法**：
-
-```python
-def on_bar(self, kline: dict, history: list[dict]):
-    if len(history) < self.min_bars:
-        return None
-
-    # ✅ EMA: 使用有限回溯窗口，确保不同回测长度信号一致
-    _ema_lookback = min(self.ema_period * 5, len(history))
-    _ema_history = history[-_ema_lookback:]
-    ema_array = ema(_ema_history, period=self.ema_period)
-    if len(ema_array) == 0:
-        return None
-    ema_val = float(ema_array[-1])
-
-    # ✅ ATR: 同理
-    _atr_lookback = min(self.atr_period * 5, len(history))
-    _atr_history = history[-_atr_lookback:]
-    atr_array = atr(_atr_history, period=self.atr_period)
-    if len(atr_array) == 0:
-        return None
-    atr_val = float(atr_array[-1])
-
-    # ❌ 错误：EMA 对全部 history 计算
-    # ema_array = ema(history, period=200)  # 不要这样写！
-
-    # ✅ 非路径依赖型指标可用全部 history，也可用小窗口
-    rsi_array = rsi(history, period=14)
-    rsi_val = float(rsi_array[-1])
-```
-
-**为什么 `period * 5`？** EMA 指数衰减权重：`(1 - 2/(period+1))^n`。当 `n = period*5` 时，初始种子权重 ≈ `e^(-10)` ≈ 0.005%，可忽略不计。
-
-#### BaseStrategy 便捷方法
-
-| 方法 | 说明 |
-|------|------|
-| `self.history(symbol?, timeframe?, n?)` | 获取历史 K 线（仅实盘用） |
-| `self.last_bar(symbol?, timeframe?)` | 获取最后一根 K 线 |
-| `self.higher_tf()` | 获取更高周期 DataFeed |
-| `self.lower_tf()` | 获取更低周期 DataFeed |
-| `self.get_watch_signals() -> list[dict]` | 返回最小周期信号配置，部署实盘时自动注册到 SignalMonitor |
-
-#### get_watch_signals — 实盘信号预筛选（可选覆盖）
-
-当策略部署到实盘/测试网时，`LiveStrategyRunner` 会调用此方法将最小周期信号注册到 `SignalMonitor`，实现两阶段信号检测：
-
-```
-SignalMonitor 定时检查单指标条件（轻量初筛）
-  → 触发 → Redis List 事件 → LiveStrategyRunner 消费
-  → 运行完整 on_bar() 验证多指标组合 → dispatch 交易信号
-```
-
-**典型场景**：策略需要"4h EMA 趋势向上 + 15m 价格突破 Donchian 上轨"，则只需将 15m Donchian 突破注册为 watch signal，4h EMA 趋势在 `on_bar()` 中完整验证。
-
-**返回值格式**：`list[dict]`，每个 dict 字段：
-
-| 字段 | 类型 | 说明 | 示例 |
-|------|------|------|------|
-| `interval` | str | K线周期 | `"15m"` |
-| `indicator_type` | str | 指标类型（donchian/bollinger/rsi/price_watch等） | `"donchian"` |
-| `indicator_params` | dict | 指标参数 | `{"period": 20}` |
-| `condition` | dict | 触发条件 | 见下方 |
-| `trigger_type` | str | `"once"`（单次）或 `"continuous"`（持续） | `"continuous"` |
-
-**condition 支持的运算符**：`gt`（大于）、`lt`（小于）、`gte`（≥）、`lte`（≤）、`eq`（等于）、`cross_above`（上穿）、`cross_below`（下穿）
-
-**condition 操作数**：`{"field": "price"}` 引用价格，`{"field": "upper"}` 引用指标字段，`{"value": 50000}` 引用常量
-
-```python
-def get_watch_signals(self) -> list[dict]:
-    return [
-        {
-            "interval": "15m",
-            "indicator_type": "donchian",
-            "indicator_params": {"period": 20},
-            "condition": {
-                "operator": "cross_above",
-                "left": {"field": "price"},
-                "right": {"field": "upper"},
-            },
-            "trigger_type": "continuous",
-        }
-    ]
-```
-
-#### 可用技术指标（来自 `indicators`）
-
-> **重要**：以下所有指标函数均返回 `np.ndarray`，策略代码中必须用 `float(arr[-1])` 取最新值后才能比较。
-
-- `sma(history, period=20) -> np.ndarray` — 简单移动平均
-- `ema(history, period=12) -> np.ndarray` — 指数移动平均
-- `rsi(history, period=14) -> np.ndarray` — 相对强弱指数
-- `macd(history, fast=12, slow=26, signal_period=9) -> dict[str, np.ndarray]` → `{"macd", "signal", "histogram"}`
-- `bollinger(history, period=20, std_dev=2.0) -> dict[str, np.ndarray]` → `{"upper", "middle", "lower"}`
-- `atr(history, period=14) -> np.ndarray` — 平均真实波幅，history 为 K 线 dict 列表；也可用 `atr(highs, lows, closes, period=N)` 直接传 np.ndarray 数组
-- `stoch(history, k_period=14, d_period=3) -> dict[str, np.ndarray]` → `{"k", "d"}`
-
-#### OrderSignal 构造
-
-```python
-# 买入
-self.ctx.buy(quantity=Decimal("0.01"), signal_name="rsi_cross")
-
-# 卖出
-self.ctx.sell(quantity=Decimal("0.01"), signal_name="take_profit")
-
-# 平仓（卖出全部持仓）
-self.ctx.close_position()
-```
-
-### 代码质量要求
-
-- **必须使用 `@register_strategy()` 装饰器** — 否则回测引擎无法发现策略
-- `on_bar` 签名必须是 `(self, kline: dict, history: list[dict])`，禁止使用其他签名
-- **必须 `return` 信号** — `ctx.buy()` / `ctx.sell()` / `ctx.close_position()` 必须作为 `on_bar` 的返回值返回，禁止仅调用不 return
-- `ctx` 通过 `self.ctx` 访问，禁止在 `on_bar` 内调用 `ctx.history()`
-- 所有参数从 `self.ctx.params` 读取，支持运行时配置
-- `params_schema` 定义所有可调参数及其类型/默认值
-- 指标计算前检查历史数据长度，避免 NaN
-- 买入前检查 `self.ctx.position == 0`，卖出前检查 `self.ctx.position > 0`
-- 使用 `Decimal` 处理数量和价格
-- 信号命名规范：`entry`、`exit`、`stop_loss`、`take_profit` 等
-- 包含 docstring 描述策略逻辑
-- **路径依赖型指标（EMA/ATR）必须使用有限回溯窗口** — 取 `history[-period*5:]`，禁止对全部 history 计算。见"指标回溯窗口 CRITICAL"章节
-- **禁止同时使用 PctCapitalPortfolio 和手动 quantity 计算** — 要么不设 `self.portfolio`（手动计算），要么设 `self.portfolio = PctCapitalPortfolio()`（不手动计算 quantity）。见"正确计算仓位的方法"章节
-
-### 指标返回值处理（CRITICAL）
-
-**所有指标函数均返回 `np.ndarray`，禁止直接与标量比较或参与布尔运算。**
-
-错误写法（会抛出 `ValueError: The truth value of an array with more than one element is ambiguous`）：
-
-```python
-# ❌ 错误：atr_value 是 numpy 数组，不能与 0 比较
-atr_value = atr(history, period=14)
-if atr_value is None or atr_value == 0:  # ValueError!
-    return None
-
-# ❌ 错误：三元表达式仍可能返回 numpy 元素
-atr_value = atr_array[-1] if len(atr_array) > 0 else None
-if atr_value == 0:  # 如果 atr_array[-1] 仍是数组类型，会报错
-    return None
-```
-
-正确写法：
-
-```python
-# ✅ 正确：先取最新值，再转 Python float
-atr_array = atr(history, period=14)
-if len(atr_array) == 0:
-    return None
-atr_value = float(atr_array[-1])
-
-# ✅ 同理适用于所有指标
-rsi_array = rsi(history, period=14)
-rsi_current = float(rsi_array[-1])
-
-ema_array = ema(history, period=20)
-ema_current = float(ema_array[-1])
-
-# ✅ macd 返回字典，每个值也是 np.ndarray
-macd_result = macd(history)
-macd_val = float(macd_result["macd"][-1])
-signal_val = float(macd_result["signal"][-1])
-
-# ✅ bollinger 同理
-bb = bollinger(history)
-upper = float(bb["upper"][-1])
-middle = float(bb["middle"][-1])
-lower = float(bb["lower"][-1])
-```
-
-**规则总结**：
-1. 先用 `len(array) == 0` 检查空数组
-2. 用 `[-1]` 取最新元素
-3. 用 `float()` 转为 Python 原生标量
-4. 之后才能安全使用 `== 0`、`is None`、`< >` 等比较运算
-
-### get_watch_signals — CRITICAL：必须实现，禁止返回空列表
-
-**每次创建策略都必须实现 `get_watch_signals`，禁止返回 `[]` 或 `pass`。**
-
-Agent 在阶段 3 生成代码后，必须自查：
-1. `get_watch_signals` 方法体是否只有 `return []`？→ **必须重写**
-2. 方法体内是否有至少一个有效 watch signal dict？
-3. 每个 dict 是否包含 `interval`、`indicator_type`、`indicator_params`、`condition`、`trigger_type` 五个字段？
-
-**自查失败 = 代码不合格，不能交付用户。**
-
-### get_watch_signals 格式要求
-
-**必须返回正确格式** — `list[dict]`，每个 dict 必须包含以下五个字段：
-- `interval` — K线周期（如 `"1h"`）
-- `indicator_type` — 指标类型（如 `"rsi"`）
-- `indicator_params` — 指标参数字典（如 `{"period": 14}`）
-- `condition` — 触发条件字典
-- `trigger_type` — 触发类型（`"once"` 或 `"continuous"`）
-
-空策略返回 `[]`，实盘策略必须有完整实现。
+| 文件 | 内容 | 何时读 |
+|------|------|--------|
+| `references/strategy-template.md` | 完整 Python 文件模板（含内联陷阱注释） | 阶段 3.3 起手 |
+| `references/api-reference.md` | StrategyContext API、仓位计算三法、指标回溯窗口、指标列表、ndarray 处理、OrderSignal | 填充逻辑时查 |
+| `references/watch-signals.md` | watch signals 推导规则、格式要求、必须实现的自查 | 阶段 3.2 推导信号时 |

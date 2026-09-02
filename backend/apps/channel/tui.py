@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from rich.console import Console
@@ -271,7 +272,9 @@ class TUIChannel(BaseChannel):
         from apps.agent.bus import publish, build_agent_task, wait_reply, AGENT_TASKS
         import json
 
-        msg = build_agent_task(user_id=self._user_id, payload={"text": text})
+        msg = build_agent_task(
+            user_id=self._user_id, payload={"text": text}, origin="tui"
+        )
         await publish(AGENT_TASKS, msg)
 
         reply = await wait_reply(msg["task_id"], timeout=360)
@@ -334,17 +337,17 @@ class TUIChannel(BaseChannel):
         return f"[对话历史]\n{history_block}\n\n[当前消息]\n{text}"
 
     async def _persist_history(self, user_text: str, agent_text: str) -> None:
-        """持久化对话历史到 L1"""
+        """持久化对话历史到 L1+L2（原子追加，防止并发覆盖）"""
         try:
             from apps.memory.manager import MemoryManager
 
             mm = MemoryManager(agent_type="supervisor", user_id=self._user_id)
-            conv = await mm.get_conv_history(max_turns=10)
-            updated = conv[-18:] + [
-                {"role": "user", "text": user_text[:200], "ts": 0},
-                {"role": "assistant", "text": agent_text[:200], "ts": 0},
-            ]
-            await mm.save_conv_history(updated)
+            await mm.append_conv_history(
+                [
+                    {"role": "user", "text": user_text, "ts": int(time.time())},
+                    {"role": "assistant", "text": agent_text, "ts": int(time.time())},
+                ]
+            )
         except Exception:
             pass
 

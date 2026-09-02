@@ -279,12 +279,8 @@ export default function TView({
   const legendItems = useMemo<IndicatorLegend[]>(() => {
     const items: IndicatorLegend[] = [];
     if (!indicators) return items;
-    if (indicators.ma7?.length) items.push({ label: "MA(7)", color: "#f59e0b" });
-    if (indicators.ma25?.length) items.push({ label: "MA(25)", color: "#3b82f6" });
-    if (indicators.ma99?.length) items.push({ label: "MA(99)", color: "#a855f7" });
     if (indicators.macd?.dif?.length) items.push({ label: "MACD(12,26,9)", color: "#3b82f6" });
     if (indicators.rsi?.length) items.push({ label: "RSI(14)", color: "#a855f7" });
-    items.push({ label: "VOL", color: "#6b7280" });
     return items;
   }, [indicators]);
 
@@ -393,33 +389,6 @@ export default function TView({
     candles.attachPrimitive(hoverInfo);
     hoverInfoRef.current = hoverInfo;
 
-    // MA overlay lines
-    const maColors: Record<string, string> = {
-      ma7: "#f59e0b",
-      ma25: "#3b82f6",
-      ma99: "#a855f7",
-    };
-
-    (["ma7", "ma25", "ma99"] as const).forEach((key) => {
-      const values = ind?.[key];
-      if (!values || values.length === 0) return;
-      const line = chart.addLineSeries({
-        color: maColors[key],
-        lineWidth: 1,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
-      });
-      const lineData = data
-        .map((p, i) =>
-          values[i] != null
-            ? { time: toUTCTime(p.timestamp), value: values[i] }
-            : null
-        )
-        .filter((d) => d !== null);
-      line.setData(lineData);
-    });
-
     // ── Sub-pane 1: Volume ──
     const volSeries = chart.addHistogramSeries({
       priceScaleId: "vol",
@@ -438,68 +407,7 @@ export default function TView({
     volumeSeriesRef.current = volSeries;
 
     // ── Sub-pane 2: MACD or RSI ──
-    if (ind?.macd?.dif?.length) {
-      const macdSeries = chart.addLineSeries({
-        color: "#3b82f6",
-        lineWidth: 1,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        priceScaleId: "macd",
-      });
-      chart.priceScale("macd").applyOptions({
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-      });
-
-      const macdData = data
-        .map((p, i) =>
-          ind.macd!.dif[i] != null
-            ? { time: toUTCTime(p.timestamp), value: ind.macd!.dif[i] }
-            : null
-        )
-        .filter((d) => d !== null);
-      macdSeries.setData(macdData);
-
-      if (ind.macd.dea?.length) {
-        const deaSeries = chart.addLineSeries({
-          color: "#f59e0b",
-          lineWidth: 1,
-          priceLineVisible: false,
-          lastValueVisible: false,
-          crosshairMarkerVisible: false,
-          priceScaleId: "macd",
-        });
-        const deaData = data
-          .map((p, i) =>
-            ind.macd!.dea![i] != null
-              ? { time: toUTCTime(p.timestamp), value: ind.macd!.dea![i] }
-              : null
-          )
-          .filter((d) => d !== null);
-        deaSeries.setData(deaData);
-      }
-    } else if (ind?.rsi?.length) {
-      const rsiSeries = chart.addLineSeries({
-        color: "#a855f7",
-        lineWidth: 1,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
-        priceScaleId: "rsi",
-      });
-      chart.priceScale("rsi").applyOptions({
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-      });
-
-      const rsiData = data
-        .map((p, i) =>
-          ind.rsi![i] != null
-            ? { time: toUTCTime(p.timestamp), value: ind.rsi![i] }
-            : null
-        )
-        .filter((d) => d !== null);
-      rsiSeries.setData(rsiData);
-    }
+    // (MACD and RSI sub-panes removed)
 
     // ── Lazy loading on scroll to edge (logical range) ─────────────────────
     // Logical range reports floating-point bar indices into the loaded data,

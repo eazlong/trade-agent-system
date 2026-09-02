@@ -21,8 +21,18 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     body = text[match.end() :]
     meta: dict[str, Any] = {}
 
-    for line in frontmatter.splitlines():
-        line = line.strip()
+    # 合并多行值（包含未闭合的 [ 的行，继续拼接直到遇到 ]）
+    raw_lines = frontmatter.splitlines()
+    merged_lines: list[str] = []
+    for line in raw_lines:
+        stripped = line.strip()
+        # Only merge into previous line if it has an unclosed bracket
+        if merged_lines and "[" in merged_lines[-1] and "]" not in merged_lines[-1]:
+            merged_lines[-1] = merged_lines[-1] + " " + stripped
+        else:
+            merged_lines.append(stripped)
+
+    for line in merged_lines:
         if not line or line.startswith("#"):
             continue
         if ":" not in line:
@@ -77,8 +87,8 @@ class PromptLoader:
     def list_agents(cls, version: str = "v1") -> list[dict[str, Any]]:
         """扫描 Prompt 目录，返回所有带 frontmatter 的 Agent 配置。
 
-        优先使用 frontmatter（--- 之间）中声明的属性（name、tools、overview 等）。
-        仅当 frontmatter 中没有 overview 时，fallback 到提取 body 前 5 行作为概述，
+        优先使用 frontmatter（--- 之间）中声明的属性（name、tools、description 等）。
+        仅当 frontmatter 中没有 description 时，fallback 到提取 body 前 5 行作为概述，
         供 Supervisor 的 LLM 意图识别使用。
         """
         version_dir = PROMPT_BASE / version
@@ -89,12 +99,13 @@ class PromptLoader:
         for f in sorted(version_dir.glob("*.txt")):
             if f.name == "supervisor.txt":
                 continue  # supervisor 不是子 Agent
+
             text = f.read_text(encoding="utf-8")
             meta, body = _parse_frontmatter(text)
             if meta and "name" in meta:
-                # frontmatter 中没有 overview 时，fallback 到 body 前 5 行
-                if "overview" not in meta:
-                    overview_lines = [line for line in body.splitlines() if line.strip()][:5]
-                    meta["overview"] = "\n".join(overview_lines)
+                # frontmatter 中没有 description 时，fallback 到 body 前 5 行
+                if "description" not in meta:
+                    description_lines = [line for line in body.splitlines() if line.strip()][:5]
+                    meta["description"] = "\n".join(description_lines)
                 agents.append(meta)
         return agents

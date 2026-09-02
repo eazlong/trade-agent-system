@@ -1,6 +1,5 @@
 import os
 import asyncio
-import json
 import logging
 
 # MUST be set before any Django-dependent imports
@@ -26,6 +25,14 @@ _telegram_channel = None
 _progress_listener_task = None
 _dlq_consumer = None
 logger = logging.getLogger(__name__)
+
+
+def get_telegram_channel():
+    """返回进程内 TelegramChannel 实例（lifespan 启动时创建）。
+
+    供 apps.agent.reply_fanout 推送主通道副本时复用，避免重复实例化。
+    """
+    return _telegram_channel
 
 
 async def _listen_progress_notifications():
@@ -81,60 +88,21 @@ async def _listen_progress_notifications():
 
 
 async def _route_notification(user_id: str, text: str):
-    """Route a notification to the user's active channel (Telegram, Lark, or WebSocket)."""
-    from channels.db import database_sync_to_async
-    from apps.channel.channel_resolver import get_user_active_channel
+    """Route a notification to BOTH the web (WS group + ws_pending drain) and
+    the user's main channel (Telegram/Lark). Multi-channel — not mutually exclusive.
+
+    Shared fan-out primitives live in apps.agent.reply_fanout, so the same
+    delivery logic is reused by agent reply fan-out (fan_out_reply).
+    """
+    from apps.agent.reply_fanout import push_main_channel, push_web
 
     # Web 兜底：所有任务完成通知都先尝试推到 chat_ws group。
     # ChatConsumer 已加入 user_{user_id}；group_send 命中即发，否则回落到 ws_pending。
-    # 与 telegram/lark 分支独立 — 多通道不互斥。
-    from channels.layers import get_channel_layer
-    from apps.agent import ws_pending
+    # 支持 open_id / telegram_id → Django UUID 解析，飞书发起的会话也能同步到 web。
+    await push_web(user_id, text)
 
-    payload = {"type": "task_notification", "data": text}
-    try:
-        layer = get_channel_layer()
-        if layer is not None:
-            await layer.group_send(
-                f"user_{user_id}",
-                {"type": "task_notification", "text": text},
-            )
-    except Exception:
-        logger.warning(
-            "[ASGI] group_send failed for user %s", user_id, exc_info=True
-        )
-
-    # 离线兜底：用户没连 ws 时也存一份，重连 drain。group_send 失败也要执行。
-    try:
-        await ws_pending.store(user_id, payload)
-    except Exception:
-        logger.warning(
-            "[ASGI] ws_pending.store failed for user %s", user_id, exc_info=True
-        )
-
-    target = await database_sync_to_async(get_user_active_channel)(user_id)
-
-    if target is None:
-        return
-
-    if target.channel_type == "telegram":
-        if _telegram_channel and _telegram_channel._app:
-            old_chat_id = _telegram_channel._chat_id
-            try:
-                _telegram_channel._chat_id = int(target.chat_id)
-                await _telegram_channel.send_message(text)
-            finally:
-                _telegram_channel._chat_id = old_chat_id
-        else:
-            logger.debug("[ASGI] Telegram not ready, dropping notification: %s", text[:50])
-
-    elif target.channel_type == "lark":
-        try:
-            from apps.channel.lark_ws import _get_channel as _get_lark_channel
-            lark = _get_lark_channel()
-            await lark.send_message_to_user(target.user_open_id, text)
-        except Exception:
-            logger.warning("[ASGI] failed to send Lark notification", exc_info=True)
+    # 主通道（MAIN_CHANNEL=lark 默认）：独立分支，多通道不互斥
+    await push_main_channel(user_id, text)
 
 
 class LifespanHandler:

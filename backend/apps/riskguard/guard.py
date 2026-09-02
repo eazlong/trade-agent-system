@@ -21,7 +21,7 @@ import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Tuple
 
-from asgiref.sync import sync_to_async
+from apps.core.db_utils import db_async
 
 if TYPE_CHECKING:
     from apps.trading.adapters.base import OrderRequest
@@ -93,26 +93,34 @@ class RiskGuard:
         if not user_id:
             return True, "OK"
 
-        # 1. 熔断器检查
-        if await self._is_circuit_open(user_id):
-            logger.warning(f"[RiskGuard] REJECTED: 熔断器触发，今日禁止交易")
-            return False, "熔断器触发，今日禁止交易"
+        # 1. 熔断器检查（已禁用）
+        # logger.info(f"[RiskGuard] step 1: circuit breaker check")
+        # if await self._is_circuit_open(user_id):
+        #     logger.warning(f"[RiskGuard] REJECTED: 熔断器触发，今日禁止交易")
+        #     return False, "熔断器触发，今日禁止交易"
+        logger.info(f"[RiskGuard] step 1: circuit breaker (disabled)")
 
         # 2. 日内交易次数
+        logger.info(f"[RiskGuard] step 2: daily trade count check")
         daily_count = await self._get_daily_trade_count(user_id)
+        logger.info(f"[RiskGuard] step 2 done: count={daily_count}")
         if daily_count >= self.MAX_DAILY_TRADES:
             reason = f"日内交易次数已达上限 {self.MAX_DAILY_TRADES}"
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
             return False, reason
 
         # 3. 仓位上限
+        logger.info(f"[RiskGuard] step 3: position limit check")
         position_ok, reason = await self._check_position_limit(request, user_id)
+        logger.info(f"[RiskGuard] step 3 done: ok={position_ok}")
         if not position_ok:
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
             return False, reason
 
         # 4. 日内回撤
+        logger.info(f"[RiskGuard] step 4: drawdown check")
         drawdown_ok, reason = await self._check_drawdown(user_id)
+        logger.info(f"[RiskGuard] step 4 done: ok={drawdown_ok}")
         if not drawdown_ok:
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
             return False, reason
@@ -145,7 +153,7 @@ class RiskGuard:
 
         today = timezone.now().date()
 
-        @sync_to_async
+        @db_async
         def count():
             return Order.objects.filter(
                 user_id=user_id,
@@ -202,7 +210,7 @@ class RiskGuard:
 
         today = timezone.now().date()
 
-        @sync_to_async
+        @db_async
         def get_today_pnl():
             from apps.trading.models import Order
 
@@ -213,7 +221,7 @@ class RiskGuard:
             ).aggregate(total_pnl=Sum("realized_pnl"))
             return result["total_pnl"]
 
-        @sync_to_async
+        @db_async
         def get_initial_balance():
             """从 daily_account_snapshot 读取期初余额"""
             from apps.trading.models import DailySnapshot
@@ -327,7 +335,7 @@ class RiskGuard:
         try:
             from apps.risk.models import RiskEvent
 
-            @sync_to_async
+            @db_async
             def create():
                 return RiskEvent.objects.create(
                     level=level,

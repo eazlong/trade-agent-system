@@ -124,6 +124,12 @@ class MockMemoryManager:
     async def save_conv_history(self, history):
         self._l1["conv_history"] = list(history)
 
+    async def append_conv_history(self, entries, keep_turns=10):
+        current = self._l1.get("conv_history", [])
+        updated = (current + entries)[-keep_turns:]
+        self._l1["conv_history"] = updated
+        return updated
+
 
 def llm_agent(name: str) -> str:
     return json.dumps({"agent": name})
@@ -370,8 +376,8 @@ class TestTargetMutation(unittest.TestCase):
         self.assertTrue(result.success)
         ctx = sm._store.get("u1")
         self.assertIsNotNone(ctx)
-        self.assertEqual(ctx["state"], SessionState.PAUSED.value)
-        self.assertEqual(ctx["active_agent"], "quant")
+        self.assertEqual(ctx["state"], SessionState.MULTI_TURN.value)
+        self.assertEqual(ctx["active_agent"], "risk_advisor")
 
     # T05 — multi-turn agent rejects, re-parse via LLM returns free_chat
     def test_multi_turn_reject_reparse_free_chat(self):
@@ -470,7 +476,8 @@ class TestTargetMutation(unittest.TestCase):
         self.assertTrue(result.success)
         ctx = sm._store.get("u1")
         self.assertIsNotNone(ctx)
-        self.assertEqual(ctx["state"], SessionState.PAUSED.value)
+        self.assertEqual(ctx["state"], SessionState.MULTI_TURN.value)
+        self.assertEqual(ctx["active_agent"], "analyst")
 
 
 # ------------------------------------------------------------------ #
@@ -557,15 +564,19 @@ class TestConcurrentSessions(unittest.TestCase):
             )
 
         self.assertTrue(result2.success)
-        self.assertEqual(sm._store["u1"]["state"], SessionState.PAUSED.value)
+        self.assertEqual(sm._store["u1"]["state"], SessionState.MULTI_TURN.value)
+        self.assertEqual(sm._store["u1"]["active_agent"], "risk_advisor")
 
-        # Device A: resumes strategy — judge says true
+        # Device A: resumes strategy — risk_advisor rejects, re-parse routes to quant
+        mock_risk_reject = make_rejecting_agent(suggestion="quant", reason="not risk")
         mock_quant_resume = make_accepting_agent(content="布林带已添加")
-        sup._llm.chat = AsyncMock(return_value="true")
+        sup._llm.chat = AsyncMock(return_value=llm_agent("quant"))
 
         with patch(
             "apps.agent.registry.AgentRegistry.get",
-            side_effect=make_agent_getter(quant=mock_quant_resume),
+            side_effect=make_agent_getter(
+                risk_advisor=mock_risk_reject, quant=mock_quant_resume
+            ),
         ):
             result3 = asyncio.run(
                 sup.handle(

@@ -10,9 +10,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
-from .base import BaseChannel
+from .base import BaseChannel, chunk_message
 
 logger = logging.getLogger(__name__)
+
+# 飞书 Open API 单条文本消息安全上限（API 整体 30KB，留余量给 JSON 开销）
+_LARK_MAX_LENGTH = 3800
 
 
 class LarkChannel(BaseChannel):
@@ -59,7 +62,8 @@ class LarkChannel(BaseChannel):
         if not self._chat_id:
             logger.warning("[LarkChannel] no chat_id set, skipping send_message")
             return
-        await self._send_im(self._chat_id, "text", {"text": text})
+        for chunk in chunk_message(text, _LARK_MAX_LENGTH):
+            await self._send_im(self._chat_id, "text", {"text": chunk})
 
     async def send_message_to_user(self, open_id: str, text: str) -> None:
         """Send a message to a specific user via their open_id.
@@ -69,7 +73,8 @@ class LarkChannel(BaseChannel):
         if not open_id:
             logger.warning("[LarkChannel] no open_id, skipping send_message_to_user")
             return
-        await self._send_im(open_id, "text", {"text": text}, receive_id_type="open_id")
+        for chunk in chunk_message(text, _LARK_MAX_LENGTH):
+            await self._send_im(open_id, "text", {"text": chunk}, receive_id_type="open_id")
 
     async def send_photo(self, photo_bytes: bytes, caption: str = "") -> None:
         if not self._chat_id:
@@ -150,7 +155,11 @@ class LarkChannel(BaseChannel):
         # 3. 降级到全局 tenant token
         if self._tenant_token and time.time() < self._tenant_token_expire_at:
             return self._tenant_token
-        return await self._refresh_tenant_token()
+        try:
+            return await self._refresh_tenant_token()
+        except Exception as e:
+            logger.error("[LarkChannel] tenant token refresh failed: %s", e)
+            raise
 
     async def _refresh_user_token_from_db(self) -> None:
         """从 DB 加载用户 token，如果过期则尝试刷新。"""
@@ -163,6 +172,7 @@ class LarkChannel(BaseChannel):
 
         @sync_to_async
         def _load_and_refresh_token():
+            # Step 1: Read token under lock, check if refresh needed
             with transaction.atomic():
                 try:
                     token_obj = FeishuUserToken.objects.select_for_update().get(
@@ -172,37 +182,57 @@ class LarkChannel(BaseChannel):
                     return None
 
                 now = datetime.now(timezone.utc)
-                if token_obj.expires_at <= now:
-                    redirect_uri = getattr(
-                        settings,
-                        "LARK_OAUTH_REDIRECT_URI",
-                        "http://localhost:8000/api/channel/auth/lark/callback/",
-                    )
-                    client = FeishuOAuthClient(
-                        self._app_id, self._app_secret, redirect_uri
-                    )
-                    refresh_token = token_obj.decrypt_refresh_token()
-                    token_data = client.refresh_token(refresh_token)
+                if token_obj.expires_at > now:
+                    return ("cached", token_obj.decrypt_access_token(), token_obj.expires_at)
 
-                    from datetime import timedelta
+                # Token expired, read refresh_token while holding lock
+                refresh_token = token_obj.decrypt_refresh_token()
+                if not refresh_token:
+                    logger.error(
+                        "[LarkChannel] empty refresh_token for %s, deactivating",
+                        token_obj.open_id[:12],
+                    )
+                    token_obj.is_active = False
+                    token_obj.save(update_fields=["is_active", "updated_at"])
+                    return None
 
-                    expires_in = token_data.get("expires_in", 7200)
-                    token_obj.access_token_enc = token_obj.encrypt_access_token(
-                        token_data["access_token"]
-                    )
-                    token_obj.refresh_token_enc = token_obj.encrypt_refresh_token(
-                        token_data["refresh_token"]
-                    )
-                    token_obj.expires_at = now + timedelta(seconds=expires_in)
-                    token_obj.save(
-                        update_fields=[
-                            "access_token_enc", "refresh_token_enc",
-                            "expires_at", "updated_at",
-                        ]
-                    )
-                    return ("refreshed", token_data["access_token"], token_obj.expires_at)
+            # Step 2: Call API OUTSIDE atomic block (avoids rollback of deactivation on failure)
+            redirect_uri = getattr(
+                settings,
+                "LARK_OAUTH_REDIRECT_URI",
+                "http://localhost:8000/api/channel/auth/lark/callback/",
+            )
+            client = FeishuOAuthClient(self._app_id, self._app_secret, redirect_uri)
+            try:
+                token_data = client.refresh_token(refresh_token)
+            except Exception as e:
+                logger.error(
+                    "[LarkChannel] refresh failed for %s: %s, deactivating",
+                    token_obj.open_id[:12],
+                    e,
+                )
+                token_obj.is_active = False
+                token_obj.save(update_fields=["is_active", "updated_at"])
+                raise
 
-                return ("cached", token_obj.decrypt_access_token(), token_obj.expires_at)
+            # Step 3: Save new tokens
+            from datetime import timedelta
+
+            expires_in = token_data.get("expires_in", 7200)
+            token_obj.access_token_enc = token_obj.encrypt_access_token(
+                token_data["access_token"]
+            )
+            token_obj.refresh_token_enc = token_obj.encrypt_refresh_token(
+                token_data["refresh_token"]
+            )
+            token_obj.expires_at = now + timedelta(seconds=expires_in)
+            token_obj.save(
+                update_fields=[
+                    "access_token_enc", "refresh_token_enc",
+                    "expires_at", "updated_at",
+                ]
+            )
+            return ("refreshed", token_data["access_token"], token_obj.expires_at)
 
         result = await _load_and_refresh_token()
         if result is None:
@@ -224,23 +254,31 @@ class LarkChannel(BaseChannel):
 
     async def _refresh_tenant_token(self) -> str:
         """获取全局 tenant_access_token。"""
-        resp = requests.post(
-            self._TOKEN_URL,
-            json={"app_id": self._app_id, "app_secret": self._app_secret},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"[LarkChannel] token request failed: {data}")
+        try:
+            resp = await asyncio.to_thread(
+                requests.post,
+                self._TOKEN_URL,
+                json={"app_id": self._app_id, "app_secret": self._app_secret},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"[LarkChannel] token request failed: {data}")
 
-        self._tenant_token = data["tenant_access_token"]
-        expire = data.get("expire", 7200)
-        self._tenant_token_expire_at = time.time() + expire - 300
-        logger.info("[LarkChannel] tenant_access_token refreshed (expires in %ds)", expire)
-        return self._tenant_token
+            self._tenant_token = data["tenant_access_token"]
+            expire = data.get("expire", 7200)
+            self._tenant_token_expire_at = time.time() + expire - 300
+            logger.info("[LarkChannel] tenant_access_token refreshed (expires in %ds)", expire)
+            return self._tenant_token
+        except Exception as e:
+            raise RuntimeError(f"[LarkChannel] tenant token refresh failed: {e}") from e
 
     async def _send_im(self, receive_id: str, msg_type: str, content: dict, receive_id_type: str = "chat_id") -> None:
-        token = await self._refresh_token()
+        try:
+            token = await self._refresh_token()
+        except Exception as e:
+            logger.error("[LarkChannel] token refresh failed, cannot send message: %s", e)
+            return
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=utf-8",
@@ -252,8 +290,9 @@ class LarkChannel(BaseChannel):
             "content": json.dumps(content, ensure_ascii=False),
         }
         try:
-            resp = requests.post(
-                self._SEND_URL, headers=headers, params=params, json=body, timeout=15
+            resp = await asyncio.to_thread(
+                requests.post,
+                self._SEND_URL, headers=headers, params=params, json=body, timeout=15,
             )
             data = resp.json()
             if data.get("code") != 0:
@@ -264,15 +303,20 @@ class LarkChannel(BaseChannel):
             logger.error("[LarkChannel] send message error: %s", e)
 
     async def _upload_image(self, receive_id: str, photo_bytes: bytes) -> str | None:
-        token = await self._refresh_token()
+        try:
+            token = await self._refresh_token()
+        except Exception as e:
+            logger.error("[LarkChannel] token refresh failed, cannot upload image: %s", e)
+            return None
         headers = {"Authorization": f"Bearer {token}"}
         form = {
             "image_type": "message",
             "image": ("image.png", photo_bytes, "image/png"),
         }
         try:
-            resp = requests.post(
-                self._IMG_UPLOAD_URL, headers=headers, files=form, timeout=15
+            resp = await asyncio.to_thread(
+                requests.post,
+                self._IMG_UPLOAD_URL, headers=headers, files=form, timeout=15,
             )
             data = resp.json()
             if data.get("code") == 0:
@@ -323,7 +367,7 @@ class LarkChannel(BaseChannel):
         from apps.agent.bus import publish, build_agent_task, wait_reply, AGENT_TASKS
 
         msg = build_agent_task(
-            user_id=user_id or "unknown", payload={"text": text}
+            user_id=user_id or "unknown", payload={"text": text}, origin="lark"
         )
 
         import os
@@ -332,7 +376,7 @@ class LarkChannel(BaseChannel):
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(publish(AGENT_TASKS, msg))
-            reply = loop.run_until_complete(wait_reply(msg["task_id"], timeout=360))
+            reply = loop.run_until_complete(wait_reply(msg["task_id"], timeout=3600))
             if reply:
                 processed = self._extract_content(reply)
                 loop.run_until_complete(self.send_message(processed))

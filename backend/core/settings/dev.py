@@ -34,4 +34,4 @@ else:
     }
 
 # dev settings override: root logger at DEBUG
-LOGGING['root']['level'] = 'DEBUG'  # noqa: F405
+LOGGING['root']['level'] = 'INFO'  # noqa: F405

@@ -53,6 +53,8 @@ def run_backtest_task(
     Returns:
         回测统计结果
     """
+    from django.db import close_old_connections
+
     from apps.strategy_engine.backtest_mode import _resolve_strategy_name
     from apps.strategy_engine.registry import StrategyRegistry
     from apps.strategy_engine.runner import StrategyRunner
@@ -65,6 +67,21 @@ def run_backtest_task(
     tracker.start(
         f"开始回测：{strategy_name} {symbol} {timeframe}",
     )
+
+    # ── Persist celery_task_id → BacktestResult mapping so get_task_result
+    #     can find the result even after Redis/Celery backends expire ──
+    if result_id:
+        try:
+            close_old_connections()
+            from apps.backtest.models import BacktestResult as BR
+            BR.objects.filter(id=result_id).update(
+                celery_task_id=self.request.id
+            )
+        except Exception:
+            logger.warning(
+                "[BacktestTask] failed to set celery_task_id on result %s",
+                result_id, exc_info=True,
+            )
 
     try:
         logger.info(
@@ -81,12 +98,22 @@ def run_backtest_task(
         if not result_id:
             try:
                 from apps.strategy_engine.backtest_mode import create_empty_result
-                from apps.strategy_engine.backtest_mode import (
-                    _resolve_strategy_id as _resolve_sid,
-                )
-                import asyncio as _aio
 
-                _sid = strategy_id or _aio.run(_resolve_sid(strategy_name))
+                # Use sync ORM directly — _aio.run(sync_to_async()) fails in Celery
+                # because Django's async context isn't initialized
+                close_old_connections()
+                from apps.trading.models import Strategy
+
+                canonical = strategy_name  # already resolved above
+                _sid_obj, _ = Strategy.objects.get_or_create(
+                    name=canonical,
+                    defaults={
+                        "code_path": f"strategies/{canonical}.py",
+                        "is_active": False,
+                    },
+                )
+                _sid = str(_sid_obj.id)
+                strategy_id = _sid
                 if _sid:
                     _s = start_date or (date.today() - timedelta(days=30)).isoformat()
                     _e = end_date or date.today().isoformat()
@@ -100,7 +127,6 @@ def run_backtest_task(
                         parameters=parameters or {},
                         user_id=user_id,
                     )
-                    strategy_id = _sid
                     logger.info(
                         f"[BacktestTask] created placeholder result_id=%s", result_id
                     )
@@ -129,6 +155,10 @@ def run_backtest_task(
             state="STARTED",
             meta={"step": "running_backtest", "bars": len(ohlcv_data)},
         )
+
+        # DB connections may have gone stale during _fetch_ohlcv_sync
+        close_old_connections()
+
         runner = StrategyRunner()
 
         loop = asyncio.new_event_loop()
@@ -168,8 +198,8 @@ def run_backtest_task(
             f"胜率 {win_rate:.1%}"
         )
         return stats
-    except Exception:
-        tracker.fail(f"回测失败: {strategy_name} {symbol} {timeframe}")
+    except Exception as e:
+        tracker.fail(f"回测失败: {strategy_name} {symbol} {timeframe}: {str(e)}")
         raise
     finally:
         tracker.stop()
@@ -313,6 +343,7 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
     """
     from celery.exceptions import SoftTimeLimitExceeded
     from django.utils import timezone
+    from django.db import close_old_connections
 
     from apps.backtest.models import BacktestResult, GridSearchJob
     from apps.agent.task_tracker import TaskTracker, tracker_context
@@ -323,7 +354,12 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         job = GridSearchJob.objects.select_related("strategy").get(id=job_id)
     except GridSearchJob.DoesNotExist:
         logger.error(f"[GridSearchTask] job {job_id} not found")
-        return {"error": "job not found"}
+        return {
+            "status": "FAILURE",
+            "error_type": "NotFoundError",
+            "error_message": "job not found",
+            "error": "job not found",
+        }
 
     # Fall back to job's user_id if not provided (e.g. called via Agent tool)
     if not user_id and job.user_id:
@@ -333,7 +369,12 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         logger.error(
             f"[GridSearchTask] user mismatch: job={job.user_id} requested={user_id}"
         )
-        return {"error": "user mismatch"}
+        return {
+            "status": "FAILURE",
+            "error_type": "PermissionError",
+            "error_message": "user mismatch",
+            "error": "user mismatch",
+        }
 
     tracker = TaskTracker(
         task_id=self.request.id, user_id=str(user_id or ""), task_type="grid_search"
@@ -369,7 +410,12 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
             job.status = "failed"
             job.error_log = [{"error": "failed to fetch OHLCV data"}]
             job.save(update_fields=["status", "error_log"])
-            return {"error": "OHLCV fetch failed"}
+            return {
+                "status": "FAILURE",
+                "error_type": "DataError",
+                "error_message": "OHLCV fetch failed",
+                "error": "OHLCV fetch failed",
+            }
 
         tracker.milestone(f"已获取 {len(ohlcv_data)} 条K线数据", progress=0.2)
 
@@ -380,11 +426,21 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
 
         try:
             for idx, params in enumerate(combinations):
+                # DB 连接在长时间的 OHLCV 抓取 / 上一个组合回测期间可能被
+                # pgbouncer 关闭（CONN_MAX_AGE=30s）。每个组合开始前刷新连接，
+                # 否则 save_backtest_result 会因 "connection already closed" 失败，
+                # 导致整个网格搜索 0 条结果落库（前端因此看不到任何子回测）。
+                close_old_connections()
                 try:
                     job.refresh_from_db()
                     if job.status == "cancelled":
                         tracker.milestone("任务已被取消", progress=0.0)
-                        return {"cancelled": True, "completed": idx}
+                        return {
+                            "status": "CANCELLED",
+                            "cancelled": True,
+                            "completed": idx,
+                            "message": f"任务已被取消，已完成 {idx} 个组合",
+                        }
                 except Exception:
                     pass
 
@@ -410,6 +466,9 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
                             user_id=str(job.user_id) if job.user_id else None,
                         )
                     )
+                    # run_backtest 可能耗时较长，期间 DB 连接可能被 pgbouncer 关闭，
+                    # 需要在 ORM 操作前刷新连接，避免 "connection already closed"
+                    close_old_connections()
                     result_id = stats.get("result_id")
                     if result_id:
                         BacktestResult.objects.filter(id=result_id).update(
@@ -421,6 +480,8 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
                 except SoftTimeLimitExceeded:
                     raise
                 except Exception as e:
+                    close_old_connections()
+                    job.refresh_from_db()
                     job.error_log = job.error_log + [
                         {"combination_index": idx, "params": params, "error": str(e)}
                     ]
@@ -474,7 +535,12 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         job.error_log = job.error_log + [{"error": "soft time limit exceeded"}]
         job.save(update_fields=["status", "error_log"])
         tracker.fail("网格搜索超时")
-        return {"error": "time limit exceeded"}
+        return {
+            "status": "FAILURE",
+            "error_type": "TimeoutError",
+            "error_message": "time limit exceeded",
+            "error": "time limit exceeded",
+        }
     except Exception as e:
         job.status = "failed"
         job.error_log = job.error_log + [{"error": str(e)}]

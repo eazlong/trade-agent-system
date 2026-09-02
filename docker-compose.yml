@@ -52,7 +52,7 @@ services:
       - SERVER_IDLE_TIMEOUT=30
       - SERVER_CONNECT_TIMEOUT=3
       - CLIENT_IDLE_TIMEOUT=60         # 空闲 60s 自动断开，防止连接泄漏累积
-      - CLIENT_LOGIN_TIMEOUT=3
+      - CLIENT_LOGIN_TIMEOUT=30         # 认证握手超时 30s，防止冷启动失败
       - ADMIN_USERS=pgbouncer_admin
       - STATS_USERS=pgbouncer_stats
       - IGNORE_STARTUP_PARAMETERS=extra_float_digits
@@ -70,6 +70,12 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: uvicorn core.asgi:application --host 0.0.0.0 --port 8000 --no-access-log
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
     volumes:
       - ./backend:/app
       - ~/.tradelogx:/root/.tradelogx
@@ -83,6 +89,8 @@ services:
       - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
     env_file:
       - ./backend/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - pgbouncer
       - redis
@@ -130,6 +138,8 @@ services:
       - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
     env_file:
       - ./backend/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - pgbouncer                      # 依赖 pgbouncer（而非 backend）
     networks:

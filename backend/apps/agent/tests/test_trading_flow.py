@@ -127,6 +127,12 @@ class MockMemoryManager:
     async def save_conv_history(self, history):
         self._l1["conv_history"] = list(history)
 
+    async def append_conv_history(self, entries, keep_turns=10):
+        current = self._l1.get("conv_history", [])
+        updated = (current + entries)[-keep_turns:]
+        self._l1["conv_history"] = updated
+        return updated
+
 
 def make_supervisor():
     """Create a real SupervisorAgent with Redis mocked out."""

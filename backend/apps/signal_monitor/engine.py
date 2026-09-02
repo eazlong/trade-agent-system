@@ -23,6 +23,31 @@ from .models import SignalMonitor, SignalTriggerLog
 
 logger = logging.getLogger(__name__)
 
+# 共享的 ccxt.binance 实例（懒加载单例）。
+# K 线回调热路径每次 fetch 若新建 ccxt 实例（requests session + 市场结构），
+# 会带来大量内存分配/回收——容器内存仅 512M，高峰期曾 OOM。
+# 复用单例显著降低峰值内存。enableRateLimit=False 避免共享实例上
+# 并发调用时的限流状态竞争（并发度已由 FrameManager 信号量限制为 2）。
+_exchange_binance: Any = None
+
+
+def _get_ccxt_binance() -> Any:
+    global _exchange_binance
+    if _exchange_binance is None:
+        import ccxt
+        from django.conf import settings
+
+        options: dict[str, Any] = {
+            "enableRateLimit": False,
+            # 网络不可达时快速失败，避免阻塞调用线程（ccxt 默认 10s + 重试）
+            "timeout": 5000,
+        }
+        proxy_url = getattr(settings, "WEB_PROXY", "") or ""
+        if proxy_url:
+            options["proxies"] = {"http": proxy_url, "https": proxy_url}
+        _exchange_binance = ccxt.binance(options)
+    return _exchange_binance
+
 
 class SignalMonitorEngine:
     """信号监控引擎"""
@@ -499,19 +524,11 @@ class SignalMonitorEngine:
     def _fetch_realtime_price(self, symbol: str) -> float | None:
         """从交易所获取实时价格"""
         try:
-            import ccxt
-            from django.conf import settings
-
             # 解析交易对
             base, quote = symbol.split("/")
             ccxt_symbol = f"{base}/{quote}"
 
-            # 创建交易所实例（使用公开接口，不需要认证）
-            options: dict[str, Any] = {"enableRateLimit": True}
-            proxy_url = getattr(settings, "WEB_PROXY", "") or ""
-            if proxy_url:
-                options["proxies"] = {"http": proxy_url, "https": proxy_url}
-            exchange = ccxt.binance(options)
+            exchange = _get_ccxt_binance()
             ticker = exchange.fetch_ticker(ccxt_symbol)
             price = ticker.get("last")
             if price:
@@ -526,17 +543,10 @@ class SignalMonitorEngine:
     ) -> list[dict]:
         """从交易所获取最近的 K 线数据"""
         try:
-            import ccxt
-            from django.conf import settings
-
             base, quote = symbol.split("/")
             ccxt_symbol = f"{base}/{quote}"
 
-            options: dict[str, Any] = {"enableRateLimit": True}
-            proxy_url = getattr(settings, "WEB_PROXY", "") or ""
-            if proxy_url:
-                options["proxies"] = {"http": proxy_url, "https": proxy_url}
-            exchange = ccxt.binance(options)
+            exchange = _get_ccxt_binance()
 
             # ccxt 时间框架映射
             tf_map = {

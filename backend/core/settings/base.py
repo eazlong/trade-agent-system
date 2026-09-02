@@ -160,6 +160,11 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL_PRIMARY = os.environ.get("OPENAI_MODEL_PRIMARY", "gpt-4o")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL_FALLBACK = os.environ.get("ANTHROPIC_MODEL_FALLBACK", "claude-opus-4-6")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL_FALLBACK = os.environ.get("DEEPSEEK_MODEL_FALLBACK", "deepseek-chat")
+DEEPSEEK_API_BASE_URL = os.environ.get(
+    "DEEPSEEK_API_BASE_URL", "https://api.deepseek.com/v1"
+)
 OPENAI_API_BASE_URL = os.environ.get(
     "OPENAI_API_BASE_URL", "https://api.openai.com/v1/"
 )
@@ -174,6 +179,7 @@ _default_proxy = os.environ.get("HTTPS_PROXY", "") or os.environ.get("HTTP_PROXY
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "") or _default_proxy
 OPENAI_PROXY = os.environ.get("OPENAI_PROXY", "") or _default_proxy
 ANTHROPIC_PROXY = os.environ.get("ANTHROPIC_PROXY", "") or _default_proxy
+DEEPSEEK_PROXY = os.environ.get("DEEPSEEK_PROXY", "") or _default_proxy
 WEB_PROXY = os.environ.get("WEB_PROXY", "") or _default_proxy
 
 # Web tools
@@ -186,6 +192,21 @@ BRAVE_SEARCH_API_KEY = os.environ.get("BRAVE_SEARCH_API_KEY", "")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 SEARXNG_BASE_URL = os.environ.get("SEARXNG_BASE_URL", "")
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
+
+# Lark / Feishu
+LARK_APP_ID = os.environ.get("LARK_APP_ID", "")
+LARK_APP_SECRET = os.environ.get("LARK_APP_SECRET", "")
+LARK_VERIFICATION_TOKEN = os.environ.get("LARK_VERIFICATION_TOKEN", "")
+LARK_ENCRYPT_KEY = os.environ.get("LARK_ENCRYPT_KEY", "")
+LARK_OAUTH_REDIRECT_URI = os.environ.get(
+    "LARK_OAUTH_REDIRECT_URI",
+    "http://localhost:8000/api/channel/auth/lark/callback/",
+)
+LARK_OAUTH_SCOPES = os.environ.get("LARK_OAUTH_SCOPES", "")
+
+# Main channel for system notifications (lark | telegram | tui)
+# Only the main channel receives notifications; others are suppressed.
+MAIN_CHANNEL = os.environ.get("MAIN_CHANNEL", "lark")
 
 # Fernet encryption key for API secrets (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
 FERNET_KEY = os.environ.get("FERNET_KEY", "")
@@ -245,6 +266,12 @@ LOGGING = {
             "handlers": ["console"],
             "propagate": False,
         },
+        "websockets": {
+            "level": "WARNING",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "urllib3": {"level": "WARNING", "handlers": ["console"], "propagate": False},
         # "celery": {"level": "WARNING", "handlers": ["console"], "propagate": False},
     },
 }

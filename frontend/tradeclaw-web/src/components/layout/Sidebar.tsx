@@ -120,6 +120,38 @@ export default function Sidebar() {
 
       <div className="h-px bg-[rgba(255,255,255,0.07)] my-2.5 mx-2" />
 
+      {/* Workflow history */}
+      <Link
+        href="/workflows"
+        className={`flex items-center gap-2 px-2.5 py-2 rounded-lg transition-all border border-transparent mb-0.5 ${
+          pathname === "/workflows"
+            ? "bg-bg3 border-[rgba(255,255,255,0.12)]"
+            : "hover:bg-bg2"
+        }`}
+      >
+        <div
+          className="w-[7px] h-[7px] rounded-full flex-shrink-0"
+          style={{
+            background: "var(--color-blue)",
+            boxShadow: "0 0 6px var(--color-blue)",
+          }}
+        />
+        <span className="text-xs font-medium text-text flex-1 truncate">
+          工作流
+        </span>
+        <span
+          className="font-mono text-[9px] px-1.5 py-0.5 rounded font-semibold whitespace-nowrap"
+          style={{
+            background: "var(--color-blue-dim)",
+            color: "var(--color-blue)",
+          }}
+        >
+          历史
+        </span>
+      </Link>
+
+      <div className="h-px bg-[rgba(255,255,255,0.07)] my-2.5 mx-2" />
+
       {/* Account overview */}
       <div className="mb-1.5">
         <div className="text-[9px] font-semibold text-text3 uppercase tracking-widest px-2 pt-1.5 pb-1">

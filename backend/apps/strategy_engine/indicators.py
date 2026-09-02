@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 
 import numpy as np
 
@@ -153,6 +154,160 @@ def atr(
     return _compute_atr(h, lo, _extract_closes(highs_or_history), p)
 
 
+def _validate_key_level_params(
+    klines: list[dict],
+    current_price: float | None,
+    atr_period: int,
+    pivot_window: int,
+    min_gap_bars: int,
+    max_levels: int,
+) -> None:
+    if pivot_window < 1:
+        raise ValueError("pivot_window 必须 >= 1")
+    if atr_period < 1:
+        raise ValueError("atr_period 必须 >= 1")
+    if min_gap_bars < 1:
+        raise ValueError("min_gap_bars 必须 >= 1")
+    if max_levels < 1 or max_levels > 20:
+        raise ValueError("max_levels 必须在 1 到 20 之间")
+    if current_price is not None and current_price <= 0:
+        raise ValueError("current_price 必须为正数")
+
+    min_bars = 2 * pivot_window + atr_period + 1
+    if len(klines) < min_bars:
+        raise ValueError(f"K线数量不足，至少需要 {min_bars} 根")
+
+    for idx, kline in enumerate(klines):
+        for field in ("high", "low", "close"):
+            try:
+                value = float(kline[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"第 {idx} 根K线缺少有效 {field}") from exc
+            if value <= 0 or not np.isfinite(value):
+                raise ValueError(f"第 {idx} 根K线 {field} 必须为正数")
+
+
+def _latest_tolerance_pct(klines: list[dict], atr_period: int) -> float:
+    atr_values = atr(klines, atr_period)
+    valid_atr = atr_values[np.isfinite(atr_values)]
+    if len(valid_atr) == 0:
+        raise ValueError("无法计算 ATR 容差")
+    atr_pct = float(valid_atr[-1]) / float(klines[-1]["close"])
+    return min(max(atr_pct * 0.5, 0.001), 0.01)
+
+
+def _is_pivot(values: np.ndarray, index: int, window: int, mode: str) -> bool:
+    left = values[index - window : index]
+    right = values[index + 1 : index + window + 1]
+    if mode == "low":
+        return bool(values[index] <= left.min() and values[index] <= right.min())
+    return bool(values[index] >= left.max() and values[index] >= right.max())
+
+
+def _count_touches(
+    klines: list[dict],
+    price: float,
+    tolerance_pct: float,
+    min_gap_bars: int,
+    source: str,
+) -> tuple[int, int, str | None]:
+    last_touch_index = -min_gap_bars - 1
+    touches = 0
+    band = price * tolerance_pct
+    field = "low" if source == "low" else "high"
+
+    for index, kline in enumerate(klines):
+        if abs(float(kline[field]) - price) <= band:
+            if index - last_touch_index >= min_gap_bars:
+                touches += 1
+            last_touch_index = index
+
+    timestamp = klines[last_touch_index].get("timestamp") if last_touch_index >= 0 else None
+    return touches, last_touch_index, timestamp
+
+
+def horizontal_key_levels(
+    klines: list[dict],
+    current_price: float | None = None,
+    atr_period: int = 14,
+    pivot_window: int = 2,
+    min_gap_bars: int = 3,
+    max_levels: int = 5,
+) -> dict:
+    """计算水平关键价位。"""
+    if not isinstance(klines, list):
+        raise ValueError("klines 必须是 K线 dict 列表")
+    current = float(current_price) if current_price is not None else None
+    _validate_key_level_params(
+        klines, current, atr_period, pivot_window, min_gap_bars, max_levels
+    )
+
+    highs = np.array([float(k["high"]) for k in klines], dtype=np.float64)
+    lows = np.array([float(k["low"]) for k in klines], dtype=np.float64)
+    tolerance_pct = _latest_tolerance_pct(klines, atr_period)
+
+    candidates = []
+    for index in range(pivot_window, len(klines) - pivot_window):
+        if _is_pivot(lows, index, pivot_window, "low"):
+            candidates.append({"price": float(lows[index]), "index": index, "source": "low"})
+        if _is_pivot(highs, index, pivot_window, "high"):
+            candidates.append({"price": float(highs[index]), "index": index, "source": "high"})
+
+    clusters: list[list[dict]] = []
+    for candidate in sorted(candidates, key=lambda item: item["price"]):
+        for cluster in clusters:
+            avg_price = sum(item["price"] for item in cluster) / len(cluster)
+            if abs(candidate["price"] - avg_price) <= avg_price * tolerance_pct:
+                cluster.append(candidate)
+                break
+        else:
+            clusters.append([candidate])
+
+    levels = []
+    for cluster in clusters:
+        price = sum(item["price"] for item in cluster) / len(cluster)
+        source = Counter(item["source"] for item in cluster).most_common(1)[0][0]
+        touches, last_index, timestamp = _count_touches(
+            klines, price, tolerance_pct, min_gap_bars, source
+        )
+        if touches == 0:
+            continue
+        levels.append(
+            {
+                "price": price,
+                "touches": touches,
+                "tolerance_pct": tolerance_pct,
+                "source": source,
+                "last_touch_index": last_index,
+                "last_touch_timestamp": timestamp,
+                "score": touches,
+            }
+        )
+
+    levels.sort(
+        key=lambda level: (
+            -level["touches"],
+            abs(level["price"] - current) if current is not None else 0,
+            -level["last_touch_index"],
+        )
+    )
+    levels = levels[:max_levels]
+
+    supports = []
+    resistances = []
+    if current is not None:
+        supports = [level for level in levels if level["price"] < current]
+        resistances = [level for level in levels if level["price"] > current]
+
+    return {
+        "levels": levels,
+        "supports": supports,
+        "resistances": resistances,
+        "tolerance_pct": tolerance_pct,
+    }
+
+
+
 def stoch(
     history: list[dict],
     k_period: int = 14,
@@ -165,3 +320,179 @@ def stoch(
     """
     highs, lows = _extract_hl(history)
     return _compute_stoch(highs, lows, _extract_closes(history), k_period, d_period)
+
+
+# --- 箱体判定 ----------------------------------------------------------
+
+def _cluster_pivot_price(
+    prices: list[float],
+    tolerance_pct: float,
+) -> tuple[float, int] | None:
+    """把多个 pivot 价格按容差带聚成单一价格。
+
+    Returns:
+        (聚合价, pivot 数量)；pivot 不足 1 个时返回 None。
+    """
+    if not prices:
+        return None
+    sorted_prices = sorted(prices)
+    clusters: list[list[float]] = []
+    for price in sorted_prices:
+        for cluster in clusters:
+            avg = sum(cluster) / len(cluster)
+            if abs(price - avg) <= avg * tolerance_pct:
+                cluster.append(price)
+                break
+        else:
+            clusters.append([price])
+    largest = max(clusters, key=len)
+    return sum(largest) / len(largest), len(largest)
+
+
+def _validate_box_range_params(
+    klines: list[dict],
+    max_width_abs: float | None,
+    max_width_pct: float | None,
+    pivot_window: int,
+    min_gap_bars: int,
+    min_pivots: int,
+    min_touches: int,
+    atr_period: int,
+) -> None:
+    if max_width_abs is None and max_width_pct is None:
+        raise ValueError("必须传入 max_width_abs 或 max_width_pct 之一")
+    if max_width_abs is not None and max_width_pct is not None:
+        raise ValueError("max_width_abs 和 max_width_pct 只能二选一")
+    if max_width_abs is not None and max_width_abs <= 0:
+        raise ValueError("max_width_abs 必须为正数")
+    if max_width_pct is not None and max_width_pct <= 0:
+        raise ValueError("max_width_pct 必须为正数")
+    if pivot_window < 1:
+        raise ValueError("pivot_window 必须 >= 1")
+    if min_gap_bars < 1:
+        raise ValueError("min_gap_bars 必须 >= 1")
+    if min_pivots < 1:
+        raise ValueError("min_pivots 必须 >= 1")
+    if min_touches < 1:
+        raise ValueError("min_touches 必须 >= 1")
+    if atr_period < 1:
+        raise ValueError("atr_period 必须 >= 1")
+
+    min_bars = 2 * pivot_window + 1
+    if len(klines) < min_bars:
+        raise ValueError(f"K线数量不足，至少需要 {min_bars} 根")
+
+    for idx, kline in enumerate(klines):
+        for field in ("high", "low", "close"):
+            try:
+                value = float(kline[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"第 {idx} 根K线缺少有效 {field}") from exc
+            if value <= 0 or not np.isfinite(value):
+                raise ValueError(f"第 {idx} 根K线 {field} 必须为正数")
+
+
+def detect_box_range(
+    klines: list[dict],
+    max_width_abs: float | None = None,
+    max_width_pct: float | None = None,
+    pivot_window: int = 2,
+    min_gap_bars: int = 3,
+    min_pivots: int = 2,
+    min_touches: int = 2,
+    atr_period: int = 14,
+) -> dict:
+    """判断 K 线窗口是否处于箱体震荡，并返回上下边界。
+
+    两次验证：上下边界必须同时满足
+        pivot_count >= min_pivots  AND  touches >= min_touches
+    """
+    if not isinstance(klines, list):
+        raise ValueError("klines 必须是 K线 dict 列表")
+    _validate_box_range_params(
+        klines, max_width_abs, max_width_pct,
+        pivot_window, min_gap_bars, min_pivots, min_touches, atr_period,
+    )
+
+    abs_threshold = float(max_width_abs) if max_width_abs is not None else None
+    pct_threshold = float(max_width_pct) if max_width_pct is not None else None
+
+    highs = np.array([float(k["high"]) for k in klines], dtype=np.float64)
+    lows = np.array([float(k["low"]) for k in klines], dtype=np.float64)
+    tolerance_pct = _latest_tolerance_pct(klines, atr_period)
+
+    high_pivots: list[float] = []
+    low_pivots: list[float] = []
+    for index in range(pivot_window, len(klines) - pivot_window):
+        if _is_pivot(highs, index, pivot_window, "high"):
+            high_pivots.append(float(highs[index]))
+        if _is_pivot(lows, index, pivot_window, "low"):
+            low_pivots.append(float(lows[index]))
+
+    upper_cluster = _cluster_pivot_price(high_pivots, tolerance_pct)
+    lower_cluster = _cluster_pivot_price(low_pivots, tolerance_pct)
+
+    params = {
+        "max_width_abs": abs_threshold,
+        "max_width_pct": pct_threshold,
+        "pivot_window": pivot_window,
+        "min_pivots": min_pivots,
+        "min_touches": min_touches,
+        "tolerance_pct": tolerance_pct,
+    }
+
+    if upper_cluster is None or lower_cluster is None:
+        return {
+            "is_ranging": False,
+            "box": None,
+            "reason": "未找到任何局部高/低 pivot",
+            "params": params,
+        }
+
+    upper, upper_pivot_count = upper_cluster
+    lower, lower_pivot_count = lower_cluster
+    width = upper - lower
+    mid = (upper + lower) / 2
+    width_pct = width / mid if mid > 0 else 0.0
+
+    upper_touches, _, _ = _count_touches(
+        klines, upper, tolerance_pct, min_gap_bars, "high"
+    )
+    lower_touches, _, _ = _count_touches(
+        klines, lower, tolerance_pct, min_gap_bars, "low"
+    )
+
+    def _fail(reason: str) -> dict:
+        return {"is_ranging": False, "box": None, "reason": reason, "params": params}
+
+    if upper_pivot_count < min_pivots:
+        return _fail(f"上边界 pivot 不足（{upper_pivot_count} < {min_pivots}）")
+    if lower_pivot_count < min_pivots:
+        return _fail(f"下边界 pivot 不足（{lower_pivot_count} < {min_pivots}）")
+    if upper_touches < min_touches:
+        return _fail(f"上边界触碰不足（{upper_touches} < {min_touches}）")
+    if lower_touches < min_touches:
+        return _fail(f"下边界触碰不足（{lower_touches} < {min_touches}）")
+    if abs_threshold is not None and width > abs_threshold:
+        return _fail(f"震荡区间绝对宽度超限（{width} > {abs_threshold}）")
+    if pct_threshold is not None and width_pct > pct_threshold:
+        return _fail(f"震荡区间相对宽度超限（{width_pct:.4%} > {pct_threshold:.4%}）")
+
+    return {
+        "is_ranging": True,
+        "box": {
+            "upper": upper,
+            "lower": lower,
+            "mid": mid,
+            "width": width,
+            "width_pct": width_pct,
+            "upper_pivot_count": upper_pivot_count,
+            "lower_pivot_count": lower_pivot_count,
+            "upper_touches": upper_touches,
+            "lower_touches": lower_touches,
+            "pivot_window": pivot_window,
+            "tolerance_pct": tolerance_pct,
+        },
+        "reason": "",
+        "params": params,
+    }

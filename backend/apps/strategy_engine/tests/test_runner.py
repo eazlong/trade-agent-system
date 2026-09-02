@@ -220,3 +220,91 @@ class DecimalTypeErrorStrategy(BaseStrategy):
             )
         finally:
             Path(path).unlink()
+
+    def test_zero_trade_is_warning_not_error(self):
+        """零交易降级为 warning：on_bar 恒返回 None 应通过但带零交易警告"""
+        content = """
+from apps.strategy_engine.base import BaseStrategy, StrategyContext
+
+class NeverTradesStrategy(BaseStrategy):
+    name = "never_trades"
+
+    def on_bar(self, kline, history):
+        return None
+"""
+        path = self._write_strategy_file(content)
+        try:
+            tester = StrategyTester(kline_count=30)
+            result = tester.test_strategy_file(path)
+            self.assertTrue(result["success"], result["errors"])
+            self.assertTrue(any("零交易" in w for w in result["warnings"]))
+        finally:
+            Path(path).unlink()
+
+    def test_ctx_position_gating_triggers_sell(self):
+        """ctx.position 门控的卖出能触发 —— 验证 BacktestEngine 同步 ctx.position（问题 B 修复）。
+
+        旧验证器从不回写 ctx.position，close_position() 因 position 恒为 0 永远返回 None，
+        导致 sell_count 恒为 0。复用 BacktestEngine 后状态同步，卖出可正常触发。
+        """
+        content = """
+from decimal import Decimal
+from apps.strategy_engine.base import BaseStrategy, StrategyContext
+
+class BuyThenSellStrategy(BaseStrategy):
+    name = "buy_then_sell"
+    params_schema = {"quantity": {"type": "number", "default": 0.01}}
+
+    def __init__(self, context: StrategyContext):
+        super().__init__(context)
+        self.qty = Decimal(str(context.params.get("quantity", 0.01)))
+        self.bars = 0
+
+    def on_bar(self, kline, history):
+        self.bars += 1
+        if self.ctx.position == 0 and self.bars % 10 == 5:
+            return self.ctx.buy(quantity=self.qty, signal_name="entry")
+        if self.ctx.position > 0 and self.bars % 10 == 0:
+            return self.ctx.close_position()
+        return None
+"""
+        path = self._write_strategy_file(content)
+        try:
+            tester = StrategyTester(kline_count=50)
+            result = tester.test_strategy_file(path)
+            self.assertTrue(result["success"], result["errors"])
+            self.assertGreaterEqual(result["stats"]["buy_count"], 1)
+            self.assertGreaterEqual(result["stats"]["sell_count"], 1)
+        finally:
+            Path(path).unlink()
+
+    def test_validation_does_not_write_db(self):
+        """护栏：验证流程绝不写入 BacktestResult（不污染真实数据）。"""
+        from apps.backtest.models import BacktestResult
+
+        content = """
+from decimal import Decimal
+from apps.strategy_engine.base import BaseStrategy, StrategyContext
+
+class CleanStrategy(BaseStrategy):
+    name = "clean_strategy"
+    params_schema = {"quantity": {"type": "number", "default": 0.01}}
+
+    def __init__(self, context: StrategyContext):
+        super().__init__(context)
+        self.qty = Decimal(str(context.params.get("quantity", 0.01)))
+
+    def on_bar(self, kline, history):
+        if self.ctx.position == 0 and len(history) > 5:
+            return self.ctx.buy(quantity=self.qty, signal_name="entry")
+        return None
+"""
+        path = self._write_strategy_file(content)
+        try:
+            before = BacktestResult.objects.count()
+            tester = StrategyTester(kline_count=30)
+            result = tester.test_strategy_file(path)
+            self.assertTrue(result["success"], result["errors"])
+            self.assertEqual(BacktestResult.objects.count(), before)
+        finally:
+            Path(path).unlink()

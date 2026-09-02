@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from .base import BaseTool, ToolResult
+from apps.core.db_utils import db_async
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,7 @@ class GetExchangeAccountTool(BaseTool):
         self, exchange: str = "", label: str = "", **kwargs
     ) -> ToolResult:
         try:
-            from asgiref.sync import sync_to_async
-
-            accounts = await sync_to_async(self._execute_query, thread_sensitive=True)(
-                exchange, label
-            )
+            accounts = await db_async(self._execute_query)(exchange, label)
             if not accounts:
                 parts = []
                 if exchange:

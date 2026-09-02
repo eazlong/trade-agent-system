@@ -3,6 +3,7 @@ name: risk_advisor
 intent: assess_risk
 tools: [fetch_ohlcv, calculate_indicators, web_fetch]
 context_fields: [position_pct, daily_pnl_pct]
+description: assess position sizing, drawdown risk, and provide actionable risk management advice.
 ---
 # RiskAdvisorAgent System Prompt v1
 # Current Date: {{CURRENT_DATETIME}}

@@ -7,6 +7,92 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock
 
 
+class TestChunkMessage(unittest.TestCase):
+    """测试 chunk_message 分片函数"""
+
+    def test_short_text_returns_single_chunk(self):
+        from apps.channel.base import chunk_message
+
+        result = chunk_message("hello world", max_length=100)
+        self.assertEqual(result, ["hello world"])
+
+    def test_exact_length_returns_single_chunk(self):
+        from apps.channel.base import chunk_message
+
+        text = "a" * 100
+        result = chunk_message(text, max_length=100)
+        self.assertEqual(result, [text])
+
+    def test_splits_by_newline(self):
+        from apps.channel.base import chunk_message
+
+        part1 = "a" * 50
+        part2 = "b" * 50
+        text = f"{part1}\n{part2}"
+        result = chunk_message(text, max_length=60)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], part1)
+        self.assertEqual(result[1], part2)
+
+    def test_splits_by_chinese_period(self):
+        from apps.channel.base import chunk_message
+
+        text = "这是第一句话。" + "这" * 50 + "。" + "这" * 50
+        result = chunk_message(text, max_length=60)
+        self.assertTrue(len(result) >= 2)
+        # 所有分片拼接回去应等于原文
+        self.assertEqual("".join(result), text)
+
+    def test_splits_by_english_period(self):
+        from apps.channel.base import chunk_message
+
+        text = "First sentence. " + "a" * 50 + ". " + "b" * 50
+        result = chunk_message(text, max_length=60)
+        self.assertTrue(len(result) >= 2)
+        self.assertEqual("".join(result), text)
+
+    def test_hard_cut_when_no_boundary(self):
+        from apps.channel.base import chunk_message
+
+        text = "a" * 150
+        result = chunk_message(text, max_length=50)
+        self.assertEqual(len(result), 3)
+        self.assertEqual("".join(result), text)
+        for chunk in result:
+            self.assertLessEqual(len(chunk), 50)
+
+    def test_empty_text(self):
+        from apps.channel.base import chunk_message
+
+        result = chunk_message("", max_length=100)
+        self.assertEqual(result, [""])
+
+    def test_paragraph_split_preferred(self):
+        from apps.channel.base import chunk_message
+
+        para1 = "a" * 50
+        para2 = "b" * 50
+        text = f"{para1}\n\n{para2}"
+        result = chunk_message(text, max_length=60)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], para1)
+        self.assertEqual(result[1], para2)
+
+    def test_long_result_preserved_in_chunks(self):
+        """模拟 Agent 长回复：中文 markdown 报告，确保所有文字保留"""
+        from apps.channel.base import chunk_message
+
+        text = ("# 分析报告\n\n" + "这是一段分析内容。" * 300)
+        result = chunk_message(text, max_length=1000)
+        self.assertTrue(len(result) >= 2)
+        # 文字内容完整（分片边界处换行可能丢失，但字符不应丢失）
+        joined = "".join(result)
+        # 去除空白后比较，因为空行分隔符在分片边界会被消费
+        self.assertEqual(joined.replace("\n", ""), text.replace("\n", ""))
+        for chunk in result:
+            self.assertLessEqual(len(chunk), 1000)
+
+
 class TestTelegramChannel(unittest.TestCase):
     """测试 Telegram Channel"""
 

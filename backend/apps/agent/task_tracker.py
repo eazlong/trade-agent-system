@@ -58,7 +58,7 @@ def _send_notification_redis(user_id: str, text: str) -> None:
 def _format_progress_message(
     task_id: str, message: str, progress: float | None = None, elapsed: str = ""
 ) -> str:
-    short_id = task_id[:8]
+    short_id = task_id
     parts = [f"\U0001f4ca 任务 #{short_id}", f"阶段：{message}"]
     if progress is not None:
         parts.append(f"进度：{int(progress * 100)}%")
@@ -205,17 +205,11 @@ class TaskTracker:
             "last_alive": datetime.now(timezone.utc).isoformat(),
         })
 
-    # ── Notification length limits (safe across all channels) ──
-    _MAX_COMPLETE_LENGTH = 3500  # Telegram safe (4096 limit minus formatting)
-    _MAX_ERROR_LENGTH = 2000
-
     def complete(self, result: str) -> None:
         """Mark task completed: push final result, update Redis, trigger async archive."""
         elapsed = _format_duration(self._start_ts)
-        short_id = self.task_id[:8]
-        text = f"✅ 任务 #{short_id} 完成\n耗时：{elapsed}\n结果：{result[:self._MAX_COMPLETE_LENGTH]}"
-        if len(result) > self._MAX_COMPLETE_LENGTH:
-            text += f"\n\n…（内容过长，共 {len(result)} 字，请在 Web 端查看完整详情）"
+        short_id = self.task_id
+        text = f"✅ 任务 #{short_id} 完成\n耗时：{elapsed}\n结果：{result}"
         self._notify(text)
         self._save_redis(
             "completed",
@@ -231,10 +225,8 @@ class TaskTracker:
 
     def fail(self, error: str) -> None:
         """Mark task failed: push error, update Redis, archive."""
-        short_id = self.task_id[:8]
-        text = f"❌ 任务 #{short_id} 失败\n错误：{error[:self._MAX_ERROR_LENGTH]}"
-        if len(error) > self._MAX_ERROR_LENGTH:
-            text += "\n…（错误信息已截断）"
+        short_id = self.task_id
+        text = f"❌ 任务 #{short_id} 失败\n错误：{error}"
         self._notify(text)
         self._save_redis(
             "failed",
@@ -250,6 +242,47 @@ class TaskTracker:
     def stop(self) -> None:
         """Clean up tracker state (called in finally block)."""
         logger.info("[TaskTracker] task %s stopped", self.task_id)
+
+    @staticmethod
+    def cancel(task_id: str) -> bool:
+        """Mark a running task as cancelled.
+
+        Returns True if the task was found and marked, False otherwise.
+        """
+        import redis
+        from django.conf import settings
+
+        url = settings.REDIS_URL
+        if url.rsplit("/", 1)[-1].isdigit():
+            url = url.rsplit("/", 1)[0] + "/3"
+
+        try:
+            r = redis.from_url(url, decode_responses=True)
+            key = f"task:progress:{task_id}"
+            if not r.exists(key):
+                return False
+            r.hset(key, "status", "cancelled")
+            logger.info("[TaskTracker] task %s cancelled", task_id)
+            return True
+        except Exception:
+            logger.warning("[TaskTracker] failed to cancel task %s", task_id, exc_info=True)
+            return False
+
+    def is_cancelled(self) -> bool:
+        """Check if this task has been cancelled by the user."""
+        import redis
+        from django.conf import settings
+
+        url = settings.REDIS_URL
+        if url.rsplit("/", 1)[-1].isdigit():
+            url = url.rsplit("/", 1)[0] + "/3"
+
+        try:
+            r = redis.from_url(url, decode_responses=True)
+            status = r.hget(self._redis_key, "status")
+            return status == "cancelled"
+        except Exception:
+            return False
 
     @classmethod
     def get_current(cls) -> TaskTracker | None:
@@ -298,7 +331,7 @@ class TaskTracker:
             pipe.execute()
             logger.info(
                 "[TaskTracker] recorded submission for task %s (type=%s)",
-                task_id[:8],
+                task_id,
                 task_type,
             )
         except Exception:
@@ -393,7 +426,81 @@ class TaskTracker:
             logger.warning("[TaskTracker] notification delivery failed", exc_info=True)
 
     def _trigger_archive(self, result: str) -> None:
-        """Dispatch Celery task to archive this tracker's data to PostgreSQL."""
+        """Persist tracker data to PostgreSQL.
+
+        If called from an async context (e.g. Redis Stream consumer), the ORM
+        write is scheduled via sync_to_async to avoid SynchronousOnlyOperation.
+        In a sync context (e.g. Celery task), the ORM is called directly.
+
+        Connection recovery: On OperationalError (e.g. PostgreSQL restart),
+        close the stale connection and retry once before falling back to Celery.
+
+        Always fires the Celery task as a best-effort backup.
+        """
+        import asyncio
+        from django.db import connection, OperationalError
+        from apps.agent.models import TaskProgress
+
+        defaults = {
+            "task_type": self.task_type,
+            "status": self._get_current_status(),
+            "progress": self._get_current_progress(),
+            "milestones": self._milestones,
+            "result": result,
+            "completed_at": datetime.now(timezone.utc),
+            "user_id": self.user_id if len(self.user_id) == 36 else None,
+        }
+
+        def _do_sync_archive() -> None:
+            """Sync archive with one retry on connection error."""
+            try:
+                TaskProgress.objects.update_or_create(
+                    task_id=self.task_id,
+                    defaults=defaults,
+                )
+            except OperationalError:
+                # Connection lost (e.g. PostgreSQL restart). Close stale
+                # connection and retry once — Django will reopen automatically.
+                logger.info(
+                    "[TaskTracker] connection lost for %s, retrying after reconnect",
+                    self.task_id,
+                )
+                connection.close()
+                TaskProgress.objects.update_or_create(
+                    task_id=self.task_id,
+                    defaults=defaults,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Sync context: call ORM directly
+            try:
+                _do_sync_archive()
+            except Exception:
+                logger.info(
+                    "[TaskTracker] direct PG archive failed for %s, falling back to Celery",
+                    self.task_id, exc_info=True,
+                )
+                self._archive_via_celery(result)
+        else:
+            # Async context: schedule via sync_to_async
+            async def _do_archive() -> None:
+                try:
+                    from asgiref.sync import sync_to_async as sta
+                    await sta(_do_sync_archive)()
+                except Exception:
+                    logger.info(
+                        "[TaskTracker] async PG archive failed for %s, "
+                        "falling back to Celery",
+                        self.task_id, exc_info=True,
+                    )
+                    self._archive_via_celery(result)
+
+            loop.create_task(_do_archive())
+
+    def _archive_via_celery(self, result: str) -> None:
+        """Dispatch archive to Celery as a fallback."""
         try:
             from apps.agent.tasks import archive_task_progress
 
@@ -408,7 +515,8 @@ class TaskTracker:
             )
         except Exception:
             logger.warning(
-                "[TaskTracker] failed to trigger archive task", exc_info=True
+                "[TaskTracker] Celery archive dispatch also failed for %s",
+                self.task_id, exc_info=True,
             )
 
     def _get_current_status(self) -> str:

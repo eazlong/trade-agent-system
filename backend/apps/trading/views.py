@@ -300,17 +300,14 @@ def live_session_start(request, pk):
 
     frame_manager = FrameManager.get_instance()
 
-    # 如果已在运行，先停掉旧框架（处理之前框架崩溃导致的幽灵状态）
+    # 如果已在运行，先停掉旧运行器（处理之前框架崩溃导致的幽灵状态）
+    # 注意：只停当前 session 的 runner，不动整个 trading frame（其他策略可能还在跑）
     if session.status == "running":
         logger.warning(
-            "Session %s is already running, stopping old frame before restart", pk
+            "Session %s is already running, stopping old runner before restart", pk
         )
         try:
-            async_to_sync(frame_manager.stop_strategy_runner)()
-        except Exception:
-            pass
-        try:
-            async_to_sync(frame_manager.stop_trading_frame)()
+            async_to_sync(frame_manager.stop_strategy_runner)(live_session_id=str(session.id))
         except Exception:
             pass
 
@@ -337,8 +334,11 @@ def live_session_start(request, pk):
         )
     except Exception as e:
         logger.exception("Failed to start strategy for session %s: %s", pk, e)
-        # 回滚已启动的交易框架
-        async_to_sync(frame_manager.stop_trading_frame)()
+        # 只回滚当前 session 的 runner，不动整个 trading frame（避免误杀并发策略）
+        try:
+            async_to_sync(frame_manager.stop_strategy_runner)(live_session_id=str(session.id))
+        except Exception:
+            pass
         return Response({"error": f"Failed to start strategy: {e}"}, status=500)
 
     session.status = "running"
@@ -414,10 +414,12 @@ def live_session_stop(request, pk):
     session.stopped_at = timezone.now()
     session.save(update_fields=["status", "stopped_at", "updated_at"])
 
-    # 停止策略运行器和交易框架
+    # 停止当前 session 的策略运行器
     frame_manager = FrameManager.get_instance()
-    async_to_sync(frame_manager.stop_strategy_runner)()
-    async_to_sync(frame_manager.stop_trading_frame)()
+    async_to_sync(frame_manager.stop_strategy_runner)(live_session_id=str(session.id))
+    # 仅当无其他策略运行时才停整个 trading frame（避免误杀并发策略）
+    if not frame_manager._strategy_runners:
+        async_to_sync(frame_manager.stop_trading_frame)()
 
     return Response({"status": session.status, "message": "Session stopped"})
 

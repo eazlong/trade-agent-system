@@ -44,6 +44,10 @@ class SystemLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
         try:
             msg = self.format(record)
+            # Truncate early to prevent large messages (e.g. full conversation
+            # history dumps) from bloating Redis streams and thread stacks.
+            if len(msg) > 4000:
+                msg = msg[:4000] + "...[truncated]"
             module = resolve_module(record.name)
             level_name = record.levelname
             trace_id = getattr(record, "trace_id", "")

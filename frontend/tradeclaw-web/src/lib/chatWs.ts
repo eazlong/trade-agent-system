@@ -66,12 +66,23 @@ class ChatWebSocket {
     };
 
     this.ws.onmessage = (event) => {
+      let data: WSMessage;
       try {
-        const data: WSMessage = JSON.parse(event.data);
-        this.callbacks.forEach((cb) => cb(data));
+        data = JSON.parse(event.data);
       } catch {
         // ignore non-JSON messages
+        return;
       }
+      // Dispatch outside the JSON try so a handler error is surfaced in the
+      // console instead of being silently swallowed — otherwise a thrown
+      // handler would drop the response with no trace ("不响应" with no clue).
+      this.callbacks.forEach((cb) => {
+        try {
+          cb(data);
+        } catch (err) {
+          console.error("[chatWs] message handler error:", err);
+        }
+      });
     };
 
     this.ws.onclose = () => {

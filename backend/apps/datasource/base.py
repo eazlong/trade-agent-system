@@ -113,6 +113,10 @@ class BaseDataSource(ABC):
 
     # 数据回调函数列表
     _callbacks: Dict[DataType, List[Callable]] = {}
+    # 精确回调表：(data_type, symbol, interval_str) → [callable, ...]
+    # 同一 (symbol, interval) 的多个上层订阅者共享同一条 WebSocket 流，
+    # 数据到达时只触发该键下的回调列表，避免广播导致的重复和串流。
+    _precise_callbacks: Dict[tuple, List[Callable]] = {}
 
     # WebSocket 状态
     _ws_status: ConnectionStatus = ConnectionStatus.DISCONNECTED
@@ -134,6 +138,7 @@ class BaseDataSource(ABC):
             raise ValueError("DataSource must define 'name' attribute")
 
         self._callbacks = {}
+        self._precise_callbacks = {}  # (data_type, symbol, interval_str) → [cb, ...]
         self._subscriptions = {}
         self._ws_status = ConnectionStatus.DISCONNECTED
         self._last_data_time = 0
@@ -343,6 +348,7 @@ class BaseDataSource(ABC):
         data_type: DataType,
         interval: Optional[KlineInterval] = None,
         market_type: MarketType = MarketType.SPOT,
+        callback: Optional[Callable] = None,
     ) -> bool:
         """
         取消订阅
@@ -352,46 +358,61 @@ class BaseDataSource(ABC):
             data_type: 数据类型
             interval: K 线周期
             market_type: 市场类型
+            callback: 可选，精确注销该回调（不传则只停 WS 流）
 
         Returns:
             是否成功取消
         """
         pass
 
-    def register_callback(self, data_type: DataType, callback: Callable) -> None:
-        """
-        注册数据回调函数
+    def register_callback(
+        self,
+        data_type: DataType,
+        callback: Callable,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> None:
+        """注册数据回调函数。
 
-        Args:
-            data_type: 数据类型
-            callback: 回调函数
+        传了 symbol 走精确注册：数据按 (type, symbol, interval) 精确分发，
+        不传则走旧的全局广播（向后兼容，逐步废弃）。
         """
+        if symbol:
+            key = (data_type, symbol, interval or "")
+            cbs = self._precise_callbacks.setdefault(key, [])
+            if callback not in cbs:
+                cbs.append(callback)
+            return
+
         if data_type not in self._callbacks:
             self._callbacks[data_type] = []
 
         if callback not in self._callbacks[data_type]:
             self._callbacks[data_type].append(callback)
 
-    def unregister_callback(self, data_type: DataType, callback: Callable) -> None:
-        """
-        移除数据回调函数
+    def unregister_callback(
+        self,
+        data_type: DataType,
+        callback: Callable,
+        symbol: Optional[str] = None,
+        interval: Optional[str] = None,
+    ) -> None:
+        """移除数据回调函数。"""
+        if symbol:
+            key = (data_type, symbol, interval or "")
+            cbs = self._precise_callbacks.get(key)
+            if cbs and callback in cbs:
+                cbs.remove(callback)
+                if not cbs:
+                    self._precise_callbacks.pop(key, None)
+            return
 
-        Args:
-            data_type: 数据类型
-            callback: 回调函数
-        """
         if data_type in self._callbacks:
             if callback in self._callbacks[data_type]:
                 self._callbacks[data_type].remove(callback)
 
     def _trigger_callbacks(self, data_type: DataType, data: Dict) -> None:
-        """
-        触发数据回调
-
-        Args:
-            data_type: 数据类型
-            data: 数据内容
-        """
+        """全局广播触发（旧行为，向后兼容）。新代码请用 _trigger_precise_callbacks。"""
         callbacks = self._callbacks.get(data_type, [])
         logger.debug(f"[DataSource] triggering {len(callbacks)} callbacks for {data_type}")
         for callback in callbacks:
@@ -399,7 +420,35 @@ class BaseDataSource(ABC):
                 import asyncio
                 import inspect
                 if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(getattr(callback, '__call__', None)):
-                    # Async callback — schedule without blocking
+                    asyncio.create_task(callback(data))
+                else:
+                    callback(data)
+            except Exception as e:
+                print(f"Error in callback for {data_type}: {e}")
+
+    def _trigger_precise_callbacks(self, data_type: DataType, data: Dict) -> None:
+        """精确分发：按数据中的 symbol/interval 路由到对应回调列表。
+        同一 (symbol, interval) 的多个上层订阅者共享同一条 WS 流，
+        数据到达时只触发该键下的回调，避免广播导致的重复和串流。
+        """
+        symbol = data.get("symbol")
+        interval = data.get("interval") or ""
+        key = (data_type, symbol, interval)
+
+        precise = self._precise_callbacks.get(key, [])
+        # 兼容旧全局广播（未迁移的上层订阅者）
+        legacy = self._callbacks.get(data_type, [])
+
+        callbacks = list(precise) + [c for c in legacy if c not in precise]
+        logger.debug(
+            f"[DataSource] precise trigger key={key} "
+            f"precise={len(precise)} legacy={len(legacy)} total={len(callbacks)}"
+        )
+        for callback in callbacks:
+            try:
+                import asyncio
+                import inspect
+                if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(getattr(callback, '__call__', None)):
                     asyncio.create_task(callback(data))
                 else:
                     callback(data)
@@ -512,6 +561,7 @@ class BaseDataSource(ABC):
 
         # 清理回调
         self._callbacks.clear()
+        self._precise_callbacks.clear()
 
         # 清理订阅
         self._subscriptions.clear()

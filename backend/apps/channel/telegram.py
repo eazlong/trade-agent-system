@@ -8,9 +8,12 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from .base import BaseChannel
+from .base import BaseChannel, chunk_message
 
 logger = logging.getLogger(__name__)
+
+# Telegram API 限制 4096 字符，留余量给格式化
+_TG_MAX_LENGTH = 4000
 
 
 class TelegramChannel(BaseChannel):
@@ -27,7 +30,8 @@ class TelegramChannel(BaseChannel):
     async def send_message(self, text: str) -> None:
         if self._chat_id and self._app:
             try:
-                await self._app.bot.send_message(chat_id=self._chat_id, text=text)
+                for chunk in chunk_message(text, _TG_MAX_LENGTH):
+                    await self._app.bot.send_message(chat_id=self._chat_id, text=chunk)
             except Exception as e:
                 logger.error(f"Failed to send message: {e}")
 
@@ -163,11 +167,13 @@ class TelegramChannel(BaseChannel):
             )
 
             msg = build_agent_task(
-                user_id=user_id, payload={"text": text, "intent": "end_multi_turn"}
+                user_id=user_id,
+                payload={"text": text, "intent": "end_multi_turn"},
+                origin="telegram",
             )
             await publish(AGENT_TASKS, msg)
 
-            reply = await wait_reply(msg["task_id"], timeout=360)
+            reply = await wait_reply(msg["task_id"], timeout=3600)
             if reply:
                 # 如果返回的是字典格式，提取content部分
                 processed_reply = self._extract_content_from_response(reply)
@@ -179,10 +185,10 @@ class TelegramChannel(BaseChannel):
 
         from apps.agent.bus import publish, build_agent_task, wait_reply, AGENT_TASKS
 
-        msg = build_agent_task(user_id=user_id, payload={"text": text})
+        msg = build_agent_task(user_id=user_id, payload={"text": text}, origin="telegram")
         await publish(AGENT_TASKS, msg)
 
-        reply = await wait_reply(msg["task_id"], timeout=360)
+        reply = await wait_reply(msg["task_id"], timeout=3600)
         if reply:
             # 处理Agent返回的响应格式，只提取内容部分
             processed_reply = self._extract_content_from_response(reply)
@@ -215,52 +221,11 @@ class TelegramChannel(BaseChannel):
             return str(reply)
 
     async def _send_long_message(self, update, message_text):
-        """
-        发送可能很长的消息，自动分段处理
-        Telegram消息长度限制约为4096字符
-        """
-        MAX_LENGTH = 4000  # 留一些余量给其他部分
+        """发送可能很长的消息，自动分段处理。"""
+        import asyncio
 
-        if len(message_text) <= MAX_LENGTH:
-            await update.message.reply_text(message_text)
-        else:
-            # 分段发送
-            segments = []
-            current_segment = ""
-
-            # 按句子分割，尽量避免切断句子
-            sentences = message_text.split(". ")
-
-            for sentence in sentences:
-                # 添加句号回去（除了最后一个句子）
-                sentence_with_dot = (
-                    sentence + ". " if sentence != sentences[-1] else sentence
-                )
-
-                if len(current_segment + sentence_with_dot) <= MAX_LENGTH:
-                    current_segment += sentence_with_dot
-                else:
-                    if current_segment:  # 如果当前段不为空，保存它
-                        segments.append(current_segment)
-                    # 如果单个句子就超过了长度限制，则按字符切割
-                    if len(sentence_with_dot) > MAX_LENGTH:
-                        for i in range(0, len(sentence_with_dot), MAX_LENGTH):
-                            segments.append(sentence_with_dot[i : i + MAX_LENGTH])
-                        current_segment = ""
-                    else:
-                        current_segment = sentence_with_dot
-
-            # 添加最后一段
-            if current_segment:
-                segments.append(current_segment)
-
-            # 发送所有段落
-            for i, segment in enumerate(segments):
-                if i == len(segments) - 1:  # 最后一段
-                    await update.message.reply_text(segment)
-                else:
-                    await update.message.reply_text(segment)
-                    # 添加一点延迟避免API限制
-                    import asyncio
-
-                    await asyncio.sleep(0.5)
+        chunks = chunk_message(message_text, _TG_MAX_LENGTH)
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+            if len(chunks) > 1:
+                await asyncio.sleep(0.5)

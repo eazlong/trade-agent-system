@@ -523,7 +523,7 @@ class SessionWatchdog:
                     if retry_count < WATCHDOG_MAX_AUTO_RETRY:
                         await self._recover_task(task_id, user_id, data, retry_count, r)
                     else:
-                        short_id = task_id[:8]
+                        short_id = task_id
                         mins = int(age) // 60
                         _send_notification_redis(
                             user_id,
@@ -543,7 +543,7 @@ class SessionWatchdog:
         if not original_task_str:
             _send_notification_redis(
                 user_id,
-                f"任务 #{task_id[:8]} 异常中断，请重新发送指令",
+                f"任务 #{task_id} 异常中断，请重新发送指令",
             )
             r.hset(f"task:progress:{task_id}", "status", "zombie")
             return
@@ -553,7 +553,7 @@ class SessionWatchdog:
         except (json.JSONDecodeError, TypeError):
             _send_notification_redis(
                 user_id,
-                f"任务 #{task_id[:8]} 数据损坏，请重新发送指令",
+                f"任务 #{task_id} 数据损坏，请重新发送指令",
             )
             return
 
@@ -581,12 +581,12 @@ class SessionWatchdog:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
-        short_id = task_id[:8]
+        short_id = task_id
         _send_notification_redis(
             user_id,
             f"任务 #{short_id} 超时无响应\n"
             f"已自动重试（第 {retry_count + 1}/{WATCHDOG_MAX_AUTO_RETRY} 次）\n"
-            f"新任务 ID: {new_task_id[:8] if new_task_id else 'N/A'}",
+            f"新任务 ID: {new_task_id if new_task_id else 'N/A'}",
         )
 
         logger.info(

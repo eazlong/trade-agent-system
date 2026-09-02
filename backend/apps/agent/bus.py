@@ -248,10 +248,15 @@ def build_agent_task(
     task_id: str | None = None,
     priority: int = 2,
     timeout_ms: int = 30_000,
+    origin: str = "",
 ) -> dict:
     """
     构造 agent:tasks 消息体。
     返回 dict 包含 task_id，调用方可用于 wait_reply()。
+
+    origin: 下达命令的 gateway（web / lark / telegram / tui / ...），
+            供 AgentTaskConsumer 在回复/通知时做多通道扇出（下发到 origin
+            之外的通道，如 web WS 与主通道飞书）。
     """
     tid = task_id or str(uuid.uuid4())
     return {
@@ -261,4 +266,5 @@ def build_agent_task(
         "payload": json.dumps(payload),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "timeout_ms": str(timeout_ms),
+        "origin": origin,
     }

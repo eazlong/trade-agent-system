@@ -1,0 +1,1184 @@
+{
+  "schemaVersion": "ecc.install.v1",
+  "installedAt": "2026-05-27T08:36:34.318Z",
+  "target": {
+    "id": "claude-project",
+    "target": "claude-project",
+    "kind": "project",
+    "root": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude",
+    "installStatePath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/ecc/install-state.json"
+  },
+  "request": {
+    "profile": null,
+    "modules": [
+      "hooks-runtime"
+    ],
+    "includeComponents": [],
+    "excludeComponents": [],
+    "legacyLanguages": [],
+    "legacyMode": false
+  },
+  "resolution": {
+    "selectedModules": [
+      "hooks-runtime"
+    ],
+    "skippedModules": []
+  },
+  "source": {
+    "repoVersion": "2.0.0-rc.1",
+    "repoCommit": null,
+    "manifestVersion": 1
+  },
+  "operations": [
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/hooks/README.md",
+      "sourceRelativePath": "hooks/README.md",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/hooks/README.md",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/hooks/hooks.json",
+      "sourceRelativePath": "hooks/hooks.json",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/hooks/hooks.json",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/hooks/memory-persistence/README.md",
+      "sourceRelativePath": "hooks/memory-persistence/README.md",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/hooks/memory-persistence/README.md",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/hooks/memory-persistence/hooks.json",
+      "sourceRelativePath": "hooks/memory-persistence/hooks.json",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/hooks/memory-persistence/hooks.json",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/auto-tmux-dev.js",
+      "sourceRelativePath": "scripts/hooks/auto-tmux-dev.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/auto-tmux-dev.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/bash-hook-dispatcher.js",
+      "sourceRelativePath": "scripts/hooks/bash-hook-dispatcher.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/bash-hook-dispatcher.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/block-no-verify.js",
+      "sourceRelativePath": "scripts/hooks/block-no-verify.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/block-no-verify.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/check-console-log.js",
+      "sourceRelativePath": "scripts/hooks/check-console-log.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/check-console-log.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/check-hook-enabled.js",
+      "sourceRelativePath": "scripts/hooks/check-hook-enabled.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/check-hook-enabled.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/config-protection.js",
+      "sourceRelativePath": "scripts/hooks/config-protection.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/config-protection.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/cost-tracker.js",
+      "sourceRelativePath": "scripts/hooks/cost-tracker.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/cost-tracker.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/design-quality-check.js",
+      "sourceRelativePath": "scripts/hooks/design-quality-check.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/design-quality-check.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/desktop-notify.js",
+      "sourceRelativePath": "scripts/hooks/desktop-notify.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/desktop-notify.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/doc-file-warning.js",
+      "sourceRelativePath": "scripts/hooks/doc-file-warning.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/doc-file-warning.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/ecc-context-monitor.js",
+      "sourceRelativePath": "scripts/hooks/ecc-context-monitor.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/ecc-context-monitor.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/ecc-metrics-bridge.js",
+      "sourceRelativePath": "scripts/hooks/ecc-metrics-bridge.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/ecc-metrics-bridge.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/ecc-statusline.js",
+      "sourceRelativePath": "scripts/hooks/ecc-statusline.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/ecc-statusline.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/evaluate-session.js",
+      "sourceRelativePath": "scripts/hooks/evaluate-session.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/evaluate-session.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/gateguard-fact-force.js",
+      "sourceRelativePath": "scripts/hooks/gateguard-fact-force.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/gateguard-fact-force.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/governance-capture.js",
+      "sourceRelativePath": "scripts/hooks/governance-capture.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/governance-capture.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/insaits-security-monitor.py",
+      "sourceRelativePath": "scripts/hooks/insaits-security-monitor.py",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/insaits-security-monitor.py",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/insaits-security-wrapper.js",
+      "sourceRelativePath": "scripts/hooks/insaits-security-wrapper.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/insaits-security-wrapper.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/mcp-health-check.js",
+      "sourceRelativePath": "scripts/hooks/mcp-health-check.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/mcp-health-check.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/observe-runner.js",
+      "sourceRelativePath": "scripts/hooks/observe-runner.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/observe-runner.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/plugin-hook-bootstrap.js",
+      "sourceRelativePath": "scripts/hooks/plugin-hook-bootstrap.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/plugin-hook-bootstrap.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-bash-build-complete.js",
+      "sourceRelativePath": "scripts/hooks/post-bash-build-complete.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-bash-build-complete.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-bash-command-log.js",
+      "sourceRelativePath": "scripts/hooks/post-bash-command-log.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-bash-command-log.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-bash-dispatcher.js",
+      "sourceRelativePath": "scripts/hooks/post-bash-dispatcher.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-bash-dispatcher.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-bash-pr-created.js",
+      "sourceRelativePath": "scripts/hooks/post-bash-pr-created.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-bash-pr-created.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-edit-accumulator.js",
+      "sourceRelativePath": "scripts/hooks/post-edit-accumulator.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-edit-accumulator.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-edit-console-warn.js",
+      "sourceRelativePath": "scripts/hooks/post-edit-console-warn.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-edit-console-warn.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-edit-format.js",
+      "sourceRelativePath": "scripts/hooks/post-edit-format.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-edit-format.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/post-edit-typecheck.js",
+      "sourceRelativePath": "scripts/hooks/post-edit-typecheck.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/post-edit-typecheck.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-bash-commit-quality.js",
+      "sourceRelativePath": "scripts/hooks/pre-bash-commit-quality.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-bash-commit-quality.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-bash-dev-server-block.js",
+      "sourceRelativePath": "scripts/hooks/pre-bash-dev-server-block.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-bash-dev-server-block.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-bash-dispatcher.js",
+      "sourceRelativePath": "scripts/hooks/pre-bash-dispatcher.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-bash-dispatcher.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-bash-git-push-reminder.js",
+      "sourceRelativePath": "scripts/hooks/pre-bash-git-push-reminder.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-bash-git-push-reminder.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-bash-tmux-reminder.js",
+      "sourceRelativePath": "scripts/hooks/pre-bash-tmux-reminder.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-bash-tmux-reminder.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-compact.js",
+      "sourceRelativePath": "scripts/hooks/pre-compact.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-compact.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/pre-write-doc-warn.js",
+      "sourceRelativePath": "scripts/hooks/pre-write-doc-warn.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/pre-write-doc-warn.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/quality-gate.js",
+      "sourceRelativePath": "scripts/hooks/quality-gate.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/quality-gate.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/run-with-flags-shell.sh",
+      "sourceRelativePath": "scripts/hooks/run-with-flags-shell.sh",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/run-with-flags-shell.sh",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/run-with-flags.js",
+      "sourceRelativePath": "scripts/hooks/run-with-flags.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/run-with-flags.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/session-activity-tracker.js",
+      "sourceRelativePath": "scripts/hooks/session-activity-tracker.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-activity-tracker.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/session-end-marker.js",
+      "sourceRelativePath": "scripts/hooks/session-end-marker.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-end-marker.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/session-end.js",
+      "sourceRelativePath": "scripts/hooks/session-end.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-end.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/session-start-bootstrap.js",
+      "sourceRelativePath": "scripts/hooks/session-start-bootstrap.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-start-bootstrap.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/session-start.js",
+      "sourceRelativePath": "scripts/hooks/session-start.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/session-start.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/stop-format-typecheck.js",
+      "sourceRelativePath": "scripts/hooks/stop-format-typecheck.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/stop-format-typecheck.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/hooks/suggest-compact.js",
+      "sourceRelativePath": "scripts/hooks/suggest-compact.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/hooks/suggest-compact.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/agent-compress.js",
+      "sourceRelativePath": "scripts/lib/agent-compress.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/agent-compress.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/cost-estimate.js",
+      "sourceRelativePath": "scripts/lib/cost-estimate.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/cost-estimate.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/cursor-agent-names.js",
+      "sourceRelativePath": "scripts/lib/cursor-agent-names.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/cursor-agent-names.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/ecc_dashboard_runtime.py",
+      "sourceRelativePath": "scripts/lib/ecc_dashboard_runtime.py",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/ecc_dashboard_runtime.py",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/github-discussions.js",
+      "sourceRelativePath": "scripts/lib/github-discussions.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/github-discussions.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/harness-adapter-compliance.js",
+      "sourceRelativePath": "scripts/lib/harness-adapter-compliance.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/harness-adapter-compliance.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/hook-flags.js",
+      "sourceRelativePath": "scripts/lib/hook-flags.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/hook-flags.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/inspection.js",
+      "sourceRelativePath": "scripts/lib/inspection.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/inspection.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-executor.js",
+      "sourceRelativePath": "scripts/lib/install-executor.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-executor.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-lifecycle.js",
+      "sourceRelativePath": "scripts/lib/install-lifecycle.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-lifecycle.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-manifests.js",
+      "sourceRelativePath": "scripts/lib/install-manifests.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-manifests.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-state.js",
+      "sourceRelativePath": "scripts/lib/install-state.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-state.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/antigravity-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/antigravity-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/antigravity-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/claude-home.js",
+      "sourceRelativePath": "scripts/lib/install-targets/claude-home.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/claude-home.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/claude-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/claude-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/claude-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/codebuddy-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/codebuddy-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/codebuddy-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/codex-home.js",
+      "sourceRelativePath": "scripts/lib/install-targets/codex-home.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/codex-home.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/cursor-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/cursor-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/cursor-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/gemini-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/gemini-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/gemini-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/helpers.js",
+      "sourceRelativePath": "scripts/lib/install-targets/helpers.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/helpers.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/joycode-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/joycode-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/joycode-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/opencode-home.js",
+      "sourceRelativePath": "scripts/lib/install-targets/opencode-home.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/opencode-home.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/qwen-home.js",
+      "sourceRelativePath": "scripts/lib/install-targets/qwen-home.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/qwen-home.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/registry.js",
+      "sourceRelativePath": "scripts/lib/install-targets/registry.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/registry.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install-targets/zed-project.js",
+      "sourceRelativePath": "scripts/lib/install-targets/zed-project.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install-targets/zed-project.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install/apply.js",
+      "sourceRelativePath": "scripts/lib/install/apply.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install/apply.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install/config.js",
+      "sourceRelativePath": "scripts/lib/install/config.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install/config.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install/request.js",
+      "sourceRelativePath": "scripts/lib/install/request.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install/request.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/install/runtime.js",
+      "sourceRelativePath": "scripts/lib/install/runtime.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/install/runtime.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/mcp-config.js",
+      "sourceRelativePath": "scripts/lib/mcp-config.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/mcp-config.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/observer-sessions.js",
+      "sourceRelativePath": "scripts/lib/observer-sessions.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/observer-sessions.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/orchestration-session.js",
+      "sourceRelativePath": "scripts/lib/orchestration-session.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/orchestration-session.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/package-manager.d.ts",
+      "sourceRelativePath": "scripts/lib/package-manager.d.ts",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/package-manager.d.ts",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/package-manager.js",
+      "sourceRelativePath": "scripts/lib/package-manager.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/package-manager.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/project-detect.js",
+      "sourceRelativePath": "scripts/lib/project-detect.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/project-detect.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/resolve-ecc-root.js",
+      "sourceRelativePath": "scripts/lib/resolve-ecc-root.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/resolve-ecc-root.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/resolve-formatter.js",
+      "sourceRelativePath": "scripts/lib/resolve-formatter.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/resolve-formatter.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-adapters/canonical-session.js",
+      "sourceRelativePath": "scripts/lib/session-adapters/canonical-session.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-adapters/canonical-session.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-adapters/claude-history.js",
+      "sourceRelativePath": "scripts/lib/session-adapters/claude-history.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-adapters/claude-history.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-adapters/dmux-tmux.js",
+      "sourceRelativePath": "scripts/lib/session-adapters/dmux-tmux.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-adapters/dmux-tmux.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-adapters/registry.js",
+      "sourceRelativePath": "scripts/lib/session-adapters/registry.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-adapters/registry.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-aliases.d.ts",
+      "sourceRelativePath": "scripts/lib/session-aliases.d.ts",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-aliases.d.ts",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-aliases.js",
+      "sourceRelativePath": "scripts/lib/session-aliases.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-aliases.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-bridge.js",
+      "sourceRelativePath": "scripts/lib/session-bridge.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-bridge.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-manager.d.ts",
+      "sourceRelativePath": "scripts/lib/session-manager.d.ts",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-manager.d.ts",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/session-manager.js",
+      "sourceRelativePath": "scripts/lib/session-manager.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/session-manager.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/shell-split.js",
+      "sourceRelativePath": "scripts/lib/shell-split.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/shell-split.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/shell-substitution.js",
+      "sourceRelativePath": "scripts/lib/shell-substitution.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/shell-substitution.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/dashboard.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/dashboard.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/dashboard.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/health.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/health.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/health.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/index.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/index.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/index.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/provenance.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/provenance.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/provenance.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/tracker.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/tracker.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/tracker.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-evolution/versioning.js",
+      "sourceRelativePath": "scripts/lib/skill-evolution/versioning.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-evolution/versioning.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-improvement/amendify.js",
+      "sourceRelativePath": "scripts/lib/skill-improvement/amendify.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-improvement/amendify.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-improvement/evaluate.js",
+      "sourceRelativePath": "scripts/lib/skill-improvement/evaluate.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-improvement/evaluate.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-improvement/health.js",
+      "sourceRelativePath": "scripts/lib/skill-improvement/health.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-improvement/health.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/skill-improvement/observations.js",
+      "sourceRelativePath": "scripts/lib/skill-improvement/observations.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/skill-improvement/observations.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/state-store/index.js",
+      "sourceRelativePath": "scripts/lib/state-store/index.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/state-store/index.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/state-store/migrations.js",
+      "sourceRelativePath": "scripts/lib/state-store/migrations.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/state-store/migrations.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/state-store/queries.js",
+      "sourceRelativePath": "scripts/lib/state-store/queries.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/state-store/queries.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/state-store/schema.js",
+      "sourceRelativePath": "scripts/lib/state-store/schema.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/state-store/schema.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/tmux-worktree-orchestrator.js",
+      "sourceRelativePath": "scripts/lib/tmux-worktree-orchestrator.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/tmux-worktree-orchestrator.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/utils.d.ts",
+      "sourceRelativePath": "scripts/lib/utils.d.ts",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/utils.d.ts",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    },
+    {
+      "kind": "copy-file",
+      "moduleId": "hooks-runtime",
+      "sourcePath": "/Users/gongzuoyonghu/.claude/plugins/cache/everything-claude-code/ecc/2.0.0-rc.1/scripts/lib/utils.js",
+      "sourceRelativePath": "scripts/lib/utils.js",
+      "destinationPath": "/Users/gongzuoyonghu/Documents/code/blockchain/bot/qt_sys/trade_agent_sys/.claude/scripts/lib/utils.js",
+      "strategy": "preserve-relative-path",
+      "ownership": "managed",
+      "scaffoldOnly": false
+    }
+  ]
+}

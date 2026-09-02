@@ -35,6 +35,7 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     BASE_URL = _BASE_URL
     TIMEOUT = 10.0
+    DEFAULT_LEVERAGE = 10  # 默认杠杆倍数
 
     def __init__(self, api_key: str, secret: str, testnet: bool = False):
         super().__init__(api_key, secret)
@@ -42,6 +43,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             self.BASE_URL = "https://demo-fapi.binance.com"
         self._client: Optional[httpx.AsyncClient] = None
         self._time_offset: int = 0  # ms: local_time = server_time + offset
+        self._leverage_set: set[str] = set()  # 已设置杠杆的交易对
 
     async def connect(self) -> None:
         headers = {"X-MBX-APIKEY": self._api_key}
@@ -112,11 +114,29 @@ class BinanceAdapter(BaseExchangeAdapter):
             raise RuntimeError("BinanceAdapter not connected. Call connect() first.")
         return self._client
 
+    async def _ensure_leverage(self, symbol: str) -> None:
+        """下单前确保已设置杠杆。每个交易对只需设置一次。"""
+        if symbol in self._leverage_set:
+            return
+        client = self._ensure_connected()
+        query = self._sign({"symbol": symbol, "leverage": self.DEFAULT_LEVERAGE})
+        resp = await client.post(f"/fapi/v1/leverage?{query}")
+        if resp.status_code == 200:
+            self._leverage_set.add(symbol)
+            logger.info(f"Leverage set for {symbol}: {self.DEFAULT_LEVERAGE}x")
+        else:
+            logger.warning(f"Failed to set leverage for {symbol}: {resp.status_code} - {resp.text}")
+
     async def place_order(self, request: OrderRequest) -> OrderResponse:
         client = self._ensure_connected()
 
+        symbol = request.symbol.upper().replace("/", "")
+
+        # 下单前设置杠杆（Futures 必须）
+        await self._ensure_leverage(symbol)
+
         params = {
-            "symbol": request.symbol.upper(),
+            "symbol": symbol,
             "side": request.side.upper(),
             "type": request.order_type.upper(),
             "quantity": str(request.quantity),
@@ -132,7 +152,13 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         query = self._sign(params)
         resp = await client.post(f"/fapi/v1/order?{query}")
-        resp.raise_for_status()
+
+        if resp.status_code >= 400:
+            error_detail = resp.text
+            logger.error(f"Binance API error: {resp.status_code} - {error_detail}")
+            # 抛出包含 Binance 错误详情的异常
+            raise RuntimeError(f"Binance API {resp.status_code}: {error_detail}")
+
         data = resp.json()
 
         return OrderResponse(

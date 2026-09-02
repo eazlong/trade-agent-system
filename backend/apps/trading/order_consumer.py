@@ -33,9 +33,24 @@ async def start_order_consumer():
 
             # 批量处理消息
             for msg_id, fields in messages:
-                await _process_order(fields)
+                try:
+                    # 60秒超时保护
+                    await asyncio.wait_for(
+                        _process_order(fields),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"[OrderConsumer] timeout processing order {fields.get('task_id')}, "
+                        f"symbol={fields.get('symbol')}"
+                    )
+                    # 超时后仍需 ACK，避免重复处理
+                except Exception as e:
+                    logger.error(
+                        f"[OrderConsumer] failed to process order {fields.get('task_id')}: {e}"
+                    )
 
-                # ACK 消息
+                # ACK 消息（无论成功失败都 ACK，避免无限重试）
                 try:
                     await ack(TRADING_ORDERS, CG_EXECUTOR, msg_id)
                 except Exception as e:
@@ -53,6 +68,11 @@ async def start_order_consumer():
 async def _process_order(fields: dict):
     """处理单个订单"""
     try:
+        logger.info(
+            f"[SF-06][OrderConsumer] received order: "
+            f"{fields.get('symbol')} {fields.get('side')} {fields.get('quantity')} "
+            f"signal={fields.get('signal_name')}"
+        )
         # 获取OrderExecutor实例
         executor = OrderExecutor.get_instance()
         if not executor:
@@ -70,6 +90,7 @@ async def _process_order(fields: dict):
         price = fields.get("price")
         exchange_account_id = fields.get("exchange_account_id")
         user_id = fields.get("user_id")
+        is_close_position = fields.get("is_close_position", False)
 
         if not all([exchange, symbol, side, order_type, quantity, exchange_account_id]):
             logger.error(f"[OrderConsumer] missing required fields in order: {fields}")
@@ -89,6 +110,7 @@ async def _process_order(fields: dict):
             price=price,
             exchange_account_id=exchange_account_id,
             user_id=user_id,
+            is_close_position=bool(is_close_position),
         )
 
         logger.info(f"[OrderConsumer] order processed: {result}")
@@ -97,5 +119,4 @@ async def _process_order(fields: dict):
         logger.error(
             f"[OrderConsumer] failed to process order {fields.get('task_id')}: {e}"
         )
-        # 这里可以添加重试逻辑或发送到死信队列
-        raise
+        # 异常已在调用方处理（ACK + 继续），此处不 raise 避免中断消费者

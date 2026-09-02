@@ -40,6 +40,11 @@ class LiveStrategyRunner:
         self._kline_history: list[dict] = []
         self._dispatcher = None
         self._validation_task: "asyncio.Task | None" = None
+        # 防止同方向重复开仓：记录每个 symbol 最近的入场方向
+        # "buy" | "sell" | None，平仓（target_qty=0）时清除
+        self._entry_direction: dict[str, str] = {}
+        # per-session 并发锁：信号处理中时拒绝新的 kline 触发
+        self._signal_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """启动实盘策略运行"""
@@ -55,6 +60,26 @@ class LiveStrategyRunner:
         from .signals import SignalDispatcher
 
         self._dispatcher = SignalDispatcher()
+
+        # 预加载历史 K 线（warmup），让指标能立即产出有效值
+        await self.load_initial_history(limit=self.strategy.min_kline_length)
+
+        # 从交易所同步当前持仓到 ctx
+        await self._sync_position_from_exchange()
+
+        # 用最新历史收盘价初始化 ctx.price，避免第一根实时 K 线到达前
+        # 策略拿到的 price 为 0（select_universe / generate_insights 可能依赖）
+        if self._kline_history:
+            try:
+                last_close = self._kline_history[-1].get("close")
+                if last_close is not None:
+                    self.strategy.ctx.set_price(
+                        self.symbol, Decimal(str(last_close))
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[LiveStrategyRunner] failed to seed ctx.price from history: {e}"
+                )
 
         # 订阅 K 线数据
         await self._subscribe_kline()
@@ -109,72 +134,154 @@ class LiveStrategyRunner:
         if not self._running:
             return
 
-        logger.info(f"[LiveStrategy] on_kline: {self.symbol} close={kline.get('close')}")
+        # 过滤：DataSource 按 DataType 广播，需按 symbol 二次过滤（防御层，
+        # 精确分发已保证同 (symbol, interval) 的回调只触发一次）
+        # kline["symbol"] 可能是 binance 原始格式 (DOGEUSDT) 或 ccxt 格式 (DOGE/USDT)
+        kline_symbol = kline.get("symbol")
+        if kline_symbol:
+            norm_kline = kline_symbol.replace("/", "").upper()
+            norm_self = self.symbol.replace("/", "").upper()
+            if norm_kline != norm_self:
+                logger.debug(
+                    f"[SF-01][LiveStrategy] drop mismatched kline: "
+                    f"expected={self.symbol} got={kline_symbol} close={kline.get('close')}"
+                )
+                return
 
-        # 更新历史
-        self._kline_history.append(kline)
+        logger.info(f"[SF-01][LiveStrategy] on_kline: {self.symbol} close={kline.get('close')}")
+
+        # 更新历史：同一根 K 线（相同 open_time）更新最后一条，新周期才 append
+        kline_ts = kline.get("timestamp")
+        if (
+            self._kline_history
+            and kline_ts is not None
+            and self._kline_history[-1].get("timestamp") == kline_ts
+        ):
+            self._kline_history[-1] = kline
+        else:
+            self._kline_history.append(kline)
         # 限制历史长度，避免内存无限增长
         max_history = 500
         if len(self._kline_history) > max_history:
             self._kline_history = self._kline_history[-max_history:]
 
         try:
-            # 同步当前价格到 context
-            self.strategy.ctx.set_price(
-                self.symbol, Decimal(str(kline.get("close", "0")))
-            )
-
-            # Phase 2: 5-step pipeline with diagnostic logging
-            universe = self.strategy.select_universe()
-            insights = self.strategy.generate_insights(kline, self._kline_history)
-            logger.debug(
-                f"[LiveStrategyRunner] pipeline: universe={universe} "
-                f"insights={len(insights)} "
-                f"insight_details={[f'{i.direction} {i.symbol} conf={i.confidence}' for i in insights]}"
-            )
-
-            targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
-            logger.debug(
-                f"[LiveStrategyRunner] portfolio: targets={len(targets)} "
-                f"target_details={[f'{t.symbol} qty={t.target_quantity} reason={t.reason}' for t in targets]}"
-            )
-
-            safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
-            filtered_count = len(targets) - len(safe_targets)
-            if filtered_count > 0:
-                logger.warning(
-                    f"[LiveStrategyRunner] risk filter: {filtered_count}/{len(targets)} targets rejected"
-                )
-            logger.debug(
-                f"[LiveStrategyRunner] risk_passed: safe_targets={len(safe_targets)}"
-            )
-
-            signal_count = 0
-            for target in safe_targets:
-                signal = self._target_to_order(target)
-                if signal is None:
-                    logger.debug(
-                        f"[LiveStrategyRunner] _target_to_order returned None for "
-                        f"target {target.symbol} (diff=0, no action needed)"
-                    )
-                    continue
-                logger.info(
-                    f"[LiveStrategyRunner] signal generated: "
-                    f"{signal.signal_name} {signal.side} qty={signal.quantity} "
-                    f"symbol={self.symbol}"
-                )
-                await self._dispatch_signal(signal)
-                estimated_price = Decimal(str(kline.get("close", "0")))
-                self._apply_signal_to_context(signal, estimated_price)
-                signal_count += 1
-
-            if signal_count == 0 and (insights or targets):
+            # per-session 并发控制：上一轮信号仍在处理时，丢弃本次 kline
+            if self._signal_lock.locked():
                 logger.debug(
-                    f"[LiveStrategyRunner] no signals dispatched this bar "
-                    f"(insights={len(insights)} targets={len(targets)} safe={len(safe_targets)})"
+                    f"[SF-01][LiveStrategy] skip kline {self.symbol}: "
+                    f"previous signal still processing"
                 )
+                return
+            async with self._signal_lock:
+                await self._process_kline(kline)
         except Exception as e:
             logger.error(f"[LiveStrategyRunner] on_kline error: {e}", exc_info=True)
+
+    async def _process_kline(self, kline: dict) -> None:
+        """单根 kline 的策略管线（在 _signal_lock 保护下执行）。"""
+        # 同步当前价格到 context
+        self.strategy.ctx.set_price(
+            self.symbol, Decimal(str(kline.get("close", "0")))
+        )
+
+        # 调试：记录当前持仓状态
+        logger.debug(
+            f"[LiveStrategyRunner] _process_kline start: ctx.position={self.strategy.ctx.position}, "
+            f"ctx._position={self.strategy.ctx._position}, "
+            f"ctx._positions={self.strategy.ctx._positions}"
+        )
+
+        # Phase 2: 5-step pipeline with diagnostic logging
+        universe = self.strategy.select_universe()
+        insights = self.strategy.generate_insights(kline, self._kline_history)
+        logger.debug(
+            f"[LiveStrategyRunner] pipeline: universe={universe} "
+            f"insights={len(insights)} "
+            f"insight_details={[f'{i.direction} {i.symbol} conf={i.confidence}' for i in insights]}"
+        )
+
+        # 调试：构造 portfolio 前记录 context
+        logger.debug(
+            f"[LiveStrategyRunner] before construct_portfolio: context.position={self.strategy.ctx.position}"
+        )
+        targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
+        logger.debug(
+            f"[LiveStrategyRunner] portfolio: targets={len(targets)} "
+            f"target_details={[f'{t.symbol} qty={t.target_quantity} reason={t.reason}' for t in targets]}"
+        )
+
+        safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
+        filtered_count = len(targets) - len(safe_targets)
+        if filtered_count > 0:
+            logger.warning(
+                f"[LiveStrategyRunner] risk filter: {filtered_count}/{len(targets)} targets rejected"
+            )
+        logger.debug(
+            f"[LiveStrategyRunner] risk_passed: safe_targets={len(safe_targets)}"
+        )
+
+        signal_count = await self._dispatch_targets(safe_targets, kline)
+
+        if signal_count == 0 and (insights or targets):
+            logger.debug(
+                f"[SF-02][LiveStrategyRunner] no signals dispatched this bar "
+                f"(insights={len(insights)} targets={len(targets)} safe={len(safe_targets)})"
+            )
+        elif signal_count > 0:
+            logger.info(
+                f"[SF-02][LiveStrategyRunner] pipeline done: "
+                f"universe={len(universe)} insights={len(insights)} "
+                f"targets={len(targets)} safe={len(safe_targets)} signals={signal_count}"
+            )
+
+    async def _sync_position_from_exchange(self) -> None:
+        """从交易所同步当前持仓到 ctx。
+
+        启动时调用，确保策略知道实际持仓，避免重复开仓。
+        """
+        try:
+            from apps.trading.executor import OrderExecutor
+
+            executor = OrderExecutor.get_instance()
+            if not executor:
+                logger.warning(
+                    f"[LiveStrategyRunner] OrderExecutor not ready, "
+                    f"position sync skipped for {self.symbol}"
+                )
+                return
+
+            adapter = executor._adapters.get("binance")
+            if not adapter:
+                logger.warning(
+                    f"[LiveStrategyRunner] Binance adapter not found, "
+                    f"position sync skipped for {self.symbol}"
+                )
+                return
+
+            positions = await adapter.get_positions()
+            symbol_norm = self.symbol.replace("/", "").upper()
+
+            for pos in positions:
+                pos_symbol = pos.symbol.replace("/", "").upper()
+                if pos_symbol == symbol_norm:
+                    actual_qty = pos.quantity if pos.side == "long" else -pos.quantity
+                    self.strategy.ctx.set_position(self.symbol, actual_qty)
+                    logger.info(
+                        f"[LiveStrategyRunner] position synced from exchange: "
+                        f"{self.symbol} = {actual_qty}"
+                    )
+                    return
+
+            # 没有找到持仓，确认为 0
+            self.strategy.ctx.set_position(self.symbol, Decimal("0"))
+            logger.info(
+                f"[LiveStrategyRunner] position synced from exchange: {self.symbol} = 0"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[LiveStrategyRunner] failed to sync position from exchange: {e}"
+            )
 
     async def _subscribe_kline(self) -> None:
         """订阅 K 线数据"""
@@ -285,15 +392,14 @@ class LiveStrategyRunner:
                 )
             except Exception:
                 pass
-
-    async def _dispatch_signal(self, signal: "OrderSignal") -> None:
-        """分发策略信号到 Redis Stream"""
+    async def _dispatch_signal(self, signal: "OrderSignal") -> bool:
+        """分发策略信号到 Redis Stream，返回是否成功分发。"""
         if not self._dispatcher:
             logger.error(
                 "[LiveStrategyRunner] _dispatcher is None! Signal will be dropped. "
                 "This means SignalDispatcher was not initialized in start()."
             )
-            return
+            return False
 
         try:
             msg_id = await self._dispatcher.dispatch_with_risk_check(
@@ -308,15 +414,18 @@ class LiveStrategyRunner:
                     f"[LiveStrategyRunner] signal dispatched: {signal.signal_name} "
                     f"msg_id={msg_id}"
                 )
+                return True
             else:
                 logger.warning(
                     f"[LiveStrategyRunner] signal REJECTED or dropped by risk check: "
                     f"{signal.signal_name} {signal.side} {signal.quantity} {self.symbol}"
                 )
+                return False
         except Exception as e:
             logger.error(
                 f"[LiveStrategyRunner] failed to dispatch signal: {e}", exc_info=True
             )
+            return False
 
     def _apply_signal_to_context(
         self, signal: "OrderSignal", estimated_price: "Decimal"
@@ -338,7 +447,7 @@ class LiveStrategyRunner:
             self.strategy.ctx.balance += proceeds
 
         logger.debug(
-            f"[LiveStrategyRunner] ctx updated: "
+            f"[SF-11][LiveStrategyRunner] ctx updated: "
             f"position={self.strategy.ctx.position} "
             f"balance={self.strategy.ctx.balance}"
         )
@@ -353,26 +462,144 @@ class LiveStrategyRunner:
         else:
             return self.strategy.ctx.sell(abs(diff), signal_name=target.reason)
 
-    async def load_initial_history(self, limit: int = 200) -> None:
+    async def _dispatch_targets(
+        self, targets: "list[PortfolioTarget]", kline: dict
+    ) -> int:
+        """遍历 safe_targets，过滤重复入场后分发信号。返回实际分发数量。
+
+        防重复规则：同一 symbol 已有同方向入场记录时，若 target 仍要求同向加仓
+        （target_quantity > ctx.position），跳过该 target。平仓（target_quantity=0）
+        时清除方向记录，允许反向入场。
+        """
+        count = 0
+        for target in targets:
+            direction = (
+                "buy" if target.target_quantity > self.strategy.ctx.position
+                else "sell"
+            )
+            prev = self._entry_direction.get(target.symbol)
+            if prev is not None and direction == prev and target.target_quantity > 0:
+                logger.debug(
+                    f"[SF-02][LiveStrategyRunner] skip repeated {direction} "
+                    f"for {target.symbol} (target={target.target_quantity} "
+                    f"position={self.strategy.ctx.position})"
+                )
+                continue
+
+            signal = self._target_to_order(target)
+            if signal is None:
+                logger.debug(
+                    f"[SF-02][LiveStrategyRunner] _target_to_order returned None for "
+                    f"target {target.symbol} (diff=0, no action needed)"
+                )
+                continue
+            logger.info(
+                f"[SF-03][LiveStrategyRunner] signal generated: "
+                f"{signal.signal_name} {signal.side} qty={signal.quantity} "
+                f"symbol={self.symbol}"
+            )
+            dispatched = await self._dispatch_signal(signal)
+            if dispatched:
+                estimated_price = Decimal(str(kline.get("close", "0")))
+                self._apply_signal_to_context(signal, estimated_price)
+                if target.target_quantity <= 0:
+                    self._entry_direction.pop(target.symbol, None)
+                else:
+                    self._entry_direction[target.symbol] = signal.side
+                count += 1
+            else:
+                logger.debug(
+                    f"[SF-02][LiveStrategyRunner] signal rejected, ctx not updated: "
+                    f"{signal.signal_name} {signal.side} {signal.quantity}"
+                )
+        return count
+
+    async def load_initial_history(self, limit: int = 500) -> None:
         """
         启动时加载历史 K 线数据，确保策略有足够的历史数据运行。
-        从 DataSource 或外部 API 获取。
-        """
-        from apps.datasource.store import get_data_store
 
+        优先从 DataSource REST API 直接拉取交易所最新 K 线（最可靠，
+        不依赖本地缓存），失败时降级到 DataStore 本地存储。
+        """
+        # 1) 优先：直接从数据源 REST API 拉取
         try:
+            klines = await self._fetch_klines_from_source(limit=limit)
+            if klines:
+                self._kline_history = klines
+                logger.info(
+                    f"[LiveStrategyRunner] pulled {len(klines)} historical klines "
+                    f"for {self.symbol} via DataSource REST"
+                )
+                return
+        except Exception as e:
+            logger.warning(
+                f"[LiveStrategyRunner] REST kline fetch failed: {e}, "
+                f"falling back to DataStore"
+            )
+
+        # 2) 降级：本地 DataStore
+        try:
+            from apps.datasource.store import get_data_store
+
             store = get_data_store()
             klines = store.get_latest("kline", self.symbol, limit=limit)
             if klines:
                 self._kline_history = klines
                 logger.info(
                     f"[LiveStrategyRunner] loaded {len(klines)} historical klines "
-                    f"for {self.symbol}"
+                    f"for {self.symbol} from DataStore"
+                )
+            else:
+                logger.warning(
+                    f"[LiveStrategyRunner] no historical klines available for "
+                    f"{self.symbol} (requested {limit}). Indicators may be invalid "
+                    f"until history accumulates."
                 )
         except Exception as e:
             logger.warning(
                 f"[LiveStrategyRunner] failed to load historical klines: {e}"
             )
+
+    async def _fetch_klines_from_source(self, limit: int) -> list[dict]:
+        """遍历已注册且已连接的 DataSource，返回最新 limit 根 K 线。"""
+        from apps.datasource.registry import DataSourceRegistry
+        from apps.datasource.base import DataType, KlineInterval, MarketType
+
+        try:
+            interval = KlineInterval(self.timeframe)
+        except ValueError:
+            interval = KlineInterval.H1
+
+        for source_name in DataSourceRegistry.list_registered():
+            if not DataSourceRegistry.is_loaded(source_name):
+                continue
+            ds = DataSourceRegistry.get(source_name)
+            if not ds.is_connected():
+                continue
+            if DataType.KLINE not in ds.supported_data_types:
+                continue
+
+            try:
+                klines = await ds.fetch_klines(
+                    symbol=self.symbol,
+                    interval=interval,
+                    market_type=MarketType.SPOT,
+                    limit=limit,
+                )
+                if klines:
+                    # 按时间升序，便于 append/update 逻辑一致
+                    klines.sort(key=lambda k: k.get("timestamp", 0))
+                    logger.info(
+                        f"[LiveStrategyRunner] source '{source_name}' provided "
+                        f"{len(klines)} historical klines"
+                    )
+                    return klines
+            except Exception as e:
+                logger.warning(
+                    f"[LiveStrategyRunner] source '{source_name}' fetch_klines "
+                    f"failed: {e}"
+                )
+        return []
 
     async def _register_signal_monitors(self) -> None:
         """将策略的 get_watch_signals() 注册到 SignalMonitor 数据库。"""
@@ -506,7 +733,7 @@ class LiveStrategyRunner:
             }
         """
         logger.info(
-            "[LiveStrategyRunner] validate trigger received: %s %s",
+            "[SF-10][LiveStrategyRunner] validate trigger received: %s %s",
             event.get("strategy_name"),
             event.get("symbol"),
         )
@@ -532,21 +759,11 @@ class LiveStrategyRunner:
             )
             targets = self.strategy.construct_portfolio(insights, self.strategy.ctx)
             safe_targets = self.strategy.apply_risk_filters(targets, self.strategy.ctx)
-            for target in safe_targets:
-                signal = self._target_to_order(target)
-                if signal:
-                    await self._dispatch_signal(signal)
-                    estimated_price = Decimal(str(latest_kline.get("close", "0")))
-                    self._apply_signal_to_context(signal, estimated_price)
-                    logger.info(
-                        "[LiveStrategyRunner] strategy confirmed signal: %s %s",
-                        signal.signal_name,
-                        signal.side,
-                    )
-                else:
-                    logger.info(
-                        "[LiveStrategyRunner] strategy rejected signal after full validation"
-                    )
+            dispatched = await self._dispatch_targets(safe_targets, latest_kline)
+            if dispatched == 0:
+                logger.info(
+                    "[LiveStrategyRunner] strategy rejected signal after full validation"
+                )
         except Exception as e:
             logger.error(
                 "[LiveStrategyRunner] validate trigger error: %s", e, exc_info=True

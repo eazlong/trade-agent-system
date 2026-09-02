@@ -1,0 +1,110 @@
+{
+  "skill_name": "quant-backtest",
+  "evals": [
+    {
+      "id": 1,
+      "name": "basic-backtest-submission",
+      "prompt": "帮我用 RSI 策略回测一下 BTC/USDT 的日线数据，RSI 周期 14，超买 70 超卖 30，时间范围最近半年。",
+      "expected_output": "推断 strategy_name 包含 rsi，调用 submit_backtest 提交任务，然后调用 submit_scheduled_task 安排 2 分钟后自动查询结果",
+      "files": [],
+      "assertions": [
+        {
+          "name": "calls_submit_backtest",
+          "type": "tool_call",
+          "description": "Agent 调用了 submit_backtest 工具",
+          "check": "检查工具调用记录中是否有 submit_backtest 调用"
+        },
+        {
+          "name": "correct_strategy_name",
+          "type": "parameter",
+          "description": "strategy_name 参数包含 rsi 关键词",
+          "check": "submit_backtest 的 strategy_name 参数应包含 'rsi'"
+        },
+        {
+          "name": "correct_parameters",
+          "type": "parameter",
+          "description": "RSI 参数正确传递",
+          "check": "parameters 应包含 rsi_period=14 及超买超卖设置"
+        },
+        {
+          "name": "schedules_auto_query",
+          "type": "tool_call",
+          "description": "提交回测后调用 submit_scheduled_task 安排自动查询",
+          "check": "submit_backtest 之后应调用 submit_scheduled_task，run_at 约为 now+2m"
+        },
+        {
+          "name": "correct_date_range",
+          "type": "parameter",
+          "description": "时间范围约为最近半年（~180天）",
+          "check": "start_date 应在大约 6 个月前"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "auto-retry-on-pending",
+      "prompt": "定时任务触发：请查询回测任务 task_id=abc123-def456 的结果。调用 get_task_result(task_id=\"abc123-def456\")。如果状态是 SUCCESS，将结果格式化为回测报告发送给用户。如果状态是 FAILURE，分析错误原因，修正参数后用 submit_backtest 重新提交回测。如果仍是 PENDING/STARTED，再安排一个 2 分钟后的定时任务继续查询。",
+      "expected_output": "调用 get_task_result 查询状态。如果 PENDING 则再安排定时任务；如果 SUCCESS 则输出报告；如果 FAILURE 则分析错误并修正后重新提交",
+      "files": [],
+      "assertions": [
+        {
+          "name": "calls_get_task_result",
+          "type": "tool_call",
+          "description": "Agent 调用了 get_task_result 工具",
+          "check": "检查工具调用记录中是否有 get_task_result 调用"
+        },
+        {
+          "name": "correct_task_id",
+          "type": "parameter",
+          "description": "使用了正确的 task_id",
+          "check": "get_task_result 的 task_id 参数应为 'abc123-def456'"
+        },
+        {
+          "name": "handles_state_correctly",
+          "type": "behavior",
+          "description": "根据任务状态采取正确的行动",
+          "check": "PENDING→再安排定时查询；SUCCESS→输出报告；FAILURE→修正并重新提交"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "grid-search-optimization",
+      "prompt": "我想优化 EMA 交叉策略的参数，快线从 5 到 20 步长 5，慢线从 20 到 60 步长 10，找出夏普比率最高的组合。BTC 4小时线，回测最近一年。",
+      "expected_output": "推断策略名并调用 submit_backtest，启用 grid_search，设置正确的参数范围和 sort_by=sharpe_ratio，然后安排自动查询",
+      "files": [],
+      "assertions": [
+        {
+          "name": "enables_grid_search",
+          "type": "parameter",
+          "description": "submit_backtest 调用中包含 grid_search 配置",
+          "check": "grid_search.enabled 应为 true"
+        },
+        {
+          "name": "correct_param_ranges",
+          "type": "parameter",
+          "description": "参数范围与用户要求一致",
+          "check": "快线 min=5 max=20 step=5，慢线 min=20 max=60 step=10"
+        },
+        {
+          "name": "sort_by_sharpe",
+          "type": "parameter",
+          "description": "按夏普比率排序",
+          "check": "grid_search.sort_by 应为 'sharpe_ratio'"
+        },
+        {
+          "name": "correct_timeframe",
+          "type": "parameter",
+          "description": "使用 4 小时线",
+          "check": "timeframe 应为 '4h'"
+        },
+        {
+          "name": "schedules_auto_query",
+          "type": "tool_call",
+          "description": "提交网格搜索后也安排自动查询",
+          "check": "submit_backtest 之后应调用 submit_scheduled_task"
+        }
+      ]
+    }
+  ]
+}

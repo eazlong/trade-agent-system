@@ -151,6 +151,11 @@ def feishu_oauth_callback(request):
 
     access_token = token_data["access_token"]
     refresh_token = token_data["refresh_token"]
+    if not refresh_token:
+        session.status = "failed"
+        session.save(update_fields=["status", "updated_at"])
+        logger.error("[FeishuOAuth] empty refresh_token in exchange response for user %s", session.user.username)
+        return JsonResponse({"error": "OAuth response missing refresh_token"}, status=400)
     expires_in = token_data.get("expires_in", 7200)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 

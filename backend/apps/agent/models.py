@@ -90,7 +90,7 @@ class TaskProgress(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"TaskProgress({self.task_id[:8]}) {self.status}"
+        return f"TaskProgress({self.task_id}) {self.status}"
 
 
 class WorkflowHistory(models.Model):

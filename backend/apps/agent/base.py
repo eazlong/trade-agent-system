@@ -26,6 +26,7 @@ class AgentMessage:
     payload: dict = field(default_factory=dict)
     timeout_ms: int = 30000
     user_id: str = "anonymous"
+    origin: str = ""  # 下达命令的 gateway: web | api | lark | telegram | tui | scheduler | ""
 
 
 @dataclass
@@ -48,7 +49,7 @@ class BaseAgent(ABC):
     # 子类可覆盖：声明该 Agent 可用的工具名称列表
     _agent_tools: list[str] = []
     # 工具调用最大循环轮数
-    _max_tool_rounds: int = 5
+    _max_tool_rounds: int = 32
 
     def __init__(self):
         self._running = False
@@ -148,12 +149,27 @@ class BaseAgent(ABC):
             logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
             return f"Error: {e}"
 
-    def _try_parse_json_tool_call(self, content: str) -> dict | None:
+    def _try_parse_json_tool_call(
+        self, content: str, tools: list[dict] | None = None
+    ) -> dict | None:
         """尝试从 LLM 文本回复中解析 JSON 格式的 tool call（fallback 路径）。
 
         当 LLM 不支持原生 function calling 时，fallback 会让 LLM 输出
         {"tool": "<name>", "args": {...}} 格式。此方法解析这种格式并返回
         标准化的 tool call dict。
+
+        额外支持两种文本伪 tool call（LLM 偶发把 native function call 写成
+        文本块返回在 content 里，而不是原生 tool_calls 字段）：
+
+        1. XML 格式:
+           <tool_call><function=NAME><arguments>{...}</arguments></function></tool_call>
+        2. DeepSeek DSML 文本格式（含全角/ASCII/退化标记变体）:
+           <｜DSML｜function_calls><｜DSML｜invoke name="NAME">...
+           <｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter>
+           ...
+
+        识别后转为标准 dict，让 _run_tool_loop 真正执行工具而不是直接 return
+        content（否则用户会收到一段原始 XML/标记文本，任务无法继续）。
         """
         if not content or not content.strip():
             return None
@@ -175,7 +191,12 @@ class BaseAgent(ABC):
                 text,
             )
             if not m:
-                return None
+                # XML 伪 tool call: <tool_call>...<function=NAME>...<arguments>{...}</arguments>...</function></tool_call>
+                xml = self._try_parse_xml_tool_call(text)
+                if xml is not None:
+                    return xml
+                # DeepSeek DSML 文本伪 tool call（含标记退化变体）
+                return self._try_parse_dsml_tool_call(text, tools)
             try:
                 data = json.loads(m.group(0))
             except json.JSONDecodeError:
@@ -183,6 +204,241 @@ class BaseAgent(ABC):
         if isinstance(data, dict) and "tool" in data and "args" in data:
             return data
         return None
+
+    def _try_parse_xml_tool_call(self, text: str) -> dict | None:
+        """Parse XML-formatted pseudo tool calls from LLM content.
+
+        Recognizes:
+            <tool_call>
+              <function=NAME>
+              <arguments>{JSON}</arguments>
+              </function>
+            </tool_call>
+
+        Returns {"tool": NAME, "args": {...}} on success, None otherwise.
+        """
+        import re
+
+        m = re.search(
+            r"<\s*tool_call\s*>\s*<\s*function\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>"
+            r"(.*?)</\s*function\s*>\s*</\s*tool_call\s*>",
+            text,
+            re.DOTALL,
+        )
+        if not m:
+            return None
+        name = m.group(1).strip()
+        inner = m.group(2) or ""
+        args_match = re.search(
+            r"<\s*arguments\s*>(.*?)</\s*arguments\s*>",
+            inner,
+            re.DOTALL,
+        )
+        if args_match is None:
+            args: dict = {}
+        else:
+            raw = args_match.group(1).strip()
+            if not raw:
+                args = {}
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    return None
+                if not isinstance(parsed, dict):
+                    return None
+                args = parsed
+        return {"tool": name, "args": args}
+
+    # ------------------------------------------------------------------ #
+    #  DeepSeek DSML 文本格式 tool call（fallback 路径）                    #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalize_dsml_text(text: str) -> str | None:
+        """将 DSML 标记的已知退化形态归一化为 `<|DSML|tag ...>`。
+
+        DeepSeek 官方文档格式使用全角标记 <｜DSML｜tag>；实际输出常退化为
+        ASCII 形式：
+          <|DSML|tag>            （单竖线）
+          <||DSML||tag>          （双竖线，HF#209）
+          <| |DSML| |tag>        （竖线间带空格，用户聊天截图形态）
+        归一化后统一为 <|DSML|tag ...>，便于正则解析。
+
+        Returns: 归一化后的文本；若文本中没有任何 DSML 标记形态则返回 None。
+        """
+        import re
+
+        if "DSML" not in text:
+            return None
+        t = text.replace("｜", "|")
+
+        def _canon(m: re.Match) -> str:
+            close = m.group(1)
+            tag = m.group(2)
+            attrs = m.group(3) or ""
+            return f"<{close}|DSML|{tag}{attrs}>"
+
+        # <| |DSML| |tag attrs> / <||DSML||tag> / <｜DSML｜tag> / </| |DSML| |tag>
+        return re.sub(
+            r"<\s*(/?)\s*\|(?:\s*\|)*\s*DSML\s*\|(?:\s*\|)*\s*"
+            r"([A-Za-z_][A-Za-z0-9_]*)([^>]*)>",
+            _canon,
+            t,
+        )
+
+    @staticmethod
+    def _parse_dsml_parameters(inner: str) -> dict:
+        """解析 DSML parameter 元素为参数字典。
+
+        <|DSML|parameter name="arg" string="true">value</|DSML|parameter>
+        string="true"（或缺省）→ 原样字符串；string="false" → 尝试 JSON 字面量。
+        """
+        import re
+
+        args: dict = {}
+        for pm in re.finditer(
+            r"<\|DSML\|parameter\s+name=\"([^\"]+)\""
+            r"(?:\s+string=\"(true|false)\")?>(.*?)</\|DSML\|parameter>",
+            inner,
+            re.DOTALL,
+        ):
+            name = pm.group(1)
+            is_string = pm.group(2) != "false"
+            raw = pm.group(3).strip()
+            if is_string:
+                value = raw
+            else:
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError:
+                    value = raw
+            args[name] = value
+        return args
+
+    @staticmethod
+    def _infer_dsml_tool_by_args(args: dict, tools: list[dict]) -> str | None:
+        """退化形态缺失 invoke/tool 名时，按参数名匹配工具 schema 推断。
+
+        只有唯一候选时才返回该工具名，否则返回 None（宁可保持原文输出，
+        也不盲猜调用错误工具）。
+        """
+        if not args or not tools:
+            return None
+        given = set(args.keys())
+        candidates: list[str] = []
+        for schema in tools:
+            fn = schema.get("function") or {}
+            params = (fn.get("parameters") or {}).get("properties") or {}
+            props = params.keys() if isinstance(params, dict) else []
+            if given.issubset(set(props)):
+                name = fn.get("name", "")
+                if name:
+                    candidates.append(name)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _try_parse_dsml_tool_call(
+        self, text: str, tools: list[dict] | None = None
+    ) -> dict | None:
+        """解析 DeepSeek DSML 文本格式的伪 tool call。
+
+        支持两种结构：
+        1. 包装形式（官方文档）：
+           <|DSML|tool_calls>...<|DSML|invoke name="TOOL">...
+           <|DSML|parameter name="a" string="true">v</|DSML|parameter>
+           </|DSML|invoke>...</|DSML|tool_calls>
+           （root 名可能是 tool_calls / function_calls；标记全角/ASCII/退化均可）
+        2. 单调用退化形式（用户截图）：
+           <| |DSML| |tool_call>...</| |DSML| |parameter name="a" string="true">v
+           </| |DSML| |parameter></| |DSML| |tool_call>
+        3. 无标记形式（服务端剥掉 DSML 标记）：
+           <function_calls><invoke name="TOOL">...</function_calls>
+
+        Returns: {"tool": NAME, "args": {...}}；NAME 缺失且无法从 tools schema
+        推断时返回 None。
+        """
+        import re
+
+        if not text:
+            return None
+        normalized = self._normalize_dsml_text(text)
+
+        # --- 1/2. 带 DSML 标记的形态（含退化） ---
+        if normalized is not None:
+            work = normalized
+
+            # 1. 包装形式：root tool_calls/function_calls > invoke > parameter
+            root_m = re.search(
+                r"<\|DSML\|(?:tool_calls|function_calls)>(.*?)"
+                r"</\|DSML\|(?:tool_calls|function_calls)>",
+                work,
+                re.DOTALL,
+            )
+            if root_m:
+                invokes = re.findall(
+                    r"<\|DSML\|invoke(?:\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\")?>"
+                    r"(.*?)</\|DSML\|invoke>",
+                    root_m.group(1),
+                    re.DOTALL,
+                )
+                if not invokes:
+                    return None
+                name, invoke_inner = invokes[0]
+                name = name or ""
+                args = self._parse_dsml_parameters(invoke_inner)
+                if not name and tools:
+                    name = self._infer_dsml_tool_by_args(args, tools) or ""
+                return {"tool": name, "args": args} if name else None
+
+            # 2. 单调用退化形式：root tool_call（可带 name 属性）> parameter
+            single_m = re.search(
+                r"<\|DSML\|tool_call(?:\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\")?>"
+                r"(.*?)</\|DSML\|tool_call>",
+                work,
+                re.DOTALL,
+            )
+            if single_m:
+                name = single_m.group(1) or ""
+                args = self._parse_dsml_parameters(single_m.group(2))
+                if not name and tools:
+                    name = self._infer_dsml_tool_by_args(args, tools) or ""
+                return {"tool": name, "args": args} if name else None
+            return None
+
+        # --- 3. 无标记形式（文本中没有 DSML 标记，服务端可能剥掉了它们） ---
+        work = text
+        bare_m = re.search(
+            r"<function_calls>(.*?)</function_calls>", work, re.DOTALL
+        )
+        if not bare_m:
+            return None
+        invokes = re.findall(
+            r"<invoke\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\"[^>]*>(.*?)</invoke>",
+            bare_m.group(1),
+            re.DOTALL,
+        )
+        if not invokes:
+            return None
+        name, invoke_inner = invokes[0]
+        args: dict = {}
+        for pm in re.finditer(
+            r"<parameter\s+name=\"([^\"]+)\""
+            r"(?:\s+string=\"(true|false)\")?>(.*?)</parameter>",
+            invoke_inner,
+            re.DOTALL,
+        ):
+            pname = pm.group(1)
+            is_string = pm.group(2) != "false"
+            raw = pm.group(3).strip()
+            if is_string:
+                value = raw
+            else:
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError:
+                    value = raw
+            args[pname] = value
+        return {"tool": name, "args": args}
 
     async def _run_tool_loop(
         self,
@@ -230,7 +486,7 @@ class BaseAgent(ABC):
                     return ("", True)
 
                 # 检查是否是 fallback 路径的 JSON tool call
-                json_tc = self._try_parse_json_tool_call(content)
+                json_tc = self._try_parse_json_tool_call(content, tools)
                 if json_tc is None:
                     if content and content.strip():
                         return (content, False)

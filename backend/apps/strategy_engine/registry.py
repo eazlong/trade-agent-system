@@ -33,13 +33,30 @@ class StrategyRegistry:
         return cls._instance
 
     @classmethod
-    def register(cls, strategy_cls: type["BaseStrategy"]) -> type["BaseStrategy"]:
+    def validate_description(cls, strategy_cls: type["BaseStrategy"]) -> None:
+        """校验策略描述是否符合 4 字段模板，失败抛异常。"""
+        desc = getattr(strategy_cls, 'description', '')
+        if not desc or not desc.strip():
+            name = getattr(strategy_cls, 'name', 'unnamed')
+            raise ValueError(f"Strategy {name!r} missing description")
+
+        required_fields = ["策略类型：", "核心指标：", "适用场景：", "入场逻辑："]
+        missing = [f for f in required_fields if f not in desc]
+        if missing:
+            name = getattr(strategy_cls, 'name', 'unnamed')
+            raise ValueError(
+                f"Strategy {name!r} description missing fields: {missing}"
+            )
+
+    @classmethod
+    def register(
+        cls, strategy_cls: type["BaseStrategy"], *, name: str | None = None
+    ) -> type["BaseStrategy"]:
         """装饰器：注册策略类"""
-        name = strategy_cls.name
-        if name in cls._strategies:
-            logger.warning("Strategy '%s' already registered, overwriting", name)
-        cls._strategies[name] = strategy_cls
-        logger.info("Strategy registered: %s", name)
+        reg_name = name or strategy_cls.name
+        cls.validate_description(strategy_cls)
+        cls._strategies[reg_name] = strategy_cls
+        logger.debug("Strategy registered: %s", reg_name)
         return strategy_cls
 
     @classmethod
@@ -57,6 +74,17 @@ class StrategyRegistry:
     @classmethod
     def list_registered(cls) -> list[str]:
         return list(cls._strategies.keys())
+
+    @classmethod
+    def list_registered_with_descriptions(cls) -> list[dict[str, str]]:
+        """汇总所有已注册策略的名称和描述，供技能层 LLM 匹配使用。"""
+        return [
+            {
+                "name": name,
+                "description": strategy_cls.description,
+            }
+            for name, strategy_cls in cls._strategies.items()
+        ]
 
     @classmethod
     def set_strategy_path(cls, path: str) -> None:
@@ -86,7 +114,7 @@ class StrategyRegistry:
                         if (isinstance(attr, type) and hasattr(attr, "name")
                                 and getattr(attr, "__module__", "") == module_name
                                 and issubclass(attr, BaseStrategy) and attr is not BaseStrategy):
-                            cls.register(attr)
+                            cls.register(attr, name=module_name)
                             discovered.append(attr.name)
                 except Exception as e:
                     logger.warning("Failed to discover strategy %s: %s", module_name, e)
@@ -96,10 +124,10 @@ class StrategyRegistry:
 def register_strategy(
     name: str | None = None,
 ) -> callable:
-    """装饰器：注册策略类"""
+    """装饰器：注册策略类，可选覆盖策略类自身的 name 属性"""
 
     def decorator(target):
-        StrategyRegistry.register(target)
+        StrategyRegistry.register(target, name=name)
         return target
 
     return decorator

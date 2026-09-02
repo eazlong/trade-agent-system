@@ -95,6 +95,7 @@ class OrderSignal:
     exchange: str = "binance"  # 默认交易所
     signal_name: str = ""  # 信号名称（用于日志和回测记录）
     metadata: dict = field(default_factory=dict)  # 额外元数据
+    is_close_position: bool = False  # 平仓信号：跳过 RiskGuard 风控检查
 
     def __post_init__(self):
         if self.side not in ("buy", "sell"):
@@ -147,6 +148,8 @@ class StrategyContext:
         # Phase 2: 多标的持仓追踪（与单标的 position 属性保持同步）
         self._positions: dict[str, Decimal] = {symbol: self._position}
         self._current_prices: dict[str, Decimal] = {}
+        # 加权平均持仓成本，由回测/实盘引擎在成交时维护（默认 0，策略可安全读取）
+        self.avg_entry_price: Decimal = Decimal("0")
 
     @property
     def balance(self) -> Decimal:
@@ -237,10 +240,16 @@ class StrategyContext:
     def close_position(
         self, price: Decimal | None = None, signal_name: str = "close", **kwargs
     ) -> OrderSignal | None:
-        """平仓信号（卖出全部持仓）"""
+        """平仓信号（卖出全部持仓）— 跳过 RiskGuard 风控检查"""
         if self._position <= 0:
             return None
-        return self.sell(self._position, price=price, signal_name=signal_name, **kwargs)
+        return self.sell(
+            self._position,
+            price=price,
+            signal_name=signal_name,
+            is_close_position=True,
+            **kwargs,
+        )
 
 
 class BaseStrategy(ABC):
@@ -261,6 +270,14 @@ class BaseStrategy(ABC):
 
     name = "unnamed"
     description = ""
+    # 策略启动前需要预加载的最小 K 线根数（warmup）。
+    # 指标（RSI/MACD/布林带等）需要足够历史才能产出首个有效值，
+    # 若启动时不预加载，策略会一直等待历史积累而无法发出信号。
+    min_kline_length: int = 500
+    description_template = """策略类型：{均值回归/趋势跟踪/突破/动量/套利}
+核心指标：{RSI/MACD/布林带/均线/ATR/...}
+适用场景：{震荡行情/趋势行情/高波动/低波动/...}
+入场逻辑：{一句话概括买入条件，不含具体参数值}"""
     params_schema: dict[str, Any] = {}
 
     def __init__(self, context: StrategyContext):
@@ -292,6 +309,7 @@ class BaseStrategy(ABC):
         signal = self.on_bar(kline, history)
         if signal is None:
             return []
+            
         insight = _signal_to_insight(signal, self.name)
         insight.symbol = self.ctx.symbol
         return [insight]

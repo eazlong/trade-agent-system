@@ -96,6 +96,13 @@ class BacktestResult(models.Model):
         default=False,
         help_text="是否为网格搜索的子回测",
     )
+    celery_task_id = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Celery 任务 ID，用于 get_task_result 反查回测结果",
+    )
 
     class Meta:
         db_table = "backtest_results"

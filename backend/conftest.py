@@ -7,6 +7,9 @@ print(f'[conftest] DJANGO_SETTINGS_MODULE = {os.environ.get("DJANGO_SETTINGS_MOD
 # Force test settings
 os.environ['DJANGO_SETTINGS_MODULE'] = 'core.settings.test'
 
+# Allow DB operations in async context (needed for async tool tests)
+os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
+
 # Now import and configure Django
 import django
 from django.conf import settings

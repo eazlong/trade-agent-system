@@ -12,6 +12,7 @@ class SessionState(Enum):
     NONE = "none"  # 空闲，所有消息走意图识别
     MULTI_TURN = "multi_turn"  # 多轮对话中，特定Agent接管
     PAUSED = "paused"  # 多轮对话被临时中断
+    WORKFLOW_RUNNING = "workflow_running"  # 工作流执行中
 
 
 class SessionManager:
@@ -47,9 +48,14 @@ class SessionManager:
         user_id: str,
         state: SessionState,
         active_agent: Optional[str] = None,
+        task_id: Optional[str] = None,
         ttl: int = 28800,
     ) -> None:  # 默认8小时过期
-        """设置用户会话上下文"""
+        """设置用户会话上下文
+
+        Args:
+            task_id: 工作流任务 ID（WORKFLOW_RUNNING 时用于取消）
+        """
         r = await self.get_redis()
         key = f"session:{user_id}:context"
 
@@ -59,6 +65,8 @@ class SessionManager:
             "expires_at": time.time() + ttl,
             "updated_at": time.time(),
         }
+        if task_id:
+            context["task_id"] = task_id
 
         await r.setex(key, ttl, json.dumps(context, ensure_ascii=False))
 

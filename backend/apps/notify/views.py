@@ -23,3 +23,17 @@ def mark_read(request, pk):
     n.is_read = True
     n.save(update_fields=["is_read"])
     return Response({"status": "ok"})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mark_all_read(request):
+    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    return Response({"status": "ok"})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def unread_count(request):
+    count = Notification.objects.filter(user=request.user, is_read=False).count()
+    return Response({"unread_count": count})

@@ -20,10 +20,24 @@ class ToolCallTruncatedError(Exception):
 TOOL_CALL_MAX_RETRIES = 2
 
 
+def _prepend_system(system: str, messages: list[dict]) -> list[dict]:
+    """组装完整 messages：将 messages 内的 system 条目并入开头 system 消息。
+
+    对话压缩摘要以 role=system 条目存储，若原样发送，网关会拒收
+    400 "System message must be at the beginning."
+    """
+    extra = "\n\n".join(
+        str(m.get("content", "")) for m in messages if m.get("role") == "system"
+    )
+    lead = f"{system}\n\n{extra}" if extra else system
+    body = [m for m in messages if m.get("role") != "system"]
+    return [{"role": "system", "content": lead}] + body
+
+
 class LLMClient:
     """
     LLM调用客户端，带降级机制。
-    主用 OpenAI (gpt-4o)，失败后自动切换 Anthropic (claude-opus-4-6)。
+    主用 OpenAI (gpt-4o)，失败后自动切换 DeepSeek。
     """
 
     _instance: Optional["LLMClient"] = None
@@ -41,21 +55,21 @@ class LLMClient:
         max_tokens: int = 1024,
         temperature: float = 0.3,
     ) -> str:
-        """调用LLM，主用OpenAI，自动降级到Anthropic"""
+        """调用LLM，主用OpenAI，自动降级到DeepSeek"""
         t0 = time.monotonic()
         try:
             result = await self._call_openai(system, user, max_tokens, temperature)
             logger.debug(f"OpenAI OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
             return result
         except Exception as e:
-            logger.warning(f"OpenAI failed ({e}), falling back to Anthropic")
+            logger.warning(f"OpenAI failed ({e}), falling back to DeepSeek")
 
         try:
-            result = await self._call_anthropic(system, user, max_tokens, temperature)
-            logger.debug(f"Anthropic OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
+            result = await self._call_deepseek(system, user, max_tokens, temperature)
+            logger.debug(f"DeepSeek OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
             return result
         except Exception as e:
-            logger.error(f"Anthropic fallback also failed: {e}")
+            logger.error(f"DeepSeek fallback also failed: {e}")
             return FALLBACK_MARKER
 
     async def _call_openai(
@@ -83,16 +97,26 @@ class LLMClient:
                     "temperature": temperature,
                 },
             )
-            if resp.status_code >= 400:
-                body = resp.text
-                logger.error(
-                    "LLM API error %d for %s:\n%s",
-                    resp.status_code,
-                    resp.url,
-                    body[:2000],
+            resp_data = resp.json()
+            choices = resp_data.get("choices", [])
+            if not choices:
+                logger.warning("[LLMClient] No choices in OpenAI response!")
+                raise ValueError("No choices in API response")
+
+            msg = choices[0].get("message", {})
+            # DeepSeek reasoning models (R1/V3) 可能将输出放在 reasoning_content 而非 content
+            content = msg.get("content", "")
+            reasoning_content = msg.get("reasoning_content", "")
+
+            # 优先使用 content,fallback 到 reasoning_content (reasoning model 场景)
+            final_content = content if content else reasoning_content
+
+            if not final_content:
+                logger.warning(
+                    f"[LLMClient] Empty content and reasoning_content in response: {msg}"
                 )
-                resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+
+            return final_content
 
     async def chat_with_tools(
         self,
@@ -104,19 +128,27 @@ class LLMClient:
     ) -> LLMToolResponse:
         """支持工具调用的LLM接口（OpenAI function calling格式），截断/网络错误自动重试"""
         last_exc: Exception | None = None
+        current_max_tokens = max_tokens
+        # 截断重试时翻倍 token 预算，上限 32768；
+        # 避免 write_file 等大参数工具因 max_tokens 不足反复失败
+        max_tokens_cap = 32768
         for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
             try:
                 return await self._call_openai_with_tools(
-                    system, messages, tools, max_tokens, temperature
+                    system, messages, tools, current_max_tokens, temperature
                 )
             except ToolCallTruncatedError as e:
                 last_exc = e
+                next_max = min(current_max_tokens * 2, max_tokens_cap)
                 logger.warning(
-                    "tool_call truncated, retry %d/%d: %s",
+                    "tool_call truncated, retry %d/%d (max_tokens %d->%d): %s",
                     attempt,
                     TOOL_CALL_MAX_RETRIES,
+                    current_max_tokens,
+                    next_max,
                     e,
                 )
+                current_max_tokens = next_max
             except httpx.HTTPStatusError as e:
                 last_exc = e
                 # 5xx / 429 可重试，其他直接降级
@@ -148,7 +180,11 @@ class LLMClient:
         
         # 降级：拼接工具描述到system prompt，让LLM输出JSON
         tool_desc = json.dumps(tools, ensure_ascii=False)
-        fallback_system = f'{system}\n\n可用工具（如需使用，以JSON输出 {{"tool": "name", "args": {{...}}}}）:\n{tool_desc}'
+        fallback_system = (
+            f'{system}\n\n可用工具（如需使用，必须以 JSON 输出 '
+            f'{{"tool": "name", "args": {{...}}}}。'
+            f'禁止输出 XML/DSML 等标记格式的工具调用。）:\n{tool_desc}'
+        )
         # 将完整对话历史格式化（不仅取最后一条），让LLM在多轮工具调用中也能看到上下文
         conversation_parts = []
         for m in messages:
@@ -172,6 +208,9 @@ class LLMClient:
                 conversation_parts.append(
                     f"[工具返回 {m.get('tool_call_id', '')}] {content[:600]}"
                 )
+            elif role == "system":
+                # 压缩摘要等 system 条目，降级时保留上下文
+                conversation_parts.append(f"[上下文] {content}")
         user_text = (
             "\n\n---\n\n".join(conversation_parts)
             if conversation_parts
@@ -196,7 +235,7 @@ class LLMClient:
             raise ValueError("OPENAI_API_KEY not configured")
         model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
         proxy = getattr(settings, "OPENAI_PROXY", "") or None
-        full_messages = [{"role": "system", "content": system}] + messages
+        full_messages = _prepend_system(system, messages)
         async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
@@ -219,13 +258,18 @@ class LLMClient:
                     body[:2000],
                 )
                 resp.raise_for_status()
-            msg = resp.json()["choices"][0]["message"]
+            resp_json = resp.json()
+            choice = resp_json["choices"][0]
+            msg = choice["message"]
+            finish_reason = choice.get("finish_reason")
             raw_calls = msg.get("tool_calls") or []
             tool_calls = []
+            parse_failed = False
             for tc in raw_calls:
                 try:
                     args = json.loads(tc["function"]["arguments"])
                 except (json.JSONDecodeError, TypeError) as exc:
+                    parse_failed = True
                     raise ToolCallTruncatedError(
                         f"tool_call '{tc['function']['name']}' arguments truncated: {exc}"
                     ) from exc
@@ -236,37 +280,49 @@ class LLMClient:
                         arguments=args,
                     )
                 )
+            # finish_reason='length' 表示输出被 max_tokens 截断；
+            # 即使 JSON 碰巧合法，tool_call 内容也可能不完整
+            if finish_reason == "length" and raw_calls:
+                raise ToolCallTruncatedError(
+                    f"finish_reason='length' with {len(raw_calls)} tool_call(s); "
+                    "arguments likely incomplete"
+                )
+            if parse_failed:
+                # json.loads 成功的路径不会到这里；保留以防未来逻辑变更
+                raise ToolCallTruncatedError("tool_call arguments truncated")
             return LLMToolResponse(
                 content=msg.get("content") or "",
                 tool_calls=tool_calls,
                 reasoning_content=msg.get("reasoning_content") or "",
             )
 
-    async def _call_anthropic(
+    async def _call_deepseek(
         self, system: str, user: str, max_tokens: int, temperature: float
     ) -> str:
-        api_key = settings.ANTHROPIC_API_KEY
+        api_key = settings.DEEPSEEK_API_KEY
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not configured")
-        model = getattr(settings, "ANTHROPIC_MODEL_FALLBACK", "claude-opus-4-6")
-        proxy = getattr(settings, "ANTHROPIC_PROXY", "") or None
+            raise ValueError("DEEPSEEK_API_KEY not configured")
+        base_url = getattr(
+            settings, "DEEPSEEK_API_BASE_URL", "https://api.deepseek.com/v1"
+        )
+        model = getattr(settings, "DEEPSEEK_MODEL_FALLBACK", "deepseek-chat")
+        proxy = getattr(settings, "DEEPSEEK_PROXY", "") or None
         async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                },
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
                     "model": model,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                 },
             )
             resp.raise_for_status()
-            return resp.json()["content"][0]["text"]
+            return resp.json()["choices"][0]["message"]["content"]
 
     async def chat_stream(
         self,
@@ -371,19 +427,25 @@ class LLMClient:
         tool_calls 在完全接收后返回。
         """
         last_exc: Exception | None = None
+        current_max_tokens = max_tokens
+        max_tokens_cap = 32768
         for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
             try:
                 return await self._call_openai_stream_with_tools(
-                    system, messages, tools, on_chunk, max_tokens, temperature
+                    system, messages, tools, on_chunk, current_max_tokens, temperature
                 )
             except ToolCallTruncatedError as e:
                 last_exc = e
+                next_max = min(current_max_tokens * 2, max_tokens_cap)
                 logger.warning(
-                    "stream tool_call truncated, retry %d/%d: %s",
+                    "stream tool_call truncated, retry %d/%d (max_tokens %d->%d): %s",
                     attempt,
                     TOOL_CALL_MAX_RETRIES,
+                    current_max_tokens,
+                    next_max,
                     e,
                 )
+                current_max_tokens = next_max
             except httpx.HTTPStatusError as e:
                 last_exc = e
                 if e.response.status_code in (429, 500, 502, 503, 504):
@@ -412,7 +474,7 @@ class LLMClient:
             f"OpenAI tool stream failed ({last_exc}), falling back to non-stream"
         )
         return await self.chat_with_tools(
-            system, messages, tools, max_tokens, temperature
+            system, messages, tools, current_max_tokens, temperature
         )
 
     async def _call_openai_stream_with_tools(
@@ -437,7 +499,8 @@ class LLMClient:
         chunks: list[str] = []
         reasoning_chunks: list[str] = []
         tool_calls_map: dict[int, dict] = {}  # index → {name, arguments}
-        full_messages = [{"role": "system", "content": system}] + messages
+        finish_reason: str | None = None
+        full_messages = _prepend_system(system, messages)
 
         async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
             async with client.stream(
@@ -471,7 +534,12 @@ class LLMClient:
                     if data == "[DONE]":
                         break
                     try:
-                        delta = json.loads(data)["choices"][0]["delta"]
+                        payload = json.loads(data)
+                        choice = payload["choices"][0]
+                        delta = choice["delta"]
+                        fr = choice.get("finish_reason")
+                        if fr:
+                            finish_reason = fr
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
 
@@ -514,6 +582,13 @@ class LLMClient:
                     name=tc_map["name"],
                     arguments=args,
                 )
+            )
+        # 流式 finish_reason='length' 表示被 max_tokens 截断；
+        # 即使 JSON 碰巧合法，tool_call 内容也可能不完整
+        if finish_reason == "length" and tool_calls_map:
+            raise ToolCallTruncatedError(
+                f"stream finish_reason='length' with {len(tool_calls_map)} "
+                "tool_call(s); arguments likely incomplete"
             )
         return LLMToolResponse(
             content="".join(chunks),

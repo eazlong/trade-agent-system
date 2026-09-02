@@ -1,0 +1,23 @@
+{
+  "skill_name": "quant-backtest",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我想用RSI策略回测BTC/USDT的日线数据，RSI周期设置为14，超买线70，超卖线30。请帮我执行回测并告诉我如何查询结果。",
+      "expected_output": "应该调用submit_backtest工具，使用rsi_strategy，设置相应的参数，并提供task_id给用户以便后续查询",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "我已经有一个任务ID是abc123-def456，请帮我查询这个回测任务的结果。",
+      "expected_output": "应该调用get_task_result工具查询任务状态和结果",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "我想要优化RSI策略的参数，找到最佳的RSI周期。请帮我执行网格搜索，测试周期从10到30，步长为5。",
+      "expected_output": "应该调用submit_backtest工具，启用grid_search功能，设置相应的参数范围",
+      "files": []
+    }
+  ]
+}

@@ -179,11 +179,13 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             from apps.agent.bus import publish, build_agent_task, wait_reply, AGENT_TASKS
 
             msg = build_agent_task(
-                user_id=user_open_id or "unknown", payload={"text": text}
+                user_id=user_open_id or "unknown",
+                payload={"text": text},
+                origin="lark",
             )
 
             loop.run_until_complete(publish(AGENT_TASKS, msg))
-            reply = loop.run_until_complete(wait_reply(msg["task_id"], timeout=360))
+            reply = loop.run_until_complete(wait_reply(msg["task_id"], timeout=3600))
 
             if reply:
                 processed = channel._extract_content(reply)

@@ -18,33 +18,40 @@ cp .env.example .env
 ```
 
 ### 数据库
+所有环境统一使用 Docker Compose 运行的 PostgreSQL + PgBouncer：
 ```bash
-# 开发环境使用 SQLite（dev settings 已配置）
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run python manage.py migrate
+# 启动数据库和依赖服务
+docker-compose up -d db redis pgbouncer
 
-# 生产环境（PostgreSQL）
-python manage.py migrate
+# 执行迁移（后端容器已配置 DB_HOST=pgbouncer）
+docker-compose exec backend python manage.py migrate
 ```
+
+> PostgreSQL 端口映射到宿主机 `6432`（PgBouncer 映射到 `5432`）。
+> 本地直连：`psql -h localhost -p 6432 -U trade -d trade_agent`
 
 ### 运行服务
 ```bash
-# 后端（Django + Celery Worker + Celery Beat + Redis + PostgreSQL）
+# 完整栈（Django + Celery Worker + Celery Beat + Redis + PostgreSQL + PgBouncer + Lark WS）
 docker-compose up -d --build
 
-# 前端
+# 前端（如适用）
 npm run dev
 ```
 
 ### 测试
 ```bash
-# 运行所有测试
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest
+# 确保 Docker 环境已启动
+docker-compose up -d
+
+# 运行所有测试（在后端容器中执行）
+docker-compose exec backend pytest
 
 # 运行单个测试文件
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest apps/agent/tests/test_xxx.py
+docker-compose exec backend pytest apps/agent/tests/test_xxx.py
 
 # 带覆盖率
-DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest --cov=apps --cov-report=term-missing
+docker-compose exec backend pytest --cov=apps --cov-report=term-missing
 ```
 
 ### Docker 完整栈
@@ -108,7 +115,7 @@ OpenAI GPT-4o → (超时/429/错误) → Anthropic Claude Opus → (失败) →
 | 文件 | 用途 |
 |------|------|
 | `core/settings/base.py` | 通用配置（所有环境共享） |
-| `core/settings/dev.py` | 开发覆盖（SQLite fallback、verbose 日志） |
+| `core/settings/dev.py` | 开发覆盖（连接 Docker 数据库、verbose 日志） |
 | `core/settings/prod.py` | 生产覆盖（强制 PostgreSQL、严格安全设置） |
 
 切换方式：`DJANGO_SETTINGS_MODULE=core.settings.dev`（或 `prod`）。
@@ -135,3 +142,17 @@ OpenAI GPT-4o → (超时/429/错误) → Anthropic Claude Opus → (失败) →
 - **消息队列**: Celery + Redis Stream — 非 Celery 的高吞吐任务走 Stream 直连
 - **向量检索**: pgvector — 用于 L3 语义记忆的相似度搜索
 - **加密**: `cryptography` Fernet — 交易所 API Key 加密存储
+
+## Database & Async Rules
+- This project uses Django async. NEVER write raw sync database queries in async contexts. ALWAYS use `sync_to_async` or the centralized `db_async` utility for any DB operation.
+- Before debugging database connection errors, verify the Docker environment is running and not serving stale code (restart containers first).
+- When fixing async/threading issues, always check for `sync_to_async` usage and `close_old_connections()` calls in long-running loops (e.g., Celery tasks, grid search).
+
+## Fix Verification Protocol
+- After any bug fix, run the FULL test suite (not just related tests) before declaring the fix complete.
+- When debugging, verify the runtime environment FIRST (Docker containers running? correct ports? stale code?) before analyzing code logic.
+- Do NOT make multiple speculative code changes. Diagnose the root cause thoroughly before editing. If 2 attempts fail, re-read the error and the actual code flow before a 3rd attempt.
+
+## Code Change Discipline
+- When using formatters (Prettier, Black, etc.), scope changes to ONLY the files/lines relevant to the task. Revert unrelated formatting changes before committing.
+- Prefer minimal, targeted edits over broad refactors unless explicitly asked to refactor.

@@ -197,6 +197,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo '$CLAUDE_FILE_PATH' | grep -qE '(models|views|tasks|celery|db_async)'; then echo '⚠️ DB/async file changed — remember to run: python -m pytest'; fi"
+          }
+        ]
       }
     ],
     "Stop": [
@@ -254,7 +263,6 @@
         ]
       }
     ],
-    
     "SessionEnd": [
       {
         "matcher": "*",
@@ -285,6 +293,8 @@
     "context7@claude-plugins-official": true,
     "ralph-loop@claude-plugins-official": true,
     "frontend-design@claude-plugins-official": true,
-    "serena@claude-plugins-official": true
+    "serena@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "ponytail@ponytail": true
   }
 }

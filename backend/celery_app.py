@@ -1,6 +1,9 @@
+import logging
 import os
 from celery import Celery
 from celery.schedules import crontab
+
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.dev')
 
@@ -85,5 +88,8 @@ def on_worker_ready(sender=None, **kwargs):
     from apps.agent.tasks import startup_recovery_check
     logger.info("[worker_ready] triggering startup recovery check")
     # Run synchronously so the worker doesn't proceed without recovery
-    result = startup_recovery_check()
-    logger.info("[worker_ready] recovery result: %s", result)
+    try:
+        result = startup_recovery_check()
+        logger.info("[worker_ready] recovery result: %s", result)
+    except Exception:
+        logger.exception("[worker_ready] recovery failed, worker continuing")

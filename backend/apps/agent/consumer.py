@@ -137,10 +137,10 @@ class AgentTaskConsumer:
             )
             supervisor = SupervisorAgent.get_instance()
 
-            # Hard timeout: 280s prevents LLM/tool hangs at source
+            # Hard timeout: 3600 prevents LLM/tool hangs at source
             result = await asyncio.wait_for(
                 supervisor.handle(msg),
-                timeout=280,
+                timeout=3600,  # 1 hour hard timeout for the entire task (including retries)
             )
 
             if result.success:
@@ -150,12 +150,31 @@ class AgentTaskConsumer:
                 else:
                     result_text = str(result.data)
                 tracker.complete(result_text[:300])
-                return result_text
             else:
                 tracker.fail(result.error)
-                return f"[错误] {result.error}"
+                result_text = f"[错误] {result.error}"
+
+            # 多通道扇出：bus 原路回复由 publish_reply 送达 origin gateway
+            # （如飞书 chat），这里把同一回复同步推送到其余通道：
+            # - web WS group + ws_pending（open_id → Django UUID 解析）
+            # - 主通道（MAIN_CHANNEL，默认飞书）副本（origin 即主通道时跳过，
+            #   避免飞书收两份）
+            try:
+                from apps.agent.reply_fanout import fan_out_reply
+
+                await fan_out_reply(
+                    user_id,
+                    result_text,
+                    origin=fields.get("origin", ""),
+                )
+            except Exception:
+                logger.warning(
+                    "[AgentTaskConsumer] fan_out_reply failed for task_id=%s",
+                    task_id, exc_info=True,
+                )
+            return result_text
         except asyncio.TimeoutError:
-            tracker.fail("处理超时（280秒），任务已自动重试")
+            tracker.fail("处理超时（3600秒），任务已自动重试")
             raise
         except Exception as e:
             tracker.fail(str(e))

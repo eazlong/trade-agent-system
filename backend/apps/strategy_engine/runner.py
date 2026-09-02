@@ -110,6 +110,11 @@ class StrategyRunner:
         stats = await engine.run()
 
         # 存入数据库：优先使用已有的 result_id（BacktestResult），否则根据 strategy_id 查找/创建
+        from django.db import close_old_connections
+
+        # DB connections may have gone stale during the backtest engine run
+        close_old_connections()
+
         if result_id:
             # result_id 是 BacktestResult UUID，需要从中获取 strategy_id
             resolved_strategy_id = await _get_strategy_id_from_result(result_id)
@@ -214,10 +219,7 @@ class StrategyRunner:
             live_session_id=live_session_id,
         )
 
-        # 加载初始历史
-        await self._live_runner.load_initial_history()
-
-        # 启动
+        # 启动（内部会按 strategy.min_kline_length 预加载历史 K 线）
         await self._live_runner.start()
 
     async def stop_live(self) -> None:

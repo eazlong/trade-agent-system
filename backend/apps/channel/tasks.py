@@ -51,6 +51,17 @@ def refresh_feishu_user_tokens(self):
             with transaction.atomic():
                 client = _get_oauth_client()
                 refresh_token_str = token.decrypt_refresh_token()
+
+                if not refresh_token_str:
+                    logger.error(
+                        "[FeishuTokenRefresh] empty refresh_token for %s, deactivating",
+                        token.open_id[:12],
+                    )
+                    token.is_active = False
+                    token.save(update_fields=["is_active", "updated_at"])
+                    failed += 1
+                    continue
+
                 token_data = client.refresh_token(refresh_token_str)
 
                 expires_in = token_data.get("expires_in", 7200)
@@ -68,10 +79,12 @@ def refresh_feishu_user_tokens(self):
         except Exception as e:
             failed += 1
             logger.error(
-                "[FeishuTokenRefresh] failed for %s: %s",
+                "[FeishuTokenRefresh] failed for %s: %s, deactivating token",
                 token.open_id[:12],
                 e,
             )
+            token.is_active = False
+            token.save(update_fields=["is_active", "updated_at"])
 
     if refreshed or failed:
         logger.info(

@@ -60,6 +60,7 @@ class SignalDispatcher:
             "user_id": user_id,
             "signal_name": signal.signal_name,
             "metadata": signal.metadata,
+            "is_close_position": signal.is_close_position,
         }
 
         if live_session_id:
@@ -68,7 +69,7 @@ class SignalDispatcher:
         try:
             msg_id = await publish(TRADING_ORDERS, payload)
             logger.info(
-                f"[SignalDispatcher] dispatched signal: {signal.signal_name} "
+                f"[SF-05][SignalDispatcher] dispatched: {signal.signal_name} "
                 f"{signal.side} {signal.quantity} {symbol} -> msg_id={msg_id}"
             )
             return msg_id
@@ -94,6 +95,13 @@ class SignalDispatcher:
 
         logger.info(f"[SignalDispatcher] dispatching {signal.signal_name} {symbol} side={signal.side} qty={signal.quantity}")
 
+        # 平仓信号跳过 RiskGuard
+        if signal.is_close_position:
+            logger.info(f"[SignalDispatcher] close position — skipping RiskGuard")
+            return await self.dispatch(
+                signal, symbol, exchange_account_id, user_id, live_session_id
+            )
+
         riskguard = RiskGuard.get_instance()
         if riskguard:
             from apps.trading.adapters.base import OrderRequest
@@ -109,7 +117,8 @@ class SignalDispatcher:
             approved, reason = await riskguard.pre_trade_check(request, user_id)
             if not approved:
                 logger.warning(
-                    f"[SignalDispatcher] signal rejected by RiskGuard: {reason}"
+                    f"[SF-04][SignalDispatcher] signal rejected by RiskGuard: {reason} "
+                    f"| {signal.signal_name} {signal.side} {signal.quantity} {symbol}"
                 )
                 return None
         else:

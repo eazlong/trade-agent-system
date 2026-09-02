@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 
 from celery_app import app
@@ -18,24 +19,41 @@ _wf_logger = logging.getLogger(f"{__name__}.workflow")
 # Health check constants
 # ---------------------------------------------------------------------------
 _HEARTBEAT_INTERVAL = 60  # seconds — push heartbeat if last_hb older than this
-_ZOMBIE_TIMEOUT = 300  # seconds — mark as zombie if no update for this long
+_ZOMBIE_TIMEOUT = 3600  # seconds — mark as zombie if no update for this long (1h)
 
 
 def _session_manager_reset() -> None:
     """Clear session-level Redis connection caches.
 
-    Resets the SessionManager singleton's Redis client and the
-    memory-layer Redis client pool for the current PID.  Must be called
-    with the event loop still running — it invokes async close() via the
-    active loop.
+    Must be called with the event loop still usable (i.e. before
+    ``loop.close()`` in the Celery-task finally block).  Failing to
+    properly close these clients leaves connections bound to the loop;
+    when the loop is then closed and Python GC collects the connection
+    objects, their ``__del__`` hits a closed loop and logs
+    ``RuntimeError: Event loop is closed``.
     """
     from apps.memory.redis_client import RedisPool
 
     RedisPool.close_client()
 
     try:
+        from apps.agent import ws_pending
+        ws_pending._reset_client()
+    except Exception:
+        pass
+
+    try:
         from apps.agent.session_manager import _session_manager
+        old = _session_manager._redis
         _session_manager._redis = None
+        if old is not None:
+            # Best-effort sync close via the still-alive thread loop.
+            try:
+                loop = asyncio.get_event_loop()
+                if loop is not None and not loop.is_closed():
+                    loop.run_until_complete(old.aclose())
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -65,6 +83,7 @@ def execute_scheduled_agent_task(
     """
     from apps.agent.base import AgentMessage, AgentResult
     from apps.agent.supervisor import SupervisorAgent
+    from apps.agent.task_tracker import TaskTracker, tracker_context
 
     logger.info(
         "[execute_scheduled_agent_task] agent=%s user_id=%s task_id=%s",
@@ -83,6 +102,18 @@ def execute_scheduled_agent_task(
                 scheduled_task_id,
             )
             return {"status": "SKIPPED", "agent_name": agent_name, "reason": "not_pending"}
+
+    # Use celery_task_id as tracker task_id, fallback to scheduled_task_id
+    tracker_task_id = self.request.id or scheduled_task_id or str(uuid.uuid4())
+
+    # Initialize TaskTracker for scheduled task execution
+    tracker = TaskTracker(
+        task_id=tracker_task_id,
+        user_id=str(user_id or ""),
+        task_type="scheduled_agent",
+    )
+    token = tracker_context.set(tracker)
+    tracker.start(f"定时任务已触发：{agent_name}")
 
     msg = AgentMessage(
         sender="scheduler",
@@ -113,6 +144,11 @@ def execute_scheduled_agent_task(
                 agent_name,
                 str(result.data)[:200],
             )
+
+            # Format result summary for notification
+            result_summary = str(result.data)[:4000] if result.data else "任务完成"
+            tracker.complete(f"{agent_name} 执行完成：{result_summary}")
+
             task_result = {
                 "status": "SUCCESS",
                 "agent_name": agent_name,
@@ -124,6 +160,9 @@ def execute_scheduled_agent_task(
                 agent_name,
                 result.error,
             )
+
+            tracker.fail(f"{agent_name} 执行失败：{result.error}")
+
             task_result = {
                 "status": "FAILURE",
                 "agent_name": agent_name,
@@ -135,12 +174,18 @@ def execute_scheduled_agent_task(
             e,
             exc_info=True,
         )
+
+        tracker.fail(f"任务执行异常：{str(e)}")
+
         task_result = {
             "status": "ERROR",
             "agent_name": agent_name,
             "error": str(e),
         }
     finally:
+        tracker.stop()
+        tracker_context.reset(token)
+
         # Always finalize DB status if scheduled_task_id provided
         if scheduled_task_id:
             status = task_result.get("status", "ERROR") if task_result else "ERROR"
@@ -515,7 +560,7 @@ def _handle_zombie_task(
     max_retries = int(data.get("max_retries", 1))
     original_task_str = data.get("original_task", "")
 
-    short_id = task_id[:8]
+    short_id = task_id
     age_str = f"{int(age)}秒"
 
     # original_task 缺失：无法重试，直接标记僵尸并通知用户
@@ -554,6 +599,7 @@ def _handle_zombie_task(
                 try:
                     new_task_id = loop.run_until_complete(_republish())
                 finally:
+                    _session_manager_reset()
                     loop.close()
 
             r.hset(
@@ -570,7 +616,7 @@ def _handle_zombie_task(
                 user_id,
                 f"⚠️ 任务 #{short_id} 超时无响应（{age_str}）\n"
                 f"🔄 已自动重试（第 {retry_count + 1}/{max_retries} 次）\n"
-                f"新任务 ID: {new_task_id[:8]}",
+                f"新任务 ID: {new_task_id}",
             )
 
             archive_task_progress.delay(
@@ -633,7 +679,7 @@ def _send_heartbeat_notification(
     """推送心跳通知——含当前进度和阶段。"""
     from apps.agent.task_tracker import _send_notification_redis
 
-    short_id = task_id[:8]
+    short_id = task_id
     mins = int(age) // 60
     secs = int(age) % 60
     elapsed = f"{mins}分{secs}秒" if mins else f"{secs}秒"

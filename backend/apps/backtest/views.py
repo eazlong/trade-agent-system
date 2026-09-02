@@ -30,7 +30,9 @@ def result_list(request):
     # --- original flat mode (unchanged) ---
     page = int(request.query_params.get("page", 1))
     page_size = min(int(request.query_params.get("page_size", 20)), 200)
-    queryset = BacktestResult.objects.order_by("-created_at")
+    queryset = BacktestResult.objects.defer(
+        "ohlcv_data", "equity_curve", "drawdown_curve", "indicator_data",
+    ).order_by("-created_at")
     paginator = Paginator(queryset, page_size)
     page_obj = paginator.get_page(page)
     return Response(
@@ -44,16 +46,23 @@ def result_list(request):
 
 
 def _build_grouped_response(request):
-    """按 grid_search_id 聚合回测结果，返回分组结构。"""
+    """按 grid_search_id 聚合回测结果，返回分组结构。
+
+    包含三种类型的分组：
+    - grid_search: 有至少一个 BacktestResult 的网格搜索任务
+    - pending_grid_search: 还没有 BacktestResult 的网格搜索任务（pending/running）
+    - orphaned_grid_search: 网格搜索任务已删除，但留有 BacktestResult
+    - single: 单个回测结果
+    """
     from .models import GridSearchJob
     from .serializers import BacktestResultSerializer, GridSearchGroupSerializer, SingleGroupSerializer
     from collections import defaultdict
 
     user = request.user
-    # 查当前用户的回测 + 无用户的回测（Agent 渠道创建的历史数据）
-    results = BacktestResult.objects.filter(
-        models.Q(user=user) | models.Q(user__isnull=True)
-    ).select_related("strategy")
+    user_filter = models.Q(user=user) | models.Q(user__isnull=True)
+    results = BacktestResult.objects.filter(user_filter).select_related("strategy").defer(
+        "ohlcv_data", "equity_curve", "drawdown_curve", "indicator_data",
+    )
 
     # 按 grid_search_id 分组
     grid_map = defaultdict(list)
@@ -65,13 +74,13 @@ def _build_grouped_response(request):
             singles.append(r)
 
     groups = []
+    existing_job_ids = set(grid_map.keys())
 
-    # 构建网格搜索分组
-    job_ids = list(grid_map.keys())
+    # ── 1. 构建有结果的网格搜索分组 ──
     # prefetch jobs
     jobs_by_id = {}
-    if job_ids:
-        for job in GridSearchJob.objects.filter(id__in=job_ids).select_related("strategy"):
+    if existing_job_ids:
+        for job in GridSearchJob.objects.filter(id__in=existing_job_ids).select_related("strategy"):
             jobs_by_id[str(job.id)] = job
 
     for job_id, job_results in grid_map.items():
@@ -114,7 +123,32 @@ def _build_grouped_response(request):
                 "results": BacktestResultSerializer(job_results, many=True).data,
             })
 
-    # 单次回测
+    # ── 2. 构建无结果的网格搜索分组（pending/running，暂无 BacktestResult） ──
+    pending_jobs = GridSearchJob.objects.filter(
+        user_filter
+    ).exclude(
+        id__in=list(existing_job_ids)
+    ).select_related("strategy").order_by("-created_at")
+
+    for job in pending_jobs:
+        strategy_name = job.strategy.name if job.strategy else "Unknown"
+        job_name = f"{strategy_name} - {job.symbol}/{job.timeframe}"
+        groups.append({
+            "type": "grid_search",
+            "job_id": str(job.id),
+            "job_name": job_name,
+            "symbol": job.symbol,
+            "timeframe": job.timeframe,
+            "status": job.status,
+            "total_combinations": job.total_combinations,
+            "completed": job.completed_combinations,
+            "best_return_pct": None,
+            "best_sharpe": None,
+            "created_at": job.created_at,
+            "results": [],
+        })
+
+    # ── 3. 单次回测 ──
     for r in singles:
         groups.append({
             "type": "single",
@@ -654,6 +688,8 @@ def grid_search_results(request, pk):
 
     results = BacktestResult.objects.filter(
         grid_search_id=job.id
+    ).defer(
+        "ohlcv_data", "equity_curve", "drawdown_curve", "indicator_data",
     ).order_by(sort)
 
     paginator = Paginator(results, page_size)
