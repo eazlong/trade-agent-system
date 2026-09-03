@@ -223,7 +223,9 @@ def _count_touches(
                 touches += 1
             last_touch_index = index
 
-    timestamp = klines[last_touch_index].get("timestamp") if last_touch_index >= 0 else None
+    timestamp = (
+        klines[last_touch_index].get("timestamp") if last_touch_index >= 0 else None
+    )
     return touches, last_touch_index, timestamp
 
 
@@ -250,9 +252,13 @@ def horizontal_key_levels(
     candidates = []
     for index in range(pivot_window, len(klines) - pivot_window):
         if _is_pivot(lows, index, pivot_window, "low"):
-            candidates.append({"price": float(lows[index]), "index": index, "source": "low"})
+            candidates.append(
+                {"price": float(lows[index]), "index": index, "source": "low"}
+            )
         if _is_pivot(highs, index, pivot_window, "high"):
-            candidates.append({"price": float(highs[index]), "index": index, "source": "high"})
+            candidates.append(
+                {"price": float(highs[index]), "index": index, "source": "high"}
+            )
 
     clusters: list[list[dict]] = []
     for candidate in sorted(candidates, key=lambda item: item["price"]):
@@ -308,7 +314,6 @@ def horizontal_key_levels(
     }
 
 
-
 def stoch(
     history: list[dict],
     k_period: int = 14,
@@ -324,6 +329,7 @@ def stoch(
 
 
 # --- 箱体判定 ----------------------------------------------------------
+
 
 def _cluster_pivot_price(
     prices: list[float],
@@ -350,9 +356,7 @@ def _cluster_pivot_price(
                 break
         else:
             clusters.append([price])
-    return [
-        (sum(cluster) / len(cluster), len(cluster)) for cluster in clusters
-    ]
+    return [(sum(cluster) / len(cluster), len(cluster)) for cluster in clusters]
 
 
 def _ts_delta_seconds(
@@ -371,7 +375,9 @@ def _ts_delta_seconds(
         end, (int, float, np.integer, np.floating)
     ):
         start_f, end_f = float(start), float(end)
-        scale = 1000.0 if max(abs(start_f), abs(end_f)) > 1e11 else 1.0
+        if (abs(start_f) > 1e11) != (abs(end_f) > 1e11):
+            return None  # 两端单位不一致（秒 vs 毫秒），避免静默算错
+        scale = 1000.0 if abs(start_f) > 1e11 else 1.0
         return (end_f - start_f) / scale
     if isinstance(start, str) and isinstance(end, str):
         try:
@@ -534,10 +540,18 @@ def detect_box_range(
     if not isinstance(klines, list):
         raise ValueError("klines 必须是 K线 dict 列表")
     _validate_box_range_params(
-        klines, max_width_abs, max_width_pct,
-        pivot_window, min_gap_bars, min_pivots, min_touches, atr_period,
-        upper_max_discard_pct, lower_max_discard_pct,
-        min_width_abs, min_width_pct,
+        klines,
+        max_width_abs,
+        max_width_pct,
+        pivot_window,
+        min_gap_bars,
+        min_pivots,
+        min_touches,
+        atr_period,
+        upper_max_discard_pct,
+        lower_max_discard_pct,
+        min_width_abs,
+        min_width_pct,
     )
 
     abs_threshold = float(max_width_abs) if max_width_abs is not None else None
@@ -611,9 +625,7 @@ def detect_box_range(
             continue
         if count < min_pivots:
             continue
-        touches, _, _ = _count_touches(
-            klines, mean, tolerance_pct, min_gap_bars, "low"
-        )
+        touches, _, _ = _count_touches(klines, mean, tolerance_pct, min_gap_bars, "low")
         if touches < min_touches:
             continue
         lower_candidates.append((mean, count, touches))
@@ -633,7 +645,7 @@ def detect_box_range(
         )
 
     # 在 (upper, lower) 组合中选 (pivot_count × touches) 乘积最大
-    best: tuple[float, float, int, int, int, int] | None = None
+    best: tuple[float, float, int, int, int, int, int] | None = None
     for u_mean, u_count, u_touches in upper_candidates:
         for l_mean, l_count, l_touches in lower_candidates:
             if u_mean <= l_mean:
@@ -651,8 +663,15 @@ def detect_box_range(
                 continue
             score = u_count * u_touches * l_count * l_touches
             if best is None or score > best[0]:
-                best = (score, u_mean, u_count, u_touches, l_mean, l_count)
-                # unpack-friendly
+                best = (
+                    score,
+                    u_mean,
+                    u_count,
+                    u_touches,
+                    l_mean,
+                    l_count,
+                    l_touches,
+                )
     if best is None:
         # 给出更精确的原因：先看 width，再看 floor
         sample_w = upper_candidates[0][0] - lower_candidates[0][0]
@@ -671,12 +690,15 @@ def detect_box_range(
             return _fail(f"震荡区间相对宽度超限（{wp:.4%} > {pct_threshold:.4%}）")
         return _fail("未找到满足宽度约束的 (upper, lower) 组合")
 
-    _score, upper, upper_pivot_count, upper_touches, lower, lower_pivot_count = best
-    lower_touches = next(
-        touches
-        for mean, count, touches in lower_candidates
-        if mean == lower and count == lower_pivot_count
-    )
+    (
+        _score,
+        upper,
+        upper_pivot_count,
+        upper_touches,
+        lower,
+        lower_pivot_count,
+        lower_touches,
+    ) = best
     width = upper - lower
     mid = (upper + lower) / 2
     width_pct = width / mid if mid > 0 else 0.0

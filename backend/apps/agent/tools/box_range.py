@@ -63,7 +63,7 @@ class DetectBoxRangeTool(BaseTool):
                 },
                 "max_width_pct": {
                     "type": "number",
-                    "description": "震荡区间相对宽度上限（占中线比例，如 0.03 表示 3%），与 max_width_pct 二选一必填",
+                    "description": "震荡区间相对宽度上限（占中线比例，如 0.03 表示 3%），与 max_width_abs 二选一必填",
                 },
                 "pivot_window": {
                     "type": "integer",
@@ -146,8 +146,16 @@ class DetectBoxRangeTool(BaseTool):
 
             data = detect_box_range(
                 klines=klines,
-                max_width_abs=kwargs.get("max_width_abs"),
-                max_width_pct=kwargs.get("max_width_pct"),
+                max_width_abs=(
+                    float(kwargs["max_width_abs"])
+                    if kwargs.get("max_width_abs") is not None
+                    else None
+                ),
+                max_width_pct=(
+                    float(kwargs["max_width_pct"])
+                    if kwargs.get("max_width_pct") is not None
+                    else None
+                ),
                 pivot_window=int(kwargs.get("pivot_window", 2)),
                 min_gap_bars=int(kwargs.get("min_gap_bars", 3)),
                 min_pivots=int(kwargs.get("min_pivots", 2)),
@@ -155,8 +163,16 @@ class DetectBoxRangeTool(BaseTool):
                 atr_period=int(kwargs.get("atr_period", 14)),
                 upper_max_discard_pct=float(kwargs.get("upper_max_discard_pct", 0.15)),
                 lower_max_discard_pct=float(kwargs.get("lower_max_discard_pct", 0.15)),
-                min_width_abs=kwargs.get("min_width_abs"),
-                min_width_pct=kwargs.get("min_width_pct"),
+                min_width_abs=(
+                    float(kwargs["min_width_abs"])
+                    if kwargs.get("min_width_abs") is not None
+                    else None
+                ),
+                min_width_pct=(
+                    float(kwargs["min_width_pct"])
+                    if kwargs.get("min_width_pct") is not None
+                    else None
+                ),
             )
             return ToolResult(success=True, data=data)
         except (TypeError, ValueError) as exc:

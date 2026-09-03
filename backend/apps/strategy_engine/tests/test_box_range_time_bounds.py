@@ -178,6 +178,13 @@ def test_malformed_iso_and_mixed_types_degrade():
     assert box["end_index"] == 24
     assert box["duration_seconds"] is None
 
+    mixed_units = [1_700_000_000 + i * 60 for i in range(len(closes))]
+    mixed_units[24] = 1_700_001_440_000  # 秒 vs 毫秒
+    box = _run(closes, timestamps=mixed_units)
+    assert box["start_index"] == 3
+    assert box["end_index"] == 24
+    assert box["duration_seconds"] is None
+
 
 def test_inbox_boundary_equality():
     """在箱判定含边界：close 恰为 lower×(1-tol) / upper×(1+tol) 算在箱内。"""
@@ -197,6 +204,45 @@ def test_inbox_boundary_equality():
     assert stats["end_index"] == 1
     assert stats["bars_in_box"] == 2
     assert stats["duration_bars"] == 2
+
+
+def test_started_inside_then_exits():
+    """窗口开头在箱内，中途离箱后不再回：started_in_box=True 且 end < len-1。"""
+    closes = [_IN] * 12 + [_OUT_LOW] * 18  # 0..11 在箱，12..29 离箱
+    timestamps = [f"2026-01-01T00:{i:02d}:00Z" for i in range(len(closes))]
+    box = _run(closes, timestamps=timestamps)
+
+    assert box["start_index"] == 0
+    assert box["end_index"] == 11
+    assert box["started_in_box"] is True
+    assert box["duration_bars"] == 12
+    assert box["bars_in_box"] == 12
+    assert box["duration_seconds"] == 11 * 60
+
+
+def test_approaching_stage_in_expansion_band():
+    """容差扩展带语义：close 尚未触及 lower（略低于 100）但 ≥ lower×(1-tol) 即算在箱。"""
+    tol = _run([_IN] * 30)["tolerance_pct"]
+    close_in_band = 100.0 * (1 - tol / 2)  # 位于 (lower×(1-tol), lower) 之间
+    assert close_in_band < 100.0  # 确实还没到 lower
+    closes = [_OUT_HIGH] * 3 + [close_in_band] * 15 + [_OUT_HIGH] * 12  # 3..17 在箱
+    box = _run(closes)
+
+    assert box["start_index"] == 3
+    assert box["end_index"] == 17
+    assert box["bars_in_box"] == 15
+
+
+def test_single_bar_in_box():
+    """退化输入：只有一根 close 在箱 → duration_bars == 1。"""
+    closes = [_OUT_HIGH] * 5 + [_IN] + [_OUT_LOW] * 14  # index 5 唯一在箱
+    box = _run(closes)
+
+    assert box["start_index"] == 5
+    assert box["end_index"] == 5
+    assert box["duration_bars"] == 1
+    assert box["bars_in_box"] == 1
+    assert box["started_in_box"] is False
 
 
 def test_missing_timestamps():
