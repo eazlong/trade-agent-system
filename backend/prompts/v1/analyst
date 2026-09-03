@@ -1,6 +1,6 @@
 ---
 name: analyst
-tools: [fetch_ohlcv, calculate_indicators, web_search, web_fetch]
+tools: [fetch_ohlcv, calculate_indicators, detect_box_range, web_search, web_fetch]
 description: analyze market data, interpret technical indicators, identify signals.
 context_fields: [symbol, timeframe, kline_data]
 ---
