@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -354,6 +355,93 @@ def _cluster_pivot_price(
     ]
 
 
+def _ts_delta_seconds(
+    start: int | float | np.integer | np.floating | str | None,
+    end: int | float | np.integer | np.floating | str | None,
+) -> float | None:
+    """尽力计算两根K线时间戳之差（秒）。
+
+    数值时间戳按 epoch 处理（两端需同一单位；值本身 > 1e11 视为毫秒）；
+    ISO 字符串尝试解析（无时区信息的解析为 naive 时按 UTC 处理，避免与
+    aware 时间戳相减抛 TypeError）；其余/不可解析情况返回 None。
+    """
+    if start is None or end is None:
+        return None
+    if isinstance(start, (int, float, np.integer, np.floating)) and isinstance(
+        end, (int, float, np.integer, np.floating)
+    ):
+        start_f, end_f = float(start), float(end)
+        scale = 1000.0 if max(abs(start_f), abs(end_f)) > 1e11 else 1.0
+        return (end_f - start_f) / scale
+    if isinstance(start, str) and isinstance(end, str):
+        try:
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            return (end_dt - start_dt).total_seconds()
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _box_time_stats(
+    klines: list[dict],
+    lower: float,
+    upper: float,
+    tolerance_pct: float,
+) -> dict:
+    """按收盘价判定每根K线是否在箱体内，返回箱体时间起止统计。
+
+    在箱判定：close 落在 [lower×(1-tol), upper×(1+tol)] 区间内（含边界），
+    与触碰容差带共用同一套 tolerance_pct 语义；影线穿透边界不算离箱。
+
+    语义（与 detect_box_range 的 box 输出一致）：
+    - start_index：第一根 close 进入箱体的 K 线；若窗口开头已在箱内则为 0，
+      并置 started_in_box=True（真实进入点可能早于窗口）。
+    - end_index：最后一根 close 仍在箱内的 K 线。
+    - duration_bars：start_index → end_index 的跨度（含中间离箱间隙，
+      “中间出去再回来算一整段”）。
+    - bars_in_box：实际处于箱内的 K 线根数。
+
+    若窗口内没有任何 close 进入箱带（first/last 均为 None），所有时间字段
+    统一为 None（仅 bars_in_box=0），避免把 0 误读为有效时长。
+    """
+    lower_floor = lower * (1 - tolerance_pct)
+    upper_ceiling = upper * (1 + tolerance_pct)
+    in_box = [lower_floor <= float(k["close"]) <= upper_ceiling for k in klines]
+    first = next((i for i, inside in enumerate(in_box) if inside), None)
+    last = next(
+        (i for i in range(len(in_box) - 1, -1, -1) if in_box[i]),
+        None,
+    )
+    if first is None or last is None:
+        return {
+            "start_index": None,
+            "end_index": None,
+            "duration_bars": None,
+            "bars_in_box": 0,
+            "started_in_box": False,
+            "start_timestamp": None,
+            "end_timestamp": None,
+            "duration_seconds": None,
+        }
+    return {
+        "start_index": first,
+        "end_index": last,
+        "duration_bars": last - first + 1,
+        "bars_in_box": sum(in_box),
+        "started_in_box": first == 0,
+        "start_timestamp": klines[first].get("timestamp"),
+        "end_timestamp": klines[last].get("timestamp"),
+        "duration_seconds": _ts_delta_seconds(
+            klines[first].get("timestamp"), klines[last].get("timestamp")
+        ),
+    }
+
+
 def _validate_box_range_params(
     klines: list[dict],
     max_width_abs: float | None,
@@ -436,6 +524,12 @@ def detect_box_range(
 
     评分挑选：在通过 pivot_count + touches + 粗筛的所有 (upper, lower) 组合中，
     选 (pivot_count × touches) 乘积最大的；若都通不过校验，依次给出失败原因。
+
+    时间起止（box 的 start/end 字段）：
+        start_index = 第一根 close 落在 [lower×(1-tol), upper×(1+tol)] 内的 K 线，
+        end_index   = 最后一根 close 仍在箱内的 K 线；
+        duration_bars = start_index → end_index 的跨度（中间离箱再回来算一整段）。
+    判定只用 close（影线穿透上下沿不算离箱）。
     """
     if not isinstance(klines, list):
         raise ValueError("klines 必须是 K线 dict 列表")
@@ -587,21 +681,24 @@ def detect_box_range(
     mid = (upper + lower) / 2
     width_pct = width / mid if mid > 0 else 0.0
 
+    box = {
+        "upper": upper,
+        "lower": lower,
+        "mid": mid,
+        "width": width,
+        "width_pct": width_pct,
+        "upper_pivot_count": upper_pivot_count,
+        "lower_pivot_count": lower_pivot_count,
+        "upper_touches": upper_touches,
+        "lower_touches": lower_touches,
+        "pivot_window": pivot_window,
+        "tolerance_pct": tolerance_pct,
+    }
+    box.update(_box_time_stats(klines, lower, upper, tolerance_pct))
+
     return {
         "is_ranging": True,
-        "box": {
-            "upper": upper,
-            "lower": lower,
-            "mid": mid,
-            "width": width,
-            "width_pct": width_pct,
-            "upper_pivot_count": upper_pivot_count,
-            "lower_pivot_count": lower_pivot_count,
-            "upper_touches": upper_touches,
-            "lower_touches": lower_touches,
-            "pivot_window": pivot_window,
-            "tolerance_pct": tolerance_pct,
-        },
+        "box": box,
         "reason": "",
         "params": params,
     }
