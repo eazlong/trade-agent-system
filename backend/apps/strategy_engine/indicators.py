@@ -327,14 +327,18 @@ def stoch(
 def _cluster_pivot_price(
     prices: list[float],
     tolerance_pct: float,
-) -> tuple[float, int] | None:
-    """把多个 pivot 价格按容差带聚成单一价格。
+) -> list[tuple[float, int]]:
+    """把多个 pivot 价格按容差带聚成一组 cluster。
 
     Returns:
-        (聚合价, pivot 数量)；pivot 不足 1 个时返回 None。
+        所有 cluster 的列表，每项为 (聚合价, pivot 数量)。空输入返回 []。
+
+    注意：之前版本只返回最大簇；那会让 detect_box_range 误把"局部紧簇"
+    当成"全窗口箱体"。现在返回全部 cluster，让调用方按 (pivot_count, touches)
+    综合评分挑选。
     """
     if not prices:
-        return None
+        return []
     sorted_prices = sorted(prices)
     clusters: list[list[float]] = []
     for price in sorted_prices:
@@ -345,8 +349,9 @@ def _cluster_pivot_price(
                 break
         else:
             clusters.append([price])
-    largest = max(clusters, key=len)
-    return sum(largest) / len(largest), len(largest)
+    return [
+        (sum(cluster) / len(cluster), len(cluster)) for cluster in clusters
+    ]
 
 
 def _validate_box_range_params(
@@ -358,6 +363,10 @@ def _validate_box_range_params(
     min_pivots: int,
     min_touches: int,
     atr_period: int,
+    upper_max_discard_pct: float,
+    lower_max_discard_pct: float,
+    min_width_abs: float | None,
+    min_width_pct: float | None,
 ) -> None:
     if max_width_abs is None and max_width_pct is None:
         raise ValueError("必须传入 max_width_abs 或 max_width_pct 之一")
@@ -377,6 +386,14 @@ def _validate_box_range_params(
         raise ValueError("min_touches 必须 >= 1")
     if atr_period < 1:
         raise ValueError("atr_period 必须 >= 1")
+    if not 0 <= upper_max_discard_pct < 1:
+        raise ValueError("upper_max_discard_pct 必须在 [0, 1) 之间")
+    if not 0 <= lower_max_discard_pct < 1:
+        raise ValueError("lower_max_discard_pct 必须在 [0, 1) 之间")
+    if min_width_abs is not None and min_width_abs < 0:
+        raise ValueError("min_width_abs 必须 >= 0")
+    if min_width_pct is not None and min_width_pct < 0:
+        raise ValueError("min_width_pct 必须 >= 0")
 
     min_bars = 2 * pivot_window + 1
     if len(klines) < min_bars:
@@ -401,25 +418,47 @@ def detect_box_range(
     min_pivots: int = 2,
     min_touches: int = 2,
     atr_period: int = 14,
+    upper_max_discard_pct: float = 0.15,
+    lower_max_discard_pct: float = 0.15,
+    min_width_abs: float | None = None,
+    min_width_pct: float | None = None,
 ) -> dict:
     """判断 K 线窗口是否处于箱体震荡，并返回上下边界。
 
     两次验证：上下边界必须同时满足
         pivot_count >= min_pivots  AND  touches >= min_touches
+
+    窗口粗筛（防止"局部紧簇冒充箱体"）：
+        选出的 upper 必须 ≥ window_high × (1 - upper_max_discard_pct)
+        选出的 lower 必须 ≤ window_low  × (1 + lower_max_discard_pct)
+        即"丢掉"窗口极值的一部分。默认 0.15 意味着上沿至少够到窗口高点 85%，
+        下沿最多只到窗口低点 115%。
+
+    评分挑选：在通过 pivot_count + touches + 粗筛的所有 (upper, lower) 组合中，
+    选 (pivot_count × touches) 乘积最大的；若都通不过校验，依次给出失败原因。
     """
     if not isinstance(klines, list):
         raise ValueError("klines 必须是 K线 dict 列表")
     _validate_box_range_params(
         klines, max_width_abs, max_width_pct,
         pivot_window, min_gap_bars, min_pivots, min_touches, atr_period,
+        upper_max_discard_pct, lower_max_discard_pct,
+        min_width_abs, min_width_pct,
     )
 
     abs_threshold = float(max_width_abs) if max_width_abs is not None else None
     pct_threshold = float(max_width_pct) if max_width_pct is not None else None
+    min_abs_floor = float(min_width_abs) if min_width_abs is not None else None
+    min_pct_floor = float(min_width_pct) if min_width_pct is not None else None
 
     highs = np.array([float(k["high"]) for k in klines], dtype=np.float64)
     lows = np.array([float(k["low"]) for k in klines], dtype=np.float64)
     tolerance_pct = _latest_tolerance_pct(klines, atr_period)
+
+    window_high = float(highs.max())
+    window_low = float(lows.min())
+    upper_floor = window_high * (1 - upper_max_discard_pct)
+    lower_ceiling = window_low * (1 + lower_max_discard_pct)
 
     high_pivots: list[float] = []
     low_pivots: list[float] = []
@@ -429,8 +468,8 @@ def detect_box_range(
         if _is_pivot(lows, index, pivot_window, "low"):
             low_pivots.append(float(lows[index]))
 
-    upper_cluster = _cluster_pivot_price(high_pivots, tolerance_pct)
-    lower_cluster = _cluster_pivot_price(low_pivots, tolerance_pct)
+    upper_clusters = _cluster_pivot_price(high_pivots, tolerance_pct)
+    lower_clusters = _cluster_pivot_price(low_pivots, tolerance_pct)
 
     params = {
         "max_width_abs": abs_threshold,
@@ -439,9 +478,13 @@ def detect_box_range(
         "min_pivots": min_pivots,
         "min_touches": min_touches,
         "tolerance_pct": tolerance_pct,
+        "upper_max_discard_pct": upper_max_discard_pct,
+        "lower_max_discard_pct": lower_max_discard_pct,
+        "min_width_abs": min_abs_floor,
+        "min_width_pct": min_pct_floor,
     }
 
-    if upper_cluster is None or lower_cluster is None:
+    if not upper_clusters or not lower_clusters:
         return {
             "is_ranging": False,
             "box": None,
@@ -449,34 +492,100 @@ def detect_box_range(
             "params": params,
         }
 
-    upper, upper_pivot_count = upper_cluster
-    lower, lower_pivot_count = lower_cluster
-    width = upper - lower
-    mid = (upper + lower) / 2
-    width_pct = width / mid if mid > 0 else 0.0
+    def _passes_coarse(price: float, is_upper: bool) -> bool:
+        if is_upper:
+            return price >= upper_floor
+        return price <= lower_ceiling
 
-    upper_touches, _, _ = _count_touches(
-        klines, upper, tolerance_pct, min_gap_bars, "high"
-    )
-    lower_touches, _, _ = _count_touches(
-        klines, lower, tolerance_pct, min_gap_bars, "low"
-    )
+    # 先在每个 cluster 上算 touches，挑出"够格"的 cluster
+    upper_candidates: list[tuple[float, int, int]] = []  # (mean, pivot_count, touches)
+    for mean, count in upper_clusters:
+        if not _passes_coarse(mean, is_upper=True):
+            continue
+        if count < min_pivots:
+            continue
+        touches, _, _ = _count_touches(
+            klines, mean, tolerance_pct, min_gap_bars, "high"
+        )
+        if touches < min_touches:
+            continue
+        upper_candidates.append((mean, count, touches))
+
+    lower_candidates: list[tuple[float, int, int]] = []
+    for mean, count in lower_clusters:
+        if not _passes_coarse(mean, is_upper=False):
+            continue
+        if count < min_pivots:
+            continue
+        touches, _, _ = _count_touches(
+            klines, mean, tolerance_pct, min_gap_bars, "low"
+        )
+        if touches < min_touches:
+            continue
+        lower_candidates.append((mean, count, touches))
 
     def _fail(reason: str) -> dict:
         return {"is_ranging": False, "box": None, "reason": reason, "params": params}
 
-    if upper_pivot_count < min_pivots:
-        return _fail(f"上边界 pivot 不足（{upper_pivot_count} < {min_pivots}）")
-    if lower_pivot_count < min_pivots:
-        return _fail(f"下边界 pivot 不足（{lower_pivot_count} < {min_pivots}）")
-    if upper_touches < min_touches:
-        return _fail(f"上边界触碰不足（{upper_touches} < {min_touches}）")
-    if lower_touches < min_touches:
-        return _fail(f"下边界触碰不足（{lower_touches} < {min_touches}）")
-    if abs_threshold is not None and width > abs_threshold:
-        return _fail(f"震荡区间绝对宽度超限（{width} > {abs_threshold}）")
-    if pct_threshold is not None and width_pct > pct_threshold:
-        return _fail(f"震荡区间相对宽度超限（{width_pct:.4%} > {pct_threshold:.4%}）")
+    if not upper_candidates:
+        return _fail(
+            f"上沿候选 cluster 不满足粗筛/pivot/触碰条件"
+            f"（window_high={window_high:.2f}, upper_floor={upper_floor:.2f}）"
+        )
+    if not lower_candidates:
+        return _fail(
+            f"下沿候选 cluster 不满足粗筛/pivot/触碰条件"
+            f"（window_low={window_low:.2f}, lower_ceiling={lower_ceiling:.2f}）"
+        )
+
+    # 在 (upper, lower) 组合中选 (pivot_count × touches) 乘积最大
+    best: tuple[float, float, int, int, int, int] | None = None
+    for u_mean, u_count, u_touches in upper_candidates:
+        for l_mean, l_count, l_touches in lower_candidates:
+            if u_mean <= l_mean:
+                continue
+            width = u_mean - l_mean
+            mid = (u_mean + l_mean) / 2
+            width_pct = width / mid if mid > 0 else 0.0
+            if abs_threshold is not None and width > abs_threshold:
+                continue
+            if pct_threshold is not None and width_pct > pct_threshold:
+                continue
+            if min_abs_floor is not None and width < min_abs_floor:
+                continue
+            if min_pct_floor is not None and width_pct < min_pct_floor:
+                continue
+            score = u_count * u_touches * l_count * l_touches
+            if best is None or score > best[0]:
+                best = (score, u_mean, u_count, u_touches, l_mean, l_count)
+                # unpack-friendly
+    if best is None:
+        # 给出更精确的原因：先看 width，再看 floor
+        sample_w = upper_candidates[0][0] - lower_candidates[0][0]
+        if min_abs_floor is not None and sample_w < min_abs_floor:
+            return _fail(f"箱体宽度低于下限（{sample_w:.2f} < {min_abs_floor}）")
+        if min_pct_floor is not None:
+            mid = (upper_candidates[0][0] + lower_candidates[0][0]) / 2
+            wp = sample_w / mid if mid > 0 else 0.0
+            if wp < min_pct_floor:
+                return _fail(f"箱体相对宽度低于下限（{wp:.4%} < {min_pct_floor:.4%}）")
+        if abs_threshold is not None:
+            return _fail(f"震荡区间绝对宽度超限（{sample_w:.2f} > {abs_threshold}）")
+        if pct_threshold is not None:
+            mid = (upper_candidates[0][0] + lower_candidates[0][0]) / 2
+            wp = sample_w / mid if mid > 0 else 0.0
+            return _fail(f"震荡区间相对宽度超限（{wp:.4%} > {pct_threshold:.4%}）")
+        return _fail("未找到满足宽度约束的 (upper, lower) 组合")
+
+    _score, upper, upper_pivot_count, upper_touches, lower, lower_pivot_count = best
+    lower_touches = next(
+        touches
+        for mean, count, touches in lower_candidates
+        if mean == lower and count == lower_pivot_count
+    )
+    width = upper - lower
+    mid = (upper + lower) / 2
+    width_pct = width / mid if mid > 0 else 0.0
 
     return {
         "is_ranging": True,

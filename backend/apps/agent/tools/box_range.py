@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from pathlib import Path
+
 from .base import BaseTool, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 class DetectBoxRangeTool(BaseTool):
@@ -14,6 +20,12 @@ class DetectBoxRangeTool(BaseTool):
         "并返回上下边界价格。判断条件：上下边界必须同时满足 "
         "局部极值点数 >= min_pivots 且被K线触碰次数 >= min_touches，"
         "且整体宽度不超过 max_width_abs / max_width_pct 阈值。"
+        "为避免「局部紧簇冒充箱体」，算法会用窗口真实高/低做粗筛："
+        "选出的上沿必须 >= window_high × (1 - upper_max_discard_pct)，"
+        "下沿必须 <= window_low × (1 + lower_max_discard_pct)，"
+        "默认值 0.15 意味着覆盖窗口至少 70% 的真实极差。"
+        "klines 可以直接传 K线 dict 列表（每项需含 high/low/close），"
+        "也可以传 fetch_ohlcv 返回的 temp_file 路径字符串（工具会自动读取）。"
         "只做纯计算，不获取行情。"
     )
 
@@ -23,9 +35,15 @@ class DetectBoxRangeTool(BaseTool):
             "type": "object",
             "properties": {
                 "klines": {
-                    "type": "array",
-                    "description": "K线列表，每项需包含 high、low、close，可包含 timestamp/open/volume",
-                    "items": {"type": "object"},
+                    "description": (
+                        "K线数据。两种形式任选其一："
+                        "(a) K线 dict 列表，每项需包含 high、low、close，可包含 timestamp/open/volume；"
+                        "(b) fetch_ohlcv 工具返回的 temp_file 路径字符串（工具会自动读取并解析）。"
+                    ),
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"type": "string"},
+                    ],
                 },
                 "max_width_abs": {
                     "type": "number",
@@ -33,7 +51,7 @@ class DetectBoxRangeTool(BaseTool):
                 },
                 "max_width_pct": {
                     "type": "number",
-                    "description": "震荡区间相对宽度上限（占中线比例，如 0.03 表示 3%），与 max_width_abs 二选一必填",
+                    "description": "震荡区间相对宽度上限（占中线比例，如 0.03 表示 3%），与 max_width_pct 二选一必填",
                 },
                 "pivot_window": {
                     "type": "integer",
@@ -60,16 +78,62 @@ class DetectBoxRangeTool(BaseTool):
                     "default": 14,
                     "description": "用于推导触碰容差的 ATR 周期",
                 },
+                "upper_max_discard_pct": {
+                    "type": "number",
+                    "default": 0.15,
+                    "description": "上沿粗筛：选出的上沿必须 >= window_high × (1 - 该值)。0.15 = 至少够到窗口高点 85%",
+                },
+                "lower_max_discard_pct": {
+                    "type": "number",
+                    "default": 0.15,
+                    "description": "下沿粗筛：选出的下沿必须 <= window_low × (1 + 该值)。0.15 = 最多只到窗口低点 115%",
+                },
+                "min_width_abs": {
+                    "type": "number",
+                    "description": "箱体绝对宽度下限（避免返回过窄的伪箱体）",
+                },
+                "min_width_pct": {
+                    "type": "number",
+                    "description": "箱体相对宽度下限（占中线比例，如 0.01 表示 1%）",
+                },
             },
             "required": ["klines"],
         }
 
+    @staticmethod
+    def _coerce_klines(value) -> list[dict]:
+        """Accept list[dict] (preferred) or a temp_file path string from fetch_ohlcv."""
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            path = Path(value)
+            if not path.exists():
+                raise ValueError(
+                    f"klines 是字符串但路径不存在: {value}。"
+                    "请直接传 K线 dict 列表，或先调用 fetch_ohlcv 拿到 temp_file"
+                )
+            try:
+                records = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"无法从 {value} 解析 K线 JSON: {exc}") from exc
+            if not isinstance(records, list):
+                raise ValueError(f"{value} 内容不是 K线列表（顶层需为数组）")
+            return records
+        raise ValueError(
+            "klines 必须是 K线 dict 列表，或 fetch_ohlcv 返回的 temp_file 路径字符串"
+        )
+
     async def execute(self, **kwargs) -> ToolResult:
+        try:
+            klines = self._coerce_klines(kwargs.get("klines"))
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
         try:
             from apps.strategy_engine.indicators import detect_box_range
 
             data = detect_box_range(
-                klines=kwargs.get("klines"),
+                klines=klines,
                 max_width_abs=kwargs.get("max_width_abs"),
                 max_width_pct=kwargs.get("max_width_pct"),
                 pivot_window=int(kwargs.get("pivot_window", 2)),
@@ -77,6 +141,10 @@ class DetectBoxRangeTool(BaseTool):
                 min_pivots=int(kwargs.get("min_pivots", 2)),
                 min_touches=int(kwargs.get("min_touches", 2)),
                 atr_period=int(kwargs.get("atr_period", 14)),
+                upper_max_discard_pct=float(kwargs.get("upper_max_discard_pct", 0.15)),
+                lower_max_discard_pct=float(kwargs.get("lower_max_discard_pct", 0.15)),
+                min_width_abs=kwargs.get("min_width_abs"),
+                min_width_pct=kwargs.get("min_width_pct"),
             )
             return ToolResult(success=True, data=data)
         except (TypeError, ValueError) as exc:
