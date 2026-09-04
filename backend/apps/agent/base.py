@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +51,26 @@ class BaseAgent(ABC):
     _agent_tools: list[str] = []
     # 工具调用最大循环轮数
     _max_tool_rounds: int = 32
+    # 未验证任务声明的最大纠错轮数（见 _run_tool_loop 防虚构守卫）
+    _max_claim_corrections: int = 2
+
+    # LLM 答复中出现这些特征，说明它在声称“任务已提交 / 结果已产出”，
+    # 这类声明必须有真实工具调用（submit_backtest / get_task_result 等）佐证。
+    _TASK_CLAIM_PATTERNS = re.compile(
+        r"(已提交|提交成功|回测(?:任务|报告)|回测已完成|已安排.{0,16}查询|"
+        r"查询.{0,8}结果如下|任务\s*已)"
+    )
+    # 用户请求必须是任务型指令时才启用防虚构守卫，避免误伤普通问答。
+    _TASK_REQUEST_KEYWORDS = re.compile(
+        r"(回测|backtest|查询|提交|结果|任务|task)",
+        re.IGNORECASE,
+    )
+    _UNVERIFIED_CLAIM_CORRECTION = (
+        "【系统校验】你刚才的回答声称已提交回测任务或已产出回测结果，"
+        "但这一轮没有调用任何工具。任务 ID 只能来自 submit_backtest 的实际返回值，"
+        "结果只能来自 get_task_result 的实际返回值——绝不能虚构。"
+        "请立即调用对应工具获取真实数据后再回答；如果工具调用失败，请如实报告错误。"
+    )
 
     def __init__(self):
         self._running = False
@@ -148,6 +169,34 @@ class BaseAgent(ABC):
         except Exception as e:
             logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
             return f"Error: {e}"
+
+    @staticmethod
+    def _looks_like_unverified_task_claim(
+        content: str, messages: list[dict], had_tool_results: bool
+    ) -> bool:
+        """判断 LLM 答复是否属于“未经工具验证的任务声明”。
+
+        场景：用户要求回测/查询结果，LLM 却在未调用任何工具的情况下直接输出
+        “回测任务已提交，task_id=xxx”或“回测报告：...”——这类答复是虚构的
+        （曾导致前端回测记录里没有任何结果的假“已完成”任务）。
+
+        仅当同时满足以下条件才判定为需要拦截：
+        1) 本轮尚未执行过任何工具（否则正常总结也会包含“回测报告”）；
+        2) 答复文本命中任务声明特征（已提交/回测报告/任务已…）；
+        3) 用户请求本身是任务型指令（回测/查询/提交/结果等）。
+        """
+        if not content or not content.strip():
+            return False
+        if had_tool_results:
+            return False
+        if not BaseAgent._TASK_CLAIM_PATTERNS.search(content):
+            return False
+        user_text = "\n".join(
+            m.get("content", "")
+            for m in messages
+            if m.get("role") in ("user", "system")
+        )
+        return bool(BaseAgent._TASK_REQUEST_KEYWORDS.search(user_text))
 
     def _try_parse_json_tool_call(
         self, content: str, tools: list[dict] | None = None
@@ -457,6 +506,7 @@ class BaseAgent(ABC):
 
         llm = LLMClient.get_instance()
         had_tool_results = False  # tracks whether any tools were executed
+        claim_corrections = 0  # 防虚构守卫的纠错轮数
 
         for round_idx in range(self._max_tool_rounds):
             resp = await llm.chat_with_tools(
@@ -489,6 +539,46 @@ class BaseAgent(ABC):
                 json_tc = self._try_parse_json_tool_call(content, tools)
                 if json_tc is None:
                     if content and content.strip():
+                        # ── 防虚构守卫 ──
+                        # LLM 声称“任务已提交 / 已出回测报告”，但本轮未执行任何工具
+                        # （如没有调用 submit_backtest / get_task_result）时，该答复
+                        # 属于虚构：任务 ID / 指标并非真实工具返回值，前端也不会有记录。
+                        # 强制追加一轮纠错，要求其实际调用工具；纠错超限则拒绝转发。
+                        if self._looks_like_unverified_task_claim(
+                            content, messages, had_tool_results
+                        ):
+                            if claim_corrections < self._max_claim_corrections:
+                                claim_corrections += 1
+                                logger.warning(
+                                    "[%s] _run_tool_loop round %d: LLM claimed task "
+                                    "submission/result without executing any tool; "
+                                    "forcing corrective round %d/%d",
+                                    self.name,
+                                    round_idx + 1,
+                                    claim_corrections,
+                                    self._max_claim_corrections,
+                                )
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": self._UNVERIFIED_CLAIM_CORRECTION,
+                                    }
+                                )
+                                continue
+                            logger.error(
+                                "[%s] _run_tool_loop: LLM persisted unverified task "
+                                "claim after %d correction(s); refusing to relay "
+                                "fabricated answer",
+                                self.name,
+                                self._max_claim_corrections,
+                            )
+                            return (
+                                "系统未能确认你的任务已提交/已执行：本轮对话中没有检测到任何"
+                                "实际的工具调用（例如 submit_backtest / get_task_result），"
+                                "因此无法验证答复中的任务 ID 与回测结果。请重试，"
+                                "或联系系统管理员检查 Agent 工具调用链路。",
+                                False,
+                            )
                         return (content, False)
                     # 空内容但之前有工具执行结果，强制 LLM 总结
                     if had_tool_results:
