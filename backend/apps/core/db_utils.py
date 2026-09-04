@@ -25,11 +25,17 @@ from django.db import close_old_connections
 def db_async(fn):
     """包装 sync_to_async，在目标线程内自动刷新数据库连接。
 
-    等价于 sync_to_async(fn)，但执行 fn 之前会调用 close_old_connections()
-    确保目标线程的连接可用。
+    等价于 sync_to_async(fn, thread_sensitive=False)，但执行 fn 之前会
+    调用 close_old_connections() 确保目标线程的连接可用。
+
+    固定 thread_sensitive=False：通用线程池里 DB 连接是 thread-local，
+    长时间空闲后 pgbouncer / Postgres 会单方面关闭 → 必须先
+    close_old_connections() 重连。同时不占用 asgiref 共享单线程，
+    避免 FrameManager K 线回调里的阻塞 ccxt 网络调用占死单线程、
+    导致 ASGI 处理器（WebSocket 握手等）排队挂死。
     """
 
-    @sync_to_async
+    @sync_to_async(thread_sensitive=False)
     def _inner(*args, **kwargs):
         close_old_connections()
         return fn(*args, **kwargs)

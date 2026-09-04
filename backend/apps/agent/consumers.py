@@ -30,31 +30,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
         token_list = query_params.get("token", [])
 
         if not token_list:
+            logger.warning("[ChatWS] Connection rejected: missing token")
             await self.close(code=4001)
             return
 
-        from rest_framework_simplejwt.tokens import AccessToken
-        from asgiref.sync import sync_to_async
+        # 走通用线程池 + 刷新目标线程的 DB 连接：
+        # - thread_sensitive=False: 不排在 asgiref 共享单线程后面，否则
+        #   FrameManager K 线回调的阻塞 ccxt 调用会占死单线程、握手挂死。
+        # - db_async: 通用线程池里的 DB 连接是 thread-local，长时间空闲后
+        #   pgbouncer / Postgres 会单方面关闭 → "server closed the
+        #   connection unexpectedly"，必须先 close_old_connections()。
+        from apps.core.db_utils import db_async
+        from apps.notify.middleware import authenticate_token
 
-        def _get_user(token_string):
-            try:
-                access_token = AccessToken(token_string)
-                user_id = access_token["user_id"]
-            except Exception:
-                return None
-            from django.contrib.auth import get_user_model
-
-            User = get_user_model()
-            try:
-                return User.objects.get(id=user_id, is_active=True)
-            except Exception:
-                return None
-
-        # thread_sensitive=False：避免排在 asgiref 的共享单线程后面。
-        # 该单线程会被 FrameManager K 线回调里的阻塞 ccxt 网络调用占住，
-        # 导致这里排队挂起、握手永远无法完成（对话"不响应"）。
-        user = await sync_to_async(_get_user, thread_sensitive=False)(token_list[0])
+        user, reason = await db_async(authenticate_token)(token_list[0])
         if not user:
+            logger.warning("[ChatWS] Connection rejected: %s", reason)
             await self.close(code=4001)
             return
 
