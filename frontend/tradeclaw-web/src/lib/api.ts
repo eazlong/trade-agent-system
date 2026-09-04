@@ -82,7 +82,7 @@ async function request<T>(
   return res.json() as Promise<T>;
 }
 
-async function tryRefreshToken(): Promise<boolean> {
+export async function tryRefreshToken(): Promise<boolean> {
   const refresh = getRefreshToken();
   if (!refresh) return false;
   try {

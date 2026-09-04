@@ -41,11 +41,6 @@ interface TViewProps {
   onLoadMore?: (direction: "earlier" | "later") => void;
 }
 
-interface IndicatorLegend {
-  label: string;
-  color: string;
-}
-
 /** Convert ISO timestamp to UTCTimestamp (seconds) */
 function toUTCTime(ts: string): UTCTimestamp {
   return Math.floor(new Date(ts).getTime() / 1000) as UTCTimestamp;
@@ -273,16 +268,6 @@ export default function TView({
       time: new Date(closest.timestamp).toLocaleString(),
     });
   }, []);
-
-  // ── Build indicator legend ───────────────────────────────────────────────
-
-  const legendItems = useMemo<IndicatorLegend[]>(() => {
-    const items: IndicatorLegend[] = [];
-    if (!indicators) return items;
-    if (indicators.macd?.dif?.length) items.push({ label: "MACD(12,26,9)", color: "#3b82f6" });
-    if (indicators.rsi?.length) items.push({ label: "RSI(14)", color: "#a855f7" });
-    return items;
-  }, [indicators]);
 
   // ── Create chart ─────────────────────────────────────────────────────────
 
@@ -577,19 +562,6 @@ export default function TView({
               </button>
             );
           })}
-        </div>
-
-        {/* Indicator legend */}
-        <div className="flex flex-wrap gap-3 text-text3">
-          {legendItems.map((item) => (
-            <span key={item.label} className="flex items-center gap-1">
-              <span
-                className="inline-block h-2 w-2 rounded-full"
-                style={{ backgroundColor: item.color }}
-              />
-              {item.label}
-            </span>
-          ))}
         </div>
 
         {/* Fullscreen button */}

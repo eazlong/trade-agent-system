@@ -42,15 +42,15 @@ export default function ChatWindow() {
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
-  const [size, setSize] = useState({ w: 380, h: 520 });
+  const [size, setSize] = useState({ w: 760, h: 1040 });
   const resizeRef = useRef<{ startX: number; startY: number; startW: number; startH: number } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const MIN_W = 320;
   const MIN_H = 400;
-  const MAX_W = 800;
-  const MAX_H = 900;
+  const MAX_W = 1600;
+  const MAX_H = 1800;
 
   const handleResizeMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
