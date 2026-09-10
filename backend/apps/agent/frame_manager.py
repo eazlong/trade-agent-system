@@ -177,7 +177,11 @@ class FrameManager:
         # _need_restart=True 表示进程重启（OrderExecutor 等底层组件无法跨进程复用），
         # 需要强制重建；否则只在"状态 running 但组件未初始化"时重启。
         if self._need_restart:
-            need_restart_trading = self._trading_state == FrameState.RUNNING
+            # _need_restart=True 意味着 orderExecutor 在上一进程已初始化
+            # （order_exec=1，仅由 start_trading_frame 设置）。此时无论
+            # frame:trading:state 是 running 还是被失败启动撕裂成 stopped，
+            # 都必须重建交易框架 —— 否则框架永远无法恢复，会话空转。
+            need_restart_trading = True
             need_restart_assist = self._assist_state == FrameState.RUNNING
         else:
             need_restart_trading = (
@@ -215,21 +219,28 @@ class FrameManager:
         await self._restore_live_sessions()
 
     async def _restore_live_sessions(self) -> None:
-        """从Redis恢复运行的LiveSession"""
+        """恢复运行的 LiveSession。
+
+        **数据源约定**：DB `LiveSession(status='running')` 是唯一权威来源；
+        Redis 键（24h TTL，易过期）只作兼容层。之前只读 Redis 键导致
+        进程重启大于 TTL 后会话全部丢失（DB 标记 running 但无进程运行）。
+        """
+        # 收集待恢复运行信息：live_session_id -> kwargs
+        pending: dict[str, dict] = {}
+
+        # 1) 兼容层：Redis 持久化键（旧实现写入的运行信息）
         try:
             r = self._get_redis()
-            pattern = "frame:live_session:*"
-            keys = r.keys(pattern)
-
-            logger.info("[FrameManager] found %d live session keys in Redis", len(keys))
-
+            keys = r.keys("frame:live_session:*")
+            logger.info(
+                "[FrameManager] found %d live session keys in Redis (legacy)",
+                len(keys),
+            )
             for key in keys:
                 key_str = key if isinstance(key, str) else key.decode()
                 session_data = r.hgetall(key)
                 if not session_data:
                     continue
-
-                # 处理bytes类型的值
                 if isinstance(session_data, dict):
                     decoded_data = {}
                     for k, v in session_data.items():
@@ -237,38 +248,132 @@ class FrameManager:
                         v_str = v if isinstance(v, str) else v.decode()
                         decoded_data[k_str] = v_str
                     session_data = decoded_data
-
                 if session_data.get("status") == "running":
                     live_session_id = key_str.split(":")[-1]
-
-                    logger.info(
-                        "[FrameManager] restoring live session: %s (%s %s)",
-                        live_session_id,
-                        session_data.get("strategy_name"),
-                        session_data.get("symbol"),
-                    )
-
-                    try:
-                        await self.start_strategy_runner(
-                            strategy_name=session_data.get("strategy_name"),
-                            symbol=session_data.get("symbol"),
-                            timeframe=session_data.get("timeframe"),
-                            parameters=json.loads(session_data.get("parameters", "{}")),
-                            exchange_account_id=session_data.get("exchange_account_id"),
-                            user_id=session_data.get("user_id") or None,
-                            live_session_id=live_session_id,
-                            initial_balance=Decimal(session_data.get("initial_balance", "0")),
-                        )
-                        logger.info("[FrameManager] live session %s restored", live_session_id)
-                    except Exception as e:
-                        logger.error(
-                            "[FrameManager] failed to restore live session %s: %s",
-                            live_session_id, e
-                        )
-                        # 标记为恢复失败
-                        r.hset(key_str, "status", "restore_failed")
+                    pending[live_session_id] = {
+                        "strategy_name": session_data.get("strategy_name"),
+                        "symbol": session_data.get("symbol"),
+                        "timeframe": session_data.get("timeframe"),
+                        "parameters": json.loads(
+                            session_data.get("parameters", "{}")
+                        ),
+                        "exchange_account_id": session_data.get(
+                            "exchange_account_id"
+                        ),
+                        "user_id": session_data.get("user_id") or None,
+                        "live_session_id": live_session_id,
+                        "initial_balance": Decimal(
+                            session_data.get("initial_balance", "0")
+                        ),
+                    }
         except Exception as e:
-            logger.warning("[FrameManager] failed to restore live sessions: %s", e)
+            logger.warning(
+                "[FrameManager] failed to read live session keys from Redis: %s", e
+            )
+
+        # 2) 权威来源：DB status=running 的 LiveSession
+        try:
+            from asgiref.sync import sync_to_async
+            from apps.trading.models import LiveSession
+
+            @sync_to_async
+            def _running_sessions() -> list:
+                close_old_connections()
+                return list(
+                    LiveSession.objects.filter(status="running").select_related(
+                        "strategy", "exchange_account", "user", "backtest_result"
+                    )
+                )
+
+            db_sessions = await _running_sessions()
+            logger.info(
+                "[FrameManager] found %d running sessions in DB", len(db_sessions)
+            )
+            for s in db_sessions:
+                sid = str(s.id)
+                # DB 是权威来源：即使 Redis 键过期或值过时，
+                # 也以 DB 字段覆盖重写（同一会话仅保留一份待恢复信息）。
+                pending[sid] = {
+                    "strategy_name": s.strategy.name,
+                    "symbol": s.symbol,
+                    "timeframe": (
+                        s.backtest_result.timeframe
+                        if s.backtest_result and s.backtest_result.timeframe
+                        else "1h"
+                    ),
+                    "parameters": s.config or {},
+                    "exchange_account_id": (
+                        str(s.exchange_account.id) if s.exchange_account else ""
+                    ),
+                    "user_id": str(s.user.id) if s.user else None,
+                    "live_session_id": sid,
+                    "initial_balance": s.initial_capital,
+                }
+        except Exception as e:
+            logger.warning(
+                "[FrameManager] failed to read running sessions from DB: %s", e
+            )
+
+        # 关键保障：只要有待恢复的 running 会话，交易框架必须处于运行态，
+        # 否则 OrderConsumer 不消费 stream → 信号分发后订单永远不会执行。
+        # （进程重启后框架可能因撕裂状态未恢复，此时先补启动。）
+        if pending:
+            if self._trading_state != FrameState.RUNNING or self._order_executor is None:
+                logger.warning(
+                    "[FrameManager] %d running session(s) to restore but trading "
+                    "frame not running — starting trading frame first",
+                    len(pending),
+                )
+                await self.start_trading_frame(mode="live", force=True)
+
+        for live_session_id, kw in pending.items():
+            strategy_name = kw.get("strategy_name")
+            if not strategy_name:
+                continue
+            logger.info(
+                "[FrameManager] restoring live session: %s (%s %s)",
+                live_session_id,
+                strategy_name,
+                kw.get("symbol"),
+            )
+            try:
+                await self.start_strategy_runner(**kw)
+                logger.info("[FrameManager] live session %s restored", live_session_id)
+            except Exception as e:
+                logger.error(
+                    "[FrameManager] failed to restore live session %s: %s",
+                    live_session_id, e,
+                )
+                # 策略无法解析（不存在/语法错误）是永久性故障：
+                # 标记 DB status=error，避免每次重启都重试喷错。
+                if isinstance(e, (ValueError, ImportError, SyntaxError)):
+                    try:
+                        from asgiref.sync import sync_to_async
+                        from apps.trading.models import LiveSession
+
+                        @sync_to_async
+                        def _mark_error():
+                            close_old_connections()
+                            LiveSession.objects.filter(id=live_session_id).update(
+                                status="error"
+                            )
+
+                        await _mark_error()
+                        logger.warning(
+                            "[FrameManager] live session %s marked status=error "
+                            "(unresolvable strategy %s)",
+                            live_session_id, kw.get("strategy_name"),
+                        )
+                    except Exception as ex:
+                        logger.warning(
+                            "[FrameManager] failed to mark session %s error: %s",
+                            live_session_id, ex,
+                        )
+                try:
+                    r = self._get_redis()
+                    r.hset(f"frame:live_session:{live_session_id}", "status", "restore_failed")
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -312,8 +417,17 @@ class FrameManager:
         force=True: 跳过状态检查，强制重建底层组件（进程重启恢复场景使用）。
         """
         if not force and self._trading_state == FrameState.RUNNING:
-            logger.warning("[FrameManager] trading frame already running")
-            return
+            if self._order_executor is not None:
+                logger.warning("[FrameManager] trading frame already running")
+                return
+            # 撕裂态自愈：状态标记 running 但 OrderExecutor 未初始化
+            # （如上一次失败启动只持久化了状态），继续 early-return 会
+            # 导致框架永远无法启动。此时强制重建底层组件。
+            logger.warning(
+                "[FrameManager] trading_state=RUNNING but OrderExecutor missing, "
+                "forcing rebuild"
+            )
+            force = True
         self._trading_state = FrameState.STARTING
         # force 模式下重置引用计数，确保底层组件干净重建
         if force:
