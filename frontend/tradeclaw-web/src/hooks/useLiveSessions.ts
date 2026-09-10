@@ -14,7 +14,7 @@ export function useLiveSessions(pollingInterval = 10000) {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const pollingRef = useRef<ReturnType<typeof setInterval>>();
+  const pollingRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   const fetchSessions = useCallback(async () => {
     try {
