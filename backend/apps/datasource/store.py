@@ -65,7 +65,17 @@ class MemoryDataStore:
         return cls._instance
 
     def __init__(self):
-        """初始化存储"""
+        """初始化存储
+
+        单例由 ``__new__`` 保证，但 Python 对每次 ``MemoryDataStore()`` 调用
+        都会重跑 ``__init__``——旧实现会把 ``_store`` 重置为空，等价于每次
+        ``get_data_store()`` 都清空行情数据（WS 刚写入的 ticker 被下一个
+        读取者清掉，接口持续 503）。首次初始化后必须短路。
+        """
+        if getattr(self, "_initialized", False):
+            return
+        self._initialized = True
+
         # 主存储：{data_type: {symbol: OrderedDict}}
         # OrderedDict 用于 LRU
         self._store: Dict[str, Dict[str, OrderedDict]] = {}

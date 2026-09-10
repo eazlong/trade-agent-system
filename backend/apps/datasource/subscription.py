@@ -97,7 +97,14 @@ class DataSubscriptionManager:
         """初始化 Redis 连接"""
         try:
             redis_url = settings.REDIS_URL
-            self._redis = redis.from_url(redis_url, decode_responses=True)
+            # 加 connect/socket 超时：Redis 不可达时快速失败（由调用方 try/except
+            # 捕获打印），避免永久阻塞挂起测试/任务（尤其测试环境连不上 dev Redis）。
+            self._redis = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
         except Exception as e:
             print(f"Redis connection failed: {e}")
             self._redis = None

@@ -5,6 +5,10 @@
 """
 
 import asyncio
+import time
+from typing import Any, Dict
+
+from django.conf import settings
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -25,6 +29,7 @@ from ..registry import DataSourceRegistry
 from ..store import get_data_store
 from ..subscription import get_subscription_manager
 from ..monitor import get_quality_monitor
+from ..ws_runner import run_ws_coroutine
 from ..base import KlineInterval, MarketType
 
 
@@ -90,11 +95,9 @@ class DataSourceViewSet(viewsets.ViewSet):
                 market_types = [MarketType(mt) for mt in market_types_raw]
                 source.set_market_types(market_types)
 
-            # 在新事件循环中执行异步连接
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            success = loop.run_until_complete(source.connect_websocket())
-            loop.close()
+            # 在持久 WS 事件循环上执行异步连接
+            # （旧的 new_event_loop + close 模式会在连接完成后立即取消接收任务）
+            success = run_ws_coroutine(source.connect_websocket(), timeout=60)
 
             if success:
                 return Response({"status": "connected", "source": source_name})
@@ -118,10 +121,9 @@ class DataSourceViewSet(viewsets.ViewSet):
         try:
             source = DataSourceRegistry.get(source_name)
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            success = loop.run_until_complete(source.disconnect_websocket())
-            loop.close()
+            # 在持久 WS 事件循环上执行（接收任务活在该循环中，
+            # 跨循环取消会挂起）
+            success = run_ws_coroutine(source.disconnect_websocket(), timeout=30)
 
             return Response(
                 {
@@ -166,6 +168,32 @@ class DataSourceViewSet(viewsets.ViewSet):
                 "created": created,
             }
         )
+
+
+def _ticker_not_ready_detail(source: str) -> Dict[str, Any]:
+    """构建 ticker 503 响应中的诊断详情，帮助定位 WS 行情流未就绪的根因。
+
+    纯 WS 设计（无 REST 回退）：503 是"流未就绪"的信号，前端按轮询重试。
+    这里附上环境侧信息（代理是否配置、自动 WS 是否开启）与数据源实时状态，
+    让运维/用户无需翻日志即可判断是代理不通、未连上、还是订阅缺失。
+    """
+    detail: Dict[str, Any] = {
+        "proxy_configured": bool(getattr(settings, "WEB_PROXY", "")),
+        "auto_ws_enabled": bool(getattr(settings, "DATASOURCE_AUTO_WS", True)),
+        "hint": (
+            "WS ticker stream not ready; check proxy reachability and "
+            "[WSRunner]/[Binance] logs"
+        ),
+    }
+    if DataSourceRegistry.is_loaded(source):
+        ds = DataSourceRegistry.get(source)
+        detail["ws_status"] = ds.get_ws_status().value
+        detail["subscriptions"] = ds.get_subscription_count()
+        last_data = ds.get_last_data_time()
+        detail["last_data_age_seconds"] = (
+            round(time.time() - last_data, 1) if last_data and last_data > 0 else None
+        )
+    return detail
 
 
 class MarketDataViewSet(viewsets.ViewSet):
@@ -230,7 +258,11 @@ class MarketDataViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get", "post"])
     def ticker(self, request):
-        """获取实时行情快照"""
+        """获取实时行情快照
+
+        数据来自 Binance WebSocket 实时流写入的内存存储（见 ws_runner 的
+        持久供给），不做 REST 回退：WS 尚未就绪时返回 503，前端下次轮询重试。
+        """
         if request.method == "POST":
             serializer = TickerRequestSerializer(data=request.data)
         else:
@@ -242,31 +274,24 @@ class MarketDataViewSet(viewsets.ViewSet):
         data = serializer.validated_data
         source = data["source"]
         symbol = data["symbol"]
-        market_type = MarketType(data.get("market_type", "spot"))
 
-        # 先尝试从内存存储获取
+        # 只从内存存储获取（由 WS @ticker 流写入）
         store = get_data_store()
         tickers = store.get_latest("ticker", symbol, 1)
+        if not tickers:
+            # WS 流按 Binance 原始符号写入（BTCUSDT），请求可能用斜杠形式（BTC/USDT）
+            tickers = store.get_latest("ticker", symbol.replace("/", ""), 1)
 
-        if tickers:
+        if tickers and tickers[0].get("last_price"):
             return Response(tickers[0])
 
-        # 从数据源获取
-        try:
-            ds = DataSourceRegistry.get(source)
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            ticker = loop.run_until_complete(ds.fetch_ticker(symbol, market_type))
-            loop.close()
-
-            return Response(ticker)
-
-        except Exception as e:
-            return Response(
-                {"error": f"Failed to fetch ticker: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        return Response(
+            {
+                "error": f"WebSocket ticker stream not ready for {symbol} from {source}",
+                "detail": _ticker_not_ready_detail(source),
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
     @action(detail=False, methods=["get", "post"])
     def trades(self, request):

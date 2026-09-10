@@ -6,7 +6,7 @@ import pytest
 from datetime import datetime, timedelta
 
 from apps.datasource.registry import DataSourceRegistry
-from apps.datasource.store import MemoryDataStore
+from apps.datasource.store import MemoryDataStore, get_data_store
 from apps.datasource.subscription import DataSubscriptionManager
 from apps.datasource.monitor import DataQualityMonitor
 from apps.datasource.base import (
@@ -75,6 +75,32 @@ class TestMemoryDataStore:
         store2 = MemoryDataStore()
         assert store1 is store2
 
+    def test_data_survives_reinstantiation(self):
+        """回归：重复调用 MemoryDataStore() 不得清空已存数据。
+
+        Python 对每次实例化都会重跑 __init__；旧实现没有短路，
+        导致每个 get_data_store() 调用点（WS 写入方、看门狗、API 视图）
+        都拿到同一个单例但状态被重置为空——WS ticker 写入后立刻被
+        下一个读取者清掉，接口持续 503。
+        """
+        store = MemoryDataStore()
+        store.clear_all()
+        store.store(
+            "ticker", "BTCUSDT",
+            {"symbol": "BTCUSDT", "last_price": 50000.0, "timestamp": datetime.now()},
+            "binance",
+        )
+
+        # 模拟 WS 写入后，看门狗/视图各自再调一次 get_data_store()
+        for _ in range(3):
+            again = get_data_store()
+            assert again is store
+            assert store._stats["total_entries"] == 1
+
+        result = store.get_latest("ticker", "BTCUSDT", 1)
+        assert len(result) == 1
+        assert result[0]["last_price"] == 50000.0
+
     def test_store_and_get(self):
         """测试存储和获取"""
         store = MemoryDataStore()
@@ -96,8 +122,15 @@ class TestMemoryDataStore:
         store = MemoryDataStore()
         store.clear_all()
 
+        base = datetime.now()
         data_list = [
-            {"symbol": "BTC/USDT", "price": 50000.0 + i, "timestamp": datetime.now()}
+            # 每项用不同 timestamp：store 以 source:symbol:type:ts 为键，
+            # 相同微秒会互相覆盖，导致批量写入静默丢失（旧测试的 flake 根因）。
+            {
+                "symbol": "BTC/USDT",
+                "price": 50000.0 + i,
+                "timestamp": base + timedelta(microseconds=i),
+            }
             for i in range(10)
         ]
 

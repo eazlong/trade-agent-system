@@ -171,6 +171,30 @@ class BaseDataSource(ABC):
             return self._market_types
         return self.supported_market_types
 
+    def ensure_market_type(self, market_type: "MarketType") -> bool:
+        """
+        确保给定市场类型在活跃集合中（幂等）。
+
+        数据源实例可能被其他调用方以受限市场配置创建（如仅 futures），
+        此时新增加的市场类型的订阅将无处发送 SUBSCRIBE 帧。
+        若已包含（或未配置=全部）则不改动。
+
+        Returns:
+            配置是否被修改
+        """
+        if not self._market_types:
+            return False
+        if market_type not in self._market_types:
+            if market_type in self.supported_market_types:
+                self._market_types = list(self._market_types) + [market_type]
+                logger.info(
+                    "[DataSource] %s market types extended: %s",
+                    self.name,
+                    [mt.value for mt in self._market_types],
+                )
+                return True
+        return False
+
     # ==================== WebSocket 管理 ====================
 
     @abstractmethod
@@ -184,9 +208,13 @@ class BaseDataSource(ABC):
         pass
 
     @abstractmethod
-    async def disconnect_websocket(self) -> bool:
+    async def disconnect_websocket(self, preserve_subs: bool = False) -> bool:
         """
         断开 WebSocket 连接
+
+        Args:
+            preserve_subs: True 时保留已登记的订阅（重连后由
+                connect_websocket 的 _resubscribe_all 重新发送）。
 
         Returns:
             是否成功断开
