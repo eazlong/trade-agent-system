@@ -438,8 +438,15 @@ class SignalMonitorEngine:
                 order_type=params.get("order_type", "market"),
                 quantity=params.get("quantity", 0),
                 price=params.get("price"),
+                # 记录触发来源：优先策略名（validate_strategy 场景），
+                # 否则回退到信号监控名称，保证交易详情可追溯触发来源
+                triggered_strategy=monitor.strategy_name or monitor.name,
             )
-            logger.info("Trade order created for monitor %s", monitor.id)
+            logger.info(
+                "Trade order created for monitor %s (triggered_strategy=%s)",
+                monitor.id,
+                monitor.strategy_name or monitor.name,
+            )
         except Exception as e:
             logger.error("Failed to execute trade: %s", e)
 

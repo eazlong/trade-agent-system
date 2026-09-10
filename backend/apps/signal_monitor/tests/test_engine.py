@@ -14,7 +14,7 @@
 import time
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -217,6 +217,55 @@ class TestEngineSignalCheck(unittest.TestCase):
             MockMonitor.objects.filter.return_value.select_related.return_value = []
             results = self.engine.check_signals_for_kline("BTCUSDT", _make_klines(30))
             self.assertEqual(results, [])
+
+
+class TestSignalMonitorTradeAction(unittest.TestCase):
+    """验证信号监控"执行交易"动作会记录触发来源策略。"""
+
+    def setUp(self):
+        self.engine = SignalMonitorEngine()
+
+    def _make_monitor(self, strategy_name: str = "", name: str = "EMA趋势"):
+        monitor = MagicMock()
+        monitor.action_params = {
+            "exchange_account_id": "acct-1",
+            "side": "buy",
+            "order_type": "market",
+            "quantity": 0.01,
+        }
+        monitor.symbol = "BTCUSDT"
+        monitor.name = name
+        monitor.strategy_name = strategy_name
+        monitor.user = MagicMock()
+        return monitor
+
+    def test_trade_order_records_strategy_name(self):
+        """validate_strategy 监控触发交易时，记录 strategy_name。"""
+        monitor = self._make_monitor(strategy_name="donchian_atr_trend_strategy")
+        exchange_account = MagicMock()
+
+        with patch("apps.trading.models.Order.objects") as mock_order_mgr, patch(
+            "apps.exchange.models.ExchangeAccount.objects"
+        ) as mock_acct_mgr:
+            mock_acct_mgr.get.return_value = exchange_account
+            self.engine._execute_trade(monitor, {})
+
+        kwargs = mock_order_mgr.create.call_args.kwargs
+        self.assertEqual(kwargs["triggered_strategy"], "donchian_atr_trend_strategy")
+
+    def test_trade_order_falls_back_to_monitor_name(self):
+        """普通 trade 监控（无 strategy_name）时，回退到监控名称。"""
+        monitor = self._make_monitor(strategy_name="", name="EMA趋势")
+        exchange_account = MagicMock()
+
+        with patch("apps.trading.models.Order.objects") as mock_order_mgr, patch(
+            "apps.exchange.models.ExchangeAccount.objects"
+        ) as mock_acct_mgr:
+            mock_acct_mgr.get.return_value = exchange_account
+            self.engine._execute_trade(monitor, {})
+
+        kwargs = mock_order_mgr.create.call_args.kwargs
+        self.assertEqual(kwargs["triggered_strategy"], "EMA趋势")
 
 
 if __name__ == "__main__":
