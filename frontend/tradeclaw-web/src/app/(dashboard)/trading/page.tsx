@@ -6,6 +6,7 @@ import { usePositions } from "@/hooks/usePositions";
 import { useAccounts } from "@/hooks/useAccounts";
 import { useFrameControl } from "@/hooks/useFrameControl";
 import { useLiveSessions } from "@/hooks/useLiveSessions";
+import TradeRecords from "@/components/trading/TradeRecords";
 import type { Order, ExchangeAccountWithBalance, LiveSession } from "@/lib/api";
 import { useState } from "react";
 
@@ -692,6 +693,9 @@ export default function TradingPage() {
           </div>
         </div>
       )}
+
+      {/* Trade Records (history + detail) */}
+      <TradeRecords orders={orders} accounts={accounts} loading={ordersLoading} />
     </DashboardShell>
   );
 }

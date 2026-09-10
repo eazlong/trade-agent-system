@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, useEffect, useRef } from "react";
 import { useRightPanel } from "@/components/layout/DashboardShell";
-import { notificationApi, type Notification } from "@/lib/api";
+import { marketApi, notificationApi, type Notification } from "@/lib/api";
 
 const NAV_ITEMS = [
   { key: "overview", label: "总览" },
@@ -23,22 +23,45 @@ export default function Topbar() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
   const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [markets, setMarkets] = useState([
-    { sym: "BTC/USDT", price: 67842, chg: 1.24 },
-    { sym: "ETH/USDT", price: 3421, chg: 0.87 },
-    { sym: "SOL/USDT", price: 182.4, chg: -0.43 },
+  const [markets, setMarkets] = useState<{ sym: string; price: number | null; chg: number | null }[]>([
+    { sym: "BTC/USDT", price: null, chg: null },
+    { sym: "ETH/USDT", price: null, chg: null },
+    { sym: "SOL/USDT", price: null, chg: null },
   ]);
 
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setMarkets((prev) =>
-        prev.map((m) => ({
-          ...m,
-          price: m.price + (Math.random() - 0.5) * m.price * 0.001,
-          chg: m.chg + (Math.random() - 0.5) * 0.05,
-        }))
+  const MARKET_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"];
+
+  const fetchMarkets = async () => {
+    try {
+      const results = await Promise.all(
+        MARKET_SYMBOLS.map(async (sym) => {
+          try {
+            const t = await marketApi.ticker({ source: "binance", symbol: sym });
+            const price = Number(t.last_price);
+            const chg = Number(t.change_pct_24h);
+            // Only accept a real, finite ticker; otherwise keep the previous value.
+            if (!Number.isFinite(price) || !Number.isFinite(chg)) return null;
+            return { sym, price, chg };
+          } catch {
+            // keep the last good value for this symbol on transient errors
+            return null;
+          }
+        })
       );
-    }, 1800);
+      setMarkets((prev) =>
+        prev.map((m) => {
+          const r = results.find((x) => x?.sym === m.sym);
+          return r ? { ...m, price: r.price, chg: r.chg } : m;
+        })
+      );
+    } catch {
+      // keep last good values on a batch failure
+    }
+  };
+
+  useEffect(() => {
+    fetchMarkets();
+    const timer = setInterval(fetchMarkets, 5000);
     return () => clearInterval(timer);
   }, []);
 
@@ -139,10 +162,9 @@ export default function Topbar() {
             className="flex items-center gap-1.5 px-2.5 py-1 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-md font-mono text-xs"
           >
             <span className="text-text2">{m.sym.split("/")[0]}</span>
-            <span className="font-semibold">{formatPrice(m.price, m.sym)}</span>
-            <span className={`font-semibold ${m.chg >= 0 ? "text-green" : "text-red"}`}>
-              {m.chg >= 0 ? "+" : ""}
-              {m.chg.toFixed(2)}%
+            <span className="font-semibold">{m.price === null ? "—" : formatPrice(m.price, m.sym)}</span>
+            <span className={`font-semibold ${m.chg === null ? "text-text2" : m.chg >= 0 ? "text-green" : "text-red"}`}>
+              {m.chg === null ? "—" : `${m.chg >= 0 ? "+" : ""}${m.chg.toFixed(2)}%`}
             </span>
           </div>
         ))}

@@ -159,7 +159,12 @@ export interface Order {
   exchange_order_id: string;
   filled_quantity: string;
   avg_fill_price: string | null;
+  realized_pnl: string | null;
   error_message: string;
+  live_session_id: string | null;
+  strategy_id: string | null;
+  strategy_name: string | null;
+  triggered_strategy: string;
   created_at: string;
   updated_at: string;
 }
@@ -848,4 +853,34 @@ export const notificationApi = {
     request<Record<string, string>>(`/api/notify/${id}/read/`, "POST"),
   markAllRead: () => request<Record<string, string>>("/api/notify/mark-all-read/", "POST"),
   unreadCount: () => request<{ unread_count: number }>("/api/notify/unread-count/"),
+};
+
+// ── Market / Ticker API ──
+
+export interface Ticker {
+  symbol: string;
+  last_price: number;
+  bid_price: number;
+  bid_quantity: number;
+  ask_price: number;
+  ask_quantity: number;
+  high_24h: number;
+  low_24h: number;
+  volume_24h: number;
+  turnover_24h: number;
+  change_24h: number;
+  change_pct_24h: number;
+  timestamp: string;
+  source: string;
+}
+
+export const marketApi = {
+  ticker: (params: { source: string; symbol: string; market_type?: string }) => {
+    const query = new URLSearchParams({
+      source: params.source,
+      symbol: params.symbol,
+      market_type: params.market_type ?? "spot",
+    });
+    return request<Ticker>(`/api/datasource/api/market/ticker/?${query.toString()}`);
+  },
 };
