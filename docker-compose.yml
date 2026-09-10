@@ -112,6 +112,7 @@ services:
       - DB_PORT=5432                   # PgBouncer 端口
       - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
       - WEB_PROXY=socks5://host.docker.internal:7890
+      - DATASOURCE_AUTO_WS=false       # WS 行情供给仅 backend 进程需要
       - CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
     env_file:
       - ./backend/.env
@@ -136,6 +137,7 @@ services:
       - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
       - DB_PORT=5432                   # PgBouncer 端口
       - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
+      - DATASOURCE_AUTO_WS=false       # WS 行情供给仅 backend 进程需要
     env_file:
       - ./backend/.env
     extra_hosts:
@@ -158,6 +160,7 @@ services:
       - DB_HOST=pgbouncer              # 连接 PgBouncer（而非 db）
       - DB_PORT=5432                   # PgBouncer 端口
       - DB_CONN_MAX_AGE=0              # 必须 0（transaction mode）
+      - DATASOURCE_AUTO_WS=false       # WS 行情供给仅 backend 进程需要
     env_file:
       - ./backend/.env
     depends_on:

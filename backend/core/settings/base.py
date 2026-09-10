@@ -182,6 +182,12 @@ ANTHROPIC_PROXY = os.environ.get("ANTHROPIC_PROXY", "") or _default_proxy
 DEEPSEEK_PROXY = os.environ.get("DEEPSEEK_PROXY", "") or _default_proxy
 WEB_PROXY = os.environ.get("WEB_PROXY", "") or _default_proxy
 
+# 数据源：后端启动时自动建立 WS 实时行情供给（默认开启；
+# 非 Web 进程如 celery 可设 DATASOURCE_AUTO_WS=false 关闭）
+DATASOURCE_AUTO_WS = (
+    os.environ.get("DATASOURCE_AUTO_WS", "true").lower() not in ("0", "false", "no")
+)
+
 # Web tools
 WEB_SEARCH_PROVIDER = os.environ.get(
     "WEB_SEARCH_PROVIDER", "duckduckgo"

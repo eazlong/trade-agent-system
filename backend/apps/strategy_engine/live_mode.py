@@ -148,7 +148,7 @@ class LiveStrategyRunner:
                 )
                 return
 
-        logger.info(f"[SF-01][LiveStrategy] on_kline: {self.symbol} close={kline.get('close')}")
+        logger.debug(f"[SF-01][LiveStrategy] on_kline: {self.symbol} close={kline.get('close')}")
 
         # 更新历史：同一根 K 线（相同 open_time）更新最后一条，新周期才 append
         kline_ts = kline.get("timestamp")
