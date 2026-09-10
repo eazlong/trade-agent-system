@@ -16,16 +16,22 @@ logger = logging.getLogger(__name__)
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def order_list(request):
-    orders = Order.objects.select_related("exchange_account").order_by("-created_at")[
-        :100
-    ]
+    queryset = Order.objects.select_related(
+        "exchange_account", "live_session__strategy"
+    ).order_by("-created_at")
+    status_filter = request.query_params.get("status")
+    if status_filter:
+        queryset = queryset.filter(status=status_filter)
+    orders = queryset[:100]
     return Response(OrderSerializer(orders, many=True).data)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def order_detail(request, pk):
-    order = Order.objects.get(pk=pk)
+    order = Order.objects.select_related(
+        "exchange_account", "live_session__strategy"
+    ).get(pk=pk)
     return Response(OrderSerializer(order).data)
 
 
@@ -196,6 +202,27 @@ def live_session_detail(request, pk):
     return Response(LiveSessionSerializer(session).data)
 
 
+async def _fetch_usdt_balance(exchange_account) -> Decimal:
+    """实时查询交易所账户 USDT 余额，作为新会话的初始资金。"""
+    from apps.trading.adapters import ADAPTER_MAP
+
+    adapter_cls = ADAPTER_MAP.get(exchange_account.exchange.lower())
+    if adapter_cls is None:
+        raise ValueError(f"Exchange {exchange_account.exchange} has no adapter")
+
+    adapter = adapter_cls(
+        exchange_account.decrypt_api_key(),
+        exchange_account.decrypt_api_secret(),
+        exchange_account.testnet,
+    )
+    try:
+        await adapter.connect()
+        balance = await adapter.get_balance()
+    finally:
+        await adapter.disconnect()
+    return balance.get("USDT", Decimal("0"))
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def live_session_create(request):
@@ -253,6 +280,16 @@ def live_session_create(request):
     except ExchangeAccount.DoesNotExist:
         return Response({"error": "Exchange account not found or inactive"}, status=404)
 
+    # 初始资金取绑定账户的实时 USDT 余额，而非回测的固定金额
+    try:
+        initial_capital = async_to_sync(_fetch_usdt_balance)(exchange_account)
+    except Exception as e:
+        logger.exception("Failed to fetch account balance for session creation: %s", e)
+        return Response(
+            {"error": f"Failed to fetch exchange account balance: {e}"},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
     # 创建 LiveSession
     session = LiveSession.objects.create(
         user=request.user,
@@ -262,8 +299,8 @@ def live_session_create(request):
         mode=mode,
         status="pending",
         exchange_account=exchange_account,
-        initial_capital=backtest.initial_capital,
-        current_equity=backtest.initial_capital,
+        initial_capital=initial_capital,
+        current_equity=initial_capital,
         config=config,
     )
 

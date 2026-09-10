@@ -1,10 +1,19 @@
-from .base import BaseExchangeAdapter, OrderRequest, OrderResponse, Position
+from .base import (
+    BaseExchangeAdapter,
+    OrderNotFoundError,
+    OrderRequest,
+    OrderResponse,
+    OrderFill,
+    Position,
+)
 from .binance import BinanceAdapter
 
 __all__ = [
     "BaseExchangeAdapter",
     "OrderRequest",
     "OrderResponse",
+    "OrderFill",
+    "OrderNotFoundError",
     "Position",
     "BinanceAdapter",
 ]

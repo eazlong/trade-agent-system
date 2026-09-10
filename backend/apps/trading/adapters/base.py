@@ -51,6 +51,20 @@ class Position:
     leverage: int
 
 
+@dataclass
+class OrderFill:
+    """订单成交状态（用于成交同步 / fill sync）"""
+
+    status: str  # 'submitted' | 'partial' | 'filled' | 'cancelled' | 'failed'
+    filled_quantity: Decimal
+    avg_fill_price: Optional[Decimal]
+    error_message: Optional[str] = None
+
+
+class OrderNotFoundError(Exception):
+    """交易所返回订单不存在（可能被外部取消或已过期）"""
+
+
 class BaseExchangeAdapter(ABC):
     """
     交易所适配器抽象基类。
@@ -77,6 +91,23 @@ class BaseExchangeAdapter(ABC):
     @abstractmethod
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
         """撤销指定订单"""
+
+    @abstractmethod
+    async def fetch_order(
+        self, exchange_order_id: str, symbol: str
+    ) -> OrderFill:
+        """查询订单当前成交状态（用于成交同步）。
+
+        Args:
+            exchange_order_id: 交易所订单号
+            symbol: 本地交易对符号（如 'DOGE/USDT'，由适配器归一化）
+
+        Returns:
+            OrderFill: 订单状态、已成交数量、成交均价
+
+        Raises:
+            OrderNotFoundError: 交易所返回订单不存在
+        """
 
     @abstractmethod
     async def get_positions(self) -> list[Position]:

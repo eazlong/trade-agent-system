@@ -121,6 +121,81 @@ class TestOrderExecutorL2(unittest.TestCase):
         self.assertEqual(result["exchange_order_id"], "123456")
         mock_adapter.place_order.assert_called_once()
 
+    @patch("apps.trading.models.LiveSession.objects")
+    @patch("apps.trading.models.Order.objects")
+    def test_submit_order_persists_triggered_strategy(self, mock_order_mgr, mock_ls_mgr):
+        """带 live_session_id 下单时，应把会话策略名快照到 triggered_strategy。"""
+        mock_adapter = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.exchange_order_id = "123456"
+        mock_response.status = "NEW"
+        mock_response.filled_qty = None
+        mock_adapter.place_order.return_value = mock_response
+        self.executor._adapters = {"binance": mock_adapter}
+        self.executor._riskguard = None  # 跳过风控
+
+        mock_strategy = MagicMock()
+        mock_strategy.name = "ema_trend_weekday"
+        mock_ls = MagicMock()
+        mock_ls.strategy = mock_strategy
+        mock_ls_mgr.select_related.return_value.get.return_value = mock_ls
+
+        mock_order = MagicMock()
+        mock_order.id = "order-uuid-ts"
+        mock_order_mgr.create.return_value = mock_order
+        mock_order_mgr.filter.return_value.update = MagicMock()
+
+        result = asyncio.run(
+            self.executor.submit_order(
+                exchange="binance",
+                symbol="BTCUSDT",
+                side="buy",
+                order_type="market",
+                quantity=Decimal("0.001"),
+                price=None,
+                exchange_account_id="uuid-placeholder",
+                live_session_id="session-uuid-1",
+            )
+        )
+
+        self.assertEqual(result["order_id"], "order-uuid-ts")
+        kwargs = mock_order_mgr.create.call_args.kwargs
+        self.assertEqual(kwargs["live_session_id"], "session-uuid-1")
+        self.assertEqual(kwargs["triggered_strategy"], "ema_trend_weekday")
+
+    @patch("apps.trading.models.Order.objects")
+    def test_submit_order_without_session_has_no_triggered_strategy(self, mock_order_mgr):
+        """无 live_session_id 下单时，不写 triggered_strategy（手动单）。"""
+        mock_adapter = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.exchange_order_id = "123456"
+        mock_response.status = "NEW"
+        mock_response.filled_qty = None
+        mock_adapter.place_order.return_value = mock_response
+        self.executor._adapters = {"binance": mock_adapter}
+        self.executor._riskguard = None
+
+        mock_order = MagicMock()
+        mock_order.id = "order-uuid-manual"
+        mock_order_mgr.create.return_value = mock_order
+        mock_order_mgr.filter.return_value.update = MagicMock()
+
+        result = asyncio.run(
+            self.executor.submit_order(
+                exchange="binance",
+                symbol="BTCUSDT",
+                side="buy",
+                order_type="market",
+                quantity=Decimal("0.001"),
+                price=None,
+                exchange_account_id="uuid-placeholder",
+            )
+        )
+
+        self.assertEqual(result["order_id"], "order-uuid-manual")
+        kwargs = mock_order_mgr.create.call_args.kwargs
+        self.assertNotIn("triggered_strategy", kwargs)
+
     @patch("apps.trading.models.Order.objects")
     def test_submit_order_exchange_error_updates_status(self, mock_order_mgr):
         """交易所发送失败时订单状态应更新为 failed"""
@@ -191,7 +266,7 @@ class TestOrderExecutorL2(unittest.TestCase):
         """shutdown() 应断开所有 adapter"""
         mock_adapter1 = AsyncMock()
         mock_adapter2 = AsyncMock()
-        self.executor._adapters = {"binance": mock_adapter1}
+        self.executor._adapters = {"binance": mock_adapter1, "okx": mock_adapter2}
         self.executor._running = True
         OrderExecutor._instance = self.executor
 

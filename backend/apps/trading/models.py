@@ -48,6 +48,14 @@ class Order(models.Model):
         related_name="orders",
         help_text="订单所属的实盘会话",
     )
+    # 触发该订单的策略/信号名称（下单时快照）。
+    # 独立于 live_session 外键，即使实盘会话被删除，交易记录详情仍能追溯触发来源。
+    triggered_strategy = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="触发该订单的策略/信号名称（下单时快照，会话删除后仍保留）",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

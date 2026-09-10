@@ -11,14 +11,21 @@ import hashlib
 import hmac
 import logging
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
 from django.conf import settings
 
-from .base import BaseExchangeAdapter, OrderRequest, OrderResponse, Position
+from .base import (
+    BaseExchangeAdapter,
+    OrderNotFoundError,
+    OrderRequest,
+    OrderResponse,
+    OrderFill,
+    Position,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         self._client: Optional[httpx.AsyncClient] = None
         self._time_offset: int = 0  # ms: local_time = server_time + offset
         self._leverage_set: set[str] = set()  # 已设置杠杆的交易对
+        self._symbol_rules: Optional[dict[str, dict]] = None  # exchangeInfo 精度规则缓存
 
     async def connect(self) -> None:
         headers = {"X-MBX-APIKEY": self._api_key}
@@ -127,10 +135,86 @@ class BinanceAdapter(BaseExchangeAdapter):
         else:
             logger.warning(f"Failed to set leverage for {symbol}: {resp.status_code} - {resp.text}")
 
+    async def _load_symbol_rules(self) -> None:
+        """拉取并缓存 exchangeInfo 精度规则（stepSize / tickSize / minQty）。"""
+        client = self._ensure_connected()
+        try:
+            resp = await client.get("/fapi/v1/exchangeInfo")
+            if resp.status_code != 200:
+                logger.warning(
+                    f"exchangeInfo fetch failed: {resp.status_code} - {resp.text[:200]}"
+                )
+                return
+            data = resp.json()
+            rules: dict[str, dict] = {}
+            for s in data.get("symbols", []):
+                symbol = s.get("symbol", "")
+                step_size = "1"
+                tick_size = "0.01"
+                min_qty = "0"
+                for f in s.get("filters", []):
+                    ftype = f.get("filterType")
+                    if ftype == "LOT_SIZE":
+                        step_size = f.get("stepSize", "1")
+                        min_qty = f.get("minQty", "0")
+                    elif ftype == "PRICE_FILTER":
+                        tick_size = f.get("tickSize", "0.01")
+                rules[symbol] = {
+                    "stepSize": Decimal(step_size),
+                    "tickSize": Decimal(tick_size),
+                    "minQty": Decimal(min_qty),
+                }
+            self._symbol_rules = rules
+            logger.info(f"exchangeInfo cached for {len(rules)} symbols")
+        except Exception as e:
+            logger.warning(f"Failed to load exchangeInfo precision rules: {e}")
+
+    def _normalize_quantity(self, symbol: str, quantity: Decimal) -> Decimal:
+        """按 LOT_SIZE stepSize 向下取整数量，避免 -1111 精度错误。"""
+        if self._symbol_rules and symbol in self._symbol_rules:
+            step = self._symbol_rules[symbol]["stepSize"]
+            if step and step > 0:
+                q = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+                # 归一化指数位数，避免 0.01000000 之类超出精度的表示
+                q = q.quantize(step)
+                return q
+        return quantity
+
+    def _validate_quantity(self, symbol: str, quantity: Decimal) -> None:
+        """校验归一化后的数量不为 0 且不低于 minQty，提前暴露下单参数错误。"""
+        if quantity <= 0:
+            raise ValueError(
+                f"quantity {quantity} for {symbol} rounds to zero "
+                f"below stepSize (use a larger order)"
+            )
+        if self._symbol_rules and symbol in self._symbol_rules:
+            min_qty = self._symbol_rules[symbol]["minQty"]
+            if min_qty and min_qty > 0 and quantity < min_qty:
+                raise ValueError(
+                    f"quantity {quantity} for {symbol} below minQty {min_qty}"
+                )
+
+    def _normalize_price(self, symbol: str, price: Decimal) -> Decimal:
+        """按 PRICE_FILTER tickSize 归一化价格。"""
+        if self._symbol_rules and symbol in self._symbol_rules:
+            tick = self._symbol_rules[symbol]["tickSize"]
+            if tick and tick > 0:
+                return price.quantize(tick, rounding=ROUND_HALF_UP)
+        return price
+
     async def place_order(self, request: OrderRequest) -> OrderResponse:
         client = self._ensure_connected()
 
         symbol = request.symbol.upper().replace("/", "")
+
+        # 首次下单前加载交易所精度规则（懒加载 + 缓存）
+        if self._symbol_rules is None:
+            await self._load_symbol_rules()
+
+        # 精度归一化：数量按 stepSize 向下取整，价格按 tickSize 对齐
+        quantity = self._normalize_quantity(symbol, request.quantity)
+        price = self._normalize_price(symbol, request.price) if request.price is not None else None
+        self._validate_quantity(symbol, quantity)
 
         # 下单前设置杠杆（Futures 必须）
         await self._ensure_leverage(symbol)
@@ -139,10 +223,10 @@ class BinanceAdapter(BaseExchangeAdapter):
             "symbol": symbol,
             "side": request.side.upper(),
             "type": request.order_type.upper(),
-            "quantity": str(request.quantity),
+            "quantity": format(quantity, "f"),
         }
-        if request.price is not None:
-            params["price"] = str(request.price)
+        if price is not None:
+            params["price"] = format(price, "f")
             params["timeInForce"] = "GTC"
         if request.client_order_id:
             params["newClientOrderId"] = request.client_order_id
@@ -170,6 +254,17 @@ class BinanceAdapter(BaseExchangeAdapter):
             raw=data,
         )
 
+    # Binance 订单状态 → 本地 Order.status 映射
+    _STATUS_MAP = {
+        "NEW": "submitted",
+        "PARTIALLY_FILLED": "partial",
+        "FILLED": "filled",
+        "CANCELED": "cancelled",
+        "EXPIRED": "cancelled",
+        "EXPIRED_IN_MATCH": "cancelled",
+        "REJECTED": "failed",
+    }
+
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
         client = self._ensure_connected()
 
@@ -181,6 +276,47 @@ class BinanceAdapter(BaseExchangeAdapter):
         )
         resp = await client.delete(f"/fapi/v1/order?{query}")
         return resp.status_code == 200
+
+    async def fetch_order(
+        self, exchange_order_id: str, symbol: str
+    ) -> OrderFill:
+        """查询订单当前状态与成交情况（/fapi/v1/order）。"""
+        client = self._ensure_connected()
+
+        query = self._sign(
+            {
+                "symbol": symbol.upper().replace("/", ""),
+                "orderId": str(exchange_order_id),
+            }
+        )
+        resp = await client.get(f"/fapi/v1/order?{query}")
+
+        if resp.status_code == 400:
+            data = resp.json()
+            if data.get("code") == -2013:  # Order does not exist
+                raise OrderNotFoundError(
+                    f"Order {exchange_order_id} does not exist on exchange"
+                )
+            raise RuntimeError(
+                f"Binance API {resp.status_code}: {resp.text[:300]}"
+            )
+        resp.raise_for_status()
+
+        data = resp.json()
+        status = self._STATUS_MAP.get(data.get("status"), "submitted")
+        filled_qty = Decimal(data.get("executedQty", "0"))
+        avg_price = (
+            Decimal(data["avgPrice"]) if data.get("avgPrice") else None
+        )
+        if status == "submitted" and filled_qty > 0:
+            status = "partial"
+
+        return OrderFill(
+            status=status,
+            filled_quantity=filled_qty,
+            avg_fill_price=avg_price,
+            error_message=None,
+        )
 
     async def get_positions(self) -> list[Position]:
         client = self._ensure_connected()

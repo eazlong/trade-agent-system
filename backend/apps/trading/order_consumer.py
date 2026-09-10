@@ -90,6 +90,7 @@ async def _process_order(fields: dict):
         price = fields.get("price")
         exchange_account_id = fields.get("exchange_account_id")
         user_id = fields.get("user_id")
+        live_session_id = fields.get("live_session_id")
         is_close_position = fields.get("is_close_position", False)
 
         if not all([exchange, symbol, side, order_type, quantity, exchange_account_id]):
@@ -110,6 +111,7 @@ async def _process_order(fields: dict):
             price=price,
             exchange_account_id=exchange_account_id,
             user_id=user_id,
+            live_session_id=live_session_id,
             is_close_position=bool(is_close_position),
         )
 
