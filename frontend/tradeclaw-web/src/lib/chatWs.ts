@@ -43,7 +43,10 @@ class ChatWebSocket {
   private preOpenRejects = 0;
 
   private getWsUrl(): string {
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const apiBase =
+      process.env.NEXT_PUBLIC_WS_URL ||
+      process.env.NEXT_PUBLIC_API_URL ||
+      "http://localhost:8000";
     const httpBase = apiBase.replace(/^https?/, "ws");
     const url = new URL("/ws/chat/", httpBase);
     const token = getAccessToken();

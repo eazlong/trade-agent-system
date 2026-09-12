@@ -52,7 +52,9 @@ export default function DashboardShell({ children }: { children: ReactNode }) {
         </div>
 
         {/* Main content */}
-        <div className="overflow-y-auto pt-3 pb-16 px-4 flex flex-col gap-3" style={{ gridRow: "2", gridColumn: "2" }}>
+        {/* [&>*]:shrink-0: 滚动容器的子项不许被 flex 压缩，否则内容超出视口时
+            子项(带 overflow-hidden 时 min-height 自动为 0)会被压扁裁切，容器无法滚动 */}
+        <div className="overflow-y-auto pt-3 pb-16 px-4 flex flex-col gap-3 [&>*]:shrink-0" style={{ gridRow: "2", gridColumn: "2" }}>
           {children}
         </div>
 

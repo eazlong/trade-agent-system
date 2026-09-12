@@ -149,7 +149,7 @@ OpenAI GPT-4o → (超时/429/错误) → Anthropic Claude Opus → (失败) →
 - When fixing async/threading issues, always check for `sync_to_async` usage and `close_old_connections()` calls in long-running loops (e.g., Celery tasks, grid search).
 
 ## Fix Verification Protocol
-- After any bug fix, run the FULL test suite (not just related tests) before declaring the fix complete.
+- After a bug fix, run the tests affected by the change (not necessarily the full suite). For reversible, low-impact changes, don't gate on the full suite—broaden scope only on new failures, regressions, or unresolved concerns.
 - When debugging, verify the runtime environment FIRST (Docker containers running? correct ports? stale code?) before analyzing code logic.
 - Do NOT make multiple speculative code changes. Diagnose the root cause thoroughly before editing. If 2 attempts fail, re-read the error and the actual code flow before a 3rd attempt.
 

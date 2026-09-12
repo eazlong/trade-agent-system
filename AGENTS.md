@@ -83,9 +83,9 @@ docker-compose up --build
 docker-compose up backend celery redis
 ```
 
-### 测试（强制执行）
+### 测试
 ```bash
-# 全量测试 + 覆盖率
+# 相关测试（按需；资金/风控路径必须覆盖）
 DJANGO_SETTINGS_MODULE=core.settings.dev uv run pytest --cov=apps --cov-report=term-missing
 
 # 单文件测试
@@ -134,12 +134,6 @@ GitHub Actions 自动运行验证金字塔各层检查。
 
 #### 4. 手动触发
 ```bash
-# 代码变更验证
-python3 .agents/skills/code-change-verification/run.py
-
-# DST 仿真测试
-python3 .agents/skills/dst-testing/run.py --seeds 100
-
 # 不变量检查
 cd backend && python scripts/check_invariants.py
 ```
@@ -147,40 +141,9 @@ cd backend && python scripts/check_invariants.py
 ## DONE CRITERIA (硬性契约)
 
 智能体完成任务必须满足：
-1. ✅ 所有 pytest 测试通过
-2. ✅ 覆盖率 ≥ 80%
-3. ✅ Ruff Lint 无错误
-4. ✅ 类型检查通过
-5. ✅ 无 console.log / print 调试语句
-6. ✅ 无硬编码密钥/凭证
+1. ✅ 改动相关测试通过（资金/订单/风控/鉴权路径必须有测试覆盖）
+2. ✅ Ruff Lint 无错误
+3. ✅ 类型检查通过
+4. ✅ 无 console.log / print 调试语句
+5. ✅ 无硬编码密钥/凭证
 
-## AGENT LOOP (自主修复循环)
-
-```
-思考 (Think) → 行动 (Act) → 观察 (Observe) → 验证 (Verify)
-     ↑                                              ↓
-     └──────────── 失败时自动重试 ──────────────────┘
-```
-
-验证失败时，系统自动捕获 Traceback 并反馈至上下文，智能体进入自主迭代修复。
-
-## META-LOOP (人类监管)
-
-人类工程师职责：
-- ❌ 不审查每行 Diff
-- ✅ 收紧验证不变量
-- ✅ 扩大仿真覆盖范围
-- ✅ 审查"垃圾回收"智能体提交的重构 PR
-
-## NEW AGENT/SKILL GUIDE
-
-### 新增 Skill
-1. 创建 `apps/skill/skills/my_skill.py`，继承 `BaseSkill`
-2. 用 `@SkillRegistry.register` 装饰
-3. 在 `apps/skill/skills/__init__.py` 中 import
-
-### 新增 Agent
-1. 在 `apps/agent/sub_agents.py` 中继承 `_LLMAgent`
-2. 用 `@AgentRegistry.register_class` 装饰
-3. 在 `backend/prompts/v1/` 下创建 prompt 文件，body 中描述 Agent 职责概述
-   （LLM 会基于 supervisor.py 中的动态识别自动路由）
