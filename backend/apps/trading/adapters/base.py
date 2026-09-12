@@ -49,6 +49,7 @@ class Position:
     entry_price: Decimal
     unrealized_pnl: Decimal
     leverage: int
+    mark_price: Optional[Decimal] = None  # 实时标记价（交易所提供，可能缺失）
 
 
 @dataclass

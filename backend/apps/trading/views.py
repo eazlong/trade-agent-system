@@ -128,8 +128,10 @@ def position_list(request):
                         "quantity": str(pos.quantity),
                         "entry_price": str(pos.entry_price),
                         "mark_price": str(
-                            pos.entry_price
-                        ),  # Position has no mark_price yet
+                            pos.mark_price
+                            if pos.mark_price is not None
+                            else pos.entry_price
+                        ),
                         "unrealized_pnl": str(pos.unrealized_pnl),
                     }
                 )

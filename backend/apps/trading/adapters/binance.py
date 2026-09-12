@@ -337,6 +337,9 @@ class BinanceAdapter(BaseExchangeAdapter):
                     entry_price=Decimal(p["entryPrice"]),
                     unrealized_pnl=Decimal(p["unRealizedProfit"]),
                     leverage=int(p["leverage"]),
+                    mark_price=(
+                        Decimal(p["markPrice"]) if p.get("markPrice") else None
+                    ),
                 )
             )
         return positions

@@ -160,6 +160,51 @@ class TestBinanceAdapterL1(unittest.TestCase):
         self.assertEqual(positions[0].symbol, "ETHUSDT")
 
     @patch("httpx.AsyncClient")
+    def test_binance_get_positions_parses_mark_price(self, mock_client_cls):
+        """get_positions() 应解析实时标记价 markPrice（与 entryPrice 区分）"""
+        adapter = BinanceAdapter("test_key", "test_secret")
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "positionAmt": "100",
+                "entryPrice": "49000",
+                "markPrice": "49500",
+                "unRealizedProfit": "100",
+                "leverage": "10",
+                "symbol": "ETHUSDT",
+            },
+        ]
+        mock_client.get.return_value = mock_response
+        adapter._client = mock_client
+
+        positions = asyncio.run(adapter.get_positions())
+        self.assertEqual(positions[0].mark_price, Decimal("49500"))
+
+    @patch("httpx.AsyncClient")
+    def test_binance_get_positions_mark_price_missing_falls_back_none(
+        self, mock_client_cls
+    ):
+        """get_positions() 在响应缺失 markPrice 时不应崩溃"""
+        adapter = BinanceAdapter("test_key", "test_secret")
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "positionAmt": "100",
+                "entryPrice": "49000",
+                "unRealizedProfit": "100",
+                "leverage": "10",
+                "symbol": "ETHUSDT",
+            },
+        ]
+        mock_client.get.return_value = mock_response
+        adapter._client = mock_client
+
+        positions = asyncio.run(adapter.get_positions())
+        self.assertIsNone(positions[0].mark_price)
+
+    @patch("httpx.AsyncClient")
     def test_binance_get_balance_returns_decimal(self, mock_client_cls):
         """get_balance() 应返回 Decimal 类型"""
         adapter = BinanceAdapter("test_key", "test_secret")
