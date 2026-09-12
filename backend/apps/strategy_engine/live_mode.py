@@ -542,8 +542,15 @@ class LiveStrategyRunner:
             from apps.datasource.store import get_data_store
 
             store = get_data_store()
-            klines = store.get_latest("kline", self.symbol, limit=limit)
+            # DataStore 里的 K 线按数据源原生格式存储（Binance: DOGEUSDT），
+            # 而 self.symbol 是 ccxt 格式（DOGE/USDT），查缓存前必须去掉 "/"，
+            # 否则永远未命中；get_latest 按时间倒序（新→旧）返回，需重新排回
+            # 升序，与主路径 _fetch_klines_from_source 保持一致（末尾=最新 K 线）
+            klines = store.get_latest(
+                "kline", self.symbol.replace("/", ""), limit=limit
+            )
             if klines:
+                klines.sort(key=lambda k: k.get("timestamp", 0))
                 self._kline_history = klines
                 logger.info(
                     f"[LiveStrategyRunner] loaded {len(klines)} historical klines "

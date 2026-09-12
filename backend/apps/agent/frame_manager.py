@@ -673,6 +673,7 @@ class FrameManager:
                 await self.subscribe_signal_klines(
                     symbol=monitor.symbol,
                     interval_str=monitor.interval or "1h",
+                    indicator_params=monitor.indicator_params,
                 )
         except Exception as e:
             logger.warning("[FrameManager] signal monitor subscription failed: %s", e)
@@ -761,7 +762,10 @@ class FrameManager:
             return []
 
     async def subscribe_signal_klines(
-        self, symbol: str, interval_str: str = "1h"
+        self,
+        symbol: str,
+        interval_str: str = "1h",
+        indicator_params: dict | None = None,
     ) -> None:
         """为信号监控订阅指定 symbol 的 K 线 WebSocket 数据。
 
@@ -772,6 +776,9 @@ class FrameManager:
         Args:
             symbol: 交易对，如 "BTC/USDT"
             interval_str: K 线周期，如 "1h", "15m"
+            indicator_params: 监控的指标参数（如 {"period": 20}），
+                回调内构造的轻量 monitor 用它决定缓存命中所需的
+                K 线根数；缺省时按最小根数处理。
         """
         from apps.datasource.registry import DataSourceRegistry
         from apps.datasource.base import DataType, KlineInterval, MarketType
@@ -808,9 +815,10 @@ class FrameManager:
                 data_type=DataType.KLINE,
                 interval=interval,
                 market_type=MarketType.SPOT,
-                callback=lambda data, sym=symbol: asyncio.get_event_loop().create_task(
-                    self._on_kline_data(data, sym)
-                ),
+                callback=lambda data, sym=symbol, iv=interval_str, ip=indicator_params or {}:
+                    asyncio.get_event_loop().create_task(
+                        self._on_kline_data(data, sym, iv, ip)
+                    ),
             )
             logger.info(
                 "[FrameManager] subscribed %s kline %s @%s for signal monitor",
@@ -819,7 +827,13 @@ class FrameManager:
                 interval.value,
             )
 
-    async def _on_kline_data(self, kline: dict, symbol: str) -> None:
+    async def _on_kline_data(
+        self,
+        kline: dict,
+        symbol: str,
+        interval: str = "1h",
+        indicator_params: dict | None = None,
+    ) -> None:
         """K 线数据回调：触发信号检查。"""
         try:
             from apps.signal_monitor.engine import SignalMonitorEngine
@@ -838,7 +852,17 @@ class FrameManager:
             def run_check():
                 close_old_connections()
                 klines = engine._load_klines_for_monitors(
-                    [type("_M", (), {"symbol": symbol, "interval": "1h"})()]
+                    [
+                        type(
+                            "_M",
+                            (),
+                            {
+                                "symbol": symbol,
+                                "interval": interval,
+                                "indicator_params": indicator_params or {},
+                            },
+                        )()
+                    ]
                 ).get(symbol, [])
                 if len(klines) >= 2:
                     engine.check_signals_for_kline(symbol, klines)
@@ -910,6 +934,7 @@ class FrameManager:
                 await self.subscribe_signal_klines(
                     symbol=monitor.symbol,
                     interval_str=monitor.interval or "1h",
+                    indicator_params=monitor.indicator_params,
                 )
             except Exception as e:
                 logger.warning(

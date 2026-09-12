@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # 复用单例显著降低峰值内存。enableRateLimit=False 避免共享实例上
 # 并发调用时的限流状态竞争（并发度已由 FrameManager 信号量限制为 2）。
 _exchange_binance: Any = None
+_exchange_binance_backfill: Any = None
 
 
 def _get_ccxt_binance() -> Any:
@@ -49,13 +50,49 @@ def _get_ccxt_binance() -> Any:
     return _exchange_binance
 
 
+def _get_ccxt_binance_backfill() -> Any:
+    """历史回填专用 ccxt 实例（放宽超时，独立于热路径单例）。
+
+    历史回填（loadMarkets + 200 根 K 线）经海外代理可能耗时 10-30s，
+    复用热路径的 5s 快速失败实例必然超时。回填低频（有冷却期），
+    独立实例不影响热路径延迟。
+    """
+    global _exchange_binance_backfill
+    if _exchange_binance_backfill is None:
+        import ccxt
+        from django.conf import settings
+
+        options: dict[str, Any] = {
+            "enableRateLimit": False,
+            # 回填走慢代理，给足时间（loadMarkets + fetch_ohlcv limit=200）
+            "timeout": 60000,
+        }
+        proxy_url = getattr(settings, "WEB_PROXY", "") or ""
+        if proxy_url:
+            options["proxies"] = {"http": proxy_url, "https": proxy_url}
+        _exchange_binance_backfill = ccxt.binance(options)
+    return _exchange_binance_backfill
+
+
 class SignalMonitorEngine:
     """信号监控引擎"""
 
     _instance: SignalMonitorEngine | None = None
 
+    # 历史回填 K 线根数（覆盖最长指标周期：ema200）
+    _BACKFILL_KLINE_LIMIT = 200
+    # 回填冷却（秒）：缓存不足时同一 symbol 在该窗口内最多回填一次，
+    # 防止 WS 热路径（每 1-2s 一次 tick）把交易所打爆。
+    # uvicorn 与 celery 是独立进程、各自独立冷却。
+    _BACKFILL_COOLDOWN = 300.0
+    # 已收盘历史 K 线回填进缓存的过期时长（秒）：已收盘 K 线不可变，
+    # 默认 4h 会让历史 4 小时后就消失，长周期指标（如 1h ema200 需要
+    # ~8 天窗口）永远凑不齐数据；7 天足够。
+    _BACKFILL_CLOSED_EXPIRE = 7 * 86400
+
     def __init__(self):
         self._prev_results: dict[str, Any] = {}
+        self._backfill_last_at: dict[str, float] = {}
 
     @classmethod
     def get_instance(cls) -> SignalMonitorEngine:
@@ -500,10 +537,31 @@ class SignalMonitorEngine:
                 "error": str(e),
             }
 
+    @classmethod
+    def _required_klines(cls, monitor: SignalMonitor) -> int:
+        """指标产生有效最新值所需的最少 K 线根数。
+
+        ema/donchian 等指标满 period 根后最新值即有效，rsi 需多一根，
+        取 period+2；封顶为回填根数，避免 period 超限时无限回填。
+        """
+        params = getattr(monitor, "indicator_params", None) or {}
+        period = int(params.get("period") or 0)
+        if not period:
+            return 2
+        return max(2, min(period + 2, cls._BACKFILL_KLINE_LIMIT))
+
     def _load_klines_for_monitors(
         self, monitors: list[SignalMonitor]
     ) -> dict[str, list[dict]]:
-        """从 MemoryDataStore 加载 K 线数据，如果缓存为空则从交易所获取"""
+        """从 MemoryDataStore 加载 K 线数据，缓存不足时从交易所回填历史。
+
+        两个关键细节（此前都踩了坑）：
+        - MemoryDataStore 里的 K 线按数据源原生格式存储（Binance: DOGEUSDT），
+          而 monitor.symbol 是 ccxt 格式（DOGE/USDT），查缓存前必须去掉 "/"，
+          否则永远未命中、每个 tick 都去打一次注定超时的交易所请求；
+        - store.get_latest 按时间倒序（新→旧）返回，而指标计算以
+          klines[-1] 为最新 K 线，必须翻转为旧→新（与交易所返回顺序一致）。
+        """
         from apps.datasource.store import get_data_store
 
         store = get_data_store()
@@ -513,20 +571,86 @@ class SignalMonitorEngine:
             if monitor.symbol in klines_map:
                 continue
 
-            # 尝试从缓存加载
-            klines = store.get_latest("kline", monitor.symbol, limit=200)
-            if klines and len(klines) >= 2:
+            required = self._required_klines(monitor)
+            # ccxt 格式（DOGE/USDT）→ 数据源原生格式（DOGEUSDT）查缓存
+            store_symbol = monitor.symbol.replace("/", "")
+
+            # 1) 优先缓存：根数足够指标计算才视为命中
+            klines = store.get_latest("kline", store_symbol, limit=200)
+            if klines:
+                klines = list(reversed(klines))  # 新→旧 翻转为 旧→新
+            if len(klines) >= required:
                 klines_map[monitor.symbol] = klines
                 continue
 
-            # 缓存为空或不完整，从交易所获取历史 K 线
-            klines = self._fetch_recent_klines(
-                monitor.symbol, interval=monitor.interval, limit=10
+            # 2) 缓存不足（进程刚启动 / 历史过期）→ 从交易所回填，带冷却
+            now_ts = time.time()
+            if (
+                now_ts - self._backfill_last_at.get(store_symbol, 0.0)
+                < self._BACKFILL_COOLDOWN
+            ):
+                if len(klines) >= 2:
+                    klines_map[monitor.symbol] = klines
+                continue
+
+            self._backfill_last_at[store_symbol] = now_ts
+            fetched = self._fetch_recent_klines(
+                monitor.symbol,
+                interval=monitor.interval,
+                limit=self._BACKFILL_KLINE_LIMIT,
             )
-            if klines:
+            if fetched:
+                self._backfill_store(store, store_symbol, fetched, monitor.interval)
+                klines_map[monitor.symbol] = fetched
+            elif len(klines) >= 2:
+                # 回填失败（如代理不可用）时，已有的缓存数据仍可用于检查
                 klines_map[monitor.symbol] = klines
 
         return klines_map
+
+    def _backfill_store(
+        self, store, store_symbol: str, klines: list[dict], interval: str
+    ) -> None:
+        """把回填的历史 K 线写入 MemoryDataStore。
+
+        - 以 K 线开盘时间生成 key，且 source 与 WebSocket 存储一致
+          （均为 "binance"），WS 后续更新天然覆盖同一 entry，不产生重复 K 线；
+        - 已收盘 K 线按 7 天过期写入（默认 4h 会让历史 4 小时后消失，
+          ema200 这类长周期指标永远凑不齐数据）；最新一根可能未收盘，
+          按默认 4h，交由 WS 更新接管。
+        """
+        import ccxt
+        from datetime import datetime, timedelta
+
+        tf_seconds = ccxt.Exchange.parse_timeframe(interval or "1h")
+        for i, k in enumerate(klines):
+            open_ms = int(k["timestamp"])
+            open_dt = datetime.fromtimestamp(open_ms / 1000)
+            is_closed = i < len(klines) - 1
+            entry = {
+                "symbol": store_symbol,
+                "interval": interval,
+                "open_time": open_dt,
+                "close_time": open_dt + timedelta(seconds=tf_seconds),
+                "open": float(k["open"]),
+                "high": float(k["high"]),
+                "low": float(k["low"]),
+                "close": float(k["close"]),
+                "volume": float(k["volume"]),
+                "turnover": 0.0,
+                "trades": 0,
+                "is_closed": is_closed,
+                "source": "binance",
+                "market_type": "spot",
+                "timestamp": open_dt,
+            }
+            expire = self._BACKFILL_CLOSED_EXPIRE if is_closed else 3600 * 4
+            try:
+                store.store("kline", store_symbol, entry, "binance", expire)
+            except Exception as e:
+                logger.warning(
+                    "Failed to store backfilled kline %s: %s", store_symbol, e
+                )
 
     def _fetch_realtime_price(self, symbol: str) -> float | None:
         """从交易所获取实时价格"""
@@ -553,7 +677,7 @@ class SignalMonitorEngine:
             base, quote = symbol.split("/")
             ccxt_symbol = f"{base}/{quote}"
 
-            exchange = _get_ccxt_binance()
+            exchange = _get_ccxt_binance_backfill()
 
             # ccxt 时间框架映射
             tf_map = {
