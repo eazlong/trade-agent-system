@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 // ── Token Management ──
 
@@ -37,7 +37,7 @@ async function request<T>(
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path.replace(/\/$/, "")}`, {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,

@@ -42,8 +42,10 @@ class LogWebSocket {
     const apiBase =
       process.env.NEXT_PUBLIC_WS_URL ||
       process.env.NEXT_PUBLIC_API_URL ||
-      "http://localhost:8000";
-    const httpBase = apiBase.replace(/^https?/, "ws");
+      (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
+    const httpBase = apiBase
+      ? apiBase.replace(/^https?/, "ws")
+      : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
     const url = new URL("/ws/logs/", httpBase);
     const token = getAccessToken();
     if (token) {

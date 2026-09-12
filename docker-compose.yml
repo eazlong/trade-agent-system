@@ -1,5 +1,6 @@
 services:
   db:
+    restart: unless-stopped
     image: timescale/timescaledb-ha:pg16
     command: >
       -c max_connections=100
@@ -25,6 +26,7 @@ services:
       - agent-net
 
   redis:
+    restart: unless-stopped
     image: redis/redis-stack:7.4.0-v2
     ports:
       - '6379:6379'
@@ -40,6 +42,7 @@ services:
       - agent-net
 
   pgbouncer:
+    restart: unless-stopped
     image: edoburu/pgbouncer:latest
     environment:
       - DATABASE_URL=postgres://trade:trade@db:5432/trade_agent
@@ -66,6 +69,7 @@ services:
       - agent-net
 
   backend:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -98,6 +102,7 @@ services:
       - agent-net
 
   celery:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -124,6 +129,7 @@ services:
       - agent-net
 
   lark-ws:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -148,6 +154,7 @@ services:
       - agent-net
 
   celery-beat:
+    restart: unless-stopped
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -165,6 +172,20 @@ services:
       - ./backend/.env
     depends_on:
       - pgbouncer                      # 依赖 pgbouncer（而非 backend）
+    networks:
+      - agent-net
+
+  frontend:
+    build:
+      context: ./frontend/tradeclaw-web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
     networks:
       - agent-net
 

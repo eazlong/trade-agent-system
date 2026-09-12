@@ -49,4 +49,4 @@ HTMLCanvasElement.prototype.getContext = function () {
     rect: () => {},
     clip: () => {},
   } as unknown as CanvasRenderingContext2D;
-};
+} as unknown as typeof HTMLCanvasElement.prototype.getContext;

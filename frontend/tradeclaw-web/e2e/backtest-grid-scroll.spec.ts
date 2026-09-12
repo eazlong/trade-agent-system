@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import type { BacktestGroup } from "../src/lib/api";
+import type { BacktestGroup, BacktestResult } from "../src/lib/api";
 
 /**
  * 回测记录页：展开网格组后，主内容区应仍可滚动。
@@ -15,7 +15,7 @@ import type { BacktestGroup } from "../src/lib/api";
  *  - /api/agent/list 等       → 空数据
  */
 
-function makeResult(i: number) {
+function makeResult(i: number): BacktestResult {
   return {
     id: `r-${i}`,
     strategy: 1,
