@@ -16,7 +16,9 @@ def api_client():
 
 @pytest.fixture
 def user(db):
-    return User.objects.create_user(username="griduser", password="testpass123")
+    return User.objects.create_user(
+        username="griduser", email="griduser@example.com", password="testpass123"
+    )
 
 
 @pytest.fixture
@@ -166,3 +168,41 @@ class TestGridSearchAPI:
             )
             assert response.status_code == 200
             assert "已取消" in response.json()["message"]
+
+
+class TestNormalizeSymbol:
+    """normalize_binance_symbol symbol 归一化"""
+
+    @staticmethod
+    def _norm(s):
+        from apps.backtest.tasks import normalize_binance_symbol
+        return normalize_binance_symbol(s)
+
+    def test_already_normalized(self):
+        assert self._norm("SOL/USDT") == "SOL/USDT"
+        assert self._norm("WBTC/USDT") == "WBTC/USDT"
+
+    def test_concatenated_exchange_format(self):
+        assert self._norm("SOLUSDT") == "SOL/USDT"
+        assert self._norm("ETHUSDC") == "ETH/USDC"
+        assert self._norm("ETHBTC") == "ETH/BTC"
+        assert self._norm("WBTCUSDT") == "WBTC/USDT"
+
+    def test_separator_format(self):
+        assert self._norm("SOL-USDT") == "SOL/USDT"
+        assert self._norm("SOL_USDT") == "SOL/USDT"
+
+    def test_bare_base_defaults_usdt(self):
+        assert self._norm("SOL") == "SOL/USDT"
+        assert self._norm("sol") == "SOL/USDT"
+        assert self._norm(" 1000SHIB ") == "1000SHIB/USDT"
+
+    def test_bare_quote_coin_is_base(self):
+        # 裸报价币种本身（如 WBTC）不得被后缀规则误切
+        assert self._norm("BTC") == "BTC/USDT"
+        assert self._norm("ETH") == "ETH/USDT"
+        assert self._norm("WBTC") == "WBTC/USDT"
+        assert self._norm("USDC") == "USDC/USDT"
+
+    def test_empty(self):
+        assert self._norm("") == ""

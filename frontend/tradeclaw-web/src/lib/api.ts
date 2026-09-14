@@ -578,6 +578,7 @@ export interface BacktestGroup {
   symbol: string;
   timeframe: string;
   status?: 'running' | 'completed' | 'failed' | 'pending' | 'cancelled';
+  error?: string;  // 失败原因（status=failed 时后端返回）
   total_combinations?: number;
   completed?: number;
   best_return_pct?: number;

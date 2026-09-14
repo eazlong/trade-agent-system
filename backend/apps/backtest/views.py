@@ -45,6 +45,18 @@ def result_list(request):
     )
 
 
+def _grid_job_error_summary(job) -> str | None:
+    """提取网格搜索任务失败原因（取 error_log 最后一条的 error 字段）。"""
+    if getattr(job, "status", None) != "failed":
+        return None
+    log = getattr(job, "error_log", None) or []
+    if not log:
+        return None
+    last = log[-1]
+    msg = last.get("error") if isinstance(last, dict) else str(last)
+    return str(msg)[:200] if msg else None
+
+
 def _build_grouped_response(request):
     """按 grid_search_id 聚合回测结果，返回分组结构。
 
@@ -103,6 +115,7 @@ def _build_grouped_response(request):
                 "best_return_pct": best_return,
                 "best_sharpe": best_sharpe,
                 "created_at": job.created_at,
+                "error": _grid_job_error_summary(job),
                 "results": BacktestResultSerializer(job_results, many=True).data,
             })
         else:
@@ -145,6 +158,7 @@ def _build_grouped_response(request):
             "best_return_pct": None,
             "best_sharpe": None,
             "created_at": job.created_at,
+            "error": _grid_job_error_summary(job),
             "results": [],
         })
 
@@ -395,6 +409,11 @@ def result_create(request):
             {"error": "strategy_name, symbol, timeframe 为必填项"}, status=400
         )
 
+    # 归一化 symbol：SOLUSDT / sol-usdt / SOL -> SOL/USDT
+    from .tasks import normalize_binance_symbol
+
+    symbol = normalize_binance_symbol(symbol)
+
     from apps.strategy_engine.backtest_mode import (
         create_empty_result,
         _resolve_strategy_id,
@@ -555,6 +574,10 @@ def grid_search_create(request):
         return Response(
             {"error": "strategy_id, symbol, timeframe 为必填项"}, status=400
         )
+    # 归一化 symbol：SOLUSDT / sol-usdt / SOL -> SOL/USDT
+    from .tasks import normalize_binance_symbol
+
+    symbol = normalize_binance_symbol(symbol)
     if not grid_search or not grid_search.get("parameters"):
         return Response(
             {"error": "grid_search.parameters 为必填项"}, status=400

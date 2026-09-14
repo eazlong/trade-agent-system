@@ -217,6 +217,11 @@ class SubmitBacktestTool(BaseTool):
                 error="strategy_name、symbol、timeframe 均为必填项",
             )
 
+        # 归一化 symbol：SOLUSDT / sol-usdt / SOL -> SOL/USDT
+        from apps.backtest.tasks import normalize_binance_symbol
+
+        symbol = normalize_binance_symbol(symbol)
+
         try:
             from datetime import date, timedelta
             from decimal import Decimal

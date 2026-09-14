@@ -206,6 +206,39 @@ def run_backtest_task(
         tracker_context.reset(token)
 
 
+# 常见报价币后缀（长后缀在前，避免 BTC 误匹配 WBTC、ETH 误匹配 WBETH）
+_QUOTE_SUFFIXES = (
+    "USDT", "USDC", "FDUSD", "BFUSD", "USDP", "TUSD", "BUSD",
+    "DAI", "WBTC", "WBETH", "BTC", "ETH", "BNB", "EUR", "GBP",
+)
+
+
+def normalize_binance_symbol(symbol: str) -> str:
+    """把用户/agent 输入的 symbol 归一化成 ccxt 标准格式 BASE/QUOTE。
+
+    - "SOL/USDT"  -> "SOL/USDT"（已标准，原样返回）
+    - "SOLUSDT"   -> "SOL/USDT"（交易所拼接格式，按报价币后缀拆分）
+    - "SOL-USDT" / "SOL_USDT" -> "SOL/USDT"
+    - "SOL"       -> "SOL/USDT"（裸基础币，默认 USDT 报价）
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    # 统一分隔符：SOL-USDT / SOL_USDT -> SOL/USDT
+    s = s.replace("-", "/").replace("_", "/")
+    if "/" in s:
+        # 已含分隔符（含上面替换产生的），去空段后原样返回
+        return "/".join(p for p in s.split("/") if p)
+    # 裸报价币种本身（BTC/ETH/WBTC/USDC...）视为基础币，默认 USDT 报价，
+    # 避免 "WBTC" 被后缀规则误切成 "W/BTC"
+    if s in _QUOTE_SUFFIXES:
+        return f"{s}/USDT"
+    for quote in _QUOTE_SUFFIXES:
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[: -len(quote)]}/{quote}"
+    return f"{s}/USDT"
+
+
 def _fetch_ohlcv_sync(
     symbol: str,
     timeframe: str,
@@ -218,9 +251,7 @@ def _fetch_ohlcv_sync(
     import ccxt.async_support as ccxt
     from django.conf import settings
 
-    symbol_normalized = symbol.replace("-", "/").replace("_", "/")
-    if "/" not in symbol_normalized:
-        symbol_normalized = f"{symbol_normalized}/USDT"
+    symbol_normalized = normalize_binance_symbol(symbol)
 
     since_ms: int | None = None
     end_ms: int | None = None
@@ -326,8 +357,8 @@ def _close_async_resources(loop: asyncio.AbstractEventLoop) -> None:
     max_retries=1,
     acks_late=True,
     track_started=True,
-    soft_time_limit=1800,
-    time_limit=3600,
+    soft_time_limit=3600,
+    time_limit=7200,
     queue='grid_search',
 )
 def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
@@ -360,6 +391,15 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
             "error_message": "job not found",
             "error": "job not found",
         }
+
+    # 归一化 symbol：修正历史任务里的拼接格式（如 SOLUSDT -> SOL/USDT）
+    normalized_symbol = normalize_binance_symbol(job.symbol)
+    if normalized_symbol != job.symbol:
+        logger.warning(
+            f"[GridSearchTask] normalized symbol {job.symbol!r} -> {normalized_symbol!r}"
+        )
+        job.symbol = normalized_symbol
+        job.save(update_fields=["symbol"])
 
     # Fall back to job's user_id if not provided (e.g. called via Agent tool)
     if not user_id and job.user_id:

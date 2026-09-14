@@ -217,6 +217,32 @@ function GroupRow({
   const borderColor = isOrphaned ? "border-gray-600" : "border-green/40";
   const bg = isOrphaned ? "bg-bg2/30" : "bg-bg2/40";
   const arrowColor = isOrphaned ? "text-gray-500" : "text-green";
+  const isFailed = group.status === "failed";
+
+  // 任务状态徽章（completed 不显示，保持列表干净）
+  const statusBadge = (() => {
+    if (isOrphaned || !group.status || group.status === "completed") return null;
+    if (group.status === "failed")
+      return (
+        <span
+          className="bg-red/20 text-red px-1.5 py-0.5 rounded text-[10px] font-semibold"
+          title={group.error || "任务失败"}
+        >
+          fail
+        </span>
+      );
+    if (group.status === "running")
+      return (
+        <span className="bg-blue/15 text-blue px-1.5 py-0.5 rounded text-[10px]">
+          running
+        </span>
+      );
+    return (
+      <span className="bg-bg3 text-text3 px-1.5 py-0.5 rounded text-[10px]">
+        {group.status}
+      </span>
+    );
+  })();
 
   return (
     <>
@@ -228,11 +254,14 @@ function GroupRow({
           {isExpanded ? "▼" : "▶"}
         </td>
         <td className="py-2 px-2">
-          <span className={`px-1.5 py-0.5 rounded text-[10px] ${isOrphaned ? "bg-gray-700 text-gray-400" : "bg-green/20 text-green"}`}>
-            {isOrphaned ? "孤儿" : "网格"}
-          </span>
+          <div className="flex items-center gap-1">
+            <span className={`px-1.5 py-0.5 rounded text-[10px] ${isOrphaned ? "bg-gray-700 text-gray-400" : "bg-green/20 text-green"}`}>
+              {isOrphaned ? "孤儿" : "网格"}
+            </span>
+            {statusBadge}
+          </div>
         </td>
-        <td className={`py-2 px-4 font-semibold ${isOrphaned ? "text-gray-500" : "text-green"}`}>
+        <td className={`py-2 px-4 font-semibold ${isOrphaned ? "text-gray-500" : isFailed ? "text-red" : "text-green"}`}>
           {group.job_name}
         </td>
         <td className="py-2 px-4 text-text2">{group.symbol}</td>
@@ -240,7 +269,7 @@ function GroupRow({
         <td className="py-2 px-4 text-text3 text-[11px]">—</td>
         <td className="py-2 px-4 text-right text-green">{fmtPct(group.best_return_pct)}</td>
         <td className="py-2 px-4 text-right text-text">{fmtNum(group.best_sharpe)}</td>
-        <td className="py-2 px-4 text-right text-text2">
+        <td className={`py-2 px-4 text-right ${isFailed ? "text-red font-semibold" : "text-text2"}`}>
           {group.completed}/{group.total_combinations}
         </td>
         <td className="py-2 px-4 text-text3">—</td>
@@ -264,6 +293,12 @@ function GroupRow({
             最佳夏普: <span className="text-green">{fmtNum(group.best_sharpe)}</span>
             {" | "}
             完成: {group.completed}/{group.total_combinations}
+            {isFailed && group.error && (
+              <>
+                {" | "}
+                <span className="text-red">失败原因: {group.error}</span>
+              </>
+            )}
             {" | "}
             {fmtDate(group.created_at)}
           </td>
