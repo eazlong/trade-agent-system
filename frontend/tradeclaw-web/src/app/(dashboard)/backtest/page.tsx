@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import DashboardShell from "@/components/layout/DashboardShell";
 import { backtestApi, type BacktestGroup } from "@/lib/api";
-import BacktestFilterBar, { type FilterType } from "@/components/backtest/BacktestFilterBar";
+import BacktestFilterBar, { type FilterType, type FilterStatus } from "@/components/backtest/BacktestFilterBar";
 import BacktestTreeTable from "@/components/backtest/BacktestTreeTable";
 import CreateStrategyModal from "@/components/dashboard/CreateStrategyModal";
 
@@ -20,6 +20,7 @@ export default function BacktestListPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [filterType, setFilterType] = useState<FilterType>("all");
+  const [filterStatus, setFilterStatus] = useState<FilterStatus>("all");
 
   const fetchData = useCallback(() => {
     setLoading(true);
@@ -54,36 +55,53 @@ export default function BacktestListPage() {
   }, []);
 
   const { filteredGroups, expandedOnMatch } = useMemo(() => {
-    if (!search.trim()) {
-      return { filteredGroups: groups, expandedOnMatch: new Set<string>() };
-    }
-
-    const q = search.toLowerCase();
+    const q = search.trim().toLowerCase();
     const expanded = new Set<string>();
     const filtered = groups.filter((group) => {
-      if (group.type === "grid_search" || group.type === "orphaned_grid_search") {
-        const matchJobName = group.job_name?.toLowerCase().includes(q);
-        const matchSymbol = group.symbol?.toLowerCase().includes(q);
-        if (matchJobName || matchSymbol) return true;
-        const childMatch = hasChildMatch(group, q);
-        if (childMatch) {
-          expanded.add(group.job_id || "");
-          return true;
-        }
+      const isGrid =
+        group.type === "grid_search" || group.type === "orphaned_grid_search";
+
+      // 类型筛选
+      if (filterType === "grid" && !isGrid) return false;
+      if (filterType === "single" && isGrid) return false;
+
+      // 状态筛选（单次回测视为成功；网格按 job 状态）
+      if (filterStatus === "failed" && !(isGrid && group.status === "failed"))
         return false;
+      if (filterStatus === "success" && isGrid && group.status !== "completed")
+        return false;
+
+      // 搜索
+      if (q) {
+        if (isGrid) {
+          const matchJobName = group.job_name?.toLowerCase().includes(q);
+          const matchSymbol = group.symbol?.toLowerCase().includes(q);
+          if (matchJobName || matchSymbol) return true;
+          const childMatch = hasChildMatch(group, q);
+          if (childMatch) {
+            expanded.add(group.job_id || "");
+            return true;
+          }
+          return false;
+        }
+        return (
+          group.result?.strategy_name?.toLowerCase().includes(q) ||
+          group.result?.symbol?.toLowerCase().includes(q)
+        );
       }
-      return (
-        group.result?.strategy_name?.toLowerCase().includes(q) ||
-        group.result?.symbol?.toLowerCase().includes(q)
-      );
+      return true;
     });
     return { filteredGroups: filtered, expandedOnMatch: expanded };
-  }, [groups, search, hasChildMatch]);
+  }, [groups, search, filterType, filterStatus, hasChildMatch]);
 
-  const handleFilterChange = useCallback((values: { search: string; filterType: FilterType }) => {
-    setSearch(values.search);
-    setFilterType(values.filterType);
-  }, []);
+  const handleFilterChange = useCallback(
+    (values: { search: string; filterType: FilterType; filterStatus: FilterStatus }) => {
+      setSearch(values.search);
+      setFilterType(values.filterType);
+      setFilterStatus(values.filterStatus);
+    },
+    []
+  );
 
   return (
     <DashboardShell>

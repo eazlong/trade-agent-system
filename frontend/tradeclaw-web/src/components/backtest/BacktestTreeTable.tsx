@@ -274,15 +274,7 @@ function GroupRow({
         </td>
         <td className="py-2 px-4 text-text3">—</td>
         <td className="py-2 px-4 text-right text-text3">—</td>
-        <td className="py-2 px-4 text-right">
-          <Link
-            href={`/settings?tab=grid-search`}
-            className="text-green hover:underline cursor-pointer"
-            onClick={(e) => e.stopPropagation()}
-          >
-            🔍 详情
-          </Link>
-        </td>
+        <td className="py-2 px-4 text-right text-text3">—</td>
       </tr>
 
       {!isExpanded && (

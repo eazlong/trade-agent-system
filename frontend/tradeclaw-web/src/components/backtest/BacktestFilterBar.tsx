@@ -3,10 +3,12 @@
 import { useState, useEffect } from "react";
 
 export type FilterType = "all" | "grid" | "single";
+export type FilterStatus = "all" | "success" | "failed";
 
 export interface FilterBarValue {
   search: string;
   filterType: FilterType;
+  filterStatus: FilterStatus;
 }
 
 interface BacktestFilterBarProps {
@@ -16,11 +18,12 @@ interface BacktestFilterBarProps {
 export default function BacktestFilterBar({ onChange }: BacktestFilterBarProps) {
   const [search, setSearch] = useState("");
   const [filterType, setFilterType] = useState<FilterType>("all");
+  const [filterStatus, setFilterStatus] = useState<FilterStatus>("all");
 
   useEffect(() => {
-    onChange({ search, filterType });
+    onChange({ search, filterType, filterStatus });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, filterType]);
+  }, [search, filterType, filterStatus]);
 
   return (
     <div className="flex gap-3 mb-4">
@@ -36,11 +39,20 @@ export default function BacktestFilterBar({ onChange }: BacktestFilterBarProps) 
       <select
         value={filterType}
         onChange={(e) => setFilterType(e.target.value as FilterType)}
-        className="px-3 py-2 text-xs bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-lg text-text focus:outline-none focus:border:border-green/50 font-mono cursor-pointer"
+        className="px-3 py-2 text-xs bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-lg text-text focus:outline-none focus:border-green/50 font-mono cursor-pointer"
       >
         <option value="all">全部类型</option>
         <option value="grid">网格搜索</option>
         <option value="single">单次回测</option>
+      </select>
+      <select
+        value={filterStatus}
+        onChange={(e) => setFilterStatus(e.target.value as FilterStatus)}
+        className="px-3 py-2 text-xs bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-lg text-text focus:outline-none focus:border-green/50 font-mono cursor-pointer"
+      >
+        <option value="all">全部状态</option>
+        <option value="success">成功</option>
+        <option value="failed">失败</option>
       </select>
     </div>
   );
