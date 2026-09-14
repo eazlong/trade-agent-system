@@ -267,7 +267,7 @@ function GroupRow({
         <td className="py-2 px-4 text-text2">{group.symbol}</td>
         <td className="py-2 px-4 text-text2">{group.timeframe}</td>
         <td className="py-2 px-4 text-text3 text-[11px]">—</td>
-        <td className="py-2 px-4 text-right text-green">{fmtPct(group.best_return_pct)}</td>
+        <td className={`py-2 px-4 text-right ${group.best_return_pct != null && group.best_return_pct < 0 ? "text-red" : "text-green"}`}>{fmtPct(group.best_return_pct)}</td>
         <td className="py-2 px-4 text-right text-text">{fmtNum(group.best_sharpe)}</td>
         <td className={`py-2 px-4 text-right ${isFailed ? "text-red font-semibold" : "text-text2"}`}>
           {group.completed}/{group.total_combinations}
@@ -280,7 +280,7 @@ function GroupRow({
       {!isExpanded && (
         <tr className={`border-b ${borderColor} ${bg}`}>
           <td colSpan={12} className="py-1.5 px-4 text-xs text-text3 font-mono pl-[40px]">
-            最佳收益: <span className="text-green">{fmtPct(group.best_return_pct)}</span>
+            最佳收益: <span className={group.best_return_pct != null && group.best_return_pct < 0 ? "text-red" : "text-green"}>{fmtPct(group.best_return_pct)}</span>
             {" | "}
             最佳夏普: <span className="text-green">{fmtNum(group.best_sharpe)}</span>
             {" | "}
