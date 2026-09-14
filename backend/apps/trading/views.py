@@ -35,6 +35,50 @@ def order_detail(request, pk):
     return Response(OrderSerializer(order).data)
 
 
+KLINE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def klines(request):
+    """单品种 K 线数据（交易记录 / 历史订单图表展示）。
+
+    查询参数：symbol（必填，如 SOL/USDT）、interval（默认 1h）、limit（默认 300，最大 1000）。
+    数据从交易所实时拉取（经 WEB_PROXY 代理），返回升序 OHLCV。
+    """
+    from apps.backtest.tasks import _fetch_ohlcv_sync
+
+    symbol = (request.query_params.get("symbol") or "").strip()
+    if not symbol:
+        return Response(
+            {"error": "symbol is required"}, status=status.HTTP_400_BAD_REQUEST
+        )
+    interval = (request.query_params.get("interval") or "1h").strip()
+    if interval not in KLINE_INTERVALS:
+        return Response(
+            {"error": f"interval must be one of {list(KLINE_INTERVALS)}"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        limit = int(request.query_params.get("limit") or 300)
+    except (TypeError, ValueError):
+        limit = 300
+    limit = max(50, min(limit, 1000))
+
+    ohlcv = _fetch_ohlcv_sync(symbol, interval, exchange="binance", limit=limit)
+    if not ohlcv:
+        return Response(
+            {
+                "error": f"failed to fetch OHLCV for {symbol} ({interval})",
+                "ohlcv_data": [],
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+    return Response(
+        {"symbol": symbol, "interval": interval, "count": len(ohlcv), "ohlcv_data": ohlcv}
+    )
+
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def strategy_list(request):

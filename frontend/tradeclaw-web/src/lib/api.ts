@@ -190,6 +190,14 @@ export const tradingApi = {
     request<PositionResponse>("/api/trading/positions/"),
   getAccounts: () =>
     request<ExchangeAccountWithBalance[]>("/api/trading/accounts/"),
+  getKlines: (symbol: string, interval: string, limit = 300) =>
+    request<{ symbol: string; interval: string; count: number; ohlcv_data: OHLCVPoint[] }>(
+      `/api/trading/klines/?${new URLSearchParams({
+        symbol,
+        interval,
+        limit: String(limit),
+      }).toString()}`
+    ),
 };
 
 // ── Trading Page Types ──

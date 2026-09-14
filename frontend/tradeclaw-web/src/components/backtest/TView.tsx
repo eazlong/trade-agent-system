@@ -27,7 +27,13 @@ import type { SeriesMarkerPosition, SeriesMarkerShape } from "lightweight-charts
 interface TViewProps {
   ohlcv: OHLCVPoint[];
   indicators?: IndicatorData;
-  trades: BacktestTrade[];
+  trades?: BacktestTrade[];
+  /** 实盘历史订单标记（交易记录详情页） */
+  orderMarkers?: TViewOrderMarker[];
+  /** K 线加载中（优先于"暂无 K 线数据"占位） */
+  loading?: boolean;
+  /** 水平价格线（如成交均价 / 委托价） */
+  priceLine?: { price: number; title: string; color?: string } | null;
   timeframe?: string;
   availableTimeframes?: string[];
   onTimeframeChange?: (tf: string) => void;
@@ -39,6 +45,17 @@ interface TViewProps {
   /** Whether more later bars may be available from the server */
   hasMoreLater?: boolean;
   onLoadMore?: (direction: "earlier" | "later") => void;
+}
+
+/** 实盘订单标记（由 Order 转换而来） */
+export interface TViewOrderMarker {
+  time: string;
+  side: "buy" | "sell";
+  price: number | null;
+  quantity: string;
+  filled: boolean;
+  /** 当前查看的订单，用醒目颜色高亮 */
+  highlighted?: boolean;
 }
 
 /** Convert ISO timestamp to UTCTimestamp (seconds) */
@@ -173,12 +190,61 @@ function buildTradeMarkers(
   });
 }
 
+/** Build markers for live (real) orders — buy below bar / sell above bar */
+function buildOrderMarkers(
+  orders: TViewOrderMarker[],
+  ohlcv: OHLCVPoint[]
+): SeriesMarker<Time>[] {
+  if (!ohlcv.length || !orders.length) return [];
+
+  const times = ohlcv.map((p) => toUTCTime(p.timestamp));
+  const minTime = times[0];
+  const maxTime = times[times.length - 1];
+
+  const findClosestTime = (targetTs: UTCTimestamp): Time => {
+    let minDist = Infinity;
+    let closestIdx = 0;
+    for (let i = 0; i < times.length; i++) {
+      const dist = Math.abs(times[i] - targetTs);
+      if (dist < minDist) {
+        minDist = dist;
+        closestIdx = i;
+      }
+    }
+    return times[closestIdx];
+  };
+
+  const markers: SeriesMarker<Time>[] = [];
+  for (const o of orders) {
+    const ts = toUTCTime(o.time);
+    if (ts < minTime || ts > maxTime) continue;
+    const isBuy = o.side === "buy";
+    markers.push({
+      time: findClosestTime(ts),
+      position: (isBuy ? "belowBar" : "aboveBar") as SeriesMarkerPosition,
+      color: o.highlighted ? "#ffd600" : isBuy ? "#00e676" : "#ff5252",
+      shape: (isBuy ? "arrowUp" : "arrowDown") as SeriesMarkerShape,
+      text: o.highlighted
+        ? `当前 ${isBuy ? "买" : "卖"} ${o.quantity}`
+        : `${isBuy ? "买" : "卖"} ${o.quantity}`,
+    });
+  }
+  return markers.sort((a, b) => {
+    const ta = a.time as number;
+    const tb = b.time as number;
+    return ta - tb;
+  });
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function TView({
   ohlcv,
   indicators,
   trades,
+  orderMarkers,
+  loading = false,
+  priceLine,
   timeframe,
   availableTimeframes = ["1m", "5m", "15m", "1h", "4h", "1d"],
   onTimeframeChange,
@@ -360,10 +426,25 @@ export default function TView({
     }));
     candles.setData(candleData);
 
-    // Trade markers
-    const markers = buildTradeMarkers(trades, data);
+    // Trade markers (backtest trades + live orders, merged & sorted by time)
+    const markers = [
+      ...buildTradeMarkers(trades ?? [], data),
+      ...buildOrderMarkers(orderMarkers ?? [], data),
+    ].sort((a, b) => (a.time as number) - (b.time as number));
     if (markers.length) {
       candles.setMarkers(markers);
+    }
+
+    // Horizontal price line (e.g. avg fill price / order price)
+    if (priceLine && Number.isFinite(priceLine.price) && priceLine.price > 0) {
+      candles.createPriceLine({
+        price: priceLine.price,
+        title: priceLine.title,
+        color: priceLine.color || "#ffd600",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+      });
     }
 
     candleSeriesRef.current = candles;
@@ -498,7 +579,7 @@ export default function TView({
       volumeSeriesRef.current = null;
       hoverInfoRef.current = null;
     };
-  }, [ohlcv, indicators, trades, isFullscreen]);
+  }, [ohlcv, indicators, trades, orderMarkers, priceLine, isFullscreen]);
 
   // ── Fullscreen toggle ────────────────────────────────────────────────────
 
@@ -531,7 +612,7 @@ export default function TView({
   if (!ohlcv?.length) {
     return (
       <div className="h-40 bg-bg2 rounded-lg animate-pulse flex items-center justify-center text-xs text-text3">
-        暂无 K 线数据
+        {loading ? "K 线加载中..." : "暂无 K 线数据"}
       </div>
     );
   }

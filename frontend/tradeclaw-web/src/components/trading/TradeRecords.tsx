@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { Order, ExchangeAccountWithBalance } from "@/lib/api";
+import type { Order, ExchangeAccountWithBalance, OHLCVPoint } from "@/lib/api";
+import { tradingApi } from "@/lib/api";
+import TView from "@/components/backtest/TView";
+import type { TViewOrderMarker } from "@/components/backtest/TView";
 
 // ── Formatting helpers ──
 
@@ -74,10 +77,12 @@ function DetailRow({ label, value, mono }: { label: string; value: React.ReactNo
 function TradeDetailModal({
   order,
   accountLabel,
+  allOrders,
   onClose,
 }: {
   order: Order;
   accountLabel: string;
+  allOrders: Order[];
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -87,6 +92,61 @@ function TradeDetailModal({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
+
+  // ── K 线 + 历史订单（TView） ──
+  const [interval, setInterval] = useState("1h");
+  const [ohlcv, setOhlcv] = useState<OHLCVPoint[]>([]);
+  const [klinesLoading, setKlinesLoading] = useState(true);
+  const [klinesError, setKlinesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let stale = false;
+    setKlinesLoading(true);
+    setKlinesError(null);
+    setOhlcv([]);
+    tradingApi
+      .getKlines(order.symbol, interval, 300)
+      .then((res) => {
+        if (!stale) setOhlcv(res.ohlcv_data || []);
+      })
+      .catch((e) => {
+        if (!stale) setKlinesError(e instanceof Error ? e.message : "K 线加载失败");
+      })
+      .finally(() => {
+        if (!stale) setKlinesLoading(false);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [order.symbol, interval]);
+
+  // 同品种全部已(部分)成交订单 → 图标记
+  const orderMarkers = useMemo<TViewOrderMarker[]>(() => {
+    return allOrders
+      .filter((o) => o.symbol === order.symbol && parseFloat(o.filled_quantity) > 0)
+      .map((o) => ({
+        time: o.updated_at || o.created_at,
+        side: o.side,
+        price: o.avg_fill_price
+          ? parseFloat(o.avg_fill_price)
+          : o.price
+            ? parseFloat(o.price)
+            : null,
+        quantity: o.filled_quantity,
+        filled: o.status === "filled" || o.status === "partial",
+        highlighted: o.id === order.id,
+      }));
+  }, [allOrders, order.symbol, order.id]);
+
+  const priceLine = useMemo(() => {
+    const p = order.avg_fill_price
+      ? parseFloat(order.avg_fill_price)
+      : order.price
+        ? parseFloat(order.price)
+        : null;
+    if (p == null || isNaN(p) || p <= 0) return null;
+    return { price: p, title: order.avg_fill_price ? "成交均价" : "委托价" };
+  }, [order]);
 
   const sideColor = order.side === "buy" ? "bg-green-dim text-green" : "bg-red-dim text-red";
   const typeLabel =
@@ -109,7 +169,7 @@ function TradeDetailModal({
       onClick={onClose}
     >
       <div
-        className="bg-bg1 border border-[rgba(255,255,255,0.1)] rounded-xl w-full max-w-lg max-h-[88vh] overflow-y-auto shadow-2xl"
+        className="bg-bg1 border border-[rgba(255,255,255,0.1)] rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -136,6 +196,26 @@ function TradeDetailModal({
         </div>
 
         <div className="px-4 py-3 flex flex-col gap-3">
+          {/* K 线 · 历史订单 */}
+          <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-lg overflow-hidden">
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold px-3 pt-2 pb-1">
+              K 线 · 历史订单
+              {klinesError && (
+                <span className="ml-2 normal-case tracking-normal text-red">{klinesError}</span>
+              )}
+            </div>
+            <div className="px-1 pb-1">
+              <TView
+                ohlcv={ohlcv}
+                orderMarkers={orderMarkers}
+                loading={klinesLoading}
+                priceLine={priceLine}
+                timeframe={interval}
+                onTimeframeChange={setInterval}
+              />
+            </div>
+          </div>
+
           {/* 成交信息 */}
           <div className="grid grid-cols-3 gap-2">
             <div className="bg-bg2/60 border border-[rgba(255,255,255,0.05)] rounded-lg px-3 py-2.5">
@@ -415,6 +495,7 @@ export default function TradeRecords({
         <TradeDetailModal
           order={selected}
           accountLabel={selectedAccountLabel}
+          allOrders={orders}
           onClose={() => setSelected(null)}
         />
       )}
