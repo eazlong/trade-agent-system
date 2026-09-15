@@ -58,9 +58,21 @@ export interface TViewOrderMarker {
   highlighted?: boolean;
 }
 
-/** Convert ISO timestamp to UTCTimestamp (seconds) */
+/** Convert ISO timestamp to UTCTimestamp (seconds).
+ *
+ *  后端返回的 K 线时间戳是「无时区后缀的 UTC 字符串」（如 "2026-09-14T02:15:00"，见
+ *  backend/apps/backtest/tasks.py 的 datetime.fromtimestamp(...).isoformat()），
+ *  而订单 created_at/updated_at 是带 Z 的 aware UTC 串。
+ *  JS 会把无时区串按「浏览器本地时区」解析（CST=+8h），导致 K 线与订单标记
+ *  相差一个时区偏移、标记被画到 8 小时之后。
+ *  这里统一按 UTC 解析：两者落到同一时间基准，再由 localization.timeFormatter
+ *  转换到系统时区显示。
+ */
 function toUTCTime(ts: string): UTCTimestamp {
-  return Math.floor(new Date(ts).getTime() / 1000) as UTCTimestamp;
+  if (!ts) return 0 as UTCTimestamp;
+  const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(ts);
+  const ms = new Date(hasTimezone ? ts : `${ts}Z`).getTime();
+  return Math.floor((Number.isFinite(ms) ? ms : 0) / 1000) as UTCTimestamp;
 }
 
 /** Ensure OHLCV data is ascending (oldest-first).
@@ -331,7 +343,7 @@ export default function TView({
       volume: closest.volume,
       change,
       changePercent,
-      time: new Date(closest.timestamp).toLocaleString(),
+      time: new Date(toUTCTime(closest.timestamp) * 1000).toLocaleString(),
     });
   }, []);
 
