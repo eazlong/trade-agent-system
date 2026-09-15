@@ -36,6 +36,8 @@ class DetectBoxRangeTool(BaseTool):
         "ISO 字符串可解析时计算；K线无 timestamp 或不可解析时为 None。"
         "started_in_box 表示窗口开头就已处于箱体（真实进入点早于窗口）；"
         "若窗口内没有任何 close 进入箱带，时间字段统一为 None。"
+        "箱体持续时间门槛：duration_bars 必须 >= min_duration_bars（默认 12 根，"
+        "0 表示不限制），否则判为非箱体（reason 会说明“箱体持续时间不足”）。"
         "klines 可以直接传 K线 dict 列表（每项需含 high/low/close），"
         "也可以传 fetch_ohlcv 返回的 temp_file 路径字符串（工具会自动读取）。"
         "只做纯计算，不获取行情。"
@@ -106,7 +108,16 @@ class DetectBoxRangeTool(BaseTool):
                 },
                 "min_width_pct": {
                     "type": "number",
-                    "description": "箱体相对宽度下限（占中线比例，如 0.01 表示 1%）",
+                    "default": 0.005,
+                    "description": "箱体相对宽度下限（占中线比例），默认 0.005 = 0.5%；0 表示不限制",
+                },
+                "min_duration_bars": {
+                    "type": "integer",
+                    "default": 12,
+                    "description": (
+                        "箱体最少持续根数：duration_bars（首根在箱 close → 末根在箱 close 的跨度，"
+                        "含中间离箱间隙）必须 >= 该值，默认 12；0 表示不限制"
+                    ),
                 },
             },
             "required": ["klines"],
@@ -168,11 +179,8 @@ class DetectBoxRangeTool(BaseTool):
                     if kwargs.get("min_width_abs") is not None
                     else None
                 ),
-                min_width_pct=(
-                    float(kwargs["min_width_pct"])
-                    if kwargs.get("min_width_pct") is not None
-                    else None
-                ),
+                min_width_pct=float(kwargs.get("min_width_pct", 0.005)),
+                min_duration_bars=int(kwargs.get("min_duration_bars", 12)),
             )
             return ToolResult(success=True, data=data)
         except (TypeError, ValueError) as exc:

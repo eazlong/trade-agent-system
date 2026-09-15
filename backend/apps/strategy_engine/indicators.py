@@ -459,9 +459,11 @@ def _validate_box_range_params(
     atr_period: int,
     upper_max_discard_pct: float,
     lower_max_discard_pct: float,
-    min_width_abs: float | None,
-    min_width_pct: float | None,
+    min_width_abs: float | None = None,
+    min_width_pct: float | None = None,
+    min_duration_bars: int | None = 12,
 ) -> None:
+    """校验 detect_box_range 入参（越早报错越省事）。"""
     if max_width_abs is None and max_width_pct is None:
         raise ValueError("必须传入 max_width_abs 或 max_width_pct 之一")
     if max_width_abs is not None and max_width_pct is not None:
@@ -488,6 +490,8 @@ def _validate_box_range_params(
         raise ValueError("min_width_abs 必须 >= 0")
     if min_width_pct is not None and min_width_pct < 0:
         raise ValueError("min_width_pct 必须 >= 0")
+    if min_duration_bars is not None and int(min_duration_bars) < 0:
+        raise ValueError("min_duration_bars 必须 >= 0（0 表示不限制箱体持续根数）")
 
     min_bars = 2 * pivot_window + 1
     if len(klines) < min_bars:
@@ -515,7 +519,8 @@ def detect_box_range(
     upper_max_discard_pct: float = 0.15,
     lower_max_discard_pct: float = 0.15,
     min_width_abs: float | None = None,
-    min_width_pct: float | None = None,
+    min_width_pct: float | None = 0.005,
+    min_duration_bars: int | None = 12,
 ) -> dict:
     """判断 K 线窗口是否处于箱体震荡，并返回上下边界。
 
@@ -527,6 +532,16 @@ def detect_box_range(
         选出的 lower 必须 ≤ window_low  × (1 + lower_max_discard_pct)
         即"丢掉"窗口极值的一部分。默认 0.15 意味着上沿至少够到窗口高点 85%，
         下沿最多只到窗口低点 115%。
+
+    宽度下限（防止"刀锋薄箱体"被当成箱体）：
+        候选箱体的 width_pct 必须 >= min_width_pct，默认 0.005（0.5%）；
+        绝对宽度下限用 min_width_abs（默认 None 不启用）。0/None = 不限制。
+
+    持续时间门槛（防止"刚形成两三根的伪箱体"）：
+        候选箱体的 duration_bars（首根在箱 close → 末根在箱 close 的跨度，
+        含中间离箱间隙）必须 >= min_duration_bars，默认 12 根；
+        设为 0/None 表示不限制。窗口内没有任何 close 进入箱带时
+        duration_bars 为 None，同样视为不满足该门槛。
 
     评分挑选：在通过 pivot_count + touches + 粗筛的所有 (upper, lower) 组合中，
     选 (pivot_count × touches) 乘积最大的；若都通不过校验，依次给出失败原因。
@@ -552,12 +567,17 @@ def detect_box_range(
         lower_max_discard_pct,
         min_width_abs,
         min_width_pct,
+        min_duration_bars,
     )
 
     abs_threshold = float(max_width_abs) if max_width_abs is not None else None
     pct_threshold = float(max_width_pct) if max_width_pct is not None else None
     min_abs_floor = float(min_width_abs) if min_width_abs is not None else None
     min_pct_floor = float(min_width_pct) if min_width_pct is not None else None
+    # 箱体持续根数下限；0/None = 不限制
+    min_duration_floor = (
+        int(min_duration_bars) if min_duration_bars else None
+    )
 
     highs = np.array([float(k["high"]) for k in klines], dtype=np.float64)
     lows = np.array([float(k["low"]) for k in klines], dtype=np.float64)
@@ -590,6 +610,7 @@ def detect_box_range(
         "lower_max_discard_pct": lower_max_discard_pct,
         "min_width_abs": min_abs_floor,
         "min_width_pct": min_pct_floor,
+        "min_duration_bars": min_duration_floor,
     }
 
     if not upper_clusters or not lower_clusters:
@@ -645,7 +666,11 @@ def detect_box_range(
         )
 
     # 在 (upper, lower) 组合中选 (pivot_count × touches) 乘积最大
-    best: tuple[float, float, int, int, int, int, int] | None = None
+    # stats 随 best 一起保存，避免最后重复计算 _box_time_stats
+    best: tuple[int, float, int, int, float, int, int, dict] | None = None
+    # 因时长不足被淘汰的组合计数，以及其中最长的 duration_bars（用于失败原因提示）
+    duration_rejected = 0
+    short_max: int | None = None
     for u_mean, u_count, u_touches in upper_candidates:
         for l_mean, l_count, l_touches in lower_candidates:
             if u_mean <= l_mean:
@@ -661,6 +686,17 @@ def detect_box_range(
                 continue
             if min_pct_floor is not None and width_pct < min_pct_floor:
                 continue
+            stats = _box_time_stats(
+                klines, lower=l_mean, upper=u_mean, tolerance_pct=tolerance_pct
+            )
+            duration = stats.get("duration_bars")
+            if min_duration_floor is not None and (
+                duration is None or duration < min_duration_floor
+            ):
+                duration_rejected += 1
+                if duration is not None and (short_max is None or duration > short_max):
+                    short_max = duration
+                continue
             score = u_count * u_touches * l_count * l_touches
             if best is None or score > best[0]:
                 best = (
@@ -671,8 +707,16 @@ def detect_box_range(
                     l_mean,
                     l_count,
                     l_touches,
+                    stats,
                 )
     if best is None:
+        if min_duration_floor is not None and duration_rejected:
+            longest = (
+                f"最长 {short_max} 根" if short_max is not None else "候选箱带内无 close 落入"
+            )
+            return _fail(
+                f"箱体持续时间不足（{longest} < 下限 {min_duration_floor} 根）"
+            )
         # 给出更精确的原因：先看 width，再看 floor
         sample_w = upper_candidates[0][0] - lower_candidates[0][0]
         if min_abs_floor is not None and sample_w < min_abs_floor:
@@ -698,6 +742,7 @@ def detect_box_range(
         lower,
         lower_pivot_count,
         lower_touches,
+        time_stats,
     ) = best
     width = upper - lower
     mid = (upper + lower) / 2
@@ -716,7 +761,7 @@ def detect_box_range(
         "pivot_window": pivot_window,
         "tolerance_pct": tolerance_pct,
     }
-    box.update(_box_time_stats(klines, lower, upper, tolerance_pct))
+    box.update(time_stats)
 
     return {
         "is_ranging": True,
