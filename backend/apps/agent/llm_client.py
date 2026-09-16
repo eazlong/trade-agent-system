@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 import time
 from typing import Any, Callable, Optional
 
@@ -17,7 +19,9 @@ class ToolCallTruncatedError(Exception):
     """LLM 返回的 tool_call arguments JSON 被截断，需要重试"""
 
 
-TOOL_CALL_MAX_RETRIES = 2
+# 工具调用重试次数：上游（LLM 中继 / 推理服务）5xx 多为瞬时故障，
+# 实测存在 ~40-50% 失败率的窗口（netgpu 中继 2026-09-16），2 次不够穿透。
+TOOL_CALL_MAX_RETRIES = 4
 
 
 def _prepend_system(system: str, messages: list[dict]) -> list[dict]:
@@ -133,6 +137,10 @@ class LLMClient:
         # 避免 write_file 等大参数工具因 max_tokens 不足反复失败
         max_tokens_cap = 32768
         for attempt in range(1, TOOL_CALL_MAX_RETRIES + 1):
+            if attempt > 1:
+                # 抖动退避：上游 5xx 多为瞬时故障，避免重试同刻叠加
+                delay = min(0.5 * (2 ** (attempt - 2)), 4.0) + random.uniform(0, 0.3)
+                await asyncio.sleep(delay)
             try:
                 return await self._call_openai_with_tools(
                     system, messages, tools, current_max_tokens, temperature
@@ -174,8 +182,14 @@ class LLMClient:
                 last_exc = e
                 break  # 配置错误等非可重试异常，直接降级
 
+        degradation_reason = (
+            f"{type(last_exc).__name__}: {last_exc}"[:300] if last_exc else "unknown"
+        )
         logger.warning(
-            f"OpenAI tool call failed ({last_exc}), falling back to plain chat"
+            "[LLMClient] tool channel unavailable after %d attempt(s) (%s); "
+            "falling back to plain chat — response marked degraded",
+            TOOL_CALL_MAX_RETRIES,
+            degradation_reason,
         )
         
         # 降级：拼接工具描述到system prompt，让LLM输出JSON
@@ -217,7 +231,11 @@ class LLMClient:
             else (messages[-1].get("content", "") if messages else "")
         )
         result = await self.chat(fallback_system, user_text, max_tokens, temperature)
-        return LLMToolResponse(content=result)
+        return LLMToolResponse(
+            content=result,
+            degraded=True,
+            degradation_reason=degradation_reason,
+        )
 
     async def _call_openai_with_tools(
         self,
@@ -616,11 +634,16 @@ class LLMToolResponse:
 
     def __init__(
         self, content: str = "", tool_calls: list[ToolCallRequest] | None = None,
-        reasoning_content: str = "",
+        reasoning_content: str = "", degraded: bool = False,
+        degradation_reason: str = "",
     ):
         self.content = content
         self.tool_calls: list[ToolCallRequest] = tool_calls or []
         self.reasoning_content = reasoning_content
+        # degraded=True 表示本轮答复来自"工具通道故障后的纯文本降级路径"：
+        # 它不代表任何工具被执行过，调用方不得当成正常答复转发给用户。
+        self.degraded = degraded
+        self.degradation_reason = degradation_reason
 
     @property
     def has_tool_calls(self) -> bool:

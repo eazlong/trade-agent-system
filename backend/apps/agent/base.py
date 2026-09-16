@@ -72,6 +72,19 @@ class BaseAgent(ABC):
         "请立即调用对应工具获取真实数据后再回答；如果工具调用失败，请如实报告错误。"
     )
 
+    # 工具通道（LLM function calling）彻底不可用时的对外答复：
+    # 必须明确告诉用户"本次未执行"，绝不能把降级文本当成正常答复转发。
+    _TOOL_CHANNEL_DOWN_REPLY = (
+        "⚠️ 本次请求未执行。Agent 的 LLM 工具调用通道故障（{reason}），"
+        "重试全部失败，因此没有调用任何工具、也没有提交任何任务或回测。\n"
+        "请稍后重试；若持续失败，请检查 LLM provider 状态。"
+    )
+    # 已真实执行过工具、仅收尾这一轮降级时的补充说明
+    _TOOL_CHANNEL_DEGRADED_NOTE = (
+        "\n\n（注：生成此回答时 LLM 工具调用通道故障（{reason}），"
+        "以上内容基于已执行的工具结果，本轮未执行新的操作。）"
+    )
+
     def __init__(self):
         self._running = False
         self._skills_loader = None
@@ -535,9 +548,29 @@ class BaseAgent(ABC):
                     )
                     return ("", True)
 
-                # 检查是否是 fallback 路径的 JSON tool call
+                # 本轮答复是否来自"工具通道故障后的降级路径"
+                degraded = bool(getattr(resp, "degraded", False))
+                degraded_reason = getattr(resp, "degradation_reason", "") or "unknown"
+
+                # 检查是否是 fallback 路径的 JSON tool call（降级路径的补救：
+                # 若模型仍输出了 JSON tool call，工具依然可以真正执行）
                 json_tc = self._try_parse_json_tool_call(content, tools)
                 if json_tc is None:
+                    # 工具通道故障 + 本轮没有任何工具执行 → 拒绝把这段
+                    # "看起来像答复"的降级文本转发给用户（否则用户会以为已执行）
+                    if degraded and not had_tool_results:
+                        logger.error(
+                            "[%s] _run_tool_loop round %d: tool channel degraded "
+                            "(%s), no tool executed this turn; refusing to relay "
+                            "degraded answer (content_len=%d)",
+                            self.name, round_idx + 1, degraded_reason, content_len,
+                        )
+                        return (
+                            self._TOOL_CHANNEL_DOWN_REPLY.format(
+                                reason=degraded_reason
+                            ),
+                            False,
+                        )
                     if content and content.strip():
                         # ── 防虚构守卫 ──
                         # LLM 声称“任务已提交 / 已出回测报告”，但本轮未执行任何工具
@@ -577,6 +610,19 @@ class BaseAgent(ABC):
                                 "实际的工具调用（例如 submit_backtest / get_task_result），"
                                 "因此无法验证答复中的任务 ID 与回测结果。请重试，"
                                 "或联系系统管理员检查 Agent 工具调用链路。",
+                                False,
+                            )
+                        if degraded:
+                            logger.warning(
+                                "[%s] _run_tool_loop round %d: degraded round "
+                                "after executed tool result(s); appending notice",
+                                self.name, round_idx + 1,
+                            )
+                            return (
+                                content
+                                + self._TOOL_CHANNEL_DEGRADED_NOTE.format(
+                                    reason=degraded_reason
+                                ),
                                 False,
                             )
                         return (content, False)
@@ -664,6 +710,23 @@ class BaseAgent(ABC):
             user=f"{history_text}\n\n请根据以上工具调用结果给出最终回答。",
             max_tokens=max_tokens,
         )
+        if is_fallback(final):
+            # 收尾总结也彻底失败：明确告知，不要把 FALLBACK_MARKER 当答复转发
+            logger.error(
+                "[%s] _run_tool_loop summary LLM unavailable (fallback marker, "
+                "had_tool_results=%s)",
+                self.name, had_tool_results,
+            )
+            tail = (
+                "已执行的工具结果仍然有效（可在回测记录中查看）。"
+                if had_tool_results
+                else "本次请求未执行：没有调用任何工具、也没有提交任何任务或回测。"
+            )
+            return (
+                f"⚠️ 无法生成总结：LLM 不可用（provider 故障）。{tail}\n"
+                "请稍后重试；若持续失败，请检查 LLM provider 状态。",
+                False,
+            )
         final_len = len(final) if final else 0
         if not final or not final.strip():
             logger.warning(
