@@ -1,4 +1,5 @@
 from channels.generic.websocket import AsyncWebsocketConsumer
+import asyncio
 import json
 import logging
 import traceback
@@ -60,12 +61,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         await self.send(text_data=json.dumps({"type": "status", "status": "connected"}))
 
-        # 投递断线期间缓存的待发消息
-        pending = await ws_pending.drain(self.user_id)
-        if pending:
-            logger.info("[ChatWS] Delivering %d pending messages to user %s", len(pending), self.user_id)
-            for msg in pending:
-                await self.send(text_data=json.dumps(msg, ensure_ascii=False))
+        # Subscribe before replay; a concurrent group wake uses the same delivery ID.
+        self._delivered = set()
+        try:
+            for message in await ws_pending.peek(self.user_id):
+                await self.web_delivery({"message": message})
+        except Exception:
+            logger.warning("[ChatWS] pending replay failed", exc_info=True)
 
     async def disconnect(self, close_code):
         user_id = getattr(self, "user_id", "unknown")
@@ -90,13 +92,49 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "data": event["text"],
         })
 
+    # Strong references keep workflows alive across socket disconnects.
+    # Process restarts still interrupt these tasks; this is not a durable job queue.
+    _running_chats: set[asyncio.Task] = set()
+
+    @classmethod
+    def _chat_finished(cls, task):
+        cls._running_chats.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("[ChatWS] background chat failed: %s", task.exception())
+
+    async def web_delivery(self, event):
+        """Deliver a user-group envelope locally, never rebroadcast it."""
+        message = event["message"]
+        delivery_id = message.get("delivery_id")
+        if delivery_id and delivery_id in self._delivered:
+            return
+        try:
+            await self.send(text_data=json.dumps(message, ensure_ascii=False))
+        except Exception:
+            # Already buffered by push_web_payload; another socket/reconnect can deliver.
+            return
+        if delivery_id:
+            self._delivered.add(delivery_id)
+            if len(self._delivered) > 4096:
+                self._delivered = {delivery_id}
+        try:
+            await ws_pending.ack(self.user_id, message)
+        except Exception:
+            logger.warning("[ChatWS] delivery ack failed", exc_info=True)
+
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
             message_type = data.get("type")
 
             if message_type == "chat":
-                await self._handle_chat(data)
+                active = getattr(self, "_chat_task", None)
+                if active is not None and not active.done():
+                    await self._safe_send({"type": "error", "error": "当前连接仍有任务处理中"})
+                    return
+                self._chat_task = asyncio.create_task(self._handle_chat(data))
+                self._running_chats.add(self._chat_task)
+                self._chat_task.add_done_callback(self._chat_finished)
             elif message_type == "ping":
                 await self._safe_send({"type": "pong"})
             else:
@@ -112,14 +150,15 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self._safe_send({"type": "error", "error": str(e)})
 
     async def _safe_send(self, message: dict) -> bool:
-        """发送消息，断线时缓存到 Redis 待重连后投递。返回是否发送成功。"""
+        """Terminal replies target current user connections, not the originating socket."""
+        if message.get("type") in {"chat_response", "task_submitted"}:
+            from apps.agent.reply_fanout import push_web_payload
+            await push_web_payload(self.user_id, message)
+            return True  # queued, not a browser acknowledgement
         try:
             await self.send(text_data=json.dumps(message, ensure_ascii=False))
             return True
         except Exception:
-            user_id = getattr(self, "user_id", "unknown")
-            logger.info("[ChatWS] Send failed (client disconnected), buffering for user %s", user_id)
-            await ws_pending.store(user_id, message)
             return False
 
     async def _handle_chat(self, data):

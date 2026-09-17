@@ -69,6 +69,51 @@ def resolve_django_user_id(user_id: str) -> str:
     return user_id
 
 
+async def push_web_payload(user_id: str, payload: dict) -> None:
+    """用户级 Web 投递：先入缓存，再唤醒当前在线连接。
+
+    修复「先 group_send 后 store」的竞态：唤醒与缓存颠倒后，重连的
+    socket 可能错过刚产生的结果。现在顺序为 store → group_send，
+    连接侧（web_delivery）发送成功后按 delivery_id 确认删除。
+    离线保留仍受 ws_pending.TTL_SECONDS（1 小时）约束。
+
+    Note: user_id 必须是 Django UUID（web 场景）；渠道 id 请先走
+    ``push_web`` 的 resolve_django_user_id。
+    """
+    from uuid import uuid4
+
+    from channels.layers import get_channel_layer
+
+    from apps.agent import ws_pending
+
+    if not user_id or user_id == "unknown":
+        return
+
+    envelope = dict(payload)
+    envelope.setdefault("delivery_id", str(uuid4()))
+
+    # 1) 先持久化：任何时刻重连都能补发（幂等，靠 delivery_id 去重）
+    try:
+        await ws_pending.store(user_id, envelope)
+    except Exception:
+        logger.warning(
+            "[Fanout] ws_pending.store failed for %s", user_id, exc_info=True
+        )
+
+    # 2) 唤醒在线连接（含发送者自己的新连接）；无成员时空操作
+    layer = get_channel_layer()
+    if layer is not None:
+        try:
+            await layer.group_send(
+                f"user_{user_id}",
+                {"type": "web_delivery", "message": envelope},
+            )
+        except Exception:
+            logger.warning(
+                "[Fanout] web wake failed for %s", user_id, exc_info=True
+            )
+
+
 async def push_web(user_id: str, text: str) -> None:
     """推送通知到 web WS group（``user_{uuid}``），离线时经 ws_pending 兜底。
 
@@ -78,36 +123,9 @@ async def push_web(user_id: str, text: str) -> None:
     - ``ws_pending.drain`` 在重连时按 Django UUID 取出待发消息。
     """
     from channels.db import database_sync_to_async
-    from channels.layers import get_channel_layer
-
-    from apps.agent import ws_pending
 
     uuid_id = await database_sync_to_async(resolve_django_user_id)(user_id)
-
-    payload = {"type": "task_notification", "data": text}
-
-    layer = get_channel_layer()
-    if layer is not None:
-        # 解析后的 UUID 键（web 场景下 user_id 本身就是 UUID，集合去重后只发一次）；
-        # 保留原始 id 键作为兜底（无成员时 group_send 是空操作）。
-        for group in {f"user_{uuid_id}", f"user_{user_id}"}:
-            try:
-                await layer.group_send(
-                    group,
-                    {"type": "task_notification", "text": text},
-                )
-            except Exception:
-                logger.warning(
-                    "[Fanout] group_send failed for %s", group, exc_info=True
-                )
-
-    # 离线兜底：统一用解析后的 UUID key，ChatWS 重连 drain 时才能命中
-    try:
-        await ws_pending.store(uuid_id, payload)
-    except Exception:
-        logger.warning(
-            "[Fanout] ws_pending.store failed for %s", uuid_id, exc_info=True
-        )
+    await push_web_payload(uuid_id, {"type": "task_notification", "data": text})
 
 
 async def push_main_channel(user_id: str, text: str) -> None:
@@ -173,7 +191,7 @@ async def fan_out_reply(user_id: str, text: str, origin: str = "") -> None:
     main_channel = getattr(settings, "MAIN_CHANNEL", "lark")
 
     # 1) web 副本：非 web 来源的回复，web 端也要收到
-    if origin not in ("web", "api"):
+    if origin != "web":
         await push_web(user_id, text)
 
     # 2) 主通道副本：origin 即主通道时已原路送达，跳过

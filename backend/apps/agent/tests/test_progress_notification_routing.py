@@ -83,8 +83,10 @@ class TestProgressNotificationRouting:
         assert call_args.args[0] == f"user_{user_id}"
         # 2. event type 为 task_notification，text 内容正确
         event = call_args.args[1]
-        assert event["type"] == "task_notification"
-        assert event["text"] == text
+        assert event["type"] == "web_delivery"
+        assert event["message"]["type"] == "task_notification"
+        assert event["message"]["data"] == text
+        assert event["message"]["delivery_id"]
 
     def test_web_user_buffers_to_ws_pending(
         self, mock_group_send, mock_ws_pending, mock_channel_resolver_none

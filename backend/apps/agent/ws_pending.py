@@ -118,6 +118,19 @@ async def store(user_id: str, message: dict) -> None:
         logger.warning("[WSPending] store failed for user %s", user_id, exc_info=True)
 
 
+async def peek(user_id: str) -> list[dict]:
+    """Read without deleting; only acknowledge after a successful socket send."""
+    r = _get_client()
+    values = await r.lrange(_key(user_id), 0, -1)
+    return [json.loads(value) for value in values]
+
+
+async def ack(user_id: str, message: dict) -> None:
+    """Remove this exact envelope, scoped to the authenticated user."""
+    r = _get_client()
+    await r.lrem(_key(user_id), 1, json.dumps(message, ensure_ascii=False))
+
+
 async def drain(user_id: str) -> list[dict]:
     """取出并删除用户的所有待发消息，按入队顺序返回。"""
     try:

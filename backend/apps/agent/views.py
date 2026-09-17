@@ -36,25 +36,19 @@ def chat(request: Request) -> Response:
         )
     )
 
-    if result.success:
-        # 多通道扇出：HTTP 响应已把回复返回给调用方（web 前端），同时把
-        # 回复推送到主通道（MAIN_CHANNEL，默认飞书）——回测「已安排 X 分钟
-        # 后自动查询结果」类通知需要飞书与下达命令的 gateway 同时收到。
-        try:
-            from apps.agent.reply_fanout import fan_out_reply
+    # API responses (including failures) must also reach Web listeners.
+    try:
+        from apps.agent.reply_fanout import fan_out_reply
 
-            content = (
-                result.data.get("content", str(result.data))
-                if isinstance(result.data, dict)
-                else str(result.data)
-            )
-            async_to_sync(fan_out_reply)(str(request.user.pk), content, origin="web")
-        except Exception:
-            logger.warning(
-                "[AgentChat] fan_out_reply failed for user %s",
-                request.user.pk,
-                exc_info=True,
-            )
+        content = (
+            result.data.get("content", str(result.data))
+            if isinstance(result.data, dict) else str(result.data)
+        ) if result.success else f"[错误] {result.error}"
+        async_to_sync(fan_out_reply)(str(request.user.pk), content, origin="api")
+    except Exception:
+        logger.warning("[AgentChat] fan_out_reply failed for user %s",
+                       request.user.pk, exc_info=True)
+    if result.success:
         return Response({"data": result.data, "task_id": result.task_id})
     return Response({"error": result.error, "task_id": result.task_id}, status=500)
 

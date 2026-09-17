@@ -110,14 +110,10 @@ class TestPushWeb:
 
         _run(push_web("ou_lark_session", text))
 
-        # open_id → 解析为 UUID 后进 web group；原始 id 键也留一份兜底（无成员时空操作）
-        mock_layer.group_send.assert_any_call(
+        # Only the resolved user's group receives the cached envelope.
+        mock_layer.group_send.assert_called_once_with(
             f"user_{WEB_UUID}",
-            {"type": "task_notification", "text": text},
-        )
-        mock_layer.group_send.assert_any_call(
-            "user_ou_lark_session",
-            {"type": "task_notification", "text": text},
+            {"type": "web_delivery", "message": mock_ws_pending.call_args.args[1]},
         )
 
         mock_ws_pending.assert_called_once()
@@ -196,7 +192,7 @@ class TestFanOutReply:
         # web 推送执行（open_id → UUID 解析后进 group + 原始 id 兜底）
         mock_layer.group_send.assert_any_call(
             f"user_{WEB_UUID}",
-            {"type": "task_notification", "text": "已安排 5 分钟后自动查询结果"},
+            {"type": "web_delivery", "message": mock_ws_pending.call_args.args[1]},
         )
         mock_ws_pending.assert_called_once()
         # 主通道不重复推（origin==main_channel 去重）
@@ -226,7 +222,7 @@ class TestFanOutReply:
 
         mock_layer.group_send.assert_any_call(
             f"user_{WEB_UUID}",
-            {"type": "task_notification", "text": "通知内容"},
+            {"type": "web_delivery", "message": mock_ws_pending.call_args.args[1]},
         )
         mock_ws_pending.assert_called_once()
         mock_lark_channel.send_message_to_user.assert_called_once_with(
@@ -239,7 +235,7 @@ class TestFanOutReply:
         mock_layer.group_send.assert_not_called()
         mock_ws_pending.assert_not_called()
 
-    def test_api_origin_behaves_like_web(
+    def test_api_origin_also_notifies_web(
         self, mock_layer, mock_ws_pending, mock_lark_channel, monkeypatch
     ):
         """REST chat（origin=api）：HTTP 响应已送达调用方 → 只补主通道"""
@@ -248,8 +244,8 @@ class TestFanOutReply:
             lambda u: None,
         )
         _run(fan_out_reply(WEB_UUID, "结果", origin="api"))
-        mock_layer.group_send.assert_not_called()
-        mock_ws_pending.assert_not_called()
+        mock_layer.group_send.assert_called_once()
+        mock_ws_pending.assert_called_once()
         mock_lark_channel.send_message_to_user.assert_not_called()
 
 
