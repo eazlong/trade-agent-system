@@ -24,7 +24,17 @@ type ErrorMessage = {
   error: string;
 };
 
-type WSMessage = ChatMessageWS | StatusMessage | PongMessage | ErrorMessage;
+type NotificationMessage = {
+  type: "task_notification";
+  data: string;
+  delivery_id?: string;
+};
+
+type SubmittedMessage = { type: "task_submitted"; task_id: string };
+type ToolProgressMessage = { type: "tool_progress"; tool: string; result: string };
+
+type WSMessage = (ChatMessageWS | StatusMessage | PongMessage | ErrorMessage |
+  NotificationMessage | SubmittedMessage | ToolProgressMessage) & { delivery_id?: string };
 
 type Callback = (message: WSMessage) => void;
 

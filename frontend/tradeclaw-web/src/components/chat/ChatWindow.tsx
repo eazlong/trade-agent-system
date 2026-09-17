@@ -12,6 +12,95 @@ interface ChatMessage {
   task_id?: string;
 }
 
+// JSON 检测：仅接受整体可解析的对象/数组（字符串、数字等标量不渲染）。
+export function parseJsonPayload(text: string): unknown | null {
+  const t = text.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return null;
+  try {
+    const v: unknown = JSON.parse(t);
+    return v !== null && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 消息气泡内容：JSON 对象/数组渲染为紧凑语法高亮视图，其余按纯文本。 */
+export function MessageContent({ content }: { content: string }) {
+  const json = parseJsonPayload(content);
+  if (json !== null) {
+    const obj: Record<string, unknown> =
+      json !== null && typeof json === "object" && !Array.isArray(json) ? (json as Record<string, unknown>) : {};
+    const rows = Object.entries(obj);
+    const isArr = Array.isArray(json);
+    const list = isArr ? (json as unknown[]) : rows;
+    const showList = rows.length > 4 || rows.length === 0;
+    return (
+      <div className="max-h-72 overflow-auto my-1 rounded-md bg-black/30 border border-[rgba(255,255,255,0.08)]">
+        <div className="sticky top-0 bg-bg3/95 backdrop-blur px-2 py-1 text-[9px] font-mono text-green border-b border-[rgba(255,255,255,0.07)] flex justify-between">
+          <span>JSON</span>
+          <span className="text-text3">{isArr ? `${(json as unknown[]).length} items` : `${rows.length} fields`}</span>
+        </div>
+        <div className="px-2 py-1.5">
+          <table className="w-full border-collapse font-mono text-[10.5px] leading-relaxed">
+            <tbody>
+              {showList
+                ? list.map((row, i) => {
+                    const [k, v]: [string, unknown] = isArr
+                      ? [String(i), row as unknown]
+                      : (row as [string, unknown]);
+                    return (
+                      <tr key={k} className="align-top">
+                        <td className="pr-2 py-[1px] text-[#7dd3fc] whitespace-nowrap">{k}</td>
+                        <td className="py-[1px] text-text2 break-all">{renderJsonValue(v)}</td>
+                      </tr>
+                    );
+                  })
+                : rows.map(([k, v]) => (
+                    <tr key={k} className="align-top">
+                      <td className="pr-2 py-[1px] text-[#7dd3fc] whitespace-nowrap">{k}</td>
+                      <td className="py-[1px] text-text2 break-all">{renderJsonValue(v)}</td>
+                    </tr>
+                  ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+  return <div className="break-words whitespace-pre-wrap">{content}</div>;
+}
+
+function renderJsonValue(v: unknown) {
+  if (v === null) return <span className="text-text3 italic">null</span>;
+  if (typeof v === "number") return <span className="text-[#fbbf24]">{String(v)}</span>;
+  if (typeof v === "boolean") return <span className="text-red">{String(v)}</span>;
+  if (typeof v === "string") {
+    return v.length > 120 ? (
+      <span className="text-[#a5d6a7]">{v.slice(0, 120)}…</span>
+    ) : (
+      <span className="text-[#a5d6a7]">{v}</span>
+    );
+  }
+  if (Array.isArray(v)) {
+    if (v.length > 3) {
+      return <span className="text-text3">[{v.length} items] {v.slice(0, 3).map((x) => renderScalar(x)).join(", ")}…</span>;
+    }
+    return <span className="text-text2">[{v.map((x) => renderScalar(x)).join(", ")}]</span>;
+  }
+  if (typeof v === "object") {
+    const s = JSON.stringify(v);
+    return <span className="text-[#c4b5fd]">{s && s.length > 80 ? s.slice(0, 80) + "…" : s}</span>;
+  }
+  return String(v);
+}
+
+function renderScalar(x: unknown) {
+  if (x === null) return "null";
+  if (typeof x === "string") return x.length > 40 ? x.slice(0, 40) + "…" : x;
+  if (typeof x === "object") return JSON.stringify(x);
+  return String(x);
+}
+
 const STORAGE_KEY = "tradeclaw_chat_history";
 
 function loadHistory(): ChatMessage[] {
@@ -83,14 +172,7 @@ export default function ChatWindow() {
 
   // WebSocket connection management
   useEffect(() => {
-    if (!isOpen) {
-      chatWS.disconnect();
-      setWsConnected(false);
-      return;
-    }
-
-    chatWS.connect();
-
+    // Keep receiving notifications even when the chat panel is collapsed.
     const unsub = chatWS.onMessage((msg) => {
       if (msg.type === "status") {
         const statusMsg = msg as StatusMessage;
@@ -158,6 +240,14 @@ export default function ChatWindow() {
           }
           return updated;
         });
+      } else if (msg.type === "task_notification" || msg.type === "task_submitted" || msg.type === "tool_progress") {
+        const content = msg.type === "task_notification" ? msg.data
+          : msg.type === "task_submitted" ? `任务已提交：${msg.task_id}`
+          : `[${msg.tool}] ${msg.result}`;
+        const id = msg.delivery_id || `notice-${Date.now()}-${Math.random()}`;
+        setMessages((prev) => prev.some((m) => m.id === id) ? prev : [...prev, {
+          id, role: "assistant", content, timestamp: new Date().toISOString(), status: "done",
+        }]);
       } else if (msg.type === "error") {
         setIsProcessing(false);
         setMessages((prev) => {
@@ -187,10 +277,12 @@ export default function ChatWindow() {
       // "pong" messages are silently ignored
     });
 
+    chatWS.connect(); // Subscribe first so replay cannot arrive without a listener.
     return () => {
       unsub();
+      chatWS.disconnect();
     };
-  }, [isOpen]);
+  }, []);
 
   // Auto-scroll to bottom — 每次打开面板时也滚动到底部
   useEffect(() => {
@@ -355,7 +447,7 @@ export default function ChatWindow() {
                     </span>
                   ) : (
                     <>
-                      <div className="break-words whitespace-pre-wrap">{msg.content}</div>
+                      <MessageContent content={msg.content} />
                       <div className="text-[9px] text-text3 font-mono mt-1 text-right">
                         {formatTime(msg.timestamp)}
                       </div>
