@@ -595,7 +595,7 @@ class BinanceDataSource(BaseDataSource):
             )
 
             # 触发回调
-            logger.info(f"[DataSource] kline: {kline.get('symbol')} close={kline.get('close')} vol={kline.get('volume')}")
+            logger.debug(f"[DataSource] kline: {kline.get('symbol')} close={kline.get('close')} vol={kline.get('volume')}")
             self._trigger_precise_callbacks(DataType.KLINE, kline)
 
         elif event_type == "trade" or event_type == "aggTrade":
