@@ -435,6 +435,54 @@ class TestNormalRouteWorkflowDetection(unittest.TestCase):
         self.assertIn("step_results", result_data)
         self.assertIn("workflow_summary", result_data)
 
+    def test_normal_route_wires_workflow_history_recorder(self):
+        """回归（c7728cd 重构漏传）：_normal_route 必须把 _record_workflow 作为
+        on_workflow_complete 传给 WorkflowEngine。
+
+        漏传的后果（2026-07-06 重构 ~ 2026-09-18 实际发生）：WorkflowHistory 永不
+        落库、也不产生"工作流完成/失败"通知——聊天发起的工作流在前端历史里完全
+        消失（DB 取证：WorkflowHistory 最后一行 2026-07-05 00:04，通知最后一条
+        同为 7/5，之后 2.5 个月为 0）。
+        """
+        from apps.agent.base import AgentResult
+
+        sup, sm = self._setup()
+
+        workflow_json = json.dumps({
+            "_workflow_plan": {
+                "summary": "研究并实现",
+                "steps": [
+                    {"agent": "researcher", "message": "研究BTC策略"},
+                ],
+            }
+        })
+        sup._llm.chat = AsyncMock(return_value=workflow_json)
+
+        captured = {}
+
+        async def spy(
+            workflow_plan, message, on_tool_result=None, on_workflow_complete=None
+        ):
+            captured["on_workflow_complete"] = on_workflow_complete
+            return AgentResult(task_id=message.task_id, success=True, data="ok")
+
+        sup._workflow_engine.execute_workflow = spy
+
+        asyncio.run(
+            sup.handle(
+                AgentMessage(
+                    payload={"text": "先研究BTC策略然后实现它"},
+                    user_id="u1",
+                )
+            )
+        )
+
+        self.assertIsNotNone(
+            captured.get("on_workflow_complete"),
+            "引擎未收到 on_workflow_complete → 工作流历史与完成通知都不会落库",
+        )
+        self.assertEqual(captured["on_workflow_complete"], sup._record_workflow)
+
     def test_single_step_task_unaffected(self):
         """Single agent task still routes normally, not through workflow."""
         sup, sm = self._setup()

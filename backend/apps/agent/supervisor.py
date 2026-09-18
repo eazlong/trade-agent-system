@@ -451,6 +451,7 @@ class SupervisorAgent(BaseAgent):
                 )
                 return await self._workflow_engine.execute_workflow(
                     workflow_plan, message, on_tool_result=on_tool_result,
+                    on_workflow_complete=self._record_workflow,
                 )
 
         # LLM 直接返回自由对话（节省一次 LLM 调用）
