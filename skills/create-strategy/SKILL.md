@@ -53,7 +53,7 @@ autonomous: false
 
 在开始需求收集前，先检查系统中是否已有匹配的策略：
 
-1. **获取所有策略列表**：调用工具 `list_strategies()`（即 `StrategyRegistry.list_registered_with_descriptions()`），返回所有策略的 name + description。
+1. **获取所有策略列表**：调用工具 `list_strategies()`（即 `StrategyRegistry.list_registered_with_descriptions()`），返回所有策略的 name + description。若注册表为空，用 `list_directory(path="strategies/")` 查看 `~/.tradelogx/strategies/` 下的已有策略文件，并 `read_file(file_path="strategies/<文件名>", agent_name="quant")` 读取至少一个作为真实 API 结构参照 — 不要从网络搜索结果猜测文件名。
 
 2. **LLM 语义匹配**：将用户意图和策略列表传给 LLM，判断是否已存在相似策略：
 
@@ -203,10 +203,15 @@ from apps.strategy_engine.registry import register_strategy
 
 ## 参考文件
 
-阶段 3 生成代码时按需读取：
+阶段 3 生成代码时按需读取。
+
+> **路径解析**：技能上下文开头会给出「技能目录」路径（read_file 用，相对 `~/.tradelogx/`）。
+> 下表中的相对路径均基于技能目录，例如：
+> `read_file(file_path="<技能目录>/references/strategy-template.md", agent_name="quant")`
+> 不要把裸 `references/xxx.md` 直接传给 `read_file`（会解析到 `~/.tradelogx/references/` 导致文件不存在）。
 
 | 文件 | 内容 | 何时读 |
 |------|------|--------|
-| `references/strategy-template.md` | 完整 Python 文件模板（含内联陷阱注释） | 阶段 3.3 起手 |
-| `references/api-reference.md` | StrategyContext API、仓位计算三法、指标回溯窗口、指标列表、ndarray 处理、OrderSignal | 填充逻辑时查 |
-| `references/watch-signals.md` | watch signals 推导规则、格式要求、必须实现的自查 | 阶段 3.2 推导信号时 |
+| `<技能目录>/references/strategy-template.md` | 完整 Python 文件模板（含内联陷阱注释） | 阶段 3.3 起手 |
+| `<技能目录>/references/api-reference.md` | StrategyContext API、仓位计算三法、指标回溯窗口、指标列表、ndarray 处理、OrderSignal | 填充逻辑时查 |
+| `<技能目录>/references/watch-signals.md` | watch signals 推导规则、格式要求、必须实现的自查 | 阶段 3.2 推导信号时 |

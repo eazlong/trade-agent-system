@@ -115,6 +115,63 @@ class ReadFileTool(BaseTool):
             return ToolResult(success=False, error=f"读取文件失败: {e}")
 
 
+class ListDirectoryTool(BaseTool):
+    """列出目录下的文件与子目录（路径相对 ~/.tradelogx/）。"""
+
+    name = "list_directory"
+    description = (
+        "列出目录内容（文件带大小、子目录带 / 后缀）。"
+        "路径相对于 ~/.tradelogx/，也接受绝对路径。"
+        "示例: 'strategies/' 查看已有策略文件；"
+        "'workspace/quant/skills/create-strategy/references/' 查看技能参考文件。"
+    )
+    @property
+    def parameters_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "目录路径，相对 ~/.tradelogx/（如 'strategies/'），也接受绝对路径",
+                }
+            },
+            "required": ["path"],
+        }
+
+    async def execute(self, path: str = "", **kwargs) -> ToolResult:
+        if not path or not str(path).strip():
+            return ToolResult(success=False, error="path 不能为空")
+        raw = str(path).strip()
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = WORKSPACE_ROOT / raw
+        if not target.exists():
+            return ToolResult(success=False, error=f"路径不存在: {target}")
+        if not target.is_dir():
+            return ToolResult(success=False, error=f"不是目录: {target}")
+        try:
+            entries: list[str] = []
+            for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name)):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    entries.append(f"{entry.name}/")
+                else:
+                    try:
+                        entries.append(f"{entry.name}  ({entry.stat().st_size} B)")
+                    except OSError:
+                        entries.append(entry.name)
+        except PermissionError:
+            return ToolResult(success=False, error=f"无权限读取目录 {target}")
+        if not entries:
+            return ToolResult(success=True, data=f"目录 {target} 为空")
+        limit = 200
+        shown = entries[:limit]
+        more = f"\n… 还有 {len(entries) - limit} 项" if len(entries) > limit else ""
+        data = f"目录 {target} 共 {len(entries)} 项:\n" + "\n".join(shown) + more
+        return ToolResult(success=True, data=data)
+
+
 class WriteFileTool(BaseTool):
     """
     Write content to a file in the agent workspace.

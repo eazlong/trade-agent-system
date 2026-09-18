@@ -191,6 +191,35 @@ Body
         self.assertIn("### Skill: test", block)
         self.assertIn("body text", block)
 
+    def test_skill_dir_resolves_agent_then_global(self):
+        agent_dir = self.skills_root.parent / "workspace" / "myagent" / "skills"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        _create_skill_dir(self.skills_root, "shared", "---\nname: shared\n---\nG")
+        agent_skill = _create_skill_dir(agent_dir, "shared", "---\nname: shared\n---\nA")
+        loader = AgentSkillsLoader(agent_name="myagent")
+        loader.global_skills_dir = self.skills_root
+        loader.agent_skills_dir = agent_dir
+        self.assertEqual(loader.skill_dir("shared"), agent_skill)
+        self.assertIsNone(loader.skill_dir("missing"))
+
+    def test_build_summary_carries_skill_dir_attribute(self):
+        content = "---\nname: dir-skill\ndescription: dir test\n---\nBody"
+        skill_dir = _create_skill_dir(self.skills_root, "dir-skill", content)
+        loader = AgentSkillsLoader(search_root=self.skills_root)
+        summary = loader.build_summary(exclude_always=False)
+        self.assertIn('dir="', summary)
+        self.assertIn(str(skill_dir), summary)
+
+    def test_skill_block_header_tells_how_to_read_references(self):
+        content = "---\nname: ref-read\n---\nread references/api-reference.md"
+        skill_dir = _create_skill_dir(self.skills_root, "ref-read", content)
+        loader = AgentSkillsLoader(search_root=self.skills_root)
+        block = loader.load_skills_content(["ref-read"])
+        self.assertIn("技能目录", block)
+        self.assertIn(str(skill_dir), block)
+        self.assertIn("references/api-reference.md", block)
+        self.assertIn("read_file", block)
+
 
 class TestGetSkillsLoader(unittest.TestCase):
     def test_returns_cached_instance(self):

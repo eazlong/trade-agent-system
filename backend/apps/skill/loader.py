@@ -122,6 +122,17 @@ class AgentSkillsLoader:
 
         return None
 
+    def skill_dir(self, name: str) -> Path | None:
+        """返回技能目录（agent 专属优先，其次全局）；不存在返回 None。"""
+        if self.agent_skills_dir:
+            d = self.agent_skills_dir / name
+            if (d / "SKILL.md").exists():
+                return d
+        d = self.global_skills_dir / name
+        if (d / "SKILL.md").exists():
+            return d
+        return None
+
     def load_skills_content(self, names: list[str]) -> str:
         """
         Load and format multiple skills for context injection.
@@ -136,7 +147,7 @@ class AgentSkillsLoader:
         for name in names:
             content = self.load_skill(name)
             if content:
-                parts.append(self._format_skill_block(name, content))
+                parts.append(self._format_skill_block(name, content, self.skill_dir(name)))
         return "\n\n---\n\n".join(parts)
 
     def build_summary(self, exclude_always: bool = True) -> str:
@@ -169,8 +180,9 @@ class AgentSkillsLoader:
             desc = esc(s["description"])
             when = esc(s.get("when_to_use", ""))
             src = s["source"]
+            dir_attr = esc(self._display_dir(Path(s["path"]).parent))
 
-            lines.append(f'  <skill name="{name}" source="{src}">')
+            lines.append(f'  <skill name="{name}" source="{src}" dir="{dir_attr}">')
             lines.append(f"    <description>{desc}</description>")
             if when:
                 lines.append(f"    <when_to_use>{when}</when_to_use>")
@@ -197,10 +209,27 @@ class AgentSkillsLoader:
         return result
     #  Internal helpers                                                    #
 
-    def _format_skill_block(self, name: str, content: str) -> str:
-        """Strip frontmatter and wrap in a named section."""
+    @staticmethod
+    def _display_dir(skill_dir: Path) -> str:
+        """技能目录的 read_file 友好路径：相对 ~/.tradelogx/，否则绝对路径。"""
+        try:
+            return skill_dir.resolve().relative_to(TRADELOGX_ROOT.resolve()).as_posix()
+        except ValueError:
+            return str(skill_dir)
+
+    def _format_skill_block(self, name: str, content: str, base_dir: Path | None = None) -> str:
+        """Strip frontmatter and wrap in a named section; attach skill dir for reference paths."""
         body = self._strip_frontmatter(content)
-        return f"### Skill: {name}\n\n{body}"
+        header = f"### Skill: {name}"
+        if base_dir is not None:
+            rel = self._display_dir(base_dir)
+            header += (
+                f"\n\n> **技能目录**: `{rel}`（read_file 用路径，相对 ~/.tradelogx/）。"
+                "技能正文中的相对路径（如 `references/xxx.md`）"
+                f"必须以 `{rel}/<相对路径>` 形式传给 read_file，"
+                f'例: `read_file(file_path="{rel}/references/api-reference.md", agent_name="{self.agent_name}")`。'
+            )
+        return f"{header}\n\n{body}"
 
     def _strip_frontmatter(self, content: str) -> str:
         """Remove YAML frontmatter block from markdown content."""
