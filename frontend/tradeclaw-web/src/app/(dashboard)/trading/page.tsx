@@ -8,23 +8,8 @@ import { useFrameControl } from "@/hooks/useFrameControl";
 import { useLiveSessions } from "@/hooks/useLiveSessions";
 import TradeRecords from "@/components/trading/TradeRecords";
 import type { Order, ExchangeAccountWithBalance, LiveSession } from "@/lib/api";
+import { formatNumber, formatPnl } from "@/lib/format";
 import { useState } from "react";
-
-function formatNumber(n: string | number, decimals = 2): string {
-  const num = typeof n === "string" ? parseFloat(n) : n;
-  if (isNaN(num)) return "0.00";
-  return num.toFixed(decimals).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-}
-
-function formatPnl(value: string | number): { text: string; color: string } {
-  const num = typeof value === "string" ? parseFloat(value) : value;
-  if (isNaN(num) || num === 0) return { text: "0.00", color: "text-text3" };
-  const formatted = formatNumber(Math.abs(num));
-  return {
-    text: `${num >= 0 ? "+" : "-"}${formatted}`,
-    color: num >= 0 ? "text-green" : "text-red",
-  };
-}
 
 function statusLabel(status: Order["status"]): string {
   const map: Record<Order["status"], string> = {
