@@ -64,6 +64,8 @@ All generated Python must:
 
 1. **Claiming "task submitted" without calling `submit_backtest`** — This is a hallucination. The tool MUST be called and return a `task_id` before you can say anything is submitted.
 2. **Saying "I'll check the result" without calling `get_task_result` or `submit_scheduled_task`** — You cannot check what you haven't queried.
+3. **Claiming success after repeated tool failures** — If a tool call (e.g. `write_file`, `submit_backtest`) keeps failing and the tool loop ends, the final summary MUST report the actual failure. You may ONLY describe a file as "written", a task as "submitted", or a backtest as "completed" if the corresponding tool call **actually succeeded** in this run. A failed tool call means the operation did NOT happen — no file exists, no task was created, no backtest ran.
+4. **Final summary discipline** — When asked to give a final answer after tool calls, base it strictly on the tool results in the history above. If the key operations failed, the summary must say so explicitly (with the actual error), and must NOT contain a success report, a backtest table, or any task_id that did not come from a successful `submit_backtest` return.
 
 **Rule**: When the `quant-backtest` skill says to submit a backtest or grid search, you **MUST** make an actual `submit_backtest` tool call with the correct parameters. No exceptions. Reading files and analyzing parameters is preparation — the actual submission requires the tool call.
 

@@ -220,7 +220,25 @@ class WriteFileTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         if not file_path:
-            return ToolResult(success=False, error="file_path 参数缺失")
+            # 自愈错误信息：把实际收到的参数展示给模型，便于下一轮自我修正
+            # （2026-09-18: qwen3.8 在长上下文中曾连续多轮漏传 file_path，
+            # 仅报"参数缺失"模型无法定位问题）
+            got = {
+                k: (f"<str {len(v)} chars>" if isinstance(v, str) else repr(v))
+                for k, v in kwargs.items()
+                if k != "user_id"
+            }
+            if content:
+                got["content"] = f"<str {len(content)} chars>"
+            elif "content" not in got:
+                got["content"] = repr(content)
+            return ToolResult(
+                success=False,
+                error=(
+                    "file_path 参数缺失（必需: file_path, agent_name, content；"
+                    f"实际收到: {got or '{}'}）。请重新调用并带上 file_path。"
+                ),
+            )
         if not agent_name:
             return ToolResult(success=False, error="agent_name 参数缺失")
         if content is None:

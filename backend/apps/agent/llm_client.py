@@ -288,9 +288,21 @@ class LLMClient:
                     args = json.loads(tc["function"]["arguments"])
                 except (json.JSONDecodeError, TypeError) as exc:
                     parse_failed = True
+                    logger.error(
+                        "tool_call %r arguments UNPARSABLE raw=%.300r",
+                        tc["function"]["name"],
+                        tc["function"]["arguments"],
+                    )
                     raise ToolCallTruncatedError(
                         f"tool_call '{tc['function']['name']}' arguments truncated: {exc}"
                     ) from exc
+                # 取证日志：记录 relay 返回的原始 arguments（截断 300 字符），
+                # 区分"模型漏传"与"relay 转换丢失"（2026-09-18 write_file 事件）
+                logger.info(
+                    "tool_call %s raw_args=%.300s",
+                    tc["function"]["name"],
+                    tc["function"]["arguments"],
+                )
                 tool_calls.append(
                     ToolCallRequest(
                         call_id=tc["id"],

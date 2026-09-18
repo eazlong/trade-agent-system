@@ -72,6 +72,26 @@ class BaseAgent(ABC):
         "请立即调用对应工具获取真实数据后再回答；如果工具调用失败，请如实报告错误。"
     )
 
+    # “声称已写入”的文件声明模式（2026-09-18 虚构事故：summary 声称
+    # `rsi_macd_short_strategy.py` 已写入，实际文件不存在）。
+    # 两个方向：`xxx.py` 已写入 / 已写入 `xxx.py`
+    _WRITTEN_FILE_CLAIMS = (
+        re.compile(
+            r"([~\w][\w./\-]*\.py)`?\s*(?:已写入|已生成|已保存|已创建|已落盘)"
+        ),
+        re.compile(
+            r"(?:已写入|已生成|已保存|已创建|已落盘)\s*`?([~\w][\w./\-]*\.py)"
+        ),
+    )
+
+    # summary 轮成功声明（比 _TASK_CLAIM_PATTERNS 更宽：09-18 事故报告的
+    # “回测完成 / 策略创建成功 / 夏普比率 / task_id: xxx”均不在 in-loop 守卫模式里）。
+    # 与磁盘文件验证联合使用：命中成功声明 + 声称写入的文件不存在 → 拦截。
+    _SUMMARY_SUCCESS_CLAIM = re.compile(
+        r"(已提交|提交成功|回测(?:任务|报告|完成|已完成)|策略(?:创建|生成).{0,6}成功|"
+        r"回测结果(?:如下)?|夏普比率|胜率|task_id\s*[:：]\s*[\w\-]{6,})"
+    )
+
     # 工具通道（LLM function calling）彻底不可用时的对外答复：
     # 必须明确告诉用户"本次未执行"，绝不能把降级文本当成正常答复转发。
     _TOOL_CHANNEL_DOWN_REPLY = (
@@ -171,6 +191,19 @@ class BaseAgent(ABC):
                 )
                 result = await tool.execute(skill_name=skill_name)
             else:
+                # 取证日志：记录收到的参数键与 content 长度（不打印内容本身），
+                # 用于诊断模型漏传/错传参数（2026-09-18 write_file 事件）
+                _arg_preview = {
+                    k: (f"<str {len(v)} chars>" if isinstance(v, str) else v)
+                    for k, v in tc.arguments.items()
+                    if k != "user_id"
+                }
+                logger.info(
+                    "[%s] executing tool: %s args=%s",
+                    self.name,
+                    tc.name,
+                    _arg_preview,
+                )
                 # 注入 user_id（如果工具支持）
                 if self._current_user_id and not tc.arguments.get("user_id"):
                     tc.arguments["user_id"] = self._current_user_id
@@ -210,6 +243,36 @@ class BaseAgent(ABC):
             if m.get("role") in ("user", "system")
         )
         return bool(BaseAgent._TASK_REQUEST_KEYWORDS.search(user_text))
+
+    @classmethod
+    def _claims_unwritten_file(cls, content: str) -> bool:
+        """验证声称“已写入”的文件在磁盘上是否真实存在。
+
+        返回 True 表示存在无法在磁盘验证的文件写入声明（疑似虚构）。
+        验证位置：绝对路径按原样；相对路径依次查 WORKSPACE_ROOT（~/.tradelogx）
+        与当前工作目录。只读检查，不做任何写操作。
+        （2026-09-18：quant summary 虚构“rsi_macd_short_strategy.py 已写入”，
+        该文件实际不存在——用磁盘验证拦截此类声明。）
+        """
+        from pathlib import Path
+
+        if not content:
+            return False
+        for pattern in cls._WRITTEN_FILE_CLAIMS:
+            for m in pattern.finditer(content):
+                path = m.group(1)
+                if path.startswith("/"):
+                    candidates = (Path(path),)
+                else:
+                    try:
+                        from .tools.file_io import WORKSPACE_ROOT
+
+                        candidates = (WORKSPACE_ROOT / path, Path(path))
+                    except Exception:
+                        candidates = (Path(path),)
+                if not any(c.is_file() for c in candidates):
+                    return True
+        return False
 
     def _try_parse_json_tool_call(
         self, content: str, tools: list[dict] | None = None
@@ -520,6 +583,10 @@ class BaseAgent(ABC):
         llm = LLMClient.get_instance()
         had_tool_results = False  # tracks whether any tools were executed
         claim_corrections = 0  # 防虚构守卫的纠错轮数
+        # 失败感知总结（2026-09-18 虚构事故）：记录每个工具的失败次数与最近错误，
+        # 供循环耗尽后的 summary 轮使用（告知 LLM 真实失败状态 + 拦截虚构总结）
+        tool_failure_counts: dict[str, int] = {}
+        last_tool_error = ""
 
         for round_idx in range(self._max_tool_rounds):
             resp = await llm.chat_with_tools(
@@ -660,6 +727,11 @@ class BaseAgent(ABC):
             tool_results = []
             for tc in tool_calls:
                 result_text = await self._execute_tool_call(tc)
+                if result_text.startswith("Error"):
+                    tool_failure_counts[tc.name] = (
+                        tool_failure_counts.get(tc.name, 0) + 1
+                    )
+                    last_tool_error = result_text[:300]
                 if on_tool_result:
                     await on_tool_result(tc.name, result_text)
                 tool_results.append(
@@ -705,9 +777,27 @@ class BaseAgent(ABC):
         history_text = "\n".join(
             f"[{m.get('role', 'user')}]: {m.get('content', '')}" for m in messages
         )
+        # ── 失败感知总结（2026-09-18 虚构事故）──
+        # 30 次 write_file 失败撞轮次上限后，裸的“请给出最终回答” prompt 让 LLM
+        # 虚构了完整成功报告（假文件已写入 + 假 task_id + 假回测指标）。
+        # summary 轮必须告知：终止原因、失败工具清单、并明令禁止对失败操作宣称成功。
+        summary_user = f"{history_text}\n\n请根据以上工具调用结果给出最终回答。"
+        total_tool_failures = sum(tool_failure_counts.values())
+        if total_tool_failures > 0:
+            fail_desc = "、".join(
+                f"{name} 失败 {cnt} 次" for name, cnt in sorted(tool_failure_counts.items())
+            )
+            summary_user += (
+                "\n\n【系统提示 · 必须遵守】工具循环因达到轮次上限被强制终止，"
+                f"期间工具执行失败：{fail_desc}。最近一次错误：{last_tool_error}。"
+                "失败的工具调用意味着对应操作没有成功——文件没有写入、任务没有提交、"
+                "回测没有执行。你的最终回答必须基于真实工具结果：对失败的操作如实说明"
+                "失败原因与实际完成的部分，严禁声称文件已写入、任务已提交、回测已完成，"
+                "严禁编造 task_id、文件路径或任何回测指标。"
+            )
         final = await llm.chat(
             system=system,
-            user=f"{history_text}\n\n请根据以上工具调用结果给出最终回答。",
+            user=summary_user,
             max_tokens=max_tokens,
         )
         if is_fallback(final):
@@ -733,6 +823,32 @@ class BaseAgent(ABC):
                 "[%s] _run_tool_loop summary returned empty content "
                 "(final_len=%d, had_tool_results=%s, messages=%d)",
                 self.name, final_len, had_tool_results, len(messages),
+            )
+        # ── 防虚构守卫（summary 轮）──
+        # 有工具失败 + summary 仍含任务完成声明 + 声称写入的文件经磁盘验证不存在
+        # → 判定虚构，拒绝转发（2026-09-18 quant write_file×30 事故：summary
+        # 虚构"文件已写入 + task_id + 回测报告"，工作流照常 STEP_OK）。
+        if (
+            total_tool_failures > 0
+            and self._SUMMARY_SUCCESS_CLAIM.search(final)
+            and self._claims_unwritten_file(final)
+        ):
+            fail_desc = "、".join(
+                f"{name} 失败 {cnt} 次" for name, cnt in sorted(tool_failure_counts.items())
+            )
+            logger.error(
+                "[%s] _run_tool_loop summary after failed tool run still claims "
+                "task success with unwritten file (failures=%s); refusing to relay "
+                "fabricated report",
+                self.name, tool_failure_counts,
+            )
+            return (
+                "⚠️ 本次总结已被系统拦截：工具循环达到轮次上限被强制终止，"
+                f"期间 {fail_desc}（最近错误：{last_tool_error}）。"
+                "总结中包含与真实工具结果不符的成功声明"
+                "（声称已写入的文件经磁盘验证不存在），为防止虚构内容作为结果送达，"
+                "已拦截该总结。请排查工具失败原因后重试任务。",
+                False,
             )
         return (final, False)
 
