@@ -830,7 +830,7 @@ class SupervisorAgent(BaseAgent):
         messages = [{"role": "user", "content": text}]
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048, on_tool_result=on_tool_result
+            system, messages, tools, max_tokens=8192, on_tool_result=on_tool_result
         )
 
         if is_fb:
@@ -866,7 +866,7 @@ class SupervisorAgent(BaseAgent):
         messages = [{"role": "user", "content": user_prompt}]
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048, on_tool_result=on_tool_result
+            system, messages, tools, max_tokens=8192, on_tool_result=on_tool_result
         )
 
         if is_fb:

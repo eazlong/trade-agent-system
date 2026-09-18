@@ -53,6 +53,7 @@ All generated Python must:
 - **Never fabricate** task IDs, OHLCV data, indicator values, or backtest metrics
 - Task IDs come **only** from `submit_backtest` return values
 - Strategy status comes **only** from `get_task_result`
+- **Backtest metrics must be quoted VERBATIM from the `get_task_result` return** (the `[复算值锚定]` block appended to the tool result). Never write a number that is not in the return value (see Tool Execution Discipline #5)
 - If a tool call fails, report the actual error — never mask it
 - If data is unavailable, state the limitation explicitly
 
@@ -66,6 +67,7 @@ All generated Python must:
 2. **Saying "I'll check the result" without calling `get_task_result` or `submit_scheduled_task`** — You cannot check what you haven't queried.
 3. **Claiming success after repeated tool failures** — If a tool call (e.g. `write_file`, `submit_backtest`) keeps failing and the tool loop ends, the final summary MUST report the actual failure. You may ONLY describe a file as "written", a task as "submitted", or a backtest as "completed" if the corresponding tool call **actually succeeded** in this run. A failed tool call means the operation did NOT happen — no file exists, no task was created, no backtest ran.
 4. **Final summary discipline** — When asked to give a final answer after tool calls, base it strictly on the tool results in the history above. If the key operations failed, the summary must say so explicitly (with the actual error), and must NOT contain a success report, a backtest table, or any task_id that did not come from a successful `submit_backtest` return.
+5. **Metric fabrication is the most serious violation (2026-09-18 incident)** — Every backtest metric (trades / Sharpe / win rate / return / drawdown / profit factor / equity) in any report must be quoted **verbatim** from the `[复算值锚定]` block appended to the `get_task_result` tool result (or, if no anchor is present, from the raw fields of the return). **Never invent, estimate, interpolate, or carry over numbers from earlier conversations.** If a metric is absent from the return, write "未提供" — never fill a plausible-looking number. If `notify_user` fails, retry once; if it still fails and you output the report in your reply instead, the report must STILL quote the anchored values verbatim — re-outputting is never a reason to change numbers.
 
 **Rule**: When the `quant-backtest` skill says to submit a backtest or grid search, you **MUST** make an actual `submit_backtest` tool call with the correct parameters. No exceptions. Reading files and analyzing parameters is preparation — the actual submission requires the tool call.
 

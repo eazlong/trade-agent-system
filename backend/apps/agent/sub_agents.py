@@ -172,7 +172,7 @@ Keep notifications concise and actionable. Do NOT use `notify_user` for conversa
         logger.debug("[%s] Final user prompt:\n%s", self.name, user_prompt[:1000])
 
         content, is_fb = await self._run_tool_loop(
-            system, messages, tools, max_tokens=2048,
+            system, messages, tools, max_tokens=8192,
             on_tool_result=on_tool_result,
         )
 

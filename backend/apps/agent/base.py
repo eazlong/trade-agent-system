@@ -92,6 +92,26 @@ class BaseAgent(ABC):
         r"回测结果(?:如下)?|夏普比率|胜率|task_id\s*[:：]\s*[\w\-]{6,})"
     )
 
+    # 指标锚定硬规则（2026-09-18 事故：定时任务 agent 在 get_task_result
+    # 返回真值后，输出中全部指标被虚构——26 笔 vs 真实 9 笔、-12.34% vs
+    # 真实 -0.56%）。锚定块与硬规则同时注入工具结果旁与 summary prompt。
+    _METRIC_ANCHOR_RULE = (
+        "硬规则：报告中出现的任何数字（交易次数/夏普/胜率/收益率/回撤/盈亏比/权益等）"
+        "必须逐字取自上述复算值（或由其四舍五入）；严禁编造、估算或引用与上述不一致的数字；"
+        "某指标若不在上述中，写“未提供”。"
+    )
+
+    # get_task_result 返回值中的关键指标白名单（注入锚定块用）
+    _TASK_METRIC_KEYS = (
+        "total_trades",
+        "sharpe_ratio",
+        "win_rate",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "final_equity",
+        "result_id",
+    )
+
     # 工具通道（LLM function calling）彻底不可用时的对外答复：
     # 必须明确告诉用户"本次未执行"，绝不能把降级文本当成正常答复转发。
     _TOOL_CHANNEL_DOWN_REPLY = (
@@ -215,6 +235,36 @@ class BaseAgent(ABC):
         except Exception as e:
             logger.warning("[%s] tool %s failed: %s", self.name, tc.name, e)
             return f"Error: {e}"
+
+    @staticmethod
+    def _extract_task_metrics(result_text: str) -> dict | None:
+        """从 get_task_result 的返回文本（str(dict) 形式）提取关键指标。
+
+        用于「复算值锚定」：只有 status=SUCCESS 且 result 为 dict 且含
+        白名单指标字段时才返回（one_time 任务分支 result 是 str → None）。
+        解析失败/非 dict/非 SUCCESS → None（宁可不锚定，不可错锚定）。
+        """
+        import ast
+
+        if not result_text or result_text.startswith("Error"):
+            return None
+        try:
+            data = ast.literal_eval(result_text)
+        except (ValueError, SyntaxError):
+            return None
+        if not isinstance(data, dict) or data.get("status") != "SUCCESS":
+            return None
+        res = data.get("result")
+        if not isinstance(res, dict):
+            return None
+        metrics = {}
+        for k in BaseAgent._TASK_METRIC_KEYS:
+            v = res.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float, str)):
+                metrics[k] = v
+        return metrics or None
 
     @staticmethod
     def _looks_like_unverified_task_claim(
@@ -570,10 +620,14 @@ class BaseAgent(ABC):
         system: str,
         messages: list[dict],
         tools: list[dict],
-        max_tokens: int = 2048,
+        max_tokens: int = 8192,
         on_tool_result=None,
     ) -> tuple[str, bool]:
         """通用工具调用循环。子类可复用。
+
+        max_tokens 默认 8192（2026-09-18：2048 对 write_file 大参数工具
+        预算过紧——6KB 策略文件 content ≈ 2000+ tokens，模型在输出预算
+        压力下漏传必填 file_path；截断重试上限 32768 不受影响）。
 
         Returns:
             (final_content, is_fallback)
@@ -587,6 +641,9 @@ class BaseAgent(ABC):
         # 供循环耗尽后的 summary 轮使用（告知 LLM 真实失败状态 + 拦截虚构总结）
         tool_failure_counts: dict[str, int] = {}
         last_tool_error = ""
+        # 指标锚定（2026-09-18 事故）：本轮 get_task_result 返回的复算值，
+        # 同时注入工具结果旁（覆盖直接返回路径）与 summary prompt
+        task_metrics: dict | None = None
 
         for round_idx in range(self._max_tool_rounds):
             resp = await llm.chat_with_tools(
@@ -732,6 +789,19 @@ class BaseAgent(ABC):
                         tool_failure_counts.get(tc.name, 0) + 1
                     )
                     last_tool_error = result_text[:300]
+                elif tc.name == "get_task_result":
+                    # 指标锚定（2026-09-18 事故）：get_task_result 成功且含指标时，
+                    # 在工具结果旁追加复算值锚定块 + 硬规则——后续每一轮
+                    # （含直接返回的最终轮）LLM 都能在原数据旁看到锚定值。
+                    task_metrics = self._extract_task_metrics(result_text)
+                    if task_metrics:
+                        result_text = (
+                            result_text
+                            + "\n\n[复算值锚定 · 报告唯一事实来源]\n"
+                            + "\n".join(f"{k}={v}" for k, v in task_metrics.items())
+                            + "\n"
+                            + self._METRIC_ANCHOR_RULE
+                        )
                 if on_tool_result:
                     await on_tool_result(tc.name, result_text)
                 tool_results.append(
@@ -794,6 +864,15 @@ class BaseAgent(ABC):
                 "回测没有执行。你的最终回答必须基于真实工具结果：对失败的操作如实说明"
                 "失败原因与实际完成的部分，严禁声称文件已写入、任务已提交、回测已完成，"
                 "严禁编造 task_id、文件路径或任何回测指标。"
+            )
+        # 指标锚定（2026-09-18 事故）：本轮 get_task_result 返回过复算值时，
+        # summary 轮 prompt 同样注入锚定块 + 硬规则（双重覆盖 summary 路径）。
+        if task_metrics:
+            summary_user += (
+                "\n\n[复算值锚定 · 报告唯一事实来源（get_task_result 返回值）]\n"
+                + "\n".join(f"{k}={v}" for k, v in task_metrics.items())
+                + "\n"
+                + self._METRIC_ANCHOR_RULE
             )
         final = await llm.chat(
             system=system,

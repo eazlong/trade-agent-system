@@ -52,25 +52,55 @@ class NotifyUserTool(BaseTool):
         if not user_id:
             return ToolResult(success=False, error="无法确定通知目标用户")
 
-        try:
-            # 持久化到 Notification 模型
-            await self._persist_notification(user_id, message)
+        # 瞬时故障重试（2026-09-18 事故）：celery worker 的 DB 连接在
+        # LLM 长生成期间被 PG idle_in_transaction_session_timeout=30s
+        # 杀死 → "server closed the connection unexpectedly" → 报告未投递，
+        # LLM 回退自行输出并虚构指标。瞬时故障丢弃疑似坏连接后重试一次。
+        last_error: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                # 持久化到 Notification 模型
+                await self._persist_notification(user_id, message)
 
-            # 通过 Redis pubsub 推送（ASGI consumer 路由到活跃渠道）
-            self._send_via_redis(user_id, message)
+                # 通过 Redis pubsub 推送（ASGI consumer 路由到活跃渠道）
+                self._send_via_redis(user_id, message)
+                last_error = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                logger.warning(
+                    "[NotifyUserTool] attempt %d/2 failed: %s",
+                    attempt, e, exc_info=True,
+                )
+                if attempt == 2:
+                    break
+                # 丢弃疑似坏掉的 DB 连接，重试使用新连接
+                try:
+                    from django.db import connections
 
-            logger.info(
-                "[NotifyUserTool] notification sent to user %s: %s",
-                user_id,
-                message[:100],
-            )
+                    connections.close_all()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "[NotifyUserTool] close_all failed", exc_info=True
+                    )
+
+        if last_error is not None:
+            return ToolResult(success=False, error=f"发送通知失败: {last_error}")
+
+        logger.info(
+            "[NotifyUserTool] notification sent to user %s: %s",
+            user_id,
+            message[:100],
+        )
+        if attempt == 2:
             return ToolResult(
                 success=True,
-                data={"message": "通知已发送"},
+                data={"message": "通知已发送（重试成功）"},
             )
-        except Exception as e:
-            logger.error("[NotifyUserTool] failed: %s", e, exc_info=True)
-            return ToolResult(success=False, error=f"发送通知失败: {e}")
+        return ToolResult(
+            success=True,
+            data={"message": "通知已发送"},
+        )
 
     @staticmethod
     async def _persist_notification(user_id: str, message: str) -> None:

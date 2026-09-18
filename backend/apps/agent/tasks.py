@@ -92,6 +92,20 @@ def execute_scheduled_agent_task(
         scheduled_task_id,
     )
 
+    # Celery worker 连接长寿复用，长 LLM 调用期间可能被 PG
+    # idle_in_transaction_session_timeout 杀死（2026-09-18 事故：
+    # notify_user "server closed the connection unexpectedly"，30s 时间线吻合）。
+    # 入口丢弃陈旧连接，保证本任务从全新连接开始。
+    try:
+        from django.db import connections
+
+        connections.close_all()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[execute_scheduled_agent_task] entry close_all failed",
+            exc_info=True,
+        )
+
     # CAS: pending -> running (idempency guard against duplicate delivery)
     if scheduled_task_id:
         cas_rows = _update_task_status(scheduled_task_id, "running")
@@ -202,6 +216,17 @@ def execute_scheduled_agent_task(
                     scheduled_task_id,
                     exc_info=True,
                 )
+
+        # 出口丢弃连接：不把（可能已被 PG 杀死的）连接留给下一个任务
+        try:
+            from django.db import connections
+
+            connections.close_all()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[execute_scheduled_agent_task] exit close_all failed",
+                exc_info=True,
+            )
 
     return task_result
 
