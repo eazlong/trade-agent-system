@@ -3,9 +3,10 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ChatWindow from './ChatWindow';
 
 const ws = vi.hoisted(() => ({ listener: null as null | ((m: unknown) => void),
-  connect: vi.fn(), disconnect: vi.fn() }));
+  connect: vi.fn(), disconnect: vi.fn(), ackDelivery: vi.fn() }));
 vi.mock('@/lib/chatWs', () => ({ chatWS: { connect: ws.connect,
-  disconnect: ws.disconnect, onMessage: (cb: (m: unknown) => void) => {
+  disconnect: ws.disconnect, ackDelivery: ws.ackDelivery,
+  onMessage: (cb: (m: unknown) => void) => {
     ws.listener = cb; return () => { ws.listener = null; };
   } } }));
 beforeEach(() => {

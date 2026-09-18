@@ -27,6 +27,12 @@ def pending(monkeypatch):
         if msg in queues.get(uid, []):
             queues[uid].remove(msg)
 
+    async def ack_by_id(uid, did):
+        for i, m in enumerate(queues.get(uid, [])):
+            if m.get('delivery_id') == did:
+                del queues[uid][i]
+                return
+
     async def drain(uid):
         return queues.pop(uid, [])
 
@@ -34,6 +40,7 @@ def pending(monkeypatch):
     monkeypatch.setattr(ws_pending, 'drain', drain)
     monkeypatch.setattr(ws_pending, 'peek', peek, raising=False)
     monkeypatch.setattr(ws_pending, 'ack', ack, raising=False)
+    monkeypatch.setattr(ws_pending, 'ack_by_id', ack_by_id, raising=False)
     monkeypatch.setattr('apps.notify.middleware.authenticate_token',
                         lambda token: (SimpleNamespace(id=token), None))
     monkeypatch.setattr('apps.agent.reply_fanout.push_main_channel', AsyncMock())
@@ -110,7 +117,11 @@ async def test_offline_replay_then_reconnect_does_not_repeat(pending):
         assert len(pending['user-a']) == 1
         first = await connect('user-a')
         try:
-            assert (await first.receive_json_from())['data'] == 'offline result'
+            msg = await first.receive_json_from()
+            assert msg['data'] == 'offline result'
+            # 浏览器回送达确认 → 服务端才删缓冲（新协议）
+            await first.send_json_to({'type': 'delivery_ack', 'delivery_id': msg['delivery_id']})
+            await asyncio.sleep(0.1)
         finally:
             await first.disconnect()
         assert not pending['user-a']
@@ -119,6 +130,30 @@ async def test_offline_replay_then_reconnect_does_not_repeat(pending):
             assert await second.receive_nothing(timeout=0.05)
         finally:
             await second.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unacked_delivery_replays_on_reconnect(pending):
+    """半死连接/页面冻结场景：消息已发出但浏览器未确认 → 重连必须补发。"""
+    from apps.agent.reply_fanout import push_web_payload
+    with override_settings(CHANNEL_LAYERS={'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}):
+        await push_web_payload('user-a', {'type': 'chat_response', 'status': 'done', 'data': 'lost report'})
+        first = await connect('user-a')
+        try:
+            assert (await first.receive_json_from())['data'] == 'lost report'
+        finally:
+            await first.disconnect()
+        # 未确认即断开：缓冲条目必须保留
+        assert len(pending['user-a']) == 1
+        second = await connect('user-a')
+        try:
+            msg = await second.receive_json_from(timeout=1)
+            assert msg['data'] == 'lost report'
+            await second.send_json_to({'type': 'delivery_ack', 'delivery_id': msg['delivery_id']})
+            await asyncio.sleep(0.1)
+        finally:
+            await second.disconnect()
+        assert not pending['user-a']
 
 
 @pytest.mark.asyncio

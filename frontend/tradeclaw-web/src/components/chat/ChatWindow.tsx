@@ -174,6 +174,10 @@ export default function ChatWindow() {
   useEffect(() => {
     // Keep receiving notifications even when the chat panel is collapsed.
     const unsub = chatWS.onMessage((msg) => {
+      // 送达确认：服务端据此知道浏览器真实收到，才删离线缓冲（未 ack 重连可补发）
+      if (msg.delivery_id) {
+        chatWS.ackDelivery(msg.delivery_id);
+      }
       if (msg.type === "status") {
         const statusMsg = msg as StatusMessage;
         if (statusMsg.status === "connected") {
@@ -236,7 +240,10 @@ export default function ChatWindow() {
           } else {
             // 没有匹配的占位（如重连后占位已被清理/多条消息交错）——
             // 绝不能静默丢弃响应，否则用户看到的就是"不响应"。
-            updated.push(resolved);
+            // 离线补发重放场景：同一 task_id 的终态消息已存在则不重复入列。
+            if (!updated.some((m) => m.id === resolved.id)) {
+              updated.push(resolved);
+            }
           }
           return updated;
         });

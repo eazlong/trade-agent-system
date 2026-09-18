@@ -131,6 +131,30 @@ async def ack(user_id: str, message: dict) -> None:
     await r.lrem(_key(user_id), 1, json.dumps(message, ensure_ascii=False))
 
 
+async def ack_by_id(user_id: str, delivery_id: str) -> None:
+    """按 delivery_id 移除待投条目（浏览器确认收到后调用，幂等）。
+
+    与 ``ack``（整包匹配）互补：客户端只回传 delivery_id，
+    这里扫描列表找到匹配条目后按原始 JSON 精确删除。
+    """
+    if not user_id or not delivery_id:
+        return
+    try:
+        r = _get_client()
+        k = _key(user_id)
+        entries = await r.lrange(k, 0, -1)
+        for raw in entries:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("delivery_id") == delivery_id:
+                await r.lrem(k, 1, raw)
+                return
+    except Exception:
+        logger.warning("[WSPending] ack_by_id failed for user %s", user_id, exc_info=True)
+
+
 async def drain(user_id: str) -> list[dict]:
     """取出并删除用户的所有待发消息，按入队顺序返回。"""
     try:

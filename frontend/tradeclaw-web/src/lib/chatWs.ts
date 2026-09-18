@@ -203,6 +203,15 @@ class ChatWebSocket {
     }
   }
 
+  /**
+   * 对带 delivery_id 的消息回送达确认。
+   * 服务端收到 ack 后才从离线缓冲删除对应条目；未 ack 前重连会补发。
+   */
+  ackDelivery(deliveryId: string) {
+    if (!deliveryId || this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "delivery_ack", delivery_id: deliveryId }));
+  }
+
   onMessage(callback: Callback) {
     this.callbacks.add(callback);
     return () => this.callbacks.delete(callback);

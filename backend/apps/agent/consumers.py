@@ -20,8 +20,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     协议格式:
     - 发送: {"type": "chat", "text": "用户消息"}
-    - 接收: {"type": "chat_response", "data": "回复内容", "task_id": "...", "status": "done|error"}
+    - 接收: {"type": "chat_response", "data": "回复内容", "task_id": "...", "status": "done|error", "delivery_id": "..."}
     - 接收: {"type": "status", "status": "connected|processing"}
+    - 发送: {"type": "delivery_ack", "delivery_id": "..."}（对带 delivery_id 的消息回送达确认；
+      服务端收到 ack 后才删除离线缓冲条目，未 ack 的条目会在重连时补发）
     """
 
     async def connect(self):
@@ -63,6 +65,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         # Subscribe before replay; a concurrent group wake uses the same delivery ID.
         self._delivered = set()
+        # 已发送但尚未收到浏览器 delivery_ack 的 delivery_id（缓冲条目的删除凭证）
+        self._awaiting_ack: set[str] = set()
         try:
             for message in await ws_pending.peek(self.user_id):
                 await self.web_delivery({"message": message})
@@ -117,15 +121,27 @@ class ChatConsumer(AsyncWebsocketConsumer):
             self._delivered.add(delivery_id)
             if len(self._delivered) > 4096:
                 self._delivered = {delivery_id}
-        try:
-            await ws_pending.ack(self.user_id, message)
-        except Exception:
-            logger.warning("[ChatWS] delivery ack failed", exc_info=True)
+            # 不在「发送成功」后删离线缓冲：TCP 发送成功 ≠ 浏览器真正收到
+            # （页面冻结 / 半死连接 / JS 异常都会丢帧，且删除后重连无法补发）。
+            # 缓冲条目等前端 delivery_ack 确认后由 receive() 删除；
+            # 未确认的条目在重连时补发，最终兜底 ws_pending.TTL_SECONDS。
+            self._awaiting_ack.add(delivery_id)
 
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
             message_type = data.get("type")
+
+            if message_type == "delivery_ack":
+                # 浏览器送达确认：删除离线缓冲中对应条目（未 ack 前重连仍可补发）
+                delivery_id = str(data.get("delivery_id") or "")
+                if delivery_id and delivery_id in self._awaiting_ack:
+                    self._awaiting_ack.discard(delivery_id)
+                    try:
+                        await ws_pending.ack_by_id(self.user_id, delivery_id)
+                    except Exception:
+                        logger.warning("[ChatWS] delivery_ack failed", exc_info=True)
+                return
 
             if message_type == "chat":
                 active = getattr(self, "_chat_task", None)
@@ -208,11 +224,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 })
 
             if result.success:
-                content = (
-                    result.data.get("content", str(result.data))
-                    if isinstance(result.data, dict)
-                    else result.data
-                )
+                if isinstance(result.data, dict):
+                    content = result.data.get("content")
+                    if not isinstance(content, str):
+                        # 结构化结果（如工作流报告）序列化为 JSON 字符串，
+                        # 前端可 parse 渲染；str(dict) 是 Python repr，前端无法解析
+                        content = json.dumps(result.data, ensure_ascii=False)
+                else:
+                    content = result.data
                 await self._safe_send({
                     "type": "chat_response",
                     "data": content,
