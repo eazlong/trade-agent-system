@@ -22,6 +22,19 @@ from apps.core.db_utils import db_async
 logger = logging.getLogger(__name__)
 
 
+def _format_beat_schedule(row: dict) -> str:
+    """把 PeriodicTask 的 values() 行格式化成可读的调度描述（用于取消审计）。"""
+    if row.get("crontab__minute") is not None:
+        return (
+            f"crontab {row.get('crontab__minute')} {row.get('crontab__hour')} "
+            f"{row.get('crontab__day_of_month')} {row.get('crontab__month_of_year')} "
+            f"{row.get('crontab__day_of_week')}"
+        )
+    if row.get("interval__every"):
+        return f"interval every {row.get('interval__every')} {row.get('interval__period')}"
+    return "N/A"
+
+
 class SubmitScheduledTaskTool(BaseTool):
     """
     提交一次性定时任务，在指定时间点触发 Agent 任务。
@@ -366,6 +379,104 @@ class CancelScheduledTaskTool(BaseTool):
             "required": ["task_id_or_name"],
         }
 
+    async def _record_cancellation(
+        self,
+        *,
+        task_type: str,
+        identifier: str,
+        detail: str,
+        user_id: str = "",
+        agent_name: str = "",
+    ) -> None:
+        """记录一次成功的取消动作（审计 + 用户可见通知）。
+
+        为什么必须有（2026-07-05 事故取证）：周期任务「每小时研究一个高频交易策略」
+        从 django_celery_beat_periodictask 中消失后**无任何痕迹可查**——AgentAuditLog
+        当时全表 0 行、无 HTTP 删除端点、无持久化日志，事后无法定位谁在何时取消。
+        本工具是全库唯一的 PeriodicTask 删除路径，因此取消必须留痕：
+          - AgentAuditLog：机器取证，无 user 上下文也写（谁=user 记在 input_summary）
+          - Notification：有 user 时额外写入，用户当场可见（带 user + created_at）
+        审计失败只记 ERROR，绝不影响取消结果本身。
+        """
+        try:
+            from apps.agent.models import AgentAuditLog
+
+            await db_async(
+                lambda: AgentAuditLog.objects.create(
+                    agent_type=(agent_name or "system")[:16],
+                    action="cancel_scheduled_task",
+                    input_summary=(
+                        f"type={task_type} task={identifier} user={user_id or '-'}"
+                    ),
+                    output_summary=f"CANCELLED: {detail}",
+                )
+            )()
+
+            if user_id:
+                from apps.notify.models import Notification
+
+                kind = "周期任务" if task_type == "recurring" else "一次性定时任务"
+                await db_async(
+                    lambda: Notification.objects.create(
+                        user_id=user_id,
+                        channel="web",
+                        message=f"⏹️ 已取消{kind}: {identifier}｜{detail}",
+                    )
+                )()
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "[CancelScheduledTaskTool] 审计写入失败（取消本身已完成，"
+                "task=%s type=%s user=%s）: %s",
+                identifier,
+                task_type,
+                user_id or "-",
+                e,
+                exc_info=True,
+            )
+
+    async def _cleanup_orphan_schedules(
+        self, *, crontab_id: int | None = None, interval_id: int | None = None
+    ) -> None:
+        """删除取消后不再被任何 PeriodicTask 引用的调度行。
+
+        django-celery-beat 删 PeriodicTask **不会**清它引用的 CrontabSchedule /
+        IntervalSchedule，线上因此累积了 8 行孤儿（含 2026-07-05 消失的那条
+        hourly research 的 `0 * * * *`）。只删**引用计数为 0** 的，共享调度
+        （仍被别的任务引用）一律保留。失败只告警，不影响取消结果。
+        """
+        try:
+            from django_celery_beat.models import CrontabSchedule, IntervalSchedule
+            from django_celery_beat.models import PeriodicTask as _PT
+
+            if crontab_id:
+                left = await db_async(
+                    lambda: _PT.objects.filter(crontab_id=crontab_id).count()
+                )()
+                if left == 0:
+                    await db_async(
+                        lambda: CrontabSchedule.objects.filter(id=crontab_id).delete()
+                    )()
+                    logger.info(
+                        "[CancelScheduledTaskTool] 清理孤儿调度 crontab_id=%s", crontab_id
+                    )
+
+            if interval_id:
+                left = await db_async(
+                    lambda: _PT.objects.filter(interval_id=interval_id).count()
+                )()
+                if left == 0:
+                    await db_async(
+                        lambda: IntervalSchedule.objects.filter(id=interval_id).delete()
+                    )()
+                    logger.info(
+                        "[CancelScheduledTaskTool] 清理孤儿调度 interval_id=%s",
+                        interval_id,
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[CancelScheduledTaskTool] 清理孤儿调度失败（不影响取消）: %s", e
+            )
+
     async def execute(
         self,
         task_id_or_name: str = "",
@@ -375,18 +486,62 @@ class CancelScheduledTaskTool(BaseTool):
         if not task_id_or_name:
             return ToolResult(success=False, error="task_id_or_name 为必填项")
 
+        user_id = kwargs.get("user_id", "") or ""
+        agent_name = kwargs.get("agent_name", "") or kwargs.get("agent_type", "") or ""
+
         try:
             if task_type == "recurring":
                 from django_celery_beat.models import PeriodicTask
+
+                # 删除前先取调度描述（删掉之后就无从得知了）
+                rows = await db_async(
+                    lambda: list(
+                        PeriodicTask.objects.filter(name=task_id_or_name).values(
+                            "crontab_id",
+                            "interval_id",
+                            "crontab__minute",
+                            "crontab__hour",
+                            "crontab__day_of_month",
+                            "crontab__month_of_year",
+                            "crontab__day_of_week",
+                            "interval__every",
+                            "interval__period",
+                        )[:1]
+                    )
+                )()
+                sched_desc = _format_beat_schedule(rows[0]) if rows else "N/A"
+                crontab_id = rows[0].get("crontab_id") if rows else None
+                interval_id = rows[0].get("interval_id") if rows else None
 
                 deleted, _ = await db_async(
                     lambda: PeriodicTask.objects.filter(name=task_id_or_name).delete()
                 )()
                 if deleted:
                     logger.info(
-                        "[CancelScheduledTaskTool] removed recurring task_name=%s",
+                        "[CancelScheduledTaskTool] removed recurring task_name=%s "
+                        "schedule=%s user=%s",
                         task_id_or_name,
+                        sched_desc,
+                        user_id or "-",
                     )
+                    await self._record_cancellation(
+                        task_type="recurring",
+                        identifier=task_id_or_name,
+                        detail=f"原调度: {sched_desc}",
+                        user_id=user_id,
+                        agent_name=agent_name,
+                    )
+                    try:
+                        await self._cleanup_orphan_schedules(
+                            crontab_id=crontab_id, interval_id=interval_id
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        # 清理是尽力而为：方法体内部已兜底，这里再兜一层，
+                        # 保证"清理出任何问题都不影响取消结果"是硬契约。
+                        logger.warning(
+                            "[CancelScheduledTaskTool] 孤儿调度清理异常（不影响取消）: %s",
+                            e,
+                        )
                     return ToolResult(
                         success=True,
                         data={
@@ -431,8 +586,16 @@ class CancelScheduledTaskTool(BaseTool):
                     celery_app.control.revoke(celery_id, terminate=True)
 
                 logger.info(
-                    "[CancelScheduledTaskTool] revoked one-time task db_id=%s",
+                    "[CancelScheduledTaskTool] revoked one-time task db_id=%s user=%s",
                     task_id_or_name,
+                    user_id or "-",
+                )
+                await self._record_cancellation(
+                    task_type="scheduled",
+                    identifier=task_id_or_name,
+                    detail=f"revoked celery_id={celery_id or '-'}",
+                    user_id=user_id,
+                    agent_name=agent_name,
                 )
                 return ToolResult(
                     success=True,
