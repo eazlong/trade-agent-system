@@ -104,13 +104,21 @@ class NotifyUserTool(BaseTool):
 
     @staticmethod
     async def _persist_notification(user_id: str, message: str) -> None:
-        """写入 Notification 模型，留存历史记录。"""
+        """写入 Notification 模型，留存历史记录。
+
+        瞬时连接故障自愈（2026-09-18 事故，第二次修正）：
+        Django 的 ``connections`` 是**线程局部**的，而 ORM 在 ``sync_to_async``
+        的线程池里执行。连接可能在 LLM 长生成期间被 PG 的
+        ``idle_in_transaction_session_timeout``（叠加 pgbouncer 中转）断开。
+        重试必须在**同步线程内** ``connection.close()`` 后重放，才能拿到真正
+        的新连接——在事件循环线程里 ``connections.close_all()`` 打不到这个
+        线程的连接，重试只会再打旧连接（实测 ``connection already closed``）。
+        """
         from asgiref.sync import sync_to_async
         from django.contrib.auth import get_user_model
 
         from apps.notify.models import Notification
 
-        @sync_to_async
         def _create():
             User = get_user_model()
             user = None
@@ -133,7 +141,23 @@ class NotifyUserTool(BaseTool):
                     message=message,
                 )
 
-        await _create()
+        @sync_to_async
+        def _create_with_stale_connection_retry():
+            from django.db import InterfaceError, OperationalError, connection
+
+            try:
+                _create()
+            except (OperationalError, InterfaceError):
+                logger.warning(
+                    "[NotifyUserTool] stale DB connection in sync thread; "
+                    "closing and retrying once",
+                    exc_info=True,
+                )
+                # 必须在同一线程内 close：下一次 ORM 调用才会重新建连
+                connection.close()
+                _create()
+
+        await _create_with_stale_connection_retry()
 
     @staticmethod
     def _send_via_redis(user_id: str, text: str) -> None:

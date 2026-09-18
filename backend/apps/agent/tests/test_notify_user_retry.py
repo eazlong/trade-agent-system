@@ -82,3 +82,62 @@ async def test_persistent_failure_returns_error():
     assert tool._persist_notification.await_count == 2
     close_all.assert_called_once()  # 仅两次尝试之间调用一次
     tool._send_via_redis.assert_not_called()
+
+
+# ── 第二次修正（2026-09-18 生产验证发现）：重试必须在同步线程内换连接 ──
+# 生产实测：事件循环线程里的 connections.close_all() 打不到 sync_to_async
+# 线程池的连接，第 2 次仍打旧连接 → "connection already closed"。
+# 正确做法：在同步线程内捕获 OperationalError/InterfaceError → connection.close() → 重放。
+
+
+@pytest.mark.asyncio
+async def test_persist_notification_self_heals_in_sync_thread(db):
+    """ORM 首次因连接失效抛错 → 同步线程内 close + 重放 → 成功且只重放一次。"""
+    from django.contrib.auth import get_user_model
+    from django.db import OperationalError
+
+    from apps.notify.models import Notification
+
+    user = get_user_model().objects.create_user(
+        email="retry@test.local", username="retry_user", password="pw12345"
+    )
+
+    calls = {"n": 0}
+    real_create = Notification.objects.create
+
+    def flaky_create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OperationalError("server closed the connection unexpectedly")
+        return real_create(**kwargs)
+
+    with patch.object(Notification.objects, "create", side_effect=flaky_create):
+        await NotifyUserTool._persist_notification(str(user.id), "自愈测试")
+
+    assert calls["n"] == 2  # 失败 1 次 + 重放 1 次 → 说明捕获了瞬时异常并重放
+    assert Notification.objects.filter(user=user, message="自愈测试").count() == 1
+    # 注：重放前的 connection.close() 无法在此断言——Django 测试库是**内存
+    # sqlite**，sqlite3 backend 对内存库的 close() 是 no-op（防止销毁库）。
+    # 该步骤（同线程 close → 新连接）由生产日志验证：
+    # "[NotifyUserTool] stale DB connection in sync thread; closing and retrying once"。
+
+
+@pytest.mark.asyncio
+async def test_persist_notification_propagates_persistent_failure(db):
+    """两次都失败 → 异常透传（由外层 execute 如实报错，不谎报成功）。"""
+    from django.contrib.auth import get_user_model
+    from django.db import OperationalError
+
+    from apps.notify.models import Notification
+
+    user = get_user_model().objects.create_user(
+        email="dead@test.local", username="dead_user", password="pw12345"
+    )
+
+    with patch.object(
+        Notification.objects,
+        "create",
+        side_effect=OperationalError("connection already closed"),
+    ):
+        with pytest.raises(OperationalError):
+            await NotifyUserTool._persist_notification(str(user.id), "x")
