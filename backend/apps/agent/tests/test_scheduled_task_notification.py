@@ -42,7 +42,11 @@ class TestScheduledTaskNotification:
         """
         # 创建测试用户
         User = get_user_model()
-        test_user = User.objects.create_user(username='test_notification_user')
+        test_user = User.objects.create_user(
+            email='tracker_record@test.local',
+            username='test_notification_user',
+            password='pw12345',
+        )
         user_id = str(test_user.id)
 
         # 创建定时任务记录
@@ -114,7 +118,11 @@ class TestScheduledTaskNotification:
           - 通知内容包含任务结果
         """
         User = get_user_model()
-        test_user = User.objects.create_user(username='test_notification_send')
+        test_user = User.objects.create_user(
+            email='notification_send@test.local',
+            username='test_notification_send',
+            password='pw12345',
+        )
         user_id = str(test_user.id)
 
         scheduled_task = ScheduledOneTimeTask.objects.create(
@@ -169,7 +177,11 @@ class TestScheduledTaskNotification:
           - 通知内容包含错误信息
         """
         User = get_user_model()
-        test_user = User.objects.create_user(username='test_notification_fail')
+        test_user = User.objects.create_user(
+            email='notification_fail@test.local',
+            username='test_notification_fail',
+            password='pw12345',
+        )
         user_id = str(test_user.id)
 
         scheduled_task = ScheduledOneTimeTask.objects.create(
