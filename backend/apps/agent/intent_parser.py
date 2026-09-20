@@ -10,6 +10,29 @@ from .prompt_loader import PromptLoader
 
 logger = logging.getLogger(__name__)
 
+# LLM 返回的 JSON 中表达「定时/周期执行」语义的字段值
+_SCHEDULE_TASK_TYPES = {"scheduled", "recurring"}
+
+
+def _carries_schedule_intent(data: dict) -> bool:
+    """LLM 返回的意图 JSON 是否带「定时/周期执行」语义。
+
+    为什么需要（2026-09-20 事故取证）：用户「每天10点全面分析加密货币市场行情并发送结果」，
+    LLM 其实已正确解析为
+        {"agent": "supervisor", "task_type": "recurring",
+         "schedule": "daily at 10:00", "summary": ..., "steps": [{...}]}
+    但 parse() 里的「裸 steps → _workflow_plan」分支先命中，把它当成一次性多 Agent
+    工作流当场执行：用户只看到立刻分析了一次（workflow_history 留有 1 步 analyst 记录），
+    每天10点的周期任务从未注册到 django_celery_beat。
+
+    agent=supervisor + steps 也归入此类：supervisor 自身没有「立即执行工作流」的落地
+    路径（它只有 submit_scheduled_task / submit_recurring_task 这类调度工具），prompt 中
+    该组合只用于周期工作流。
+    """
+    if str(data.get("task_type", "")).lower() in _SCHEDULE_TASK_TYPES:
+        return True
+    return data.get("agent") == "supervisor" and bool(data.get("steps"))
+
 
 class IntentParser:
     """Parse user intent via LLM + rule-based fallback."""
@@ -129,6 +152,10 @@ class IntentParser:
             # 自由对话：LLM 直接返回回复内容
             if data.get("_free_chat"):
                 return {"_free_chat": True, "response": data.get("response", "")}
+
+            # 定时/周期意图：必须交给 supervisor 自身处理，不能降级成「立即执行的工作流」
+            if _carries_schedule_intent(data):
+                return "supervisor"
 
             # 工作流计划：多 Agent 顺序任务（支持 _workflow_plan 包装和裸 steps 两种格式）
             if data.get("_workflow_plan"):

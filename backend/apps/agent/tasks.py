@@ -315,6 +315,24 @@ def _resolve_scheduler_user_id(user_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _result_summary_for_user(result) -> str:
+    """把 AgentResult 压成用户可读的结果文本（用于任务完成通知）。
+
+    workflow 分支的 data 是
+    ``{"workflow_id", "workflow_summary", "step_results", "elapsed_seconds"}``，
+    直接 ``str()`` 会把带嵌套 dict 的整份 repr 塞进通知（还极易被截断），
+    所以优先取 workflow_summary / content。
+    """
+    data = getattr(result, "data", None)
+    if isinstance(data, dict):
+        for key in ("workflow_summary", "content"):
+            if data.get(key):
+                return str(data[key])
+        # 未知结构：宁可截断，也不要把整份 repr 塞进通知
+        return str(data)[:500]
+    return str(data or "任务完成")
+
+
 @app.task(bind=True, acks_late=True, track_started=True)
 def execute_recurring_agent_task(
     self,
@@ -343,6 +361,7 @@ def execute_recurring_agent_task(
     """
     from apps.agent.base import AgentMessage, AgentResult
     from apps.agent.supervisor import SupervisorAgent
+    from apps.agent.task_tracker import TaskTracker, tracker_context
 
     is_workflow = bool(workflow_steps)
     _wf_logger.info(
@@ -358,6 +377,23 @@ def execute_recurring_agent_task(
     )
 
     resolved_user_id = _resolve_scheduler_user_id(user_id)
+
+    # 用户可见性：周期任务此前**完全没有** TaskTracker。
+    # workflow 分支只落一条 web Notification（_record_workflow），单 Agent 分支连这条
+    # 都没有——用户在主通道（Telegram/Lark）收不到任何结果，失败也无人知晓。
+    # （与 execute_scheduled_agent_task 的同类修复保持一致。）
+    #
+    # 注意 user_id 用**通道侧** id（telegram_id / feishu open_id），不能用
+    # resolved_user_id：后者在无用户上下文时是 system_scheduler 这个 Django UUID，
+    # 推给用户是错的。
+    tracker_task_id = self.request.id or f"recurring-{task_name or agent_name}"
+    tracker = TaskTracker(
+        task_id=tracker_task_id,
+        user_id=str(user_id or ""),
+        task_type="recurring_agent",
+    )
+    token = tracker_context.set(tracker)
+    tracker.start(f"周期任务已触发：{task_name or agent_name}")
 
     msg = AgentMessage(
         sender="scheduler",
@@ -412,6 +448,7 @@ def execute_recurring_agent_task(
                 task_name,
                 agent_name,
             )
+            tracker.complete(_result_summary_for_user(result))
             return {
                 "status": "SUCCESS",
                 "task_name": task_name,
@@ -425,6 +462,7 @@ def execute_recurring_agent_task(
                 agent_name,
                 result.error,
             )
+            tracker.fail(f"{task_name or agent_name} 执行失败：{result.error}")
             return {
                 "status": "FAILURE",
                 "task_name": task_name,
@@ -437,12 +475,16 @@ def execute_recurring_agent_task(
             e,
             exc_info=True,
         )
+        tracker.fail(f"{task_name or agent_name} 执行异常：{e}")
         return {
             "status": "ERROR",
             "task_name": task_name,
             "agent_name": agent_name,
             "error": str(e),
         }
+    finally:
+        tracker.stop()
+        tracker_context.reset(token)
 
 
 @app.task(bind=True, acks_late=True)
