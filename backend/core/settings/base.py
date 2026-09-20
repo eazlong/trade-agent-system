@@ -155,6 +155,10 @@ LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_TZ = True
 
+# 业务时区：用户口语时间（"每天10点"）按此时区解释，见 apps/common/time_utils.py。
+# 注意这不改变 TIME_ZONE/CELERY_TIMEZONE —— 那两个保持 UTC 以兼容已有数据。
+BUSINESS_TIMEZONE = os.environ.get("BUSINESS_TIMEZONE", "Asia/Shanghai")
+
 # LLM
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL_PRIMARY = os.environ.get("OPENAI_MODEL_PRIMARY", "gpt-4o")

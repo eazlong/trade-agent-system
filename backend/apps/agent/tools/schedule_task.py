@@ -12,11 +12,18 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 from celery_app import app as celery_app
 
 from .base import BaseTool, ToolResult
+from apps.common.time_utils import (
+    business_now,
+    business_tz_label,
+    business_tz_name,
+    format_business,
+    to_business,
+)
 from apps.core.db_utils import db_async
 
 logger = logging.getLogger(__name__)
@@ -25,10 +32,11 @@ logger = logging.getLogger(__name__)
 def _format_beat_schedule(row: dict) -> str:
     """把 PeriodicTask 的 values() 行格式化成可读的调度描述（用于取消审计）。"""
     if row.get("crontab__minute") is not None:
+        tz = row.get("crontab__timezone") or "UTC"
         return (
             f"crontab {row.get('crontab__minute')} {row.get('crontab__hour')} "
             f"{row.get('crontab__day_of_month')} {row.get('crontab__month_of_year')} "
-            f"{row.get('crontab__day_of_week')}"
+            f"{row.get('crontab__day_of_week')}（时区 {tz}）"
         )
     if row.get("interval__every"):
         return f"interval every {row.get('interval__every')} {row.get('interval__period')}"
@@ -61,7 +69,11 @@ class SubmitScheduledTaskTool(BaseTool):
                 },
                 "run_at": {
                     "type": "string",
-                    "description": "执行时间（ISO 格式，如 2026-04-19T09:00:00+08:00），支持 'now+5m'、'tomorrow 09:00' 等相对格式",
+                    "description": (
+                        "执行时间。支持 ISO 格式（带时区，如 2026-04-19T09:00:00+08:00）、"
+                        "相对格式（'now+5m'）、口语格式（'tomorrow 09:00'）。"
+                        f"**不带时区的时间按北京时间（{business_tz_label()}）解释**。"
+                    ),
                 },
                 "user_id": {
                     "type": "string",
@@ -72,7 +84,12 @@ class SubmitScheduledTaskTool(BaseTool):
         }
 
     def _parse_run_at(self, run_at: str) -> datetime:
-        """解析执行时间，支持 ISO 格式和相对时间表达式。"""
+        """解析执行时间，支持 ISO 格式和相对时间表达式。
+
+        时区口径：**不带时区的口语时间（如 `tomorrow 09:00`）按业务时区解释**
+        （默认北京时间，见 apps/common/time_utils.py），返回的时间一律是
+        aware 的业务时区时间。
+        """
         from datetime import timedelta
 
         run_at = run_at.strip()
@@ -85,9 +102,10 @@ class SubmitScheduledTaskTool(BaseTool):
             value = int(rel.group(1))
             unit = rel.group(2).lower()
             deltas = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
-            return datetime.now(timezone.utc) + timedelta(**{deltas[unit]: value})
+            return business_now() + timedelta(**{deltas[unit]: value})
 
-        # 相对时间：tomorrow HH:MM
+        # 口语时间：tomorrow HH:MM —— 用户说的是他/她的本地时钟（北京时间），
+        # 不能拿 UTC 的 now() 去 replace(hour=...)。
         tom_match = __import__("re").match(
             r"^tomorrow\s+(\d{1,2}):(\d{2})$", run_at, __import__("re").IGNORECASE
         )
@@ -95,16 +113,19 @@ class SubmitScheduledTaskTool(BaseTool):
             hour, minute = int(tom_match.group(1)), int(tom_match.group(2))
             from datetime import timedelta
 
-            tomorrow = datetime.now(timezone.utc).replace(
-                hour=hour, minute=minute, second=0
+            tomorrow = business_now().replace(
+                hour=hour, minute=minute, second=0, microsecond=0
             ) + timedelta(days=1)
             return tomorrow
 
         # ISO 格式
         try:
-            return datetime.fromisoformat(run_at)
+            parsed = datetime.fromisoformat(run_at)
         except ValueError:
-            pass
+            parsed = None
+        if parsed is not None:
+            # naive ISO 同样按业务时区解释；带时区的按同一时刻换算到业务时区
+            return to_business(parsed)
 
         raise ValueError(
             f"无法解析时间格式: {run_at}，支持 ISO 格式或 now+5m、tomorrow 09:00"
@@ -157,6 +178,7 @@ class SubmitScheduledTaskTool(BaseTool):
             await db_async(task_record.save)(update_fields=["celery_task_id", "updated_at"])
 
             eta_str = eta.isoformat()
+            eta_local = format_business(eta)
             logger.info(
                 "[SubmitScheduledTaskTool] scheduled db_id=%s celery_id=%s agent=%s eta=%s",
                 db_uuid,
@@ -172,10 +194,12 @@ class SubmitScheduledTaskTool(BaseTool):
                     "celery_task_id": celery_result.id,
                     "agent_name": agent_name,
                     "run_at": eta_str,
+                    "run_at_local": eta_local,
+                    "timezone": business_tz_name(),
                     "status": "SCHEDULED",
                     "message": (
                         f"定时任务已提交，schedule_id={db_uuid}，"
-                        f"将在 {eta_str} 触发 Agent={agent_name}。"
+                        f"将在 {eta_local} 触发 Agent={agent_name}。"
                         f"使用 get_task_result 查询执行状态。"
                     ),
                 },
@@ -215,7 +239,11 @@ class SubmitRecurringTaskTool(BaseTool):
                 },
                 "cron_expression": {
                     "type": "string",
-                    "description": "Crontab 表达式，5个字段：分 时 日 月 周。例如 '0 9 * * 1-5' 表示工作日每天早上9点",
+                    "description": (
+                        "Crontab 表达式，5个字段：分 时 日 月 周。"
+                        f"**按北京时间（{business_tz_label()}）解释**，"
+                        "例如 '0 9 * * 1-5' 表示工作日北京时间早上9点。"
+                    ),
                 },
                 "task_name": {
                     "type": "string",
@@ -244,6 +272,33 @@ class SubmitRecurringTaskTool(BaseTool):
             },
             "required": ["agent_name", "message", "cron_expression", "task_name"],
         }
+
+    @staticmethod
+    def _describe_next_run(schedule) -> str:
+        """尽力算出「下次触发时间」（业务时区），用于回给用户的确认消息。
+
+        用 `is_due()` 而不是 `remaining_estimate()`：`TzAwareCrontab` 只在 `is_due()`
+        里把参考时间 `astimezone(self.tz)`，直接调 `remaining_estimate()` 会拿 UTC 的
+        钟点去匹配 crontab，结果少算 8 小时（实测）。
+
+        纯展示用途：crontab 边界情况（例如 2 月 30 号这种永不匹配的表达式）不应
+        影响任务注册本身，所以任何异常都吞掉并返回空串。
+        """
+        try:
+            from datetime import timedelta
+            from math import ceil
+
+            from django.utils import timezone as djtz
+
+            now = djtz.now()
+            _, remaining_secs = schedule.schedule.is_due(now)
+            # 向上取整到秒，避免浮点截断把 10:00 显示成 09:59
+            return format_business(now + timedelta(seconds=ceil(max(remaining_secs, 0))))
+        except Exception:
+            logger.warning(
+                "[SubmitRecurringTaskTool] 无法推算下次触发时间: %s", schedule, exc_info=True
+            )
+            return ""
 
     async def execute(
         self,
@@ -280,13 +335,20 @@ class SubmitRecurringTaskTool(BaseTool):
 
             minute, hour, day_of_month, month_of_year, day_of_week = parts
 
+            # 用户在 Telegram 上说「每天10点」指的是自己的本地时钟（北京时间），
+            # 而 celery-beat 默认按 UTC 解释 crontab。这里显式带上业务时区，
+            # 让 '0 10 * * *' 真的落在北京时间 10:00。
+            # 注意：timezone 参与 get_or_create 的查找条件，因此不会复用（也不会
+            # 改写）已有 tz=UTC 的调度行 —— 系统自带的几个 crontab 保持原样。
             schedule, _ = await db_async(CrontabSchedule.objects.get_or_create)(
                 minute=minute,
                 hour=hour,
                 day_of_month=day_of_month,
                 month_of_year=month_of_year,
                 day_of_week=day_of_week,
+                timezone=business_tz_name(),
             )
+            next_run_desc = self._describe_next_run(schedule)
 
             import json as _json
 
@@ -320,10 +382,11 @@ class SubmitRecurringTaskTool(BaseTool):
             )
 
             logger.info(
-                "[SubmitRecurringTaskTool] registered task_name=%s agent=%s cron=%s workflow=%s",
+                "[SubmitRecurringTaskTool] registered task_name=%s agent=%s cron=%s tz=%s workflow=%s",
                 task_name,
                 effective_agent,
                 cron_expression,
+                business_tz_name(),
                 "yes(%d steps)" % len(steps) if steps else "no",
             )
             return ToolResult(
@@ -332,12 +395,17 @@ class SubmitRecurringTaskTool(BaseTool):
                     "task_name": task_name,
                     "agent_name": effective_agent,
                     "cron_expression": cron_expression,
+                    "timezone": business_tz_name(),
+                    "timezone_label": business_tz_label(),
+                    "next_run_local": next_run_desc,
                     "status": "ACTIVE",
                     "workflow": bool(steps),
                     "message": (
                         f"周期定时任务已注册，task_name={task_name}，"
-                        f"Agent={effective_agent}，cron={cron_expression}。"
+                        f"Agent={effective_agent}，cron={cron_expression}"
+                        f"（时区 {business_tz_label()}，即表达式中的小时数按北京时间计）。"
                         f"{'workflow 包含 %d 个步骤，' % len(steps) if steps else ''}"
+                        f"{f'下次触发：{next_run_desc}。' if next_run_desc else ''}"
                         f"任务已持久化到数据库，celery-beat 将按 crontab 定时周期触发。"
                     ),
                 },
@@ -504,6 +572,7 @@ class CancelScheduledTaskTool(BaseTool):
                             "crontab__day_of_month",
                             "crontab__month_of_year",
                             "crontab__day_of_week",
+                            "crontab__timezone",
                             "interval__every",
                             "interval__period",
                         )[:1]
@@ -645,7 +714,12 @@ class ListScheduledTasksTool(BaseTool):
             for task in tasks:
                 schedule_desc = ""
                 if task.crontab:
-                    schedule_desc = f"crontab({task.crontab})"
+                    # 带上时区，否则用户看到 '0 10 * * *' 无从判断是北京时间还是 UTC
+                    schedule_desc = (
+                        f"crontab({task.crontab.minute} {task.crontab.hour} "
+                        f"{task.crontab.day_of_month} {task.crontab.month_of_year} "
+                        f"{task.crontab.day_of_week}，时区 {task.crontab.timezone})"
+                    )
                 elif task.interval:
                     schedule_desc = str(task.interval)
 
@@ -677,7 +751,7 @@ class ListScheduledTasksTool(BaseTool):
                     }.get(task.status, "")
                     lines.append(
                         f"- {status_icon} **{task.task_name}** | Agent: {task.agent_name} | "
-                        f"Run at: {task.run_at.isoformat()} | Status: {task.status}"
+                        f"Run at: {format_business(task.run_at)} | Status: {task.status}"
                     )
 
             if not tasks and not one_time:

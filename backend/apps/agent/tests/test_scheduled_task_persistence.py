@@ -461,19 +461,23 @@ class TestScheduledTaskIntegration(TestCase):
 class TestRunAtParsingTimezone(TestCase):
     """Test _parse_run_at timezone handling."""
 
-    def test_tomorrow_uses_utc(self):
-        """tomorrow HH:MM should produce a UTC datetime."""
+    def test_tomorrow_is_interpreted_as_beijing(self):
+        """tomorrow HH:MM 是用户口语时间，按业务时区（北京时间）解释。
+
+        原实现拿 UTC 的 now() 去 replace(hour=9)，于是「tomorrow 09:00」实际落在
+        北京时间 17:00。详细回归见 test_schedule_timezone.py。
+        """
         from apps.agent.tools.schedule_task import SubmitScheduledTaskTool
+        from apps.common.time_utils import business_tz_name
 
         tool = SubmitScheduledTaskTool()
         result = tool._parse_run_at("tomorrow 09:00")
 
         self.assertIsNotNone(result)
-        self.assertEqual(result.tzinfo, timezone.utc)
-        expected = datetime.now(timezone.utc).replace(
-            hour=9, minute=0, second=0, microsecond=0
-        )
-        expected += timedelta(days=1)
-        self.assertAlmostEqual(
-            (result - expected).total_seconds(), 0, delta=2
-        )
+        # 返回的就是业务时区时刻
+        self.assertEqual(getattr(result.tzinfo, "key", None), business_tz_name())
+        self.assertEqual((result.hour, result.minute), (9, 0))
+        # 北京 09:00 == UTC 01:00；修复前这里会是 UTC 09:00
+        self.assertEqual(result.astimezone(timezone.utc).hour, 1)
+        # 且必须落在「明天」（按业务时区算）
+        self.assertEqual(result.date(), datetime.now(result.tzinfo).date() + timedelta(days=1))

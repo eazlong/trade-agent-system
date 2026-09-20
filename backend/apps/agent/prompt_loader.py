@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from apps.common.time_utils import business_now, business_tz_label
 
 PROMPT_BASE = Path.home() / ".tradelogx" / "agents"
 
 _cache: dict[str, str] = {}
 _meta_cache: dict[str, dict[str, Any]] = {}
+
+
+def _current_datetime_label() -> str:
+    """注入 prompt 的「当前时间」：业务时区（北京时间）+ 明确时区标注。
+
+    只给一个钟点并标注清楚时区，避免出现两个数字让 LLM 挑错。
+    """
+    return f"{business_now():%Y-%m-%d %H:%M:%S}（{business_tz_label()}）"
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -78,9 +87,11 @@ class PromptLoader:
             _cache[cache_key] = body
 
         prompt = _cache[cache_key]
-        # 动态注入当前时间，替换占位符
-        current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = prompt.replace("{{CURRENT_DATETIME}}", current_date)
+        # 动态注入当前时间，替换占位符。
+        # 必须带时区标注：Django 进程内 datetime.now() 是 UTC（Django 会用
+        # TIME_ZONE 覆盖进程 TZ），而用户口语里的「每天10点」是北京时间；
+        # 不标注时区，LLM 会把 UTC 的钟点当成用户的钟点来生成 cron。
+        prompt = prompt.replace("{{CURRENT_DATETIME}}", _current_datetime_label())
         return prompt
 
     @classmethod
