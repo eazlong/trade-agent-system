@@ -122,13 +122,75 @@ class BinanceAdapter(BaseExchangeAdapter):
             raise RuntimeError("BinanceAdapter not connected. Call connect() first.")
         return self._client
 
+    async def _reconnect(self) -> None:
+        """丢弃并重建 HTTP 客户端（并重新同步时钟）。
+
+        长活客户端在代理/网络抖动后可能永久卡死（2026-09-20 事故：每个请求都 httpx 超时、
+        连续约 10 小时 100% 失败，只能靠重启进程恢复）。重建是唯一的自愈手段。
+        """
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception as e:  # noqa: BLE001 - 关闭失败不应阻断重建
+                logger.debug(f"Failed to close binance client before reconnect: {e!r}")
+        self._client = None
+        await self.connect()
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        *,
+        signed: bool = True,
+        **kwargs,
+    ) -> httpx.Response:
+        """所有请求的统一出口：传输层自愈 + 时间戳失效自愈。
+
+        1. httpx.TransportError（连接/读写/池超时等）→ 重建客户端后重试一次。
+           注意：httpx 这些异常的 message 为空，日志必须带类型名，否则只剩空消息。
+        2. 响应为 -1021（timestamp 超出 recvWindow）→ 重新同步时钟后重试一次
+           （重试会重新签名，拿到的是校正后的 timestamp）。
+        有界重试：每种情况最多一次，仍失败则抛出，由调用方处理。
+        """
+
+        async def attempt() -> httpx.Response:
+            client = self._ensure_connected()
+            target = f"{path}?{self._sign(params or {})}" if signed else path
+            # 用 getattr 分发到 get/post/delete（而非 client.request）：与既有调用风格、
+            # 既有测试的 mock 断言保持一致，自愈改造不动其他任何地方。
+            send = getattr(client, method.lower())
+            return await send(target, **kwargs)
+
+        try:
+            resp = await attempt()
+        except httpx.TransportError as e:
+            logger.warning(
+                f"Binance transport error on {method} {path} "
+                f"({type(e).__name__}: {e!r}); reconnecting and retrying once"
+            )
+            await self._reconnect()
+            resp = await attempt()
+
+        if resp.status_code == 400 and "-1021" in (resp.text or ""):
+            logger.warning(
+                f"Binance -1021 on {method} {path} (timestamp outside recvWindow); "
+                "re-syncing clock and retrying once"
+            )
+            await self._sync_time()
+            resp = await attempt()
+
+        return resp
+
     async def _ensure_leverage(self, symbol: str) -> None:
         """下单前确保已设置杠杆。每个交易对只需设置一次。"""
         if symbol in self._leverage_set:
             return
-        client = self._ensure_connected()
-        query = self._sign({"symbol": symbol, "leverage": self.DEFAULT_LEVERAGE})
-        resp = await client.post(f"/fapi/v1/leverage?{query}")
+        resp = await self._request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": symbol, "leverage": self.DEFAULT_LEVERAGE},
+        )
         if resp.status_code == 200:
             self._leverage_set.add(symbol)
             logger.info(f"Leverage set for {symbol}: {self.DEFAULT_LEVERAGE}x")
@@ -137,9 +199,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     async def _load_symbol_rules(self) -> None:
         """拉取并缓存 exchangeInfo 精度规则（stepSize / tickSize / minQty）。"""
-        client = self._ensure_connected()
         try:
-            resp = await client.get("/fapi/v1/exchangeInfo")
+            resp = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
             if resp.status_code != 200:
                 logger.warning(
                     f"exchangeInfo fetch failed: {resp.status_code} - {resp.text[:200]}"
@@ -203,8 +264,6 @@ class BinanceAdapter(BaseExchangeAdapter):
         return price
 
     async def place_order(self, request: OrderRequest) -> OrderResponse:
-        client = self._ensure_connected()
-
         symbol = request.symbol.upper().replace("/", "")
 
         # 首次下单前加载交易所精度规则（懒加载 + 缓存）
@@ -234,8 +293,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             params["stopPrice"] = str(request.stop_loss)
             params["workType"] = "STOP"
 
-        query = self._sign(params)
-        resp = await client.post(f"/fapi/v1/order?{query}")
+        resp = await self._request("POST", "/fapi/v1/order", params)
 
         if resp.status_code >= 400:
             error_detail = resp.text
@@ -266,30 +324,25 @@ class BinanceAdapter(BaseExchangeAdapter):
     }
 
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
-        client = self._ensure_connected()
-
-        query = self._sign(
-            {
-                "symbol": symbol.upper(),
-                "orderId": exchange_order_id,
-            }
+        resp = await self._request(
+            "DELETE",
+            "/fapi/v1/order",
+            {"symbol": symbol.upper(), "orderId": exchange_order_id},
         )
-        resp = await client.delete(f"/fapi/v1/order?{query}")
         return resp.status_code == 200
 
     async def fetch_order(
         self, exchange_order_id: str, symbol: str
     ) -> OrderFill:
         """查询订单当前状态与成交情况（/fapi/v1/order）。"""
-        client = self._ensure_connected()
-
-        query = self._sign(
+        resp = await self._request(
+            "GET",
+            "/fapi/v1/order",
             {
                 "symbol": symbol.upper().replace("/", ""),
                 "orderId": str(exchange_order_id),
-            }
+            },
         )
-        resp = await client.get(f"/fapi/v1/order?{query}")
 
         if resp.status_code == 400:
             data = resp.json()
@@ -319,10 +372,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         )
 
     async def get_positions(self) -> list[Position]:
-        client = self._ensure_connected()
-
-        query = self._sign({})
-        resp = await client.get(f"/fapi/v2/positionRisk?{query}")
+        resp = await self._request("GET", "/fapi/v2/positionRisk")
         resp.raise_for_status()
 
         positions = []
@@ -350,10 +400,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         /fapi/v2/balance 返回格式: [{asset, balance, walletBalance, ...}]
         Demo 环境使用 v2 端点。
         """
-        client = self._ensure_connected()
-
-        query = self._sign({})
-        resp = await client.get(f"/fapi/v2/balance?{query}")
+        resp = await self._request("GET", "/fapi/v2/balance")
 
         if resp.status_code != 200:
             logger.error(f"Binance balance API error: {resp.status_code} - {resp.text}")

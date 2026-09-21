@@ -48,6 +48,8 @@ class RiskGuard:
         self.mode = mode
         self._running = False
         self._monitor_task: asyncio.Task | None = None
+        # 持仓抓取连续失败计数（成功后归零）：用于区分偶发超时与适配器卡死
+        self._position_fetch_failures = 0
 
     @classmethod
     def get_instance(cls) -> "RiskGuard | None":
@@ -289,9 +291,25 @@ class RiskGuard:
         for exchange, adapter in executor._adapters.items():
             try:
                 positions = await adapter.get_positions()
+            except Exception as e:
+                self._position_fetch_failures += 1
+                # 必须带异常类型：httpx 超时异常的 message 为空，只打 {e} 会得到一行空消息
+                # （2026-09-20 事故：连续 10 小时 100% 失败却无从诊断）
+                logger.error(
+                    f"Failed to fetch positions from {exchange} "
+                    f"({type(e).__name__}: {e!r}); "
+                    f"consecutive_failures={self._position_fetch_failures}"
+                )
+                continue
+            self._position_fetch_failures = 0
+
+            try:
                 balance = await adapter.get_balance()
             except Exception as e:
-                logger.error(f"Failed to fetch positions from {exchange}: {e}")
+                logger.error(
+                    f"Failed to fetch balance from {exchange} "
+                    f"({type(e).__name__}: {e!r})"
+                )
                 continue
 
             total = balance.get("USDT", Decimal("1"))
