@@ -55,7 +55,13 @@ def _adapter_with(script: list) -> tuple[BinanceAdapter, _FakeClient]:
     a = BinanceAdapter("key", "secret", testnet=True)
     client = _FakeClient(script, name="客户端")
     a._client = client  # type: ignore[assignment]
-    a._symbol_rules = {}
+    a._symbol_rules = {
+        "DOGEUSDT": {
+            "stepSize": Decimal("0.00000001"),
+            "tickSize": Decimal("0.00000001"),
+            "minQty": Decimal("0"),
+        }
+    }  # 本文件只测传输层重试语义，规则取"不改变数量"的精度
     a._leverage_set.add("DOGEUSDT")
     return a, client
 

@@ -7,6 +7,7 @@ Binance Futures 交易所适配器。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -67,6 +68,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         if testnet:
             self.BASE_URL = "https://demo-fapi.binance.com"
         self._client: Optional[httpx.AsyncClient] = None
+        # 记录创建客户端的 event loop：跨 loop 使用会抛
+        # "Event is bound to a different event loop"（启动窗口实测），需要重建。
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
         self._time_offset: int = 0  # ms: local_time = server_time + offset
         self._leverage_set: set[str] = set()  # 已设置杠杆的交易对
         self._symbol_rules: Optional[dict[str, dict]] = None  # exchangeInfo 精度规则缓存
@@ -80,6 +84,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             timeout=self.TIMEOUT,
             proxy=proxy if proxy else None,
         )
+        self._client_loop = self._running_loop()
         # Sync clock with Binance server to avoid timestamp drift errors
         await self._sync_time()
 
@@ -116,6 +121,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+        self._client_loop = None
 
     def _sign(self, params: dict) -> str:
         """HMAC SHA256 签名，返回完整查询字符串。
@@ -139,6 +145,36 @@ class BinanceAdapter(BaseExchangeAdapter):
         if self._client is None:
             raise RuntimeError("BinanceAdapter not connected. Call connect() first.")
         return self._client
+
+    @staticmethod
+    def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
+        """当前 running loop（无则 None）。"""
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+    async def _ensure_client_for_current_loop(self) -> None:
+        """客户端绑定在别的 event loop 上时重建它。
+
+        适配器可能在启动阶段的某个 loop 里 connect()，之后被 runner/consumer 任务在
+        另一个 loop 中调用 → httpx/anyio 的 loop-bound 原语抛
+        `RuntimeError: <asyncio.locks.Event ...> is bound to a different event loop`
+        （2026-09-21 启动窗口实测：持仓同步/下单/RiskGuard 拉持仓全中招，靠 _reconnect
+        自愈，约 20-40s 才恢复）。这里提前按 loop 重建，消除该窗口。
+        仅当客户端由本适配器创建（记录了创建 loop）且与当前 loop 不同才重建；
+        测试注入的替身（_client_loop is None）不碰。
+        """
+        loop = self._running_loop()
+        if loop is None or self._client is None or self._client_loop is None:
+            return
+        if self._client_loop is loop:
+            return
+        logger.warning(
+            "[Binance] HTTP client bound to another event loop; "
+            "rebuilding for the current loop"
+        )
+        await self._reconnect()
 
     async def _reconnect(self) -> None:
         """丢弃并重建 HTTP 客户端（并重新同步时钟）。
@@ -176,6 +212,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         """
 
         async def attempt() -> httpx.Response:
+            await self._ensure_client_for_current_loop()
             client = self._ensure_connected()
             target = f"{path}?{self._sign(params or {})}" if signed else path
             # 用 getattr 分发到 get/post/delete（而非 client.request）：与既有调用风格、
@@ -312,10 +349,12 @@ class BinanceAdapter(BaseExchangeAdapter):
         try:
             resp = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
             if resp.status_code != 200:
-                logger.warning(
+                logger.error(
                     f"exchangeInfo fetch failed: {resp.status_code} - {resp.text[:200]}"
                 )
-                return
+                raise RuntimeError(
+                    f"exchangeInfo fetch failed: {resp.status_code}"
+                )
             data = resp.json()
             rules: dict[str, dict] = {}
             for s in data.get("symbols", []):
@@ -338,7 +377,12 @@ class BinanceAdapter(BaseExchangeAdapter):
             self._symbol_rules = rules
             logger.info(f"exchangeInfo cached for {len(rules)} symbols")
         except Exception as e:
-            logger.warning(f"Failed to load exchangeInfo precision rules: {e}")
+            # 不可静默吞掉：规则缺失会让数量以未归一化形态直发交易所（-1111）。
+            logger.error(
+                f"Failed to load exchangeInfo precision rules "
+                f"({type(e).__name__}: {e!r})"
+            )
+            raise
 
     def _normalize_quantity(self, symbol: str, quantity: Decimal) -> Decimal:
         """按 LOT_SIZE stepSize 向下取整数量，避免 -1111 精度错误。"""
@@ -379,6 +423,15 @@ class BinanceAdapter(BaseExchangeAdapter):
         # 首次下单前加载交易所精度规则（懒加载 + 缓存）
         if self._symbol_rules is None:
             await self._load_symbol_rules()
+
+        # 精度规则不可用 → 无法保证数量/价格合法：拒绝下单。
+        # 2026-09-21 实测：加载失败被静默吞掉 → _normalize_quantity 原样返回 →
+        # 5332.37953400 直发 DOGEUSDT（stepSize=1）→ 交易所 -1111。
+        if not self._symbol_rules or symbol not in self._symbol_rules:
+            raise RuntimeError(
+                f"exchangeInfo 精度规则不可用（symbol={symbol}）"
+                "：拒绝下单以避免 -1111 精度错误"
+            )
 
         # 精度归一化：数量按 stepSize 向下取整，价格按 tickSize 对齐
         quantity = self._normalize_quantity(symbol, request.quantity)

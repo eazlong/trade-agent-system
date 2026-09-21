@@ -21,6 +21,30 @@ class FrameState(str, Enum):
     STOPPING = "stopping"
 
 
+def live_session_kwargs(session) -> dict:
+    """由 LiveSession 记录构造 start_strategy_runner 的入参。
+
+    DB 是唯一权威来源（Redis 兼容层可能过期）：恢复 / 恢复运行（resume）共用同一构造，
+    避免两处口径漂移。
+    """
+    return {
+        "strategy_name": session.strategy.name,
+        "symbol": session.symbol,
+        "timeframe": (
+            session.backtest_result.timeframe
+            if session.backtest_result and session.backtest_result.timeframe
+            else "1h"
+        ),
+        "parameters": session.config or {},
+        "exchange_account_id": (
+            str(session.exchange_account.id) if session.exchange_account else ""
+        ),
+        "user_id": str(session.user.id) if session.user else None,
+        "live_session_id": str(session.id),
+        "initial_balance": session.initial_capital,
+    }
+
+
 class FrameManager:
     """管理交易/辅助/回测框架的生命周期（懒加载，按需启动）"""
 
@@ -272,6 +296,8 @@ class FrameManager:
             )
 
         # 2) 权威来源：DB status=running 的 LiveSession
+        db_ids: set[str] = set()
+        db_ok = False
         try:
             from asgiref.sync import sync_to_async
             from apps.trading.models import LiveSession
@@ -286,6 +312,8 @@ class FrameManager:
                 )
 
             db_sessions = await _running_sessions()
+            db_ids = {str(s.id) for s in db_sessions}
+            db_ok = True
             logger.info(
                 "[FrameManager] found %d running sessions in DB", len(db_sessions)
             )
@@ -293,26 +321,49 @@ class FrameManager:
                 sid = str(s.id)
                 # DB 是权威来源：即使 Redis 键过期或值过时，
                 # 也以 DB 字段覆盖重写（同一会话仅保留一份待恢复信息）。
-                pending[sid] = {
-                    "strategy_name": s.strategy.name,
-                    "symbol": s.symbol,
-                    "timeframe": (
-                        s.backtest_result.timeframe
-                        if s.backtest_result and s.backtest_result.timeframe
-                        else "1h"
-                    ),
-                    "parameters": s.config or {},
-                    "exchange_account_id": (
-                        str(s.exchange_account.id) if s.exchange_account else ""
-                    ),
-                    "user_id": str(s.user.id) if s.user else None,
-                    "live_session_id": sid,
-                    "initial_balance": s.initial_capital,
-                }
+                pending[sid] = live_session_kwargs(s)
         except Exception as e:
             logger.warning(
                 "[FrameManager] failed to read running sessions from DB: %s", e
             )
+
+        # 3) DB 是唯一权威：Redis 兼容层里 status=running、但 DB 已非 running 的会话
+        # 一律不恢复（否则"暂停/停止"在重启后失效——2026-09-21 实际踩到：两个已 paused
+        # 的 DOGE 会话被 Redis 旧值捞回来并自动开仓），并把兼容层状态纠正为 DB 真值。
+        if db_ok and pending:
+            stale = [sid for sid in pending if sid not in db_ids]
+            for sid in stale:
+                pending.pop(sid, None)
+                logger.warning(
+                    "[FrameManager] skip live session %s: DB status is not running "
+                    "(Redis legacy key says running)",
+                    sid,
+                )
+            if stale:
+                try:
+                    from asgiref.sync import sync_to_async
+                    from apps.trading.models import LiveSession
+
+                    @sync_to_async
+                    def _real_statuses() -> dict:
+                        close_old_connections()
+                        return dict(
+                            LiveSession.objects.filter(id__in=stale).values_list(
+                                "id", "status"
+                            )
+                        )
+
+                    real = {str(k): v for k, v in (await _real_statuses()).items()}
+                    r = self._get_redis()
+                    for sid in stale:
+                        if sid in real:
+                            r.hset(f"frame:live_session:{sid}", "status", real[sid])
+                        else:
+                            r.delete(f"frame:live_session:{sid}")
+                except Exception as e:  # noqa: BLE001 - 兼容层纠正失败不影响恢复
+                    logger.warning(
+                        "[FrameManager] failed to correct legacy Redis keys: %s", e
+                    )
 
         # 关键保障：只要有待恢复的 running 会话，交易框架必须处于运行态，
         # 否则 OrderConsumer 不消费 stream → 信号分发后订单永远不会执行。
@@ -570,6 +621,33 @@ class FrameManager:
             user_id=user_id or "",
             initial_balance=str(initial_balance),
         )
+
+    async def start_live_session(self, live_session_id: str) -> None:
+        """按 DB 记录启动（或重启）某个 live session 的 runner（resume 用）。
+
+        入参一律取自 DB（权威来源）；start_strategy_runner 会顺带重建 Redis 兼容层键。
+        """
+        from apps.trading.models import LiveSession
+
+        @sync_to_async
+        def _load():
+            close_old_connections()
+            return (
+                LiveSession.objects.filter(id=live_session_id)
+                .select_related("strategy", "exchange_account", "user", "backtest_result")
+                .first()
+            )
+
+        session = await _load()
+        if session is None:
+            raise ValueError(f"LiveSession {live_session_id} not found")
+        if self._trading_state != FrameState.RUNNING or self._order_executor is None:
+            logger.warning(
+                "[FrameManager] starting trading frame before resuming session %s",
+                live_session_id,
+            )
+            await self.start_trading_frame(mode="live", force=True)
+        await self.start_strategy_runner(**live_session_kwargs(session))
 
     async def stop_strategy_runner(self, live_session_id: str | None = None) -> None:
         """停止策略运行器。

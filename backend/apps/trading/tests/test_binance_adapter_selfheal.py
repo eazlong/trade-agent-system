@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -166,7 +167,13 @@ class TestTransportSelfHeal(unittest.IsolatedAsyncioTestCase):
 
     async def test_place_order_transport_timeout_reconnects_and_places(self):
         a, old, new = _adapter([httpx.ConnectTimeout("")], [_Resp(200, ORDER_PAYLOAD)])
-        a._symbol_rules = {}
+        a._symbol_rules = {
+            "BNBUSDT": {
+                "stepSize": Decimal("1"),
+                "tickSize": Decimal("0.01"),
+                "minQty": Decimal("0"),
+            }
+        }  # 本文件只测自愈语义，规则取"不改变下单参数"的精度
         a._leverage_set.add("BNBUSDT")
         request = _order_request()
 

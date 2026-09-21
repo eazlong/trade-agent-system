@@ -456,6 +456,20 @@ def live_session_pause(request, pk):
     session.status = "paused"
     session.save(update_fields=["status", "updated_at"])
 
+    # 真正停住 runner：只改 DB 状态的话（旧实现）runner 继续跑，且 Redis 兼容层键
+    # 仍写着 running → 下次重启又被恢复（2026-09-21 实际踩到）。stop_strategy_runner
+    # 会停 runner 并删除兼容层键，缓存与 DB 随之一致。
+    from apps.agent.frame_manager import FrameManager
+
+    frame_manager = FrameManager.get_instance()
+    if frame_manager is not None:
+        try:
+            async_to_sync(frame_manager.stop_strategy_runner)(
+                live_session_id=str(session.id)
+            )
+        except Exception as e:  # noqa: BLE001 - 暂停语义以 DB 为准，停 runner 失败不阻断
+            logger.error("pause: failed to stop runner for %s: %s", session.id, e)
+
     return Response({"status": session.status, "message": "Session paused"})
 
 
@@ -474,6 +488,17 @@ def live_session_resume(request, pk):
 
     session.status = "running"
     session.save(update_fields=["status", "updated_at"])
+
+    # 真正拉起 runner（并重建 Redis 兼容层键）。失败时 DB 已是 running，
+    # 下次重启仍会被恢复，属可自愈状态，故只记录错误。
+    from apps.agent.frame_manager import FrameManager
+
+    frame_manager = FrameManager.get_instance()
+    if frame_manager is not None:
+        try:
+            async_to_sync(frame_manager.start_live_session)(str(session.id))
+        except Exception as e:  # noqa: BLE001
+            logger.error("resume: failed to start runner for %s: %s", session.id, e)
 
     return Response({"status": session.status, "message": "Session resumed"})
 

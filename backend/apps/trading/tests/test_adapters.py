@@ -107,6 +107,13 @@ class TestBinanceAdapterL1(unittest.TestCase):
         }
         mock_client.post.return_value = mock_response
         adapter._client = mock_client
+        adapter._symbol_rules = {
+            "BTCUSDT": {
+                "stepSize": Decimal("0.001"),
+                "tickSize": Decimal("0.01"),
+                "minQty": Decimal("0"),
+            }
+        }
 
         req = OrderRequest(
             exchange="binance",
