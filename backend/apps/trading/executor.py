@@ -254,16 +254,23 @@ class OrderExecutor:
             raise TimeoutError("Order persistence timeout")
         logger.info(f"[SF-07c][OrderExecutor] order persisted: id={order.id}")
 
+        # 用订单行的 request_id 作为交易所幂等键（newClientOrderId）：
+        # 重试与"响应丢失后对账"都以它为准。没有它时，transport 重试可能重复下单
+        # （2026-09-21 事故后补：当次失败单没有幂等键，交易所侧无法对账）。
+        request.client_order_id = str(order.request_id)
+
         # 3. 发送到交易所
         try:
             logger.info("[SF-07d][OrderExecutor] calling adapter.place_order...")
             try:
                 response = await asyncio.wait_for(
                     adapter.place_order(request),
-                    timeout=15.0
+                    # 45s：适配器内部预算为 10s(首次超时) + 10s(重连重发或按 clientOrderId
+                    # 对账) + 余量。低于此值会在对账完成前取消，导致"订单状态未知"。
+                    timeout=45.0,
                 )
             except asyncio.TimeoutError:
-                logger.error("[SF-07d][OrderExecutor] adapter.place_order timeout (15s)")
+                logger.error("[SF-07d][OrderExecutor] adapter.place_order timeout (45s)")
                 raise TimeoutError("Exchange API timeout")
 
             # 应用下单响应中的即时成交信息（市价单通常同步成交）
@@ -328,14 +335,23 @@ class OrderExecutor:
                 "status": response.status,
             }
         except Exception as e:
+            # 失败原因必须带类型名：httpx 超时异常的 message 为空，只写 str(e) 会落一条空消息
+            # （2026-09-21 事故：库里的 failed 单 error_message='' ，无法诊断）
+            error_text = f"{type(e).__name__}: {e}".strip().rstrip(":") or type(e).__name__
             await self._update_order(
                 order_id=str(order.id),
                 status="failed",
-                error_message=str(e),
+                error_message=error_text,
             )
             if self._riskguard:
-                await self._riskguard.record_order_failure(uid)
-            logger.error(f"[SF-09][OrderExecutor] failed: order_id={order.id} - {e}")
+                await self._riskguard.record_order_failure(
+                    uid,
+                    symbol=symbol,
+                    side=side,
+                    quantity=str(quantity),
+                    error=error_text,
+                )
+            logger.error(f"[SF-09][OrderExecutor] failed: order_id={order.id} - {error_text}")
             raise
 
     async def cancel_order(

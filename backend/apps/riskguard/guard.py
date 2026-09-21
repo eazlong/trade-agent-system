@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from apps.core.db_utils import db_async
 
@@ -141,12 +141,45 @@ class RiskGuard:
         cb = CircuitBreaker(user_id=user_id)
         await cb.record_success()
 
-    async def record_order_failure(self, user_id: str) -> None:
-        """订单失败时调用，连续失败触发熔断"""
+    async def record_order_failure(
+        self,
+        user_id: Optional[str],
+        *,
+        symbol: str = "",
+        side: str = "",
+        quantity: str = "",
+        error: str = "",
+    ) -> None:
+        """订单失败时调用：连续失败触发熔断 + 给用户一条可见通知。
+
+        2026-09-21 事故：失败只喂熔断器，用户完全无感（意图中的订单被静默丢弃，
+        只能翻订单列表才发现）。因此这里必须留一条用户可见的通知。
+        通知失败只记 ERROR，绝不影响下单/风控主流程。
+        """
         if not user_id:
             return
         cb = CircuitBreaker(user_id=user_id)
         await cb.record_failure()
+
+        try:
+            from apps.notify.models import Notification
+
+            detail = f"{symbol} {side} qty={quantity}".strip()
+            await db_async(
+                lambda: Notification.objects.create(
+                    user_id=user_id,
+                    channel="web",
+                    message=f"⚠️ 下单失败: {detail}｜原因: {error or '交易所未返回原因'}",
+                )
+            )()
+        except Exception as e:  # noqa: BLE001 - 通知失败不得影响主流程
+            logger.error(
+                "下单失败通知写入失败（熔断计数已完成，user=%s symbol=%s）: %s",
+                user_id,
+                symbol,
+                e,
+                exc_info=True,
+            )
 
     async def _get_daily_trade_count(self, user_id: str) -> int:
         """统计日内已成交订单数量"""

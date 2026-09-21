@@ -32,6 +32,24 @@ logger = logging.getLogger(__name__)
 # Futures API base URL
 _BASE_URL = "https://fapi.binance.com"
 
+# 传输层异常分类（httpx）
+# 只有"请求肯定没发出去"的错误，对下单才是可安全重发的；其余（读超时/协议错误）
+# 可能已被交易所受理，重发即为重复下单 → 只能按 clientOrderId 对账。
+_PRE_SEND_ERRORS: tuple = (
+    httpx.ConnectError,  # TCP 连接建立失败
+    httpx.ConnectTimeout,  # 连接超时（尚未发出）
+    httpx.PoolTimeout,  # 未从连接池拿到连接
+)
+_AMBIGUOUS_ORDER_ERRORS: tuple = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.WriteError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+# 交易所报"单号重复"= 前一次请求其实已被受理（幂等命中）
+_DUPLICATE_ORDER_MARKERS = ("-4116", "Duplicate order sent")
+
 
 class BinanceAdapter(BaseExchangeAdapter):
     """
@@ -143,14 +161,17 @@ class BinanceAdapter(BaseExchangeAdapter):
         params: Optional[dict] = None,
         *,
         signed: bool = True,
+        retry_transport: bool = True,
         **kwargs,
     ) -> httpx.Response:
         """所有请求的统一出口：传输层自愈 + 时间戳失效自愈。
 
         1. httpx.TransportError（连接/读写/池超时等）→ 重建客户端后重试一次。
            注意：httpx 这些异常的 message 为空，日志必须带类型名，否则只剩空消息。
+           `retry_transport=False`（下单用）：只有"发送前"错误才重发，
+           含糊错误（读超时/协议错误）直接抛给调用方去对账——避免重复下单。
         2. 响应为 -1021（timestamp 超出 recvWindow）→ 重新同步时钟后重试一次
-           （重试会重新签名，拿到的是校正后的 timestamp）。
+           （重试会重新签名，拿到的是校正后的 timestamp。被拒=未受理，对下单也安全）。
         有界重试：每种情况最多一次，仍失败则抛出，由调用方处理。
         """
 
@@ -165,6 +186,14 @@ class BinanceAdapter(BaseExchangeAdapter):
         try:
             resp = await attempt()
         except httpx.TransportError as e:
+            if not retry_transport and not isinstance(e, _PRE_SEND_ERRORS):
+                # 请求可能已被交易所受理（响应丢失）→ 重发会造成重复下单，交给调用方对账
+                logger.warning(
+                    f"Binance transport error on {method} {path} "
+                    f"({type(e).__name__}: {e!r}); not resending "
+                    "(request may have been accepted)"
+                )
+                raise
             logger.warning(
                 f"Binance transport error on {method} {path} "
                 f"({type(e).__name__}: {e!r}); reconnecting and retrying once"
@@ -181,6 +210,87 @@ class BinanceAdapter(BaseExchangeAdapter):
             resp = await attempt()
 
         return resp
+
+    async def find_order_by_client_id(
+        self, client_order_id: str, symbol: str
+    ) -> Optional[dict]:
+        """按 clientOrderId 查交易所侧真实订单（"请求发出但响应丢失"时的对账手段）。
+
+        返回订单原始 dict；订单确实不存在（-2013）返回 None；
+        查询本身失败也返回 None（调用方据此保守处理：不宣称成功）。
+        """
+        try:
+            resp = await self._request(
+                "GET",
+                "/fapi/v1/order",
+                {
+                    "symbol": symbol.upper().replace("/", ""),
+                    "origClientOrderId": client_order_id,
+                },
+            )
+        except httpx.TransportError as e:
+            logger.warning(
+                f"Binance order lookup by clientOrderId failed "
+                f"({type(e).__name__}: {e!r}); 无法确认订单状态"
+            )
+            return None
+
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 400:
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001
+                data = {}
+            if data.get("code") == -2013:  # Order does not exist
+                return None
+        logger.warning(
+            f"Binance order lookup by clientOrderId unexpected: "
+            f"{resp.status_code} - {(resp.text or '')[:200]}"
+        )
+        return None
+
+    def _order_response_from_raw(self, data: dict) -> OrderResponse:
+        """交易所订单 dict → OrderResponse（下单与对账共用，保持与原来一致的**原始**
+        交易所状态；本地状态由 executor._map_exchange_status 统一映射）。"""
+        return OrderResponse(
+            exchange_order_id=str(data["orderId"]),
+            status=data.get("status", ""),
+            filled_qty=Decimal(data.get("executedQty", "0")),
+            avg_price=Decimal(data["avgPrice"]) if data.get("avgPrice") else None,
+            fee=None,
+            raw=data,
+        )
+
+    async def _reconcile_order(
+        self, request: OrderRequest, error: Optional[BaseException]
+    ) -> Optional[OrderResponse]:
+        """下单结果不明时按 clientOrderId 向交易所对账。
+
+        查到 → 采用交易所真实状态（说明请求已被受理，避免"假失败"）；
+        查不到/无幂等键/查询失败 → 返回 None（调用方按原错误处理，绝不臆造成功）。
+        """
+        if not request.client_order_id:
+            logger.warning(
+                "Binance 下单结果不明但没有 clientOrderId，无法对账（订单状态未知）"
+                f"：{type(error).__name__ if error else 'duplicate-reject'}"
+            )
+            return None
+
+        raw = await self.find_order_by_client_id(request.client_order_id, request.symbol)
+        if raw is None:
+            logger.warning(
+                f"Binance 对账未命中 clientOrderId={request.client_order_id}"
+                "（请求未被受理）"
+            )
+            return None
+
+        logger.warning(
+            f"Binance 对账命中 clientOrderId={request.client_order_id} → 采用交易所真实状态 "
+            f"status={raw.get('status')} executedQty={raw.get('executedQty')} "
+            f"avgPrice={raw.get('avgPrice')}"
+        )
+        return self._order_response_from_raw(raw)
 
     async def _ensure_leverage(self, symbol: str) -> None:
         """下单前确保已设置杠杆。每个交易对只需设置一次。"""
@@ -293,24 +403,29 @@ class BinanceAdapter(BaseExchangeAdapter):
             params["stopPrice"] = str(request.stop_loss)
             params["workType"] = "STOP"
 
-        resp = await self._request("POST", "/fapi/v1/order", params)
+        try:
+            resp = await self._request(
+                "POST", "/fapi/v1/order", params, retry_transport=False
+            )
+        except _AMBIGUOUS_ORDER_ERRORS as e:
+            # 请求可能已被受理但响应丢失：绝不重发，先按 clientOrderId 对账
+            reconciled = await self._reconcile_order(request, e)
+            if reconciled is not None:
+                return reconciled
+            raise
 
         if resp.status_code >= 400:
-            error_detail = resp.text
+            error_detail = resp.text or ""
+            if any(marker in error_detail for marker in _DUPLICATE_ORDER_MARKERS):
+                # 单号重复 = 前一次其实已受理（幂等命中），取交易所真实状态而非当作失败
+                reconciled = await self._reconcile_order(request, None)
+                if reconciled is not None:
+                    return reconciled
             logger.error(f"Binance API error: {resp.status_code} - {error_detail}")
             # 抛出包含 Binance 错误详情的异常
             raise RuntimeError(f"Binance API {resp.status_code}: {error_detail}")
 
-        data = resp.json()
-
-        return OrderResponse(
-            exchange_order_id=str(data["orderId"]),
-            status=data["status"],
-            filled_qty=Decimal(data.get("executedQty", "0")),
-            avg_price=Decimal(data["avgPrice"]) if data.get("avgPrice") else None,
-            fee=None,
-            raw=data,
-        )
+        return self._order_response_from_raw(resp.json())
 
     # Binance 订单状态 → 本地 Order.status 映射
     _STATUS_MAP = {
