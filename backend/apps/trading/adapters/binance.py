@@ -17,6 +17,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+from anyio import BrokenResourceError, ClosedResourceError
 from django.conf import settings
 
 from .base import (
@@ -41,12 +42,19 @@ _PRE_SEND_ERRORS: tuple = (
     httpx.ConnectTimeout,  # 连接超时（尚未发出）
     httpx.PoolTimeout,  # 未从连接池拿到连接
 )
+# anyio 资源类错误：连接被关闭/损坏。**不是** httpx.TransportError，日志里同样只有空消息。
+# 语义与传输层错误同族：请求可能没出去，也可能出去后响应通道被关掉（含糊，不可盲目重发）。
+_CONNECTION_LOST_ERRORS: tuple = (ClosedResourceError, BrokenResourceError)
+# 统一出口 _request 需要捕获的全部"连接层"错误
+_EGRESS_ERRORS: tuple = (httpx.TransportError, *_CONNECTION_LOST_ERRORS)
+
 _AMBIGUOUS_ORDER_ERRORS: tuple = (
     httpx.ReadTimeout,
     httpx.WriteTimeout,
     httpx.WriteError,
     httpx.ReadError,
     httpx.RemoteProtocolError,
+    *_CONNECTION_LOST_ERRORS,  # 可能已被受理：必须按 clientOrderId 对账，不能直接判失败
 )
 # 交易所报"单号重复"= 前一次请求其实已被受理（幂等命中）
 _DUPLICATE_ORDER_MARKERS = ("-4116", "Duplicate order sent")
@@ -61,6 +69,8 @@ class BinanceAdapter(BaseExchangeAdapter):
 
     BASE_URL = _BASE_URL
     TIMEOUT = 10.0
+    # 旧客户端延迟关闭的宽限期：重建当刻可能正有并发请求在用旧的（见 _close_client_later）
+    CLIENT_CLOSE_GRACE_SECONDS = 15.0
     DEFAULT_LEVERAGE = 10  # 默认杠杆倍数
 
     def __init__(self, api_key: str, secret: str, testnet: bool = False):
@@ -71,11 +81,17 @@ class BinanceAdapter(BaseExchangeAdapter):
         # 记录创建客户端的 event loop：跨 loop 使用会抛
         # "Event is bound to a different event loop"（启动窗口实测），需要重建。
         self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+        # 延迟关闭任务强引用（asyncio 只弱引用 task，不持有会被 GC 掉）
+        self._closing_tasks: set = set()
         self._time_offset: int = 0  # ms: local_time = server_time + offset
         self._leverage_set: set[str] = set()  # 已设置杠杆的交易对
         self._symbol_rules: Optional[dict[str, dict]] = None  # exchangeInfo 精度规则缓存
 
     async def connect(self) -> None:
+        await self._create_client()
+
+    async def _create_client(self) -> None:
+        """创建 HTTP 客户端并同步时钟（重建路径复用；不负责处置旧客户端）。"""
         headers = {"X-MBX-APIKEY": self._api_key}
         proxy = getattr(settings, "WEB_PROXY", "") or None
         self._client = httpx.AsyncClient(
@@ -174,7 +190,21 @@ class BinanceAdapter(BaseExchangeAdapter):
             "[Binance] HTTP client bound to another event loop; "
             "rebuilding for the current loop"
         )
-        await self._reconnect()
+        # 先建新客户端并换引用，旧的**延迟**关闭：重建当刻可能正有并发请求在用旧客户端，
+        # 内联 aclose() 会让它们报 ClosedResourceError（2026-09-21 线上实测：SOL 同步被拦一轮）。
+        old = self._client
+        await self._create_client()
+        task = asyncio.create_task(self._close_client_later(old))
+        self._closing_tasks.add(task)
+        task.add_done_callback(self._closing_tasks.discard)
+
+    async def _close_client_later(self, client) -> None:
+        """延迟关闭旧客户端：并发中的在途请求可能还在用它。"""
+        await asyncio.sleep(self.CLIENT_CLOSE_GRACE_SECONDS)
+        try:
+            await client.aclose()
+        except Exception as e:  # noqa: BLE001 - 关闭失败不影响新客户端
+            logger.debug(f"deferred aclose failed: {type(e).__name__}: {e!r}")
 
     async def _reconnect(self) -> None:
         """丢弃并重建 HTTP 客户端（并重新同步时钟）。
@@ -222,7 +252,7 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         try:
             resp = await attempt()
-        except httpx.TransportError as e:
+        except _EGRESS_ERRORS as e:
             if not retry_transport and not isinstance(e, _PRE_SEND_ERRORS):
                 # 请求可能已被交易所受理（响应丢失）→ 重发会造成重复下单，交给调用方对账
                 logger.warning(

@@ -126,6 +126,29 @@ class TestTransportSelfHeal(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(old.closed, "旧客户端必须被关闭，否则连接池一直烂着")
         self.assertIs(a._client, new, "重试必须走新客户端")
 
+    async def test_closed_resource_error_on_read_retries_after_rebuild(self):
+        """anyio ClosedResourceError（空消息，非 httpx.TransportError）也按连接层故障处理。
+
+        线上实测（2026-09-21）：适配器客户端被并发重建关闭时，在途读请求会报
+        `ClosedResourceError:`（消息为空）。读接口必须重建后重试一次，而不是把这次
+        同步失败直接抛给上层（那会让策略在持仓未知时被迫跳过一轮）。
+        """
+        from anyio import ClosedResourceError
+
+        a, old, new = _adapter(
+            [ClosedResourceError(""), _Resp(200, POSITION_PAYLOAD)],
+            [_Resp(200, POSITION_PAYLOAD)],
+        )
+        with patch.object(
+            BinanceAdapter, "connect", AsyncMock(side_effect=lambda: _set_client(a, new))
+        ) as recon:
+            positions = await a.get_positions()
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].symbol, "BNBUSDT")
+        self.assertEqual(recon.await_count, 1, "连接层错误必须重建客户端后重试")
+        self.assertIs(a._client, new)
+
     async def test_positions_timeout_after_reconnect_raises_and_retries_only_once(self):
         a, old, new = _adapter([httpx.ConnectTimeout("")], [httpx.ConnectTimeout("")])
         with patch.object(

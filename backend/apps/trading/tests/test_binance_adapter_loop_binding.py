@@ -26,7 +26,7 @@ class _FakeClient:
 
 class TestLoopAwareClient(SimpleTestCase):
     def test_rebuilds_client_when_loop_differs(self):
-        """客户端记录的 loop 与当前 loop 不同 → 关掉旧的、换成新 loop 的客户端。"""
+        """记录的 loop 与当前 loop 不同 → 建新客户端、换引用，旧的最终被关闭。"""
         a = BinanceAdapter("key", "secret", testnet=True)
         old = _FakeClient("old")
         a._client = old  # type: ignore[assignment]
@@ -34,19 +34,59 @@ class TestLoopAwareClient(SimpleTestCase):
         a._client_loop = foreign_loop
         new = _FakeClient("new")
 
-        async def fake_connect():
-            a._client = new  # type: ignore[assignment]
+        async def scenario():
+            a.CLIENT_CLOSE_GRACE_SECONDS = 0
+
+            async def fake_create():
+                a._client = new  # type: ignore[assignment]
+
+            with patch.object(
+                BinanceAdapter, "_create_client", AsyncMock(side_effect=fake_create)
+            ):
+                await a._ensure_client_for_current_loop()
+            await asyncio.gather(*a._closing_tasks, return_exceptions=True)
+            return a._client
 
         try:
-            with patch.object(
-                BinanceAdapter, "connect", AsyncMock(side_effect=fake_connect)
-            ):
-                asyncio.run(a._ensure_client_for_current_loop())
+            resolved = asyncio.run(scenario())
         finally:
             foreign_loop.close()
 
-        self.assertTrue(old.closed, "旧客户端必须被关闭")
-        self.assertIs(a._client, new)
+        self.assertTrue(old.closed, "旧客户端最终必须被关闭（否则连接池一直烂着）")
+        self.assertIs(resolved, new)
+
+    def test_old_client_is_not_closed_inline(self):
+        """重建当刻不得内联关闭旧客户端——并发在途请求还在用它。
+
+        线上实证（2026-09-21）：内联 aclose() 导致 SOL 持仓同步报
+        `ClosedResourceError:`（空消息）被 fail-loud 拦了一轮。
+        """
+        a = BinanceAdapter("key", "secret", testnet=True)
+        old = _FakeClient("old")
+        a._client = old  # type: ignore[assignment]
+        foreign_loop = asyncio.new_event_loop()
+        a._client_loop = foreign_loop
+        a.CLIENT_CLOSE_GRACE_SECONDS = 30
+
+        async def scenario():
+            async def fake_create():
+                a._client = _FakeClient("new")  # type: ignore[assignment]
+
+            with patch.object(
+                BinanceAdapter, "_create_client", AsyncMock(side_effect=fake_create)
+            ):
+                await a._ensure_client_for_current_loop()
+
+            assert not old.closed, "旧客户端不得被内联关闭"
+            assert a._closing_tasks, "延迟关闭任务必须被强引用持有（否则会被 GC）"
+            for task in list(a._closing_tasks):
+                task.cancel()
+            await asyncio.gather(*a._closing_tasks, return_exceptions=True)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            foreign_loop.close()
 
     def test_same_loop_keeps_client(self):
         """同一 loop 内不得重建（避免每次请求都换客户端）。"""

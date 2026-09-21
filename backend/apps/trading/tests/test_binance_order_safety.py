@@ -149,3 +149,42 @@ class TestOrderRetrySafety(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(positions), 1)
         self.assertEqual(recon.await_count, 1)
+
+
+class TestAmbiguousAnyioErrors(unittest.IsolatedAsyncioTestCase):
+    """anyio 资源类错误（ClosedResourceError 等）在下单路径属于**含糊错误**。
+
+    2026-09-21 加固：这类错误不是 httpx.TransportError，日志里同样只有空消息；
+    连接可能是在请求写出去之后才被关闭 → 必须按 clientOrderId 对账，绝不盲目重发。
+    """
+
+    async def test_closed_resource_error_on_order_reconciles(self):
+        from anyio import ClosedResourceError
+
+        # 脚本：下单 POST 抛 ClosedResourceError → 对账 GET 命中真实订单
+        a, client = _adapter_with([ClosedResourceError(""), _Resp(200, ORDER_RAW)])
+
+        resp = await a.place_order(_req("cid-abc"))
+
+        self.assertEqual(resp.exchange_order_id, "2347999999")
+        posts = [c for c in client.requests if c[0] == "POST"]
+        gets = [c for c in client.requests if c[0] == "GET"]
+        self.assertEqual(len(posts), 1, f"绝不重发：{client.requests}")
+        self.assertEqual(len(gets), 1, f"必须对账一次：{client.requests}")
+
+    async def test_broken_resource_error_on_order_without_match_raises(self):
+        """对账查不到（订单不存在）→ 仍按失败抛出，不臆造成功。"""
+        from anyio import BrokenResourceError
+
+        a, client = _adapter_with(
+            [
+                BrokenResourceError(""),
+                _Resp(400, {"code": -2013, "msg": "Order does not exist."}, text=NOT_FOUND_BODY),
+            ]
+        )
+
+        with self.assertRaises(BrokenResourceError):
+            await a.place_order(_req("cid-abc"))
+
+        posts = [c for c in client.requests if c[0] == "POST"]
+        self.assertEqual(len(posts), 1, "绝不重发")
