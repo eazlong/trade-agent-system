@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 class LiveStrategyRunner:
+
+    # 持仓同步的最小间隔（秒）。同一根 K 线的多次 tick 推送、以及高频验证事件
+    # 都按此节流；**新 K 线到来时强制刷新**（每 bar 至少一次真值）。
+    POSITION_SYNC_MIN_INTERVAL = 15.0
 
     def __init__(
         self,
@@ -45,6 +50,13 @@ class LiveStrategyRunner:
         self._entry_direction: dict[str, str] = {}
         # per-session 并发锁：信号处理中时拒绝新的 kline 触发
         self._signal_lock = asyncio.Lock()
+        # 持仓同步状态（C 修复）：None=从未同步 / True=最近成功 / False=最近失败。
+        # 失败时决策路径直接跳过本轮，绝不拿"未知或陈旧持仓"下单。
+        self._position_synced: bool | None = None
+        self._last_position_sync_ts: float = 0.0
+        self._position_sync_failure_notified = False
+        # 最近一次决策使用的 K 线 timestamp（用于识别"新 bar"→ 强制刷新持仓）
+        self._last_bar_ts = None
 
     async def start(self) -> None:
         """启动实盘策略运行"""
@@ -185,6 +197,20 @@ class LiveStrategyRunner:
             self.symbol, Decimal(str(kline.get("close", "0")))
         )
 
+        # 决策前同步真实持仓（C 修复）：ctx 只在启动时同步过一次，持仓被其他会话/
+        # 手工改变后若沿用旧值，close_position() 会按旧数量下单（2026-09-20 事故：
+        # ctx 记着 +17718、交易所实际为 0，卖出后把账户卖成了 −17718 空头）。
+        # 同一根 bar 的多次 tick 推送按 TTL 节流；新 bar 强制刷新。
+        bar_ts = kline.get("timestamp")
+        is_new_bar = bar_ts is not None and bar_ts != self._last_bar_ts
+        if bar_ts is not None:
+            self._last_bar_ts = bar_ts
+        if not await self._refresh_position_before_decision(force=is_new_bar):
+            logger.debug(
+                f"[LiveStrategyRunner] 持仓未知 → 跳过本轮 {self.symbol} 决策"
+            )
+            return
+
         # 调试：记录当前持仓状态
         logger.debug(
             f"[LiveStrategyRunner] _process_kline start: ctx.position={self.strategy.ctx.position}, "
@@ -235,29 +261,27 @@ class LiveStrategyRunner:
                 f"targets={len(targets)} safe={len(safe_targets)} signals={signal_count}"
             )
 
-    async def _sync_position_from_exchange(self) -> None:
-        """从交易所同步当前持仓到 ctx。
+    async def _sync_position_from_exchange(self) -> bool:
+        """从交易所同步当前持仓到 ctx，返回是否同步成功。
 
         启动时调用，确保策略知道实际持仓，避免重复开仓。
+        2026-09-21（C 修复）：同步失败**不再静默按现有 ctx 继续**——置位
+        `_position_synced=False`、记 ERROR、通知用户一次，决策路径据此跳过本轮。
         """
         try:
             from apps.trading.executor import OrderExecutor
 
             executor = OrderExecutor.get_instance()
             if not executor:
-                logger.warning(
-                    f"[LiveStrategyRunner] OrderExecutor not ready, "
-                    f"position sync skipped for {self.symbol}"
+                await self._on_position_sync_failed(
+                    "OrderExecutor not ready（交易框架未就绪）"
                 )
-                return
+                return False
 
             adapter = executor._adapters.get("binance")
             if not adapter:
-                logger.warning(
-                    f"[LiveStrategyRunner] Binance adapter not found, "
-                    f"position sync skipped for {self.symbol}"
-                )
-                return
+                await self._on_position_sync_failed("binance 适配器未加载")
+                return False
 
             positions = await adapter.get_positions()
             symbol_norm = self.symbol.replace("/", "").upper()
@@ -271,17 +295,76 @@ class LiveStrategyRunner:
                         f"[LiveStrategyRunner] position synced from exchange: "
                         f"{self.symbol} = {actual_qty}"
                     )
-                    return
+                    self._on_position_sync_ok()
+                    return True
 
             # 没有找到持仓，确认为 0
             self.strategy.ctx.set_position(self.symbol, Decimal("0"))
             logger.info(
                 f"[LiveStrategyRunner] position synced from exchange: {self.symbol} = 0"
             )
+            self._on_position_sync_ok()
+            return True
         except Exception as e:
-            logger.warning(
-                f"[LiveStrategyRunner] failed to sync position from exchange: {e}"
+            await self._on_position_sync_failed(f"{type(e).__name__}: {e}")
+            return False
+
+    def _on_position_sync_ok(self) -> None:
+        """同步成功：记录状态与时间戳，并允许后续失败重新通知。"""
+        if self._position_synced is False:
+            logger.error(
+                f"[LiveStrategyRunner] 持仓同步已恢复: {self.symbol} "
+                f"ctx.position={self.strategy.ctx.position}"
             )
+        self._position_synced = True
+        self._last_position_sync_ts = time.monotonic()
+        self._position_sync_failure_notified = False
+
+    async def _on_position_sync_failed(self, reason: str) -> None:
+        """同步失败：fail-loud + 通知用户一次（转为失败时），绝不静默当作空仓。"""
+        already_notified = self._position_sync_failure_notified
+        self._position_synced = False
+        self._last_position_sync_ts = time.monotonic()
+        logger.error(
+            f"[LiveStrategyRunner] 持仓同步失败 → 本轮禁止下单 "
+            f"({self.symbol}, session={self.live_session_id}): {reason}"
+        )
+        self._position_sync_failure_notified = True
+        if already_notified or not self.user_id:
+            return
+        try:
+            from apps.core.db_utils import db_async
+            from apps.notify.models import Notification
+
+            await db_async(
+                lambda: Notification.objects.create(
+                    user_id=self.user_id,
+                    channel="web",
+                    message=f"⚠️ {self.symbol} 持仓同步失败，该会话已暂停下单：{reason}",
+                )
+            )()
+        except Exception as e:  # noqa: BLE001 - 通知失败不得影响主流程
+            logger.error(
+                f"[LiveStrategyRunner] 持仓同步失败通知写入失败 "
+                f"(user={self.user_id}): {e}"
+            )
+
+    async def _refresh_position_before_decision(self, *, force: bool) -> bool:
+        """决策前确保 ctx.position 是交易所真实持仓。
+
+        返回 False 表示持仓未知/同步失败 → 调用方必须跳过本轮决策。
+
+        节流策略（K 线流对同一根 bar 会反复推送，约 1~2 秒一次，不能每 tick 打 API）：
+          - force=True（新 bar 到来）：立即同步，保证每根 bar 至少一次真值
+          - TTL 内：沿用上次结果（成功→可交易；失败→按不可交易处理，不重复打 API）
+          - TTL 外：重新同步（失败态因此每 15s 退避重试一次，而不是每 tick 重试）
+        """
+        fresh = (
+            time.monotonic() - self._last_position_sync_ts
+        ) < self.POSITION_SYNC_MIN_INTERVAL
+        if not force and fresh:
+            return bool(self._position_synced)
+        return await self._sync_position_from_exchange()
 
     async def _subscribe_kline(self) -> None:
         """订阅 K 线数据"""
@@ -754,6 +837,14 @@ class LiveStrategyRunner:
                         "[LiveStrategyRunner] insufficient kline history for validation"
                     )
                     return
+
+            # 持仓同步（C 修复）：验证事件可能高频触发，按最小间隔节流
+            if not await self._refresh_position_before_decision(force=False):
+                logger.debug(
+                    "[LiveStrategyRunner] 持仓未知 → 跳过本轮验证触发 "
+                    f"({self.symbol})"
+                )
+                return
 
             # 用最新 K 线运行完整策略逻辑 (Phase 2 pipeline)
             latest_kline = self._kline_history[-1]
