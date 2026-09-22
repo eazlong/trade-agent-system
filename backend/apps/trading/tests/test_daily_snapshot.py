@@ -398,19 +398,35 @@ class TestTaskWiring(unittest.TestCase):
         )
 
     def test_task_runs_the_writer(self):
-        """任务体必须真的调到写入方，而不是只返回一个空 dict。"""
+        """任务体必须真的调到写入方，而不是只返回一个空 dict。
+
+        判定也一并替掉：它读日线（DB），而这里是 ``unittest.TestCase``，不该为了
+        一条接线测试去开数据库。判定与快照的先后由 ``apps.regime.tests.test_timing``
+        负责，这里只确认两条职责都被调到、都进了返回值。
+        """
         from apps.trading.tasks import snapshot_daily_equity
 
         fake = MagicMock()
         fake.as_dict.return_value = {"users": 1, "written": 1}
-        with patch(
-            "apps.trading.daily_snapshot.write_daily_snapshots",
-            new=AsyncMock(return_value=fake),
-        ) as writer:
+        with (
+            patch(
+                "apps.trading.daily_snapshot.write_daily_snapshots",
+                new=AsyncMock(return_value=fake),
+            ) as writer,
+            patch(
+                "apps.regime.judgement.run_daily_judgement",
+                new=MagicMock(return_value={"skipped": "no_candles"}),
+            ) as judgement,
+        ):
             payload = snapshot_daily_equity()
 
         writer.assert_awaited_once()
-        self.assertEqual(payload, {"users": 1, "written": 1})
+        judgement.assert_called_once()
+        self.assertEqual(
+            payload,
+            {"users": 1, "written": 1, "regime": {"skipped": "no_candles"}},
+            "返回值是任务健康检查唯一看得到的东西，两条职责都必须在里面",
+        )
 
 
 class TestTrackedRealRun(_SnapshotTestBase):

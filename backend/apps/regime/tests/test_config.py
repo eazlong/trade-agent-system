@@ -50,6 +50,7 @@ class TestGroupDiscipline(SimpleTestCase):
         self.assertIs(config.GROUPS["judgement"], config.JUDGEMENT)
         self.assertIs(config.GROUPS["judgement_lifecycle"], config.JUDGEMENT_LIFECYCLE)
         self.assertIs(config.GROUPS["evidence"], config.EVIDENCE)
+        self.assertIs(config.GROUPS["news"], config.NEWS)
 
     def test_every_group_can_be_derived_with_replace(self):
         """测试靠 replace 临时改参数（不改全局），判定留痕也靠它。"""
@@ -98,6 +99,17 @@ class TestSnapshot(SimpleTestCase):
             ),
             "judgement_lifecycle": ("min_dwell_days", "stale_after_days"),
             "evidence": ("min_trades", "min_months"),
+            "news": (
+                "window_floor_hours",
+                "window_cap_hours",
+                "fetch_timeout_seconds",
+                "max_items_per_source",
+                "keywords",
+                "max_items_to_llm",
+                "body_max_chars",
+                "sources",
+                "kinds_covered",
+            ),
         }
         snap = config.full_snapshot()
         self.assertEqual(set(snap), set(expected))
@@ -193,6 +205,73 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.EVIDENCE.min_trades, 30)
         self.assertEqual(config.EVIDENCE.min_months, 3)
 
+    def test_news_defaults(self):
+        self.assertEqual(config.NEWS.window_floor_hours, 24)
+        self.assertEqual(config.NEWS.window_cap_hours, 96)
+        self.assertEqual(config.NEWS.max_items_to_llm, 20)
+        self.assertEqual(config.NEWS.body_max_chars, 2000)
+        self.assertEqual(config.NEWS.fetch_timeout_seconds, 20.0)
+        self.assertEqual(config.NEWS.max_items_per_source, 40)
+
+
+class TestNewsWhitelist(SimpleTestCase):
+    """白名单源表本身要成立：三类都有成员，且解析入口是登记过的具名 parser。"""
+
+    def test_all_three_kinds_have_at_least_one_source(self):
+        """三类各至少一个源，且被 `kinds_covered` 如实反映。
+
+        这条不是「设计上禁止某一类为空」——空是允许的（源全挂了、被移出白名单），
+        `kinds_covered` 存在的意义正是把空出来那一类**显示出来**。这里钉的是默认
+        白名单这一份数据本身别退化成空。
+        """
+        self.assertEqual(set(config.NEWS.kinds_covered), {"exchange", "crypto_media", "macro"})
+
+    def test_exchange_sources_use_named_parsers(self):
+        """第一类不是 RSS：交易所公告走结构化 JSON 接口，各自的信封不一样。
+
+        这条同时钉住「不是靠 URL 猜站点」：parser 是配置表上的字面量，采集器只需要
+        按名字取函数，不必对 url 做任何字符串判断。
+        """
+        exchange = [s for s in config.NEWS.sources if s.kind is config.NewsSourceKind.EXCHANGE]
+        self.assertEqual({s.name for s in exchange}, {"binance", "okx"})
+        for source in exchange:
+            with self.subTest(source=source.name):
+                self.assertIn(source.parser, config.NEWS_PARSERS)
+                self.assertNotEqual(source.parser, "rss")
+
+    def test_every_source_parser_is_registered(self):
+        for source in config.NEWS.sources:
+            with self.subTest(source=source.name):
+                self.assertIn(source.parser, config.NEWS_PARSERS)
+
+    def test_sources_survive_the_snapshot_as_nested_plain_data(self):
+        """白名单是**嵌套 dataclass**：`asdict` 会递归，`_jsonable` 必须跟着递归下去，
+        否则判定记录塞进 JSONField 的那一刻才会炸。枚举要落成取值而不是成员名。"""
+        snap = config.snapshot("news")["news"]
+        self.assertIsInstance(snap["sources"], list)
+        by_name = {s["name"]: s for s in snap["sources"]}
+        self.assertEqual(by_name["binance"]["kind"], "exchange")
+        self.assertEqual(by_name["binance"]["parser"], "binance_announcements")
+        self.assertEqual(by_name["cointelegraph"]["kind"], "crypto_media")
+        json.dumps(snap, ensure_ascii=False)
+
+    def test_kinds_covered_is_derived_not_a_field(self):
+        """派生属性：单独存一份就会与 sources 漂移，而漂移的表现是日报说三类齐全、
+        实际有一类一个源都没有。"""
+        news = config.snapshot("news")["news"]
+        self.assertIn("kinds_covered", news)
+        self.assertNotIn("kinds_covered", [f.name for f in fields(config.NEWS)])
+
+    def test_kinds_covered_shrinks_when_a_kind_is_removed(self):
+        """摘掉第一类 → 少一项，而不是静默地仍然报三类齐全。"""
+        without_exchange = replace(
+            config.NEWS,
+            sources=tuple(
+                s for s in config.NEWS.sources if s.kind is not config.NewsSourceKind.EXCHANGE
+            ),
+        )
+        self.assertEqual(set(without_exchange.kinds_covered), {"crypto_media", "macro"})
+
 
 class TestSelfValidation(SimpleTestCase):
     """坏编辑在 import 时炸，而不是先安静地跑出一批怪判定。"""
@@ -252,6 +331,70 @@ class TestSelfValidation(SimpleTestCase):
             config.EvidenceConfig(min_trades=0)
         with self.assertRaises(ValueError):
             config.EvidenceConfig(min_months=0)
+
+    def test_news_window_cannot_be_inverted(self):
+        """上限 < 下限 ⇒ 区间恒为空，而表现是「每天都 0 条」——安静得不像配错。"""
+        with self.assertRaises(ValueError) as ctx:
+            config.NewsConfig(window_floor_hours=48, window_cap_hours=24)
+        self.assertIn("window_cap_hours", str(ctx.exception))
+
+    def test_news_window_floor_cannot_be_zero(self):
+        """下限 0 ⇒ 窗口退化成「这一刻之后」，永远没有输入。"""
+        with self.assertRaises(ValueError):
+            config.NewsConfig(window_floor_hours=0)
+
+    def test_news_counts_must_be_positive(self):
+        for name in ("max_items_per_source", "max_items_to_llm", "body_max_chars"):
+            with self.subTest(field=name):
+                with self.assertRaises(ValueError):
+                    replace(config.NEWS, **{name: 0})
+        with self.assertRaises(ValueError):
+            config.NewsConfig(fetch_timeout_seconds=0)
+
+    def test_empty_keyword_list_is_rejected(self):
+        """空词表 = 所有条目都命中，预筛这道成本闸门会静默消失。"""
+        with self.assertRaises(ValueError):
+            config.NewsConfig(keywords=())
+
+    def test_keywords_must_be_lowercase_without_padding(self):
+        """匹配是小写子串匹配：词表里出现大写等于这个词永远不命中。"""
+        for bad in ("Bitcoin", " bitcoin", "bitcoin ", ""):
+            with self.subTest(keyword=bad):
+                with self.assertRaises(ValueError):
+                    config.NewsConfig(keywords=(bad,))
+
+    def test_empty_source_list_is_rejected(self):
+        """没有源就没有输入，而「没有输入」与「今天 0 条」在运行时表现成同一件事。"""
+        with self.assertRaises(ValueError):
+            config.NewsConfig(sources=())
+
+    def test_duplicate_source_names_are_rejected(self):
+        """来源名是条目与判定留痕里的标识：重名会让「这条来自哪个源」无法回答。"""
+        dup = config.NEWS.sources[0]
+        with self.assertRaises(ValueError) as ctx:
+            config.NewsConfig(sources=(config.NEWS.sources[0], dup))
+        self.assertIn("重名", str(ctx.exception))
+
+    def test_unknown_source_kind_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            config.NewsSource(name="x", url="https://example.com", kind="exchang")
+        self.assertIn("kind", str(ctx.exception))
+
+    def test_unknown_parser_is_rejected_at_import(self):
+        """拼错的 parser 会让整个源安静地取不到条目——那看起来像「这个源今天没发东西」。
+        所以在 import 时拦下，不留给运行时逐源失败去发现。"""
+        with self.assertRaises(ValueError) as ctx:
+            config.NewsSource(
+                name="x", url="https://example.com", kind=config.NewsSourceKind.EXCHANGE,
+                parser="binance_annoucements",
+            )
+        self.assertIn("parser", str(ctx.exception))
+
+    def test_source_name_and_url_are_validated(self):
+        with self.assertRaises(ValueError):
+            config.NewsSource(name="  ", url="https://example.com", kind=config.NewsSourceKind.MACRO)
+        with self.assertRaises(ValueError):
+            config.NewsSource(name="x", url="ftp://example.com", kind=config.NewsSourceKind.MACRO)
 
     def test_a_valid_derivation_passes_validation(self):
         """replace 派生也会过 __post_init__，好编辑不该被拦。"""
