@@ -21,6 +21,7 @@ import apps.backtest.tasks  # noqa: F401
 import apps.signal_monitor.tasks  # noqa: F401
 import apps.channel.tasks  # noqa: F401
 import apps.trading.tasks  # noqa: F401
+import apps.regime.tasks  # noqa: F401
 
 # Grid search independent queue
 app.conf.task_routes = {

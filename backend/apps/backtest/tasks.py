@@ -13,6 +13,8 @@ from decimal import Decimal
 
 from celery_app import app
 
+from apps.regime.tasks import dispatch_slice
+
 logger = logging.getLogger(__name__)
 
 
@@ -197,6 +199,10 @@ def run_backtest_task(
             f"夏普 {sharpe:.2f} | "
             f"胜率 {win_rate:.1%}"
         )
+        # 行情阶段切片：结果已落库，独立投递一个轻量任务去算（见 apps/regime/slicing.py
+        # 的模块 docstring 说明为什么不放在这里同步算）。投递失败不抛也不会走到这个
+        # except：一次成功的回测不该被附加产物拖成失败。
+        dispatch_slice([stats.get("result_id")])
         return stats
     except Exception as e:
         tracker.fail(f"回测失败: {strategy_name} {symbol} {timeframe}: {str(e)}")
@@ -557,6 +563,11 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         best_val = results[0].get(sort_key) if results else "N/A"
         job.status = "completed"
         job.save(update_fields=["status", "completed_combinations", "best_result"])
+
+        # 切片：**循环结束后一次性投整批**，不在循环里逐组合投——那个循环带 7200 秒硬
+        # 超时，把切片塞进去等于让「切片有多慢」决定「网格搜索跑不跑得完」。超时/取消
+        # 的路径不投（那些结果由 recompute_regime_slices 兜底，见命令的 docstring）。
+        dispatch_slice([r.get("result_id") for r in results])
 
         tracker.complete(
             f"网格搜索完成：{len(results)}/{job.total_combinations}，"
