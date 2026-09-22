@@ -109,7 +109,7 @@ class RiskGuard:
         if daily_count >= self.MAX_DAILY_TRADES:
             reason = f"日内交易次数已达上限 {self.MAX_DAILY_TRADES}"
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
-            return False, reason
+            return await self._reject(user_id, reason)
 
         # 3. 仓位上限
         logger.info(f"[RiskGuard] step 3: position limit check")
@@ -117,7 +117,7 @@ class RiskGuard:
         logger.info(f"[RiskGuard] step 3 done: ok={position_ok}")
         if not position_ok:
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
-            return False, reason
+            return await self._reject(user_id, reason)
 
         # 4. 日内回撤
         logger.info(f"[RiskGuard] step 4: drawdown check")
@@ -125,9 +125,28 @@ class RiskGuard:
         logger.info(f"[RiskGuard] step 4 done: ok={drawdown_ok}")
         if not drawdown_ok:
             logger.warning(f"[RiskGuard] REJECTED: {reason}")
-            return False, reason
+            return await self._reject(user_id, reason)
 
         return True, "OK"
+
+    async def _reject(self, user_id: str, reason: str) -> Tuple[bool, str]:
+        """拒绝下单**并让用户看见**，然后返回 (False, reason)。
+
+        2026-09-22：`pre_trade_check` 返回 False 时 `OrderExecutor` 抛
+        PermissionError，而这发生在订单落库**之前**——既没有订单行，也不会走
+        `record_order_failure` 那条通知。用户的意图于是被静默丢弃，与
+        `record_order_failure` 里记的 2026-09-21 事故是同一种病。
+        通知失败只记日志，绝不改变「拒绝」这个决定本身。
+        """
+        from apps.trading.alerts import notify_user
+
+        try:
+            await notify_user(user_id, f"⚠️ 下单被风控拦截\n{reason}")
+        except Exception:  # noqa: BLE001 - 通知不得影响风控判定
+            logger.error(
+                "[RiskGuard] 拒单通知投递失败 user=%s", user_id, exc_info=True
+            )
+        return False, reason
 
     async def _is_circuit_open(self, user_id: str) -> bool:
         """检查熔断器是否打开"""
@@ -149,36 +168,55 @@ class RiskGuard:
         side: str = "",
         quantity: str = "",
         error: str = "",
+        unknown: bool = False,
     ) -> None:
         """订单失败时调用：连续失败触发熔断 + 给用户一条可见通知。
 
         2026-09-21 事故：失败只喂熔断器，用户完全无感（意图中的订单被静默丢弃，
         只能翻订单列表才发现）。因此这里必须留一条用户可见的通知。
-        通知失败只记 ERROR，绝不影响下单/风控主流程。
+
+        2026-09-22：通知改走出站唯一口 ``notify_user``（落库 + 即时推送），不再自己
+        内联写 ``Notification``——两个投递口迟早会漂。**行为变更**：订单失败从此
+        还有一条即时推送，不再只在 Web 通知中心可见。
+        通知失败只记 ERROR，绝不影响熔断/下单主流程。
+
+        ``unknown=True`` 用于「下单结果未知」（``OrderPlacementUnknown``）：那张单
+        可能已在交易所活着，所以**必须改口径**——说「下单失败」会让用户重下一张，
+        把敞口变成两倍。熔断计数不变（未知单同样是风险信号），只是措辞如实。
         """
         if not user_id:
             return
         cb = CircuitBreaker(user_id=user_id)
         await cb.record_failure()
 
-        try:
-            from apps.notify.models import Notification
+        from apps.trading.alerts import notify_user
 
-            detail = f"{symbol} {side} qty={quantity}".strip()
-            await db_async(
-                lambda: Notification.objects.create(
-                    user_id=user_id,
-                    channel="web",
-                    message=f"⚠️ 下单失败: {detail}｜原因: {error or '交易所未返回原因'}",
-                )
-            )()
+        detail = f"{symbol} {side} qty={quantity}".strip()
+        if unknown:
+            prefix = "⚠️ 下单结果未知（可能已成交，请先到交易所核对再决定是否重下）"
+        else:
+            prefix = "⚠️ 下单失败"
+        try:
+            delivered = await notify_user(
+                user_id,
+                f"{prefix}: {detail}｜原因: {error or '交易所未返回原因'}",
+            )
         except Exception as e:  # noqa: BLE001 - 通知失败不得影响主流程
             logger.error(
-                "下单失败通知写入失败（熔断计数已完成，user=%s symbol=%s）: %s",
+                "下单失败通知投递异常（熔断计数已完成，user=%s symbol=%s）: %s",
                 user_id,
                 symbol,
                 e,
                 exc_info=True,
+            )
+            return
+
+        if not delivered:
+            logger.error(
+                "下单失败通知未送达（熔断计数已完成，user=%s symbol=%s）: %s",
+                user_id,
+                symbol,
+                error or "交易所未返回原因",
             )
 
     async def _get_daily_trade_count(self, user_id: str) -> int:
@@ -190,10 +228,12 @@ class RiskGuard:
 
         @db_async
         def count():
+            # 「未知」也计入：它意味着这张单可能真的发到了交易所，按保守口径
+            # 必须占用当日的下单额度（漏计会让熔断线被绕过）。
             return Order.objects.filter(
                 user_id=user_id,
                 created_at__date=today,
-                status__in=["submitted", "filled"],
+                status__in=["submitted", "filled", "unknown"],
             ).count()
 
         return await count()
@@ -235,10 +275,24 @@ class RiskGuard:
 
     async def _check_drawdown(self, user_id: str) -> Tuple[bool, str]:
         """
-        日内已实现回撤检查。
-        对比期初净值（从 daily_account_snapshot 表读取）。
-        若当日亏损超过初始资金的5%，禁止交易。
-        若无法获取数据，保守策略返回拒绝。
+        日内已实现回撤检查：分子是当日已实现盈亏，分母是**当日净值快照**
+        （`daily_snapshots`，由 `apps.trading.tasks.snapshot_daily_equity` 每 5 分钟
+        写入、当日只写第一条 → `date=today` 那条就是「当日首次观测到的权益」，
+        也正是本检查要的「期初」）。
+
+        分母只取**当日**（`date=today`），不向前回退到昨天：昨天的权益配今天的
+        盈亏是两个口径，宁可承认「今天还没有分母」也不拿旧分母充数。代价是每个
+        UTC 日界之后、当日第一条快照写出来之前（≤ 一个 beat 周期）分母缺失，这段
+        窗口本检查降级放行（见下）。
+
+        原实现在这里直接「无法获取期初资金数据」拒单——把「当天还没有分母」当成
+        「不该下单」，于是新用户第一天完全不能开仓、每天日界后还要禁交易 5 分钟，
+        且不产生任何告警。这是本单元要消灭的静默故障：**降级放行 + WARNING**，
+        而写入方取不到余额时会主动告警用户（`daily_snapshot._alert_write_failure`）。
+
+        已知残留缺口（未消除，只是不再沉默）：若 beat/worker 长期不跑，`date=today`
+        永远取不到分母，回撤保护就一直处于降级状态，而写入方自己也没机会告警。
+        这一层由任务健康检查兜底；`date__lte` 那种回退写法没有这个缺口。
         """
         from django.db.models import Sum
         from django.utils import timezone
@@ -257,14 +311,14 @@ class RiskGuard:
             return result["total_pnl"]
 
         @db_async
-        def get_initial_balance():
-            """从 daily_account_snapshot 读取期初余额"""
+        def get_opening_equity():
+            """取**当日**快照；当日还没写出来则返回 None（由调用方降级放行）。"""
             from apps.trading.models import DailySnapshot
 
             snap = (
                 DailySnapshot.objects.filter(
                     user_id=user_id,
-                    date__lt=today,
+                    date=today,
                 )
                 .order_by("-date")
                 .first()
@@ -276,7 +330,7 @@ class RiskGuard:
         try:
             pnl = await get_today_pnl()
         except Exception:
-            return False, "无法获取当日已实现盈亏数据"
+            return await self._reject(user_id, "无法获取当日已实现盈亏数据")
 
         # 无已成交订单，视作无亏损
         if pnl is None:
@@ -286,17 +340,32 @@ class RiskGuard:
             return True, ""
 
         try:
-            initial = await get_initial_balance()
+            initial = await get_opening_equity()
         except Exception:
-            return False, "无法获取期初资金数据"
+            return await self._reject(user_id, "无法读取净值快照（数据库异常）")
 
-        if initial is None or initial == 0:
-            return False, "无法获取期初资金数据"
+        if initial is None:
+            logger.warning(
+                "[RiskGuard] user=%s 当日（%s）没有净值快照，日内回撤检查本轮降级放行"
+                "（等待 snapshot_daily_equity 写入，它与本检查同一口径）",
+                user_id,
+                today,
+            )
+            return True, ""
+
+        if initial <= 0:
+            # 账户净值真的是 0（不是「取不到」）——这是可以告知用户的事实，
+            # 且此时任何下单都会在交易所侧失败，拒绝是如实而不是沉默。
+            return await self._reject(
+                user_id, f"账户净值为 {initial}，无法计算日内回撤"
+            )
 
         drawdown = abs(pnl) / initial
         if drawdown > self.MAX_DAILY_DRAWDOWN:
-            return False, (
+            return await self._reject(
+                user_id,
                 f"日内回撤 {drawdown:.1%} 超过上限 {self.MAX_DAILY_DRAWDOWN:.0%}"
+                f"（当日已实现亏损 {pnl}，期初净值 {initial}）",
             )
         return True, ""
 
