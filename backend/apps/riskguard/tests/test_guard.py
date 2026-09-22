@@ -35,8 +35,16 @@ class TestRiskGuardL2(unittest.TestCase):
         result = asyncio.run(self.guard.pre_trade_check(request, None))
         self.assertEqual(result, (True, "OK"))
 
-    def test_pre_trade_check_circuit_open_rejects(self):
-        """熔断器打开时拒绝下单"""
+    def test_pre_trade_check_does_not_read_the_circuit_breaker(self):
+        """前置校验**不读**熔断器状态：即使它是打开的也不拒单。
+
+        ADR 0001 把 CircuitBreaker 降级成「触发源」，并让它在 pre_trade_check 里
+        保持禁用（见 guard.py 第 1 步的注释）。这条契约不是可有可无：熔断器状态若还能
+        拒单，就等于存在一个**绕过 halt 状态机**的隐藏停机开关——用户看到的拒单理由
+        会是熔断，而框架的停机口径在别处，两边对不上。
+
+        所以这里不测「熔断器打开会拒绝」，而测「熔断器**根本没被问过**」。
+        """
         request = OrderRequest(
             exchange="binance",
             symbol="BTCUSDT",
@@ -46,10 +54,13 @@ class TestRiskGuardL2(unittest.TestCase):
             price=None,
         )
 
-        mock_cb = AsyncMock()
-        mock_cb.is_open.return_value = True
+        asked = []
 
-        with patch.object(self.guard, "_is_circuit_open", mock_cb.is_open):
+        async def track_circuit(*a):
+            asked.append(True)
+            return True  # 打开状态：旧实现会据此拒单
+
+        with patch.object(self.guard, "_is_circuit_open", track_circuit):
             with patch.object(
                 self.guard, "_get_daily_trade_count", AsyncMock(return_value=0)
             ):
@@ -67,8 +78,8 @@ class TestRiskGuardL2(unittest.TestCase):
                             self.guard.pre_trade_check(request, "user123")
                         )
 
-        self.assertEqual(result[0], False)
-        self.assertIn("熔断器触发", result[1])
+        self.assertEqual(asked, [], "熔断器状态不得参与前置校验的判定")
+        self.assertEqual(result, (True, "OK"))
 
     def test_pre_trade_check_daily_trade_limit_rejects(self):
         """日内交易次数超限时拒绝"""
@@ -172,7 +183,11 @@ class TestRiskGuardL2(unittest.TestCase):
         self.assertEqual(result, (True, "OK"))
 
     def test_pre_trade_check_order(self):
-        """校验按正确顺序执行（熔断→次数→仓位→回撤）"""
+        """校验按正确顺序执行（次数→仓位→回撤；熔断器已不在链上）。
+
+        顺序本身是契约：次数与仓位是**免费**的本地判定，回撤要查净值快照。
+        贵的放后面，被前面的条件拒掉时就不必付它的代价。
+        """
         request = OrderRequest(
             exchange="binance",
             symbol="BTCUSDT",
@@ -182,10 +197,6 @@ class TestRiskGuardL2(unittest.TestCase):
             price=Decimal("50000"),
         )
         call_order = []
-
-        async def track_circuit(*a):
-            call_order.append("circuit")
-            return False
 
         async def track_count(*a):
             call_order.append("count")
@@ -199,13 +210,12 @@ class TestRiskGuardL2(unittest.TestCase):
             call_order.append("drawdown")
             return True, ""
 
-        with patch.object(self.guard, "_is_circuit_open", track_circuit):
-            with patch.object(self.guard, "_get_daily_trade_count", track_count):
-                with patch.object(self.guard, "_check_position_limit", track_pos):
-                    with patch.object(self.guard, "_check_drawdown", track_drawdown):
-                        asyncio.run(self.guard.pre_trade_check(request, "user123"))
+        with patch.object(self.guard, "_get_daily_trade_count", track_count):
+            with patch.object(self.guard, "_check_position_limit", track_pos):
+                with patch.object(self.guard, "_check_drawdown", track_drawdown):
+                    asyncio.run(self.guard.pre_trade_check(request, "user123"))
 
-        self.assertEqual(call_order, ["circuit", "count", "position", "drawdown"])
+        self.assertEqual(call_order, ["count", "position", "drawdown"])
 
 
 class TestRiskGuardLifecycle(unittest.TestCase):

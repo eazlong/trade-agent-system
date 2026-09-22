@@ -15,15 +15,22 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
 from apps.riskguard.guard import RiskGuard
+from apps.trading.executor import OrderExecutor
 
 
-def _executor_with(adapter) -> MagicMock:
-    executor = MagicMock()
+def _executor_with(adapter) -> OrderExecutor:
+    """真 OrderExecutor，只手工填适配器地图（其余加载流程要连 DB 与交易所）。
+
+    用真对象而不是 MagicMock：`_unique_adapters()` 里「账户地图与交易所名地图怎么
+    合并、谁被顶掉」正是「哪个账户会被巡检」的那一环，替身自己实现一份就测不到它。
+    """
+    executor = OrderExecutor()
     executor._adapters = {"binance": adapter}
     return executor
 
@@ -86,4 +93,49 @@ class TestGuardFailureDiagnostics(unittest.IsolatedAsyncioTestCase):
             await guard._check_floating_pnl()
         self.assertEqual(
             guard._position_fetch_failures, 0, "成功后计数必须归零"
+        )
+
+
+class TestFloatingPnlCoversEveryAccount(unittest.IsolatedAsyncioTestCase):
+    """浮亏巡检必须覆盖**每个账户**，而不只是每个交易所名（2026-09-22）。
+
+    旧实现遍历 `executor._adapters`（按交易所名索引）。同一交易所有两个活跃账户时
+    那张表里只有最后加载的那个，另一个账户的持仓**永远不被巡检**——浮亏超阈值也没有
+    告警，日志上还看不出少了什么。这与成交同步按账户分组修掉的是同一类错误。
+    """
+
+    def tearDown(self):
+        OrderExecutor._instance = None
+
+    async def test_every_account_is_polled_and_the_label_tells_them_apart(self):
+        guard = RiskGuard("trading")
+        dead = MagicMock()
+        dead.get_positions = AsyncMock(side_effect=httpx.ConnectTimeout(""))
+        live = MagicMock()
+        live.get_positions = AsyncMock(return_value=[])
+        live.get_balance = AsyncMock(return_value={"USDT": Decimal("1")})
+
+        executor = OrderExecutor()
+        executor._account_adapters = {"acct-1": dead, "acct-2": live}
+        # `_load_adapters` 加载时顺手记下的账户→交易所：被顶掉的那个账户不在
+        # `_adapters` 里，交易所名只能从这里来。
+        executor._account_exchanges = {"acct-1": "binance", "acct-2": "binance"}
+        executor._adapters = {"binance": live}  # 后加载的把 dead 顶掉
+
+        with patch(
+            "apps.trading.executor.OrderExecutor.get_instance", return_value=executor
+        ), self.assertLogs("apps.riskguard.guard", level="ERROR") as cm:
+            await guard._check_floating_pnl()
+
+        msg = "\n".join(cm.output)
+        self.assertIn(
+            "binance#acct-1",
+            msg,
+            "标签必须能区分同交易所的两个账户：只写 binance 等于没告诉是哪个账户",
+        )
+        live.get_positions.assert_awaited_once()
+        self.assertEqual(
+            [label for label, _ in executor._unique_adapters()],
+            ["binance#acct-1", "binance#acct-2"],
+            "两个账户都必须被巡检，且谁是谁一眼可读",
         )

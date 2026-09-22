@@ -113,6 +113,9 @@ class SignalDispatcher:
                 order_type=signal.order_type,
                 quantity=signal.quantity,
                 price=signal.price,
+                # 带上账户 id：风控按它解析适配器，才不会拿同交易所另一个账户的
+                # 余额来算本单的仓位上限。
+                exchange_account_id=exchange_account_id,
             )
             approved, reason = await riskguard.pre_trade_check(request, user_id)
             if not approved:

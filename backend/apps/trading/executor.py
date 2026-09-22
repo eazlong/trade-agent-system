@@ -117,6 +117,11 @@ class OrderExecutor:
         # 按 **ExchangeAccount.id** 索引：这才是唯一不会拿错密钥的口径。同一交易所的
         # 多个账户各有各的密钥与 testnet 属性，按交易所名解析会用到**别人**的凭证。
         self._account_adapters: dict[str, BaseExchangeAdapter] = {}
+        # 账户 id → 交易所名。适配器自己不记得交易所（`BaseExchangeAdapter` 上没有这个
+        # 属性），只能在加载时顺手记下：**同交易所有两个账户时，被顶掉的那个在
+        # `_adapters` 里查不到交易所名**，日志标签就只剩一个 UUID 可看。这份映射是
+        # `_unique_adapters()` 能给出「binance#<账户id>」的唯一来源。
+        self._account_exchanges: dict[str, str] = {}
         # 同交易所有多个活跃账户的交易所名：`_adapters` 里那一条只是「最后一个加载的」，
         # 是个任意选择，调用方据此判断「按名字解析是否可信」。
         self._ambiguous_exchanges: set[str] = set()
@@ -184,6 +189,7 @@ class OrderExecutor:
 
         self._adapters.clear()
         self._account_adapters.clear()
+        self._account_exchanges.clear()
         self._ambiguous_exchanges.clear()
         OrderExecutor._instance = None
         logger.info("OrderExecutor shutdown")
@@ -191,7 +197,20 @@ class OrderExecutor:
     # ─── 适配器查找 ──────────────────────────────────────────────────────────
 
     def _unique_adapters(self) -> list[tuple[str, BaseExchangeAdapter]]:
-        """(标签, 适配器) 去重列表：账户地图是超集，遗留地图只补它没有的实例。"""
+        """(标签, 适配器) 去重列表：账户地图是超集，遗留地图只补它没有的实例。
+
+        标签取**交易所名**，同交易所有多个账户时补账户 id（``binance#3f2a…``）：
+        账户地图的键是账户 id，直接用它会得到一行只有 UUID 的日志；而只写交易所名
+        则两个账户都叫 binance，等于没区分。账户 id 才是「不会拿错密钥」的那个口径，
+        所以它必须出现在标签里。
+
+        交易所名优先查 ``_account_exchanges``（加载时记下的账户→交易所）：同交易所有
+        两个账户时，被顶掉的那个**不在** ``_adapters`` 里，反查不到名字，标签会退化成
+        一个裸 UUID——而那恰恰是最需要分辨账户的那个场景。
+
+        调用方（浮亏巡检、断连日志）拿到的标签因此是**可读且唯一**的。
+        """
+        exchange_of = {id(a): name for name, a in self._adapters.items()}
         seen: set[int] = set()
         out: list[tuple[str, BaseExchangeAdapter]] = []
         for label, adapter in list(self._account_adapters.items()) + list(
@@ -200,7 +219,12 @@ class OrderExecutor:
             if adapter is None or id(adapter) in seen:
                 continue
             seen.add(id(adapter))
-            out.append((label, adapter))
+            exchange = self._account_exchanges.get(label) or exchange_of.get(id(adapter))
+            if exchange is None or exchange == label:
+                # 遗留条目的键本来就是交易所名（也是账户地图为空时唯一的条目）
+                out.append((label, adapter))
+            else:
+                out.append((f"{exchange}#{label}", adapter))
         return out
 
     def is_ambiguous_exchange(self, exchange: str) -> bool:
@@ -295,6 +319,9 @@ class OrderExecutor:
             order_type=order_type,
             quantity=quantity,
             price=price,
+            # 风控要按**同一个**账户解析：这里传下去的账户 id 就是本单即将使用的那个
+            # 适配器，风控拿它算仓位/余额才和下面的下单是同一笔钱。
+            exchange_account_id=str(exchange_account_id) if exchange_account_id else None,
         )
         if is_close_position:
             logger.info("[SF-07a][OrderExecutor] close position — skipping RiskGuard")
@@ -540,6 +567,7 @@ class OrderExecutor:
 
                 await adapter.connect()
                 self._account_adapters[str(account.id)] = adapter
+                self._account_exchanges[str(account.id)] = exchange
                 self._adapters[exchange] = adapter
                 loaded.setdefault(exchange, []).append(str(account.id))
                 logger.info(

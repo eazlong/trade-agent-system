@@ -241,14 +241,24 @@ class RiskGuard:
     async def _check_position_limit(
         self, request: "OrderRequest", user_id: str
     ) -> Tuple[bool, str]:
-        """单笔仓位不超过总资产20%"""
+        """单笔仓位不超过总资产20%
+
+        2026-09-22：适配器改按 ``request.exchange_account_id`` 解析（与
+        `OrderExecutor.submit_order` 用的是同一个口径）。此前按**交易所名**取
+        `executor._adapters`：同一交易所挂两个账户时那张表里只有「最后加载的」那个，
+        于是给 A 账户下的单可能拿 B 账户的余额当分母——仓位上限被算成了别人的钱，
+        而且两边日志都写着 binance，看不出来。拿不到账户 id 的调用方（纸面交易）
+        仍走 `_resolve_adapter` 的遗留回退，取不到适配器就放行（与旧行为一致）。
+        """
         from apps.trading.executor import OrderExecutor
 
         executor = OrderExecutor.get_instance()
         if not executor:
             return True, ""
 
-        adapter = executor._adapters.get(request.exchange)
+        adapter = executor._resolve_adapter(
+            request.exchange, getattr(request, "exchange_account_id", None)
+        )
         if not adapter:
             return True, ""
 
@@ -383,14 +393,20 @@ class RiskGuard:
             await asyncio.sleep(60)
 
     async def _check_floating_pnl(self) -> None:
-        """浮亏超阈值时发送告警"""
+        """浮亏超阈值时发送告警
+
+        2026-09-22：遍历改用 `OrderExecutor._unique_adapters()`（账户地图为超集，
+        标签形如 ``binance#<账户id>``）。此前遍历 `executor._adapters`——那张表按
+        **交易所名**索引，同一交易所的两个活跃账户里只有一个在里面，于是另一个账户的
+        持仓**永远不会被巡检**，浮亏到了阈值也没人告警，而日志上看不出少了什么。
+        """
         from apps.trading.executor import OrderExecutor
 
         executor = OrderExecutor.get_instance()
         if not executor:
             return
 
-        for exchange, adapter in executor._adapters.items():
+        for target, adapter in executor._unique_adapters():
             try:
                 positions = await adapter.get_positions()
             except Exception as e:
@@ -398,7 +414,7 @@ class RiskGuard:
                 # 必须带异常类型：httpx 超时异常的 message 为空，只打 {e} 会得到一行空消息
                 # （2026-09-20 事故：连续 10 小时 100% 失败却无从诊断）
                 logger.error(
-                    f"Failed to fetch positions from {exchange} "
+                    f"Failed to fetch positions from {target} "
                     f"({type(e).__name__}: {e!r}); "
                     f"consecutive_failures={self._position_fetch_failures}"
                 )
@@ -409,7 +425,7 @@ class RiskGuard:
                 balance = await adapter.get_balance()
             except Exception as e:
                 logger.error(
-                    f"Failed to fetch balance from {exchange} "
+                    f"Failed to fetch balance from {target} "
                     f"({type(e).__name__}: {e!r})"
                 )
                 continue
@@ -421,27 +437,27 @@ class RiskGuard:
             for pos in positions:
                 pnl_ratio = pos.unrealized_pnl / total
                 if pnl_ratio < self.FLOATING_LOSS_ALERT:
-                    await self._send_floating_loss_alert(exchange, pos, pnl_ratio)
+                    await self._send_floating_loss_alert(target, pos, pnl_ratio)
                     # 记录风控事件
                     await self._record_risk_event(
                         level="P1",
                         event_type="floating_loss",
-                        message=f"{exchange}:{pos.symbol} 浮亏 {pnl_ratio:.2%}",
+                        message=f"{target}:{pos.symbol} 浮亏 {pnl_ratio:.2%}",
                     )
 
     async def _send_floating_loss_alert(
-        self, exchange: str, pos, ratio: Decimal
+        self, target: str, pos, ratio: Decimal
     ) -> None:
-        """发送 Telegram 浮亏预警"""
+        """发送 Telegram 浮亏预警（``target`` = 交易所名或 ``交易所#账户id``）"""
         try:
             # TelegramChannel 需要 app 实例，通过日志作为 fallback
             logger.warning(
-                f"浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | "
+                f"浮亏预警 | 交易所/账户: {target} | 品种: {pos.symbol} | "
                 f"方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}"
             )
         except Exception:
             logger.warning(
-                f"浮亏预警 | 交易所: {exchange} | 品种: {pos.symbol} | "
+                f"浮亏预警 | 交易所/账户: {target} | 品种: {pos.symbol} | "
                 f"方向: {pos.side} | 数量: {pos.quantity} | 浮亏: {ratio:.2%}"
             )
 
