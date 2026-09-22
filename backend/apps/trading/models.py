@@ -19,6 +19,11 @@ class Order(models.Model):
         #     让账面与实际分叉，而分叉的账面比空白更危险。
         ("unknown", "未知"),
     ]
+    # 处于这些状态的订单仍可能变成真实敞口，**每一处「活跃订单」枚举都必须用这个
+    # 常量**，不许再手抄一份字面量：`unknown` 是唯一可能活着的单，漏掉它的那一处
+    # 会把这张单当成不存在（2026-09-22 之前 views / pending_reconcile 各抄了一份）。
+    ACTIVE_STATUSES = ("pending", "submitted", "partial", "unknown")
+
     SIDE_CHOICES = [("buy", "Buy"), ("sell", "Sell")]
     TYPE_CHOICES = [("market", "Market"), ("limit", "Limit"), ("stop", "Stop")]
 

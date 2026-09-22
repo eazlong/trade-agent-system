@@ -30,7 +30,6 @@ from .adapters import (
     OrderRequest,
 )
 from .pending_reconcile import (
-    ACTIVE_ORDER_STATUSES,
     get_fernet,
     is_beyond_placement_window,
     sweep_dangling_orders,
@@ -803,7 +802,7 @@ class OrderExecutor:
         orders = await db_async(
             lambda: list(
                 Order.objects.filter(
-                    status__in=list(ACTIVE_ORDER_STATUSES)
+                    status__in=list(Order.ACTIVE_STATUSES)
                 ).select_related("exchange_account")
             )
         )()

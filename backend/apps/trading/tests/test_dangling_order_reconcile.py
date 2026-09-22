@@ -26,8 +26,8 @@ from apps.trading.adapters.base import (
     OrderLookupUnavailableError,
     OrderLookupUnsupportedError,
 )
+from apps.trading.models import Order
 from apps.trading.pending_reconcile import (
-    ACTIVE_ORDER_STATUSES,
     PLACEMENT_GRACE_SECONDS,
     DanglingOutcome,
     is_beyond_placement_window,
@@ -243,8 +243,12 @@ class TestSweepScope(unittest.TestCase):
         build.assert_not_awaited()
 
     def test_unknown_is_an_active_status(self):
-        """「未知」是非终态：漏出活跃枚举等于把唯一可能活着的单当成不存在"""
-        self.assertIn("unknown", ACTIVE_ORDER_STATUSES)
+        """「未知」是非终态：漏出活跃枚举等于把唯一可能活着的单当成不存在。
+
+        断言的是 **Order 上那个常量**：扫描器、成交同步、视图读的必须是同一份，
+        各自手抄一个字面量迟早有一处漏掉 ``unknown``。
+        """
+        self.assertIn("unknown", Order.ACTIVE_STATUSES)
 
     def test_adapter_is_resolved_per_account_not_per_exchange(self):
         """两个账户同交易所 → 各查各的（按交易所名索引会互相顶掉，把活单查成不存在）"""

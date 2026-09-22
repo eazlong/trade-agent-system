@@ -10,7 +10,7 @@
   2. 失败落库的 `error_message` 必须带异常类型名，不能是空串（否则以后翻单只能靠猜）。
   3. 适配器抛 `OrderPlacementUnknown`（对不上账）时落 **`unknown`** 而不是 `failed`
      （2026-09-22）：那张单可能已在交易所活着，记 failed 会让账面分叉、并诱导用户
-     重下一张。`unknown` 在 `ACTIVE_ORDER_STATUSES` 里，悬挂扫描会继续找它。
+     重下一张。`unknown` 在 `Order.ACTIVE_STATUSES` 里，悬挂扫描会继续找它。
 """
 
 from __future__ import annotations
@@ -220,11 +220,11 @@ class TestSubmitOrderSafety(unittest.TestCase):
                 )
             )
 
-        from apps.trading.pending_reconcile import ACTIVE_ORDER_STATUSES
+        from apps.trading.models import Order
 
         self.assertIn(
             "unknown",
-            ACTIVE_ORDER_STATUSES,
+            Order.ACTIVE_STATUSES,
             "unknown 是非终态：漏掉它就等于把这张单丢出所有对账路径",
         )
         written = [

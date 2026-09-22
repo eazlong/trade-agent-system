@@ -117,8 +117,9 @@ def trading_summary(request):
     today_count = len(today_filled)
 
     # 活跃订单数（含「未知」：它是非终态，可能仍在交易所活着）
+    # 枚举不许手抄：常量在 Order 上（`Order.ACTIVE_STATUSES`），这里是它唯一的家。
     active_count = Order.objects.filter(
-        status__in=["pending", "submitted", "partial", "unknown"]
+        status__in=Order.ACTIVE_STATUSES
     ).count()
 
     # 交易所账户数

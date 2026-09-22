@@ -43,8 +43,8 @@ from .alerts import alert_order_anomaly
 logger = logging.getLogger(__name__)
 
 # 处于这些状态的订单仍可能变成真实敞口，扫描与成交同步都要看它们。
-# ``unknown`` 必须在这里：它是**非终态**，漏掉等于把唯一可能活着的单当成不存在。
-ACTIVE_ORDER_STATUSES = ("pending", "submitted", "partial", "unknown")
+# 常量本体在 ``Order.ACTIVE_STATUSES``（见 models.py 上的说明），不再在这里另立一份：
+# 同一份枚举抄两处，迟早有一处漏掉 ``unknown``。
 
 # 落单到 ``place_order`` 返回的窗口。适配器内部预算 45s（下单）+ 30s（落库），
 # 留出余量到 5 分钟：比这更新的 ``pending`` 行可能只是正在途中的请求，
@@ -236,7 +236,7 @@ async def sweep_dangling_orders(
     candidates = await db_async(
         lambda: list(
             Order.objects.filter(
-                status__in=ACTIVE_ORDER_STATUSES, exchange_order_id=""
+                status__in=Order.ACTIVE_STATUSES, exchange_order_id=""
             ).select_related("exchange_account")
         )
     )()
