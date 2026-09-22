@@ -4,8 +4,9 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 import httpx
 from django.conf import settings
@@ -14,9 +15,81 @@ logger = logging.getLogger(__name__)
 
 FALLBACK_MARKER = "__FALLBACK__"
 
+#: 普通调用的超时。长文本生成（分析、教练）要留足时间，历史上就是这个值。
+_DEFAULT_TIMEOUT = 360.0
+
+#: `chat_json()` 的超时。短 JSON 用不着 360 秒，而它挂在 5 分钟心跳上，
+#: 两跳各 360 秒就是 12 分钟的沉默——心跳会被任务健康检查判成僵尸。
+_JSON_TIMEOUT = 60.0
+
+T = TypeVar("T")
+
 
 class ToolCallTruncatedError(Exception):
     """LLM 返回的 tool_call arguments JSON 被截断，需要重试"""
+
+
+class LLMResponseError(RuntimeError):
+    """LLM 的返回**不能当作有效答案**使用。
+
+    与「降级到 DeepSeek」是两件事：换一跳是**正常服务**，`chat()` 照样返回可用文本，
+    调用方不需要也不应该知道发生过降级。这个异常只在两种情况抛出：两条链都失败
+    （`FALLBACK_MARKER`），或返回的内容根本不是合法 JSON。
+
+    **调用方自己的校验错误不走这里**（见 `chat_json`）：那些是领域结论的问题，不是
+    LLM 服务的问题，包成这个类型只会让「模型说了句胡话」和「两条链都挂了」在日志里
+    长得一样。这里只负责「客户端这一侧拿不到可解析的东西」。
+
+    为什么抛异常而不是返回 `None` 或空串：调用方必须能分辨「没有结论」与「结论是
+    无/否」。资讯判定里这两者相差一个「今天到底抬没抬」，而 `None`、空串、`False`
+    在 `if verdict:` 这种写法下会塌进同一个分支——那恰好把「判不出来」读成「没抬升」，
+    是这套机制里最危险的一次静默。异常逼着调用方写下一个 `except`，那一步绕不过去。
+
+    基类选 `RuntimeError` 而不是 `ValueError`：`apps.regime.judgement` 用
+    `ValueError` 表示「抬升标志本身是错的」（`apply_escalation`），两个 `except
+    ValueError` 撞在一起会把「LLM 判不出来」读成「配置写错了」。
+    """
+
+
+def _reject_message(resp: httpx.Response, hop: str) -> str:
+    """JSON 模式下上游拒收请求时的异常消息：带上状态码与响应体。
+
+    只在 `json_mode` 下用（见 `_raise_if_json_mode_rejected`），既有的纯文本与工具
+    调用链路一字不改。裸 `raise_for_status()` 的消息里只有 URL 和状态码，而上游不认
+    `response_format`、密钥过期、额度用尽**都会是 400**——不把响应体带出来，日报里就
+    只能看到「今日资讯判定缺失」，查不出是哪一种。
+    """
+    return f"{hop} 拒绝 JSON 模式请求：HTTP {resp.status_code} {resp.text[:300]}"
+
+
+def _raise_if_json_mode_rejected(
+    resp: httpx.Response, json_mode: bool, hop: str
+) -> None:
+    if json_mode and resp.status_code >= 400:
+        raise LLMResponseError(_reject_message(resp, hop))
+
+
+def _loads_json_object(text: str) -> Any:
+    """从模型输出里取出一个 JSON 值。取不出来抛 `LLMResponseError`。
+
+    **仍然要剥 markdown 围栏**：`response_format` 是请求里的一个字段，上游可以照收
+    不误、返回 200，却照样把 JSON 包在 ``` 里。剥法沿用 `intent_parser` 的既有先例
+    （先找围栏，找不到再退化成「第一对花括号之间的内容」）。
+    """
+    stripped = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped)
+    if fence:
+        stripped = fence.group(1).strip()
+    else:
+        obj = re.search(r"\{[\s\S]*\}", stripped)
+        if obj:
+            stripped = obj.group(0).strip()
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise LLMResponseError(
+            f"返回的内容不是合法 JSON（{exc}）：{text[:200]!r}"
+        ) from exc
 
 
 # 工具调用重试次数：上游（LLM 中继 / 推理服务）5xx 多为瞬时故障，
@@ -58,26 +131,110 @@ class LLMClient:
         user: str,
         max_tokens: int = 1024,
         temperature: float = 0.3,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> str:
         """调用LLM，主用OpenAI，自动降级到DeepSeek"""
+        text, _ = await self._chat_chain(
+            system, user, max_tokens, temperature, timeout=timeout
+        )
+        return text
+
+    async def chat_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        validate: Callable[[Any], T],
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        timeout: float = _JSON_TIMEOUT,
+    ) -> T:
+        """要求 LLM 输出一个 JSON 对象，解析后交给 `validate` 校验并返回其结果。
+
+        JSON 模式是 **body 上的一个字段**（`response_format`），不是 SDK kwarg：
+        本客户端不走 openai SDK，是裸 `httpx` POST 到 `{base_url}/chat/completions`。
+        两条链都带上它——实测主链（中继）与 DeepSeek 都接受，所以「上游不认 JSON
+        模式」不会退化成硬故障，降级链在 JSON 模式下照样完整。
+
+        **默认 `timeout` 比其他方法短得多。** 360 秒是给长文本生成留的，而这一个
+        调用要的是几十个 token 的短 JSON，且它挂在 5 分钟心跳上；两跳各 360 秒就
+        是 12 分钟的沉默，心跳早被任务健康检查判成僵尸了。所以超时是这里的**保护**
+        参数，不是可调旋钮——真要改，改的是常量而不是逐次调用。
+
+        `validate` 拿到的是 `json.loads` 之后的**任意值**（对象、数组、标量都可能），
+        必须自己检查形状。校验逻辑放在调用方而不是这里：本项目没有 pydantic，既有
+        先例（`intent_parser`、`workflow_engine`）也都是手写 `.get()` 守卫，为一个
+        调用方发明一套 schema DSL 是赔本买卖。代价是**提示词里写的形状与 `validate`
+        里查的形状是两处**，所以调用方必须让两边读同一个常量，别各写一遍。
+
+        `validate` 抛什么就传什么出去，这里不包一层：校验代码里的 bug（`TypeError`
+        之类）必须炸给人看，不能被折成一句「LLM 判不出来」——那正是把「判不出来」
+        读成「没抬升」的那类静默。客户端自己只负责两类失败并统一抛 `LLMResponseError`：
+        降级链两跳全挂，以及返回的内容根本不是 JSON。
+        """
+        contract = (
+            f"{system}\n\n"
+            "只输出一个 JSON 对象，不要输出任何解释、前后缀或 markdown 代码块。"
+        )
+        text, failure = await self._chat_chain(
+            contract, user, max_tokens, temperature, json_mode=True, timeout=timeout
+        )
+        if is_fallback(text):
+            raise LLMResponseError(f"两条降级链都失败：{failure or '原因未记录'}")
+        return validate(_loads_json_object(text))
+
+    async def _chat_chain(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int,
+        temperature: float,
+        json_mode: bool = False,
+        timeout: float = _DEFAULT_TIMEOUT,
+    ) -> tuple[str, str]:
+        """两跳降级链：返回 `(文本, 失败原因)`，成功时原因为空串。
+
+        `chat()` 丢掉第二个元素——它的契约是「文本，或 `FALLBACK_MARKER`」，这也是
+        所有既有调用方依赖的东西。`chat_json()` 留着它：`FALLBACK_MARKER` 把「哪一跳
+        因为什么挂的」压扁成了一个常量，而日报里的「资讯判定缺失」必须能说清是哪一种
+        （上游不认 JSON 模式 / 密钥过期 / 网络不通），否则没人查得下去。
+
+        **换到 DeepSeek 不是失败。** 它只是换了一个服务方，`chat()` 照样返回可用文本。
+        这个区分是 `chat_json` 里那一句 `is_fallback()` 的全部意义：只有两条链**都**
+        挂了才算没有结论。
+        """
         t0 = time.monotonic()
         try:
-            result = await self._call_openai(system, user, max_tokens, temperature)
+            result = await self._call_openai(
+                system, user, max_tokens, temperature, json_mode, timeout
+            )
             logger.debug(f"OpenAI OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
-            return result
+            return result, ""
         except Exception as e:
             logger.warning(f"OpenAI failed ({e}), falling back to DeepSeek")
+            first_hop = e
 
         try:
-            result = await self._call_deepseek(system, user, max_tokens, temperature)
+            result = await self._call_deepseek(
+                system, user, max_tokens, temperature, json_mode, timeout
+            )
             logger.debug(f"DeepSeek OK ({(time.monotonic() - t0) * 1000:.0f}ms)")
-            return result
+            return result, ""
         except Exception as e:
             logger.error(f"DeepSeek fallback also failed: {e}")
-            return FALLBACK_MARKER
+            return FALLBACK_MARKER, (
+                f"OpenAI: {type(first_hop).__name__}: {first_hop} | "
+                f"DeepSeek: {type(e).__name__}: {e}"
+            )[:500]
 
     async def _call_openai(
-        self, system: str, user: str, max_tokens: int, temperature: float
+        self,
+        system: str,
+        user: str,
+        max_tokens: int,
+        temperature: float,
+        json_mode: bool = False,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> str:
         api_key = settings.OPENAI_API_KEY
         base_url = getattr(
@@ -87,20 +244,28 @@ class LLMClient:
             raise ValueError("OPENAI_API_KEY not configured")
         model = getattr(settings, "OPENAI_MODEL_PRIMARY", "gpt-4o")
         proxy = getattr(settings, "OPENAI_PROXY", "") or None
-        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
+                json=body,
             )
+            # `_call_openai` 不像 `_call_deepseek` 那样调 `raise_for_status()`：它读完
+            # JSON 再看有没有 `choices`。JSON 模式下这个习惯会掩盖真正的失败原因——
+            # 上游不认 `response_format`、密钥过期、额度用尽**都是 400**，而它们的
+            # 响应体各不相同。不把响应体带出来，日报里就只有「今日资讯判定缺失」。
+            _raise_if_json_mode_rejected(resp, json_mode, "OpenAI")
             resp_data = resp.json()
             choices = resp_data.get("choices", [])
             if not choices:
@@ -327,7 +492,13 @@ class LLMClient:
             )
 
     async def _call_deepseek(
-        self, system: str, user: str, max_tokens: int, temperature: float
+        self,
+        system: str,
+        user: str,
+        max_tokens: int,
+        temperature: float,
+        json_mode: bool = False,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> str:
         api_key = settings.DEEPSEEK_API_KEY
         if not api_key:
@@ -337,20 +508,24 @@ class LLMClient:
         )
         model = getattr(settings, "DEEPSEEK_MODEL_FALLBACK", "deepseek-chat")
         proxy = getattr(settings, "DEEPSEEK_PROXY", "") or None
-        async with httpx.AsyncClient(timeout=360.0, proxy=proxy) as client:
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        async with httpx.AsyncClient(timeout=timeout, proxy=proxy) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
+                json=body,
             )
+            _raise_if_json_mode_rejected(resp, json_mode, "DeepSeek")
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
 
