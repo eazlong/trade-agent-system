@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
+from apps.exchange.models import ExchangeAccount
 from apps.trading.adapters.base import Position
 
 
@@ -29,13 +30,19 @@ class TestPositionListView(APITestCase):
             password="x",
         )
         self.client.force_authenticate(self.user)
+        # 视图按 **账户 id** 遍历 executor._account_adapters，所以夹具必须有一个真实
+        # 的 ExchangeAccount 行：适配器的键就是它的 id（原先按交易所名遍历，两个账户
+        # 同交易所时会互相冒名）。
+        self.account = ExchangeAccount.objects.create(
+            exchange="binance", label="default", api_key_enc=b"", api_secret_enc=b""
+        )
 
     def _mock_executor(self, positions: list[Position]) -> MagicMock:
         adapter = MagicMock()
         adapter.get_positions = AsyncMock(return_value=positions)
         executor = MagicMock()
         executor._running = True
-        executor._adapters = {"binance": adapter}
+        executor._account_adapters = {str(self.account.id): adapter}
         return executor
 
     def test_position_list_returns_realtime_mark_price(self):

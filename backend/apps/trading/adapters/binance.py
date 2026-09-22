@@ -22,7 +22,9 @@ from django.conf import settings
 
 from .base import (
     BaseExchangeAdapter,
+    OrderLookupUnavailableError,
     OrderNotFoundError,
+    OrderPlacementUnknown,
     OrderRequest,
     OrderResponse,
     OrderFill,
@@ -283,8 +285,10 @@ class BinanceAdapter(BaseExchangeAdapter):
     ) -> Optional[dict]:
         """按 clientOrderId 查交易所侧真实订单（"请求发出但响应丢失"时的对账手段）。
 
-        返回订单原始 dict；订单确实不存在（-2013）返回 None；
-        查询本身失败也返回 None（调用方据此保守处理：不宣称成功）。
+        返回订单原始 dict；**只有交易所明确回答「订单不存在」（-2013）才返回 None**。
+        查询本身失败（网络不可达、意外响应）抛 ``OrderLookupUnavailableError``——
+        这两者是不同的事实，混成一个 ``None`` 会让调用方把「不知道」当成「不存在」，
+        从而把一张可能真实存在的订单记成 failed（本地账面与交易所分叉）。
         """
         try:
             resp = await self._request(
@@ -296,11 +300,10 @@ class BinanceAdapter(BaseExchangeAdapter):
                 },
             )
         except httpx.TransportError as e:
-            logger.warning(
-                f"Binance order lookup by clientOrderId failed "
-                f"({type(e).__name__}: {e!r}); 无法确认订单状态"
-            )
-            return None
+            raise OrderLookupUnavailableError(
+                f"Binance order lookup by clientOrderId unreachable: "
+                f"{type(e).__name__}: {e}"
+            ) from e
 
         if resp.status_code == 200:
             return resp.json()
@@ -311,11 +314,10 @@ class BinanceAdapter(BaseExchangeAdapter):
                 data = {}
             if data.get("code") == -2013:  # Order does not exist
                 return None
-        logger.warning(
+        raise OrderLookupUnavailableError(
             f"Binance order lookup by clientOrderId unexpected: "
             f"{resp.status_code} - {(resp.text or '')[:200]}"
         )
-        return None
 
     def _order_response_from_raw(self, data: dict) -> OrderResponse:
         """交易所订单 dict → OrderResponse（下单与对账共用，保持与原来一致的**原始**
@@ -334,21 +336,34 @@ class BinanceAdapter(BaseExchangeAdapter):
     ) -> Optional[OrderResponse]:
         """下单结果不明时按 clientOrderId 向交易所对账。
 
-        查到 → 采用交易所真实状态（说明请求已被受理，避免"假失败"）；
-        查不到/无幂等键/查询失败 → 返回 None（调用方按原错误处理，绝不臆造成功）。
+        返回 ``OrderResponse`` → 请求其实已被受理，采用交易所真实状态；
+        返回 ``None`` → **交易所确定没有这张单**（请求未被受理），调用方按原错误处理；
+        抛 ``OrderPlacementUnknown`` → **对不上账**（无幂等键 / 反查不可达 / 两处证据
+        矛盾）：既证明不了已受理，也证明不了没受理。
+
+        第三种情况原先被并进 ``None``，于是「不知道」被记成 ``failed``——若那张单
+        其实活着，账面就与交易所分叉了。现在它有自己的出口（2026-09-22）。
         """
         if not request.client_order_id:
-            logger.warning(
-                "Binance 下单结果不明但没有 clientOrderId，无法对账（订单状态未知）"
+            raise OrderPlacementUnknown(
+                "下单结果不明且没有 clientOrderId，无法对账（订单状态未知）"
                 f"：{type(error).__name__ if error else 'duplicate-reject'}"
             )
-            return None
 
-        raw = await self.find_order_by_client_id(request.client_order_id, request.symbol)
+        try:
+            raw = await self.find_order_by_client_id(
+                request.client_order_id, request.symbol
+            )
+        except OrderLookupUnavailableError as e:
+            raise OrderPlacementUnknown(
+                f"对账不可达 clientOrderId={request.client_order_id}"
+                f"（订单状态未知，不得据此判定不存在）：{e}"
+            ) from e
+
         if raw is None:
             logger.warning(
                 f"Binance 对账未命中 clientOrderId={request.client_order_id}"
-                "（请求未被受理）"
+                "（交易所确定无此单，请求未被受理）"
             )
             return None
 
@@ -495,6 +510,9 @@ class BinanceAdapter(BaseExchangeAdapter):
             reconciled = await self._reconcile_order(request, e)
             if reconciled is not None:
                 return reconciled
+            # 能走到这里只有一种情况：对账**确定**交易所没有这张单（请求确实没出去），
+            # 于是原样抛传输错误 = 确定失败。对不上账的情况 `_reconcile_order` 已经
+            # 抛 OrderPlacementUnknown（未知），不会落到这一行。
             raise
 
         if resp.status_code >= 400:
@@ -504,6 +522,13 @@ class BinanceAdapter(BaseExchangeAdapter):
                 reconciled = await self._reconcile_order(request, None)
                 if reconciled is not None:
                     return reconciled
+                # 交易所说这个单号已存在，反查却说没有——两处证据矛盾。既证不了已受理
+                # 也证不了没受理，只能如实记为「未知」，不能挑一边信。
+                raise OrderPlacementUnknown(
+                    f"交易所报单号重复（Binance API {resp.status_code}: "
+                    f"{error_detail[:200]}），但按 clientOrderId="
+                    f"{request.client_order_id or 'N/A'} 反查未命中：两处证据矛盾"
+                )
             logger.error(f"Binance API error: {resp.status_code} - {error_detail}")
             # 抛出包含 Binance 错误详情的异常
             raise RuntimeError(f"Binance API {resp.status_code}: {error_detail}")

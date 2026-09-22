@@ -1,6 +1,9 @@
 from .base import (
     BaseExchangeAdapter,
+    OrderLookupUnavailableError,
+    OrderLookupUnsupportedError,
     OrderNotFoundError,
+    OrderPlacementUnknown,
     OrderRequest,
     OrderResponse,
     OrderFill,
@@ -14,6 +17,9 @@ __all__ = [
     "OrderResponse",
     "OrderFill",
     "OrderNotFoundError",
+    "OrderLookupUnavailableError",
+    "OrderLookupUnsupportedError",
+    "OrderPlacementUnknown",
     "Position",
     "BinanceAdapter",
 ]

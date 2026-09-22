@@ -21,14 +21,19 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from apps.trading.models import Order
 
-from django.conf import settings
-
 from apps.core.db_utils import db_async
 from .adapters import (
     ADAPTER_MAP,
     BaseExchangeAdapter,
     OrderNotFoundError,
+    OrderPlacementUnknown,
     OrderRequest,
+)
+from .pending_reconcile import (
+    ACTIVE_ORDER_STATUSES,
+    get_fernet,
+    is_beyond_placement_window,
+    sweep_dangling_orders,
 )
 
 if TYPE_CHECKING:
@@ -105,10 +110,20 @@ class OrderExecutor:
     _instance: "OrderExecutor | None" = None
 
     def __init__(self):
+        # 按**交易所名**索引：同一交易所只挂一个活跃账户时它才唯一确定适配器。
+        # 遗留口径，只给「调用方拿不到账户 id」的位置用（cancel_order / get_positions /
+        # get_balance / 视图）；下单与成交同步一律走 `_account_adapters`。
         self._adapters: dict[str, BaseExchangeAdapter] = {}
+        # 按 **ExchangeAccount.id** 索引：这才是唯一不会拿错密钥的口径。同一交易所的
+        # 多个账户各有各的密钥与 testnet 属性，按交易所名解析会用到**别人**的凭证。
+        self._account_adapters: dict[str, BaseExchangeAdapter] = {}
+        # 同交易所有多个活跃账户的交易所名：`_adapters` 里那一条只是「最后一个加载的」，
+        # 是个任意选择，调用方据此判断「按名字解析是否可信」。
+        self._ambiguous_exchanges: set[str] = set()
         self._riskguard: Optional[RiskGuard] = None
         self._running = False
         self._fill_sync_task: Optional[asyncio.Task] = None
+        self._dangling_sweep_task: Optional[asyncio.Task] = None
 
     @classmethod
     def get_instance(cls) -> "OrderExecutor | None":
@@ -131,7 +146,11 @@ class OrderExecutor:
         self._load_riskguard()
         self.start_fill_sync()
 
-        logger.info(f"OrderExecutor initialized with {len(self._adapters)} adapters")
+        logger.info(
+            "OrderExecutor initialized: %s 个账户适配器（%s 个交易所名条目）",
+            len(self._account_adapters),
+            len(self._adapters),
+        )
 
     async def shutdown(self) -> None:
         """
@@ -148,13 +167,76 @@ class OrderExecutor:
                 pass
             self._fill_sync_task = None
 
-        for name, adapter in self._adapters.items():
+        # 悬挂行扫描是分离任务：它持有已加载的订单对象且不阻塞成交同步，
+        # 所以关框架时必须显式取消，否则它会带着断掉的适配器继续跑。
+        if self._dangling_sweep_task and not self._dangling_sweep_task.done():
+            self._dangling_sweep_task.cancel()
+            try:
+                await self._dangling_sweep_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._dangling_sweep_task = None
+
+        # 两个地图可能指向同一个适配器实例（同交易所单账户），按对象去重后各断一次。
+        for name, adapter in self._unique_adapters():
             await adapter.disconnect()
             logger.info(f"Adapter disconnected: {name}")
 
         self._adapters.clear()
+        self._account_adapters.clear()
+        self._ambiguous_exchanges.clear()
         OrderExecutor._instance = None
         logger.info("OrderExecutor shutdown")
+
+    # ─── 适配器查找 ──────────────────────────────────────────────────────────
+
+    def _unique_adapters(self) -> list[tuple[str, BaseExchangeAdapter]]:
+        """(标签, 适配器) 去重列表：账户地图是超集，遗留地图只补它没有的实例。"""
+        seen: set[int] = set()
+        out: list[tuple[str, BaseExchangeAdapter]] = []
+        for label, adapter in list(self._account_adapters.items()) + list(
+            self._adapters.items()
+        ):
+            if adapter is None or id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            out.append((label, adapter))
+        return out
+
+    def is_ambiguous_exchange(self, exchange: str) -> bool:
+        """该交易所名下是否有多个活跃账户（此时按交易所名解析不可信）。"""
+        return (exchange or "").lower() in self._ambiguous_exchanges
+
+    def _resolve_adapter(
+        self, exchange: str, exchange_account_id: str | None
+    ) -> BaseExchangeAdapter | None:
+        """按**账户 id** 取适配器；拿不到就让调用方失败，绝不退到别的账户。
+
+        2026-09-22：`_adapters` 以交易所名为键，同一交易所挂两个账户时后者顶掉
+        前者，于是下单、成交同步、反查都可能拿着**另一个账户**的密钥去做——订单
+        落到错账户上是真实的资金错误，而日志里看不出来。
+
+        遗留回退（按交易所名）只在「账户地图为空」时生效：两个地图由
+        `_load_adapters` 同一段循环填充，真实运行里账户地图为空等价于「一个适配器
+        都没加载」，所以这条回退在真实运行中恒为 None，只为兼容手工构造 `_adapters`
+        的调用方（测试夹具）而留。**账户清单非空却没有这个账户时一律返回 None**：
+        那种情况下按名字找到的是同交易所另一个账户的适配器。
+        """
+        account_key = str(exchange_account_id) if exchange_account_id else ""
+        if account_key:
+            adapter = self._account_adapters.get(account_key)
+            if adapter is not None:
+                return adapter
+            if self._account_adapters:
+                logger.warning(
+                    "[OrderExecutor] 账户 %s（交易所 %s）没有已加载的适配器"
+                    "（密钥缺失/已停用/加载失败）——拒绝回退到按交易所名解析："
+                    "那会拿到同交易所另一个账户的密钥",
+                    account_key,
+                    exchange,
+                )
+                return None
+        return self._adapters.get((exchange or "").lower())
 
     # ─── 下单主流程 ───────────────────────────────────────────────────────────
 
@@ -199,9 +281,11 @@ class OrderExecutor:
         if not self._running:
             raise RuntimeError("OrderExecutor is not running")
 
-        adapter = self._adapters.get(exchange)
+        adapter = self._resolve_adapter(exchange, exchange_account_id)
         if not adapter:
-            raise ValueError(f"Exchange adapter not found: {exchange}")
+            raise ValueError(
+                f"Exchange adapter not found: {exchange}（account={exchange_account_id}）"
+            )
 
         # 1. RiskGuard 前置校验（平仓跳过）
         request = OrderRequest(
@@ -338,9 +422,14 @@ class OrderExecutor:
             # 失败原因必须带类型名：httpx 超时异常的 message 为空，只写 str(e) 会落一条空消息
             # （2026-09-21 事故：库里的 failed 单 error_message='' ，无法诊断）
             error_text = f"{type(e).__name__}: {e}".strip().rstrip(":") or type(e).__name__
+            # 「下单结果未知」不是失败：交易所侧可能正有一张活着的单，记 failed 会让
+            # 账面与实际分叉，而且用户看到「失败」会再下一张 → 双倍敞口。落成非终态的
+            # unknown，交给悬挂扫描/成交同步继续找它；熔断计数照旧（仍然算一次失败），
+            # 因为未知单同样是风险信号。
+            placement_unknown = isinstance(e, OrderPlacementUnknown)
             await self._update_order(
                 order_id=str(order.id),
-                status="failed",
+                status="unknown" if placement_unknown else "failed",
                 error_message=error_text,
             )
             if self._riskguard:
@@ -350,8 +439,12 @@ class OrderExecutor:
                     side=side,
                     quantity=str(quantity),
                     error=error_text,
+                    unknown=placement_unknown,
                 )
-            logger.error(f"[SF-09][OrderExecutor] failed: order_id={order.id} - {error_text}")
+            logger.error(
+                f"[SF-09][OrderExecutor] {'结果未知' if placement_unknown else 'failed'}: "
+                f"order_id={order.id} - {error_text}"
+            )
             raise
 
     async def cancel_order(
@@ -402,7 +495,15 @@ class OrderExecutor:
     # ─── 内部方法 ─────────────────────────────────────────────────────────────
 
     async def _load_adapters(self) -> None:
-        """从 DB 加载已激活的交易所账号，解密并连接适配器"""
+        """从 DB 加载已激活的交易所账号，解密并连接适配器。
+
+        **同时填两个地图**，它们指向同一个适配器实例：
+        ``_account_adapters[account.id]``（唯一不会拿错密钥的口径）与
+        ``_adapters[exchange]``（遗留口径，只给拿不到账户 id 的调用方）。
+        同交易所有多个活跃账户时，``_adapters`` 里那条只是「最后加载的」，是个
+        任意选择——所以这里把它记进 ``_ambiguous_exchanges`` 并打出 ERROR，
+        让「按名字解析到底选了谁」在日志里可查，而不是静默顶掉。
+        """
         from apps.exchange.models import ExchangeAccount
 
         accounts = await db_async(
@@ -410,6 +511,9 @@ class OrderExecutor:
         )()
 
         fernet = self._get_fernet()
+
+        # exchange → 已成功加载的账户 id（按加载顺序，最后一个就是 `_adapters` 里的赢家）
+        loaded: dict[str, list[str]] = {}
 
         for account in accounts:
             exchange = account.exchange.lower()
@@ -435,12 +539,28 @@ class OrderExecutor:
                 adapter = adapter_cls(api_key, api_secret, account.testnet)
 
                 await adapter.connect()
+                self._account_adapters[str(account.id)] = adapter
                 self._adapters[exchange] = adapter
+                loaded.setdefault(exchange, []).append(str(account.id))
                 logger.info(
                     f"Adapter loaded: {exchange} ({account.label or 'default'})"
                 )
             except Exception as e:
                 logger.error(f"Failed to load adapter for {exchange}: {e}")
+
+        for exchange, account_ids in loaded.items():
+            if len(account_ids) < 2:
+                continue
+            self._ambiguous_exchanges.add(exchange)
+            logger.error(
+                "[OrderExecutor] 交易所 %s 有 %s 个活跃账户（%s）：按交易所名解析"
+                "只能得到最后加载的那个（account=%s），其余账户必须按账户 id 访问；"
+                "下单与成交同步已一律按账户 id 解析",
+                exchange,
+                len(account_ids),
+                ", ".join(account_ids),
+                account_ids[-1],
+            )
 
     def _load_riskguard(self) -> None:
         """获取 RiskGuard 单例引用"""
@@ -449,13 +569,8 @@ class OrderExecutor:
         self._riskguard = RiskGuard.get_instance()
 
     def _get_fernet(self):
-        """创建 Fernet 解密器"""
-        from cryptography.fernet import Fernet
-
-        key = getattr(settings, "FERNET_KEY", "")
-        if not key:
-            raise ValueError("FERNET_KEY not configured in settings")
-        return Fernet(key.encode())
+        """创建 Fernet 解密器（与 pending_reconcile 共用同一条解密路径）"""
+        return get_fernet()
 
     async def _persist_order(
         self,
@@ -645,14 +760,22 @@ class OrderExecutor:
             await asyncio.sleep(interval)
 
     async def _sync_active_orders(self) -> None:
-        """查询所有活跃订单（pending/submitted/partial），
-        从交易所拉取最新成交状态并落库。"""
+        """同步所有活跃订单（pending/submitted/partial/unknown）的成交状态。
+
+        ``unknown`` 必须在活跃集里：它是非终态，语义是「这张单可能仍在交易所活着」，
+        漏掉它等于把唯一可能变成真实敞口的那一档当成不存在。
+
+        无 ``exchange_order_id`` 的行不再被跳过（CONTEXT.md 第 137 条修掉的那句）
+        ——它们交给 ``sweep_dangling_orders`` 反查；但**不在本循环里 await**：
+        反查要走交易所网络、可能一直超时，内联等待会把后面所有交易所的成交同步
+        一起饿死。所以它被 spawn 成一个分离任务。
+        """
         from apps.trading.models import Order
 
         orders = await db_async(
             lambda: list(
                 Order.objects.filter(
-                    status__in=["pending", "submitted", "partial"]
+                    status__in=list(ACTIVE_ORDER_STATUSES)
                 ).select_related("exchange_account")
             )
         )()
@@ -661,17 +784,24 @@ class OrderExecutor:
             return
 
         by_exchange: dict[str, list] = {}
+        has_dangling = False
         for order in orders:
-            exchange = (order.exchange_account.exchange or "").lower()
-            by_exchange.setdefault(exchange, []).append(order)
+            if not order.exchange_order_id:
+                # 刚下单、place_order 还在途中的行不该被反查（此刻交易所还没有它），
+                # 只有超出下单窗口的才是崩溃/丢响应的遗留。
+                if is_beyond_placement_window(order):
+                    has_dangling = True
+                continue
+            # 按**账户**分组而不是按交易所名：成交通知必须用订单自己那个账户的密钥
+            # 去查，否则同交易所的两个账户会互相查对方的单（查不到 → 误判 cancelled）。
+            by_exchange.setdefault(str(order.exchange_account_id), []).append(order)
 
-        for exchange, order_list in by_exchange.items():
-            adapter = self._adapters.get(exchange)
+        for account_id, order_list in by_exchange.items():
+            exchange = (order_list[0].exchange_account.exchange or "").lower()
+            adapter = self._resolve_adapter(exchange, account_id)
             if not adapter:
                 continue
             for order in order_list:
-                if not order.exchange_order_id:
-                    continue
                 try:
                     fill = await adapter.fetch_order(
                         order.exchange_order_id, order.symbol
@@ -693,6 +823,31 @@ class OrderExecutor:
                     )
                     continue
                 await self._apply_fill(order, fill)
+
+        if has_dangling:
+            self._spawn_dangling_sweep()
+
+    def _spawn_dangling_sweep(self) -> None:
+        """起一个分离任务扫描悬挂行（同一时刻只有一个，不叠加）。"""
+        task = self._dangling_sweep_task
+        if task and not task.done():
+            return
+        try:
+            self._dangling_sweep_task = asyncio.create_task(
+                self._run_dangling_sweep()
+            )
+        except RuntimeError as e:
+            logger.warning(f"[FillSync] 悬挂行扫描未启动（无运行中的 loop）：{e}")
+
+    async def _run_dangling_sweep(self) -> None:
+        """悬挂行扫描的异常必须就地吞掉：这是一个 fire-and-forget 任务，
+        逃出去的异常会被 asyncio 记成「Task exception was never retrieved」而丢失上下文。"""
+        try:
+            await sweep_dangling_orders()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("[FillSync] 悬挂订单扫描失败", exc_info=True)
 
     async def _apply_fill(self, order, fill) -> None:
         """把交易所返回的成交状态落库（仅在变化时更新）。"""

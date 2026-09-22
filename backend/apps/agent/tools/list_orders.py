@@ -134,7 +134,17 @@ class ListOrdersTool(BaseTool):
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "submitted", "partial", "filled", "cancelled", "failed"],
+                    # unknown = 下单结果未知（可能已在交易所活着）。不给它一个名字，
+                    # Agent 就查不到这批最需要人看的单手。
+                    "enum": [
+                        "pending",
+                        "submitted",
+                        "partial",
+                        "filled",
+                        "cancelled",
+                        "failed",
+                        "unknown",
+                    ],
                     "description": "订单状态",
                 },
                 "backtest_id": {

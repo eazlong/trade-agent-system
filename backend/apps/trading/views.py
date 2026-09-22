@@ -116,9 +116,9 @@ def trading_summary(request):
     today_pnl = sum(float(o.realized_pnl or 0) for o in today_filled)
     today_count = len(today_filled)
 
-    # 活跃订单数
+    # 活跃订单数（含「未知」：它是非终态，可能仍在交易所活着）
     active_count = Order.objects.filter(
-        status__in=["pending", "submitted", "partial"]
+        status__in=["pending", "submitted", "partial", "unknown"]
     ).count()
 
     # 交易所账户数
@@ -151,14 +151,21 @@ def position_list(request):
             }
         )
 
-    # 构建 exchange -> account_id 映射
-    exchange_to_account = {}
-    for acc in ExchangeAccount.objects.filter(is_active=True):
-        exchange_to_account[acc.exchange.lower()] = str(acc.id)
+    # 按**账户**遍历，不按交易所名：`_adapters` 以交易所名为键，同交易所有两个活跃
+    # 账户时它只留最后一个，于是两个账户的持仓都会记在那个账户名下（原先这里是
+    # `exchange -> account_id` 手工反查，同样是后写覆盖）。账户地图才是每个账户各自
+    # 的适配器，`exchange_account_id` 也就直接是键本身。
+    account_by_id = {
+        str(acc.id): acc for acc in ExchangeAccount.objects.filter(is_active=True)
+    }
 
     all_positions = []
-    for exchange_name, adapter in executor._adapters.items():
-        account_id = exchange_to_account.get(exchange_name.lower())
+    for account_id, adapter in executor._account_adapters.items():
+        account = account_by_id.get(account_id)
+        if account is None:
+            # 适配器还在但账户已停用/删除：不猜它的交易所名，跳过。
+            continue
+        exchange_name = (account.exchange or "").lower()
         try:
             positions = async_to_sync(adapter.get_positions)()
             for pos in positions:
@@ -204,16 +211,17 @@ def account_list(request):
     serializer = ExchangeAccountSerializer(accounts, many=True)
     account_data = serializer.data
 
-    # 尝试从 OrderExecutor 获取各账户余额
+    # 尝试从 OrderExecutor 获取各账户余额。**按账户 id 索引**：同一交易所有两个账户
+    # 时按交易所名索引会让两个账户共用（且是最后加载那个账户的）余额。
     executor = OrderExecutor.get_instance()
     balances = {}
     if executor and executor._running:
-        for exchange_name, adapter in executor._adapters.items():
+        for account_id, adapter in executor._account_adapters.items():
             try:
                 balance = async_to_sync(adapter.get_balance)()
                 # balance is dict[str, Decimal], e.g. {"USDT": Decimal("100.0")}
                 usdt_balance = balance.get("USDT", Decimal("0"))
-                balances[exchange_name] = {
+                balances[account_id] = {
                     "total": str(usdt_balance),
                     "available": str(usdt_balance),
                     "used": "0",
@@ -223,8 +231,7 @@ def account_list(request):
 
     # 合并余额信息
     for acc in account_data:
-        exchange = acc["exchange"].lower()
-        acc["balance"] = balances.get(exchange)
+        acc["balance"] = balances.get(str(acc["id"]))
 
     return Response(account_data)
 
@@ -381,6 +388,11 @@ def live_session_start(request, pk):
     if not session.exchange_account:
         return Response({"error": "No exchange account configured"}, status=400)
 
+    # mode 与账户 testnet 必须自洽：错配意味着「以为在演练、实际在动钱」
+    mismatch = session.mode_account_mismatch()
+    if mismatch:
+        return Response({"error": mismatch}, status=400)
+
     frame_manager = FrameManager.get_instance()
 
     # 如果已在运行，先停掉旧运行器（处理之前框架崩溃导致的幽灵状态）
@@ -486,6 +498,11 @@ def live_session_resume(request, pk):
             {"error": f"Session is {session.status}, cannot resume"}, status=400
         )
 
+    # 与 start 同一不变式：恢复也是一次「启动」，同样不能带着 mode 错配跑起来
+    mismatch = session.mode_account_mismatch()
+    if mismatch:
+        return Response({"error": mismatch}, status=400)
+
     session.status = "running"
     session.save(update_fields=["status", "updated_at"])
 
@@ -571,6 +588,31 @@ def live_session_promote(request, pk):
     if session.status not in ("running", "stopped", "paused"):
         return Response(
             {"error": f"Session is {session.status}, cannot promote"}, status=400
+        )
+
+    # promote 把源账户**原样继承**给新的 live 会话，而 live 会话按不变式要求
+    # testnet=False；源会话是 paper、按同一条不变式必须绑 testnet 账户，所以继承
+    # 来的账户必然 testnet=True——产物是一支永远启动不了的 live 会话，而本接口却
+    # 返回 201「Promoted to live trading session」。一个起不来的会话配一句成功
+    # 文案，比直接失败更难查，所以这里 fail-loud。
+    # （要让 promote 真正可用，得让它接受一个 testnet=False 的目标账户——那是新增
+    # 能力，不在第①段「只把静默失效变成可见失败」的范围内。）
+    account = session.exchange_account
+    if account is None:
+        return Response(
+            {"error": "源会话未绑定交易所账户，无法 promote 出实盘会话"}, status=400
+        )
+    if account.testnet:
+        return Response(
+            {
+                "error": (
+                    f"promote 需要实盘账户（testnet=False），但源会话绑定的"
+                    f"「{account.label}」testnet=True：新的 live 会话会继承该账户，"
+                    f"启动时必被 mode 一致性校验拒绝。"
+                    "请改用 testnet=False 的账户直接创建 live 会话。"
+                )
+            },
+            status=400,
         )
 
     # 停止当前 paper 会话

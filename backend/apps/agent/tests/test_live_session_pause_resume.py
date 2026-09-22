@@ -39,6 +39,19 @@ def _strategy(user, name: str = "donchian_atr_trend_strategy"):
     )
 
 
+def _paper_account(label: str = "pause-resume-paper"):
+    """paper 会话必须绑 testnet 账户：mode 与账户 testnet 自洽是启动前提。"""
+    from apps.exchange.models import ExchangeAccount
+
+    return ExchangeAccount.objects.create(
+        exchange="binance",
+        label=label,
+        api_key_enc=b"enc",
+        api_secret_enc=b"enc",
+        testnet=True,
+    )
+
+
 def _session(user, strategy, status: str = "running"):
     from apps.trading.models import LiveSession
 
@@ -48,6 +61,7 @@ def _session(user, strategy, status: str = "running"):
         symbol="DOGE/USDT",
         mode="paper",
         status=status,
+        exchange_account=_paper_account(),
         initial_capital=Decimal("10000"),
         current_equity=Decimal("10000"),
         config={},

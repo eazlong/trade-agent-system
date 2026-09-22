@@ -11,6 +11,13 @@
      有 client_order_id 时按它向交易所对账，查到则返回交易所真实状态当成功，查不到才抛。
   3. 交易所报重复单（-4116 / "Duplicate order sent"）→ 同上对账，视为已受理（不是失败）。
   4. 读接口（持仓/余额等）不受影响：读超时照旧重连重试。
+
+出口只有三种，第三种是 2026-09-22 新增的（此前"对不上账"被并进"确定没这张单"，
+于是未知被记成 failed）：
+  - 对账命中 → OrderResponse（已受理）
+  - 交易所明确回答 -2013 → 返回 None，调用方按原错误抛（确定失败）
+  - **对不上账**（无幂等键 / 反查不可达 / 两处证据矛盾）→ 抛 ``OrderPlacementUnknown``，
+    调用方必须落 ``status="unknown"``（非终态），绝不能当成 failed。
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from apps.trading.adapters.binance import BinanceAdapter
-from apps.trading.adapters.base import OrderRequest
+from apps.trading.adapters.base import OrderPlacementUnknown, OrderRequest
 from apps.trading.tests.test_binance_adapter_selfheal import (
     POSITION_PAYLOAD,
     _FakeClient,
@@ -98,17 +105,44 @@ class TestOrderRetrySafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(gets), 1, "必须按 clientOrderId 查一次")
         self.assertIn("origClientOrderId=cid-abc", gets[0][1])
 
-    async def test_read_timeout_without_client_order_id_raises(self):
-        """没有幂等键就无法对账 → 直接抛（绝不盲重发）。"""
+    async def test_read_timeout_without_client_order_id_raises_unknown(self):
+        """没有幂等键就无法对账 → 抛「结果未知」（绝不盲重发，也绝不记成确定失败）。"""
         a, client = _adapter_with([httpx.ReadTimeout("")])
 
         with patch.object(BinanceAdapter, "connect", AsyncMock()) as recon:
-            with self.assertRaises(httpx.ReadTimeout):
+            with self.assertRaises(OrderPlacementUnknown):
                 await a.place_order(_req(None))
 
         self.assertEqual(recon.await_count, 0)
         self.assertEqual(len([r for r in client.requests if r[0] == "POST"]), 1)
         self.assertEqual([r for r in client.requests if r[0] == "GET"], [], "无幂等键时不做对账")
+
+    async def test_reconcile_unreachable_raises_unknown(self):
+        """对账查询本身失败（网络不可达）→ **未知**，不是失败：那张单可能活着。"""
+        a, client = _adapter_with(
+            [httpx.ReadTimeout(""), httpx.ConnectError("lookup down")]
+        )
+
+        with self.assertRaises(OrderPlacementUnknown) as ctx:
+            await a.place_order(_req("cid-abc"))
+
+        self.assertIn("cid-abc", str(ctx.exception), "未知单必须带上幂等键，否则无法人工核对")
+        self.assertEqual(len([r for r in client.requests if r[0] == "POST"]), 1, "绝不重发")
+        self.assertEqual(len([r for r in client.requests if r[0] == "GET"]), 1, "必须对账一次")
+
+    async def test_duplicate_reject_with_missing_lookup_raises_unknown(self):
+        """交易所说单号重复、反查却说没有 → 两处证据矛盾，如实记未知，不挑一边信。"""
+        a, client = _adapter_with(
+            [
+                _Resp(400, {"code": -4116, "msg": "clientOrderId is duplicated"}, text=DUP_BODY),
+                _Resp(400, {"code": -2013, "msg": "Order does not exist."}, text=NOT_FOUND_BODY),
+            ]
+        )
+
+        with self.assertRaises(OrderPlacementUnknown):
+            await a.place_order(_req("cid-abc"))
+
+        self.assertEqual(len([r for r in client.requests if r[0] == "POST"]), 1, "绝不重发")
 
     async def test_read_timeout_reconcile_not_found_raises(self):
         """对账查不到（-2013）→ 说明没被受理，抛出原始错误。"""
@@ -173,7 +207,11 @@ class TestAmbiguousAnyioErrors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(gets), 1, f"必须对账一次：{client.requests}")
 
     async def test_broken_resource_error_on_order_without_match_raises(self):
-        """对账查不到（订单不存在）→ 仍按失败抛出，不臆造成功。"""
+        """交易所明确回答 -2013（订单不存在）→ **确定没受理**，按原错误抛出，不臆造成功。
+
+        与 `test_reconcile_unreachable_raises_unknown` 成对：同样是"查不到"，
+        交易所说"没有"是事实（→ failed），问不到交易所只是"不知道"（→ unknown）。
+        """
         from anyio import BrokenResourceError
 
         a, client = _adapter_with(

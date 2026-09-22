@@ -11,6 +11,13 @@ class Order(models.Model):
         ("filled", "Filled"),
         ("cancelled", "Cancelled"),
         ("failed", "Failed"),
+        # 「未知」= 按 clientOrderId 反查**没有得出结论**（不可达 / 意外响应）。
+        # 它是一个**非终态**，语义是「这张单可能仍在交易所活着」：
+        #   * 所以它必须出现在每一处「活跃订单」枚举里（漏掉一处等于把它当成
+        #     不存在，而它恰恰是唯一可能变成真实敞口的那一档）；
+        #   * 所以它不能自动降级成 failed——若单子其实在交易所，本地记 failed 会
+        #     让账面与实际分叉，而分叉的账面比空白更危险。
+        ("unknown", "未知"),
     ]
     SIDE_CHOICES = [("buy", "Buy"), ("sell", "Sell")]
     TYPE_CHOICES = [("market", "Market"), ("limit", "Limit"), ("stop", "Stop")]
@@ -156,6 +163,26 @@ class LiveSession(models.Model):
             models.Index(fields=["user", "mode"]),
             models.Index(fields=["backtest_result"]),
         ]
+
+    def mode_account_mismatch(self) -> str | None:
+        """mode 与绑定账户的 testnet 属性是否自洽；自洽返回 None，否则返回原因。
+
+        不变式：`paper ⇒ testnet=True`、`live ⇒ testnet=False`。字段名承诺隔离而
+        实现不隔离，是这份代码里代价最高的一类错误（用户以为在演练、实际在动钱）。
+        本方法只把**静默错配变成启动失败**，不新增任何能力。
+        """
+        if self.mode not in ("paper", "live"):
+            return f"未知的会话模式 {self.mode!r}（只接受 paper / live）"
+        account = self.exchange_account
+        if account is None:
+            return "会话未绑定交易所账户"
+        expected_testnet = self.mode == "paper"
+        if account.testnet != expected_testnet:
+            return (
+                f"mode={self.mode} 要求账户 testnet={expected_testnet}，"
+                f"但绑定的账户「{account.label}」testnet={account.testnet}"
+            )
+        return None
 
     def __str__(self):
         return f"LiveSession({self.mode}/{self.status}) - {self.strategy.name} {self.symbol}"

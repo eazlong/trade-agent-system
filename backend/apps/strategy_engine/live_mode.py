@@ -278,9 +278,14 @@ class LiveStrategyRunner:
                 )
                 return False
 
-            adapter = executor._adapters.get("binance")
+            # 按**本会话的账户 id** 取适配器，不按交易所名：同交易所有两个账户时
+            # `_adapters["binance"]` 只是「最后加载的」那一个，会把**别的账户**的
+            # 持仓当成本会话的持仓同步进 ctx——决策据此下单就是真实的资金错误。
+            adapter = executor._resolve_adapter("binance", self.exchange_account_id)
             if not adapter:
-                await self._on_position_sync_failed("binance 适配器未加载")
+                await self._on_position_sync_failed(
+                    f"账户 {self.exchange_account_id} 的 binance 适配器未加载"
+                )
                 return False
 
             positions = await adapter.get_positions()

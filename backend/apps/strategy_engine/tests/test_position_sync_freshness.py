@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 from django.test import TestCase
 
 from apps.strategy_engine.live_mode import LiveStrategyRunner
+from apps.trading.executor import OrderExecutor
 
 KLINE = {
     "open": "0.0900",
@@ -141,8 +142,18 @@ class _FakeAdapter:
 
 
 class _FakeExecutor:
+    """替身只提供 `_resolve_adapter` 需要的两张地图，解析逻辑复用真实实现。
+
+    适配器按**账户 id** 取（同交易所两个账户时按交易所名会拿到别人的适配器），
+    所以这里必须把适配器挂在会话用的那个账户上，而不是只挂一个 "binance"。
+    """
+
+    # 复用真实解析逻辑：替身自己实现一份迟早会和被替身的东西漂开
+    _resolve_adapter = OrderExecutor._resolve_adapter
+
     def __init__(self, adapter):
         self._adapters = {"binance": adapter}
+        self._account_adapters = {"acct-1": adapter}
 
 
 def _make_runner(position: str, adapter: _FakeAdapter):

@@ -20,6 +20,7 @@ import apps.agent.tasks  # noqa: F401
 import apps.backtest.tasks  # noqa: F401
 import apps.signal_monitor.tasks  # noqa: F401
 import apps.channel.tasks  # noqa: F401
+import apps.trading.tasks  # noqa: F401
 
 # Grid search independent queue
 app.conf.task_routes = {
@@ -69,6 +70,19 @@ app.conf.beat_schedule = {
     'clean-expired-monitors': {
         'task': 'apps.signal_monitor.tasks.clean_expired_monitors',
         'schedule': crontab(minute=15),
+    },
+    # 悬挂订单兜底扫描（本地已落单但交易所 ID 为空的行 → 反查交易所）
+    # 交易框架活跃时本任务自行跳过，由进程内成交同步（10s 一轮）负责
+    'check-order-status': {
+        'task': 'apps.trading.tasks.check_order_status',
+        'schedule': 60.0,
+    },
+    # 当日净值快照（日内回撤检查的期初净值只有这一个来源：daily_snapshots 表
+    # 在此之前没有任何写入方，检查于是必然走「无法获取期初资金数据」拒绝下单且不告警）
+    # 5 分钟一轮 + 幂等（当日只写第一条）→ 不需要「必须在日界准确跑」
+    'snapshot-daily-equity': {
+        'task': 'apps.trading.tasks.snapshot_daily_equity',
+        'schedule': 300.0,
     },
 }
 
