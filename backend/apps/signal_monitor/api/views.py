@@ -195,6 +195,25 @@ class BacktestImportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 这是三个 action_type 入口中最宽的一条：本接口按请求体自由 JSON 取值，
+        # 完全不经过 ChoiceField（创建/更新序列化器已收窄到 notify）。漏掉这里
+        # 等于留着一条缝，且它还接受任意字符串（落进 engine 后是一个静默空动作）。
+        # fail-loud：不静默降级成 notify——那会让「我要下单」的调用方拿到一条只是
+        # 通知的 monitor 而毫无察觉。
+        invalid = [
+            {"index": i, "action_type": s.get("action_type")}
+            for i, s in enumerate(signals)
+            if s.get("action_type", "notify") != "notify"
+        ]
+        if invalid:
+            return Response(
+                {
+                    "success": False,
+                    "error": f"signals[].action_type 仅支持 'notify'，收到：{invalid}",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         created_monitors = []
         for signal in signals:
             monitor = SignalMonitor(

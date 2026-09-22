@@ -17,10 +17,13 @@ class SignalMonitorCreateSerializer(serializers.Serializer):
     trigger_type = serializers.ChoiceField(
         choices=["once", "continuous"], default="once"
     )
-    action_type = serializers.ChoiceField(
-        choices=["notify", "trade", "notify_and_trade"],
-        default="notify",
-    )
+    # 收窄到 notify（2026-09-21 认定）：`trade` / `notify_and_trade` 是一条**断路径**
+    # ——它只做一次 `Order.objects.create()`，而全仓没有任何消费者读这些行，订单
+    # 永久停在 `status="pending"`、`exchange_order_id=""`，没有卡单告警也没有清理
+    # 任务；`validate_strategy` 由 live_mode 内部写入（见 apps/strategy_engine/
+    # live_mode.py），同样不由用户创建。处置方式是**使路径不可达**，不是在这条已
+    # 被判定为断路径的代码上补拦截点（详见 CONTEXT.md「断路径的处置是收窄入口」）。
+    action_type = serializers.ChoiceField(choices=["notify"], default="notify")
     action_params = serializers.JSONField(default=dict)
     backtest_result_id = serializers.UUIDField(required=False, allow_null=True)
     expires_at = serializers.DateTimeField(required=False, allow_null=True)
@@ -34,10 +37,9 @@ class SignalMonitorUpdateSerializer(serializers.Serializer):
     trigger_type = serializers.ChoiceField(
         choices=["once", "continuous"], required=False
     )
-    action_type = serializers.ChoiceField(
-        choices=["notify", "trade", "notify_and_trade"],
-        required=False,
-    )
+    # 同创建序列化器收窄到 notify：不堵这里，`patch` 会把一条既有的 notify 型
+    # monitor 改成 trade，等于从更新口重新开出一条断路径。
+    action_type = serializers.ChoiceField(choices=["notify"], required=False)
     action_params = serializers.JSONField(required=False)
     status = serializers.ChoiceField(
         choices=["active", "disabled"],
