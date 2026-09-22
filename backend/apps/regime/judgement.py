@@ -77,6 +77,24 @@ CONTEXT.md 写的是「调度用 beat 的 crontab，且业务时区在 crontab �
 一个断言钉住，而不是等单元 5 接资讯时再靠自觉。资讯抬升**不受最小持续期约束**（它按日
 生效），但同样次日 08:00 才生效——即它只改 `effective_regime`，不参与 `base_regime`
 的切换判定。
+
+## 资讯轴从哪里接进来（单元 5iv）
+
+资讯通道（`news_verdict.run_news_judgement`）在**量化判定之后、`_record_once` 之前**跑：
+
+- 在量化之后，是因为判不出量化的日子（预热未满、日线还没到签署日）连记录都不会有，
+  此时跑一轮资讯采集等于白花一次 LLM 调用；
+- 在落库之前，是因为记录是事件、不更新，反了就是静默丢掉抬升标志。
+
+**一天只跑一次**由「当天记录是否已存在」这道闸决定，不另设运行时刻配置——判定本身搭在
+5 分钟心跳上，没有这道闸就是每 5 分钟一次真实调用。已有记录时整条通道跳过，返回值改成
+**读库**（`_describe`），而不是拿本次重算的中间量汇报：通道没跑，重算出来的 `escalation`
+恒为空，照它汇报就等于谎报「今天没有抬升」，而那正是日报第①段要读的字段。
+
+通道失败（`status="failed"`）不抛：退回纯量化，`escalation` 为空，`news_ref` 里写明是
+哪一段掉的。**不沿用昨日的资讯结论**——资讯抬升是唯一不受最小持续期约束的路径，拿
+「保持上一有效状态」去兜它，会让「连着三天判不出来」看起来像「连着三天判过、结论是
+不抬」。
 """
 
 from __future__ import annotations
@@ -95,6 +113,7 @@ from apps.regime.models import (
     RegimeJudgement,
     business_midnight,
 )
+from apps.regime.news_verdict import run_news_judgement
 from apps.regime.quant import PRIORITY, BaseRegime, latest_label
 
 logger = logging.getLogger(__name__)
@@ -295,16 +314,18 @@ def build_evidence(label, decision: dict) -> dict:
 def run_daily_judgement(
     symbol: str = SYMBOL,
     now: datetime | None = None,
-    escalation: str = "",
+    escalation: str | None = None,
     news_ref: dict | None = None,
 ) -> dict:
     """跑一次当日判定并按需落库。返回值进日志与任务健康检查，不静默。
 
-    `escalation` / `news_ref` 是单元 5 的接入点，v1 恒为空。
+    `escalation=None` 是**生产路径**：自己去跑一轮资讯通道（`run_news_judgement`），用
+    它给出的抬升标志与引用快照。给了值（`""` 或 `Escalation.NEWS.value`）就是**覆盖**，
+    通道不跑——这是测试与数据订正用的口子，不是第二条生产路径。
 
     **同一个运行日只会写一条记录**：`(symbol, effective_at)` 上有唯一约束，写入走
     `get_or_create`。心跳每 5 分钟一次，一天里绝大多数 tick 都会走到这里，因此这条路
-    必须便宜且无副作用——判不出来时它只读不写。
+    必须便宜且无副作用——判不出来时它只读不写，已判过时连资讯通道都不跑。
     """
     now = now or timezone.now()
     run_day = to_business(now).date()
@@ -351,6 +372,18 @@ def run_daily_judgement(
         }
 
     effective_at = business_midnight(run_day + timedelta(days=1))
+    existing = _find_record(symbol, effective_at)
+    if existing is not None:
+        # 今天已经判过了——心跳一天里绝大多数 tick 走这条路。**资讯通道不能重跑**：
+        # 记录是事件、不更新，重跑只是把同一批条目再投一次 LLM，而那些结论永远没有
+        # 落库的机会。
+        return _describe(existing, run_day)
+
+    if escalation is None:
+        outcome = run_news_judgement(symbol, now)
+        escalation = outcome.escalation
+        news_ref = outcome.ref
+
     current = current_judgement(symbol, now=now)
     base, reason, numbers = apply_min_dwell(
         label.regime,
@@ -393,6 +426,36 @@ def run_daily_judgement(
     if created:
         logger.info("[regime] 判定落库 %s", result)
     return result
+
+
+def _find_record(symbol: str, effective_at: datetime) -> RegimeJudgement | None:
+    """今天这条记录是否已经写过了。查询键与 `_record_once` 的唯一约束是同一对。"""
+    return _records(symbol).filter(effective_at=effective_at).first()
+
+
+def _describe(record: RegimeJudgement, run_day: date) -> dict:
+    """把一条**已有**记录读成 `run_daily_judgement` 的返回值。
+
+    读库而不是拿本次重算的中间量汇报：走到这条路时资讯通道根本没跑，重算出来的
+    `escalation` 恒为空，照它汇报就等于谎报「今天没有抬升」——而那正是日报第①段
+    要读的字段。`decision` 与 `reason` 同理，从 `evidence` 里读回落库时的原话。
+
+    `recorded` 恒为 `False`：本次没有新建记录。调用方据此区分「今天刚出结论」与
+    「今天早就有结论，这只是心跳又跑了一遍」。
+    """
+    decision = (record.evidence or {}).get("decision") or {}
+    return {
+        "symbol": record.symbol,
+        "run_day": run_day.isoformat(),
+        "attribute_date": record.attribute_date.isoformat(),
+        "effective_at": record.effective_at.isoformat(),
+        "base_regime": record.base_regime,
+        "escalation": record.escalation,
+        "effective_regime": record.effective_regime,
+        "decision": decision.get("action", ""),
+        "reason": decision.get("reason", ""),
+        "recorded": False,
+    }
 
 
 def _record_once(**fields) -> tuple[RegimeJudgement, bool]:

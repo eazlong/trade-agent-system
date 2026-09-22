@@ -13,6 +13,12 @@
 DB 用的都是 `TestCase`（真事务回滚），K 线用合成序列而不是固定 fixture：判定参数
 （ATR 14 / EMA 20·60 / 分位窗口 250）决定了「能被判定」需要 250 天以上的序列，
 写死 340 行 fixture 不如生成出来，改参数时也只改一处。
+
+资讯通道（单元 5iv）在这组测试里一律是替身：它是**网络 + LLM** 的一轮，而这一组用例
+关心的是量化那根轴与落库口径。替身默认给出「跑了，结论是不抬升」，让这些用例的形状与
+单元 4 时完全一样；要抬升或要它缺席的用例自己配置。接线本身（什么时候跑、一天跑几次、
+通道失败怎么办）由本文件末尾那组用例钉住，通道内部的判定与快照在
+`test_news_verdict.py`。
 """
 
 from __future__ import annotations
@@ -20,11 +26,13 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
+import pytest
 from django.db import IntegrityError
 from django.test import TestCase
 
 from apps.common.time_utils import business_tz, to_business
 from apps.regime import config
+from apps.regime import judgement
 from apps.regime.judgement import (
     _REASON_MIN_DWELL,
     apply_escalation,
@@ -41,6 +49,7 @@ from apps.regime.models import (
     RegimeJudgement,
     business_midnight,
 )
+from apps.regime.news_verdict import NewsOutcome
 from apps.regime.quant import PRIORITY, BaseRegime
 
 SYMBOL = config.CANDLES.symbol
@@ -55,6 +64,51 @@ NOW = datetime(2026, 9, 22, 3, 0, tzinfo=timezone.utc)
 
 #: 此刻应已收盘的那根日线（运行日 D → 签署日 D−1）。
 SIGNED_DAY = RUN_DAY - timedelta(days=1)
+
+
+class NewsChannelStub:
+    """`run_news_judgement` 的替身：默认「通道跑了，结论是不抬升」。
+
+    为什么必须是替身而不能让它真跑：`escalation=None` 是生产路径，真跑一轮要抓七个
+    真实源、再打一次真实 LLM。那既让这一组用例依赖网络，又会因为「今天网上有什么」
+    而随机变红——而这一组用例要钉的是量化那根轴。
+
+    不能退回到「默认传 `escalation=""`」：那会把生产路径整个跳过去，于是**没有任何
+    用例**走过「通道被调用、它的抬升真的落进了记录」这条线。
+    """
+
+    def __init__(self) -> None:
+        self.escalation = ""
+        self.ref: dict | None = None
+        self.calls: list[tuple[str, datetime | None]] = []
+
+    def __call__(self, symbol: str, now: datetime | None = None) -> NewsOutcome:
+        self.calls.append((symbol, now))
+        return NewsOutcome(escalation=self.escalation, ref=self.ref)
+
+    def resolves_to(self, escalation: str, ref: dict | None = None) -> None:
+        """让这一轮的资讯结论变成抬升（或不抬升）。"""
+        self.escalation = escalation
+        self.ref = ref
+
+
+#: 本模块共用的那一个替身。用例通过它配置结论、检查调用次数。
+NEWS = NewsChannelStub()
+
+
+@pytest.fixture(autouse=True)
+def _stub_news_channel(monkeypatch):
+    """把资讯通道换成替身，并在每个用例前复位。
+
+    用例体里不能直接 `patch(...)` 包住 `run_daily_judgement`——它们是
+    `unittest.TestCase` 的方法，收不到 fixture 参数，写起来会到处是缩进层级；
+    autouse fixture 对 `unittest.TestCase` 同样生效（探针验证过）。
+    """
+    monkeypatch.setattr(judgement, "run_news_judgement", NEWS)
+    NEWS.escalation = ""
+    NEWS.ref = None
+    NEWS.calls.clear()
+    yield NEWS
 
 
 def series(
@@ -537,6 +591,7 @@ class TestRunDailyJudgementSkipsWhatItCannotJudge(TestCase):
         self.assertEqual(result["skipped"], "undecidable")
         self.assertEqual(result["attribute_date"], SIGNED_DAY.isoformat())
         self.assertEqual(RegimeJudgement.objects.count(), 0)
+        self.assertEqual(NEWS.calls, [], "判不出量化的日子连资讯都不用抓——反正没有记录可写")
 
     def test_a_skip_does_not_disturb_the_record_in_force(self):
         """判不出来时保持上一有效状态——由查询语义天然承担，不需要写一条「沿用」记录。"""
@@ -599,19 +654,30 @@ class TestRunDailyJudgementRecordsOneConclusionPerDay(TestCase):
     def test_an_existing_record_is_never_rewritten(self):
         """记录是事件，不是缓存：同一天已有结论时不更新它。
 
-        这条同时也是资讯通道（单元 5）的**排序约束**：资讯必须在判定之前跑完，
-        否则当天的记录已经落下，抬升标志就丢了——丢了的表现是「今天资讯判断过应当
-        保守，而系统照常开新仓」。真需要纠正只能走数据订正。
+        这条同时也是资讯通道的**排序约束**：资讯必须在判定落库之前跑完，否则当天的
+        记录已经落下，抬升标志就丢了——丢了的表现是「今天资讯判断过应当保守，而系统
+        照常开新仓」，且当天没有任何东西报错。真需要纠正只能走数据订正。
         """
         run_daily_judgement(now=NOW)
-        again = run_daily_judgement(
-            now=NOW + timedelta(minutes=5), escalation=Escalation.NEWS.value
+        self.assertEqual(
+            NEWS.calls,
+            [(SYMBOL, NOW)],
+            "第一次心跳必须真跑一轮通道——记录里的抬升标志只能来自它",
         )
+
+        # 通道这一轮之后给出的抬升，第二次心跳不许再采信：它连跑都不跑。
+        NEWS.resolves_to(Escalation.NEWS.value, {"status": "ok"})
+        again = run_daily_judgement(now=NOW + timedelta(minutes=5))
 
         self.assertFalse(again["recorded"])
         record = RegimeJudgement.objects.get()
         self.assertEqual(record.escalation, "")
         self.assertEqual(record.effective_regime, BaseRegime.UPTREND.value)
+        self.assertEqual(
+            NEWS.calls,
+            [(SYMBOL, NOW)],
+            "已有当天记录时连通道都不跑：记录不更新，重跑只是白花一次 LLM",
+        )
 
     def test_the_decision_carries_the_current_stage_when_the_dwell_is_not_elapsed(self):
         """端到端走一遍被持续期拦下的路径：结论落在库里，内容是「维持不变」。"""
@@ -651,16 +717,95 @@ class TestRunDailyJudgementRecordsOneConclusionPerDay(TestCase):
         self.assertEqual(result["base_regime"], BaseRegime.DOWNTREND.value)
 
     def test_an_escalation_is_applied_on_top_of_the_quant_axis(self):
-        result = run_daily_judgement(now=NOW, escalation=Escalation.NEWS.value)
+        """生产路径：通道自己跑出来的抬升，与基础阶段合成后一起落库。"""
+        ref = {"status": "ok", "verdict": {"escalate": True, "cited": [1]}}
+        NEWS.resolves_to(Escalation.NEWS.value, ref)
+
+        result = run_daily_judgement(now=NOW)
+
         record = RegimeJudgement.objects.get()
         self.assertEqual(result["base_regime"], BaseRegime.UPTREND.value)
+        self.assertEqual(result["escalation"], Escalation.NEWS.value)
         self.assertEqual(record.escalation, Escalation.NEWS.value)
         self.assertEqual(record.effective_regime, BaseRegime.HIGH_VOL.value)
+        self.assertEqual(record.news_ref, ref, "引用快照原样落库")
+        self.assertEqual(NEWS.calls, [(SYMBOL, NOW)], "生产路径由判定自己驱动通道")
 
-    def test_the_news_reference_is_persisted_verbatim(self):
+    def test_an_explicit_escalation_is_an_override_not_a_second_production_path(self):
+        """给了值就是覆盖（测试与数据订正的口子），此时通道不跑。"""
         news = {"entries": [{"title": "t", "url": "u"}], "conclusion": "high_vol"}
         run_daily_judgement(now=NOW, escalation=Escalation.NEWS.value, news_ref=news)
         self.assertEqual(RegimeJudgement.objects.get().news_ref, news)
+        self.assertEqual(NEWS.calls, [])
+
+    def test_the_channel_running_without_an_escalation_still_records_its_reference(self):
+        """通道跑了、结论是不抬升：抬升标志为空，但那一轮的结论快照要留下。
+
+        `news_ref` 是日报第①段唯一的资讯依据（「今日资讯判定缺失」这句话就是靠它
+        `status` 判出来的），所以它在不抬升的日子里也必须落库。
+        """
+        ref = {"status": "ok", "verdict": {"escalate": False, "cited": []}}
+        NEWS.resolves_to("", ref)
+
+        result = run_daily_judgement(now=NOW)
+
+        self.assertEqual(result["escalation"], "")
+        self.assertEqual(RegimeJudgement.objects.get().news_ref, ref)
+
+
+class TestTheSecondTickReportsWhatWasStored(TestCase):
+    """同一天的第二次心跳读库汇报（`_describe`），不拿这次的中间量重算。
+
+    重算出来的 `escalation` 恒为空——通道根本没跑。照它汇报就是谎报「今天没有抬升」，
+    而「今天抬没抬」正是日报第①段要读的字段。这类错误不会让任何东西报错：日报会
+    平静地说今天资讯无异常。
+    """
+
+    def setUp(self):
+        persist(series(), last_day=SIGNED_DAY)
+
+    def test_it_repeats_the_stored_conclusion_field_by_field(self):
+        NEWS.resolves_to(Escalation.NEWS.value, {"status": "ok", "verdict": {"escalate": True}})
+        first = run_daily_judgement(now=NOW)
+
+        NEWS.escalation = ""  # 通道不会再跑；若照它汇报，「抬升」就凭空消失了
+        NEWS.ref = None
+        again = run_daily_judgement(now=NOW + timedelta(minutes=5))
+
+        self.assertTrue(first["recorded"], "第一次心跳写下记录，第二次才有「已存在」可读")
+        self.assertFalse(again["recorded"])
+
+        first_at = datetime.fromisoformat(first.pop("effective_at"))
+        again_at = datetime.fromisoformat(again.pop("effective_at"))
+        first.pop("recorded")
+        again.pop("recorded")
+
+        # 生效时刻比**时刻**，不比字符串：第一次报的是刚算出来的业务时刻（+08:00），
+        # 第二次是从库里读回来的（Django 读回来统一是 UTC）。两种写法指的是同一刻，
+        # 按字符串比会把一个不存在的差异当成 bug。
+        self.assertEqual(
+            again_at,
+            first_at,
+            "生效时刻是同一天界：+08:00 与 UTC 只是同一刻的两种写法",
+        )
+        self.assertEqual(
+            again,
+            first,
+            "除了「本次没有新建记录」，第二次心跳说的必须与第一次一模一样",
+        )
+
+    def test_a_carried_decision_is_still_reported_as_carried(self):
+        """被持续期拦下的那天，第二次心跳不能改口说「采纳」。"""
+        make_judgement(RUN_DAY, BaseRegime.UPTREND)
+        persist(series(end_from=320, end_step=-1.5), last_day=SIGNED_DAY)
+
+        first = run_daily_judgement(now=NOW)
+        again = run_daily_judgement(now=NOW + timedelta(minutes=5))
+
+        self.assertEqual(first["decision"], "carried")
+        self.assertEqual(again["decision"], "carried")
+        self.assertEqual(again["reason"], _REASON_MIN_DWELL)
+        self.assertEqual(again["base_regime"], BaseRegime.UPTREND.value)
 
 
 class TestLoadCandlesReadsEverythingInOrder(TestCase):
