@@ -1,0 +1,461 @@
+"""窗口同步：把「事件表 + 判定表」上该拦的事搬运成 ``HaltDeclaration`` 行（第②段单元 ②c）。
+
+这是 ADR 0001 里那条分界线的**写方**：`halt.py` 的判定函数只读 ``HaltDeclaration`` 与
+``RegimeMechanismSwitch`` 两张状态表、绝不 import ``MajorEvent``（CONTEXT.md:134「判定函数
+只读状态，不读事件表」），于是「事件表 → 状态行」的搬运必须有人做。做的就是这个模块：
+每次**整表重算**一遍，把事件表与判定表上的事实投影成一组声明行。
+
+## 一行 = 一个源在一个作用域上的当前（或下一个）态度
+
+`uniq_live_halt_declaration` 是（触发源 × 作用域）上的**活行唯一键**，而它只看
+`closed_at IS NULL`——它不知道 `expires_at`。所以同一个源在同一个作用域上，**同一时刻只能
+有一行活着**，哪怕两件事的窗口根本不重叠。这不是可以绕开的实现细节：两行并存的话，第二行
+写入当场撞唯一键；而「一次触发一行」的写法又要求「解除」一次终结多行，那与
+``HaltDeclaration`` docstring 定的「解除只终结自己那一行」直接冲突。
+
+于是这一行记的是**这个源在这个作用域上此刻的态度**（正在拦 → 窗口是当前这一段；现在没拦
+→ 窗口是**下一段**）。窗口在两段之间推进时是**原地改写**，不关一行再开一行：关开一次会在
+这张表里留下「声明—解除」的假历史，而这张表是排查停用原因的依据。
+
+**由此得到的一条硬性质：窗口永远不早于事实。** `opened_at` 取的是事实里**已经存好的那个
+时刻**（事件的 `halt_at`、判定的 `effective_at`），不是任务跑起来的 `timezone.now()`。
+好处有两层：一是逐次重算出来的期望值**逐字相同**，于是绝大多数轮次是零写入的空转（幂等的
+对账，不是一次性投递）；二是任务延迟不会把「什么时候开始拦的」写歪——那会让日报与事件表
+对同一件事给出两个时刻。唯一例外见下面的「提前写入的边界」。
+
+## 为什么「下一段」要提前写进表里
+
+任务是 300 秒一轮（`celery_app.beat_schedule`），**任何一轮都可能没跑**。若只写「此刻正在
+拦」的那一段，两段之间哪怕只差一轮，第二段的开头就会有一段时间谁都拦不住——而事件熔断
+**不可人工豁免**，那段敞口没有任何补救手段。提前写入换来的性质是：只要上一轮跑过，下一个
+窗口开启的那一刻它已经在表里了，判定函数直接命中，不依赖那一轮任务是否准时。
+
+**提前写入的边界（接受的代价）**：一行还没生效时，它的窗口可以被**无痕改写**（事件改期就
+会改），因为这张表刻意没有「底层事件是谁」这一列，改写的痕迹只能留在事件表那边（事件改期
+本身有流水）。这是上面那条唯一键换来的，写在 `HaltDeclaration` 的 docstring 里。
+
+## 两段之间的小空隙：敞口上限是一轮任务
+
+事实上的窗口是**半开区间** `[halt_at, resume_at)`。相邻或相接的窗口会被**合并成一段**（相接
+也算：`[10:00,12:00)` 与 `[12:00,14:00)` 之间没有一刻是不拦的）。所以真正会漏的只有「空隙
+窄于一轮任务间隔」的那种：段 A 结束后、段 B 开始前只隔了几十秒，任务在空隙里没跑，段 B 的
+开头就会空一小段。代价有界（≤ 一轮任务间隔），且只在两件高影响事件挨得极近时出现。**不
+把这种空隙也合成一段**（把 gap 抹掉的写法会真的多拦一段时间）——多拦是「用户眼里机制莫名
+在拦」，比一小段敞口更难排查，而事件熔断又没有豁免通道。
+
+## 合并、作用域、解除
+
+- **重叠/相接的事件合成一行**：`label` 是各事件名按开窗时刻连起来（`、`），`reason` 把每个
+  事件的事件时刻与熔断窗口都写出来。合并在写入方做，因为只有写入方知道此刻一共有哪些事件
+  在窗口里（`HaltDeclaration` docstring 明写这一点）。
+- **`market` 作用域 = 一行 `global`；`symbols` 作用域 = 每个品种各一行** `symbol:<品种>`。
+  不把多个品种塞进一行：`scope` 存的是一个记号，而 `halt._matches` 是**按品种逐个比**的，
+  塞进去的行会谁都匹配不上——表现为「声明写了却拦不住」。
+- **`symbols` 为空 = 不写任何行**，而不是退回全市场。``EventScope`` 没有「默认全市场」这条
+  退路（`applies_to` 对空列表恒为假），这里跟着它走：一条没有作用域的事件不该拦住全场。
+- **没什么可写时解除**：写 `closed_at` + 一个原因码，不删行。原因码区分「窗口结束 / 事件已
+  取消 / 改期改档后不再覆盖此刻 / 阶段离开高波动」，口径与 `deactivation_run` 的
+  `CLOSE_REASON_*` 一致（短码 + `*_DISPLAY` 词表）。
+- **写与开关无关**：声明说的是「这个源想拦」，开关说的是「这个源启用了没有」。就算
+  `EVENT_BREAKER` 还停在 Shadow，事件窗口照样要进表——两者分开的理由写在 `HaltDeclaration`
+  的 docstring 里；而反过来的表现（Shadow 期不写行、出 Shadow 时表是空的）会让「出了
+  Shadow」那一刻**什么都不拦**，一直到下一个窗口才有行，等于把出 Shadow 的时点变成敞口。
+
+## 只认自己管的触发源
+
+本模块只对 `HaltTrigger.EVENT` 与 `HaltTrigger.BLANKET` 做对账。`DEACTIVATION` 的行归第③段
+（`HaltTrigger` 的映射表里写着它由 `REGIME_GATE` 管辖），本模块**算不出**它的期望值——把它
+当成「计划里没有」就会在每天第一轮把别人的声明解除掉。所以遇到不认识的触发源直接跳过，见
+`_OWNED_TRIGGERS`。
+
+**第③段接策略停用决策时，要么把那一档也接进 `_plan`，要么把它从这个跳过名单的语义里显式
+分开**——两条路都行，但必须选一条。
+
+## 一个可见性缺口（第②段有意留着）
+
+任务失败**不自己发告警**（CONTEXT.md:66 的「告警」= 给具体某个人的即时消息，日志不算被
+看见；CONTEXT.md:180「不让每个新任务自己写告警」）。它只往上抛，失败可见性走已有的两条路：
+任务健康检查（跑了没）+ 日报第④段机制健康（结论新不新）。而「声明写入失败」该发的那条
+**即时**消息归单元 ②e，见 `tasks.py` 的模块 docstring。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+
+from django.utils import timezone
+
+from apps.regime import deactivation_run, events, halt
+from apps.regime.models import (
+    ActorKind,
+    EventImpact,
+    EventScope,
+    EventStatus,
+    HaltDeclaration,
+    HaltTrigger,
+    MajorEvent,
+)
+from apps.regime.slice import REASON_DISPLAY, REASON_HIGH_VOL_BLANKET
+
+logger = logging.getLogger(__name__)
+
+# 本任务的署名。写入方的身份是这张表的一半价值（「谁投的」）——排查时「谁」答不出来，
+# 声明表就只剩一个看不出真假的布尔。
+ACTOR_KIND = ActorKind.TASK
+ACTOR_NAME = "regime.sync_halt_windows"
+
+# 保命档那一行的触发源名称。**不用「保命档」**：触发源显示名已经是「保命档（高波动）」，
+# 名称再用同一个词会读成「保命档（保命档（高波动）…）」。
+BLANKET_LABEL = "高波动"
+
+# 解除原因码。短码 + 词表，与 `deactivation_run.CLOSE_REASON_*` 同一口径（那里同样是
+# 「短码进库、人话在 `*_DISPLAY`」）。`regime_left` 与那边的常量同值但**各定义各的**：
+# 两张表解除的是两种不同的东西（人工豁免 / 停止声明），共用一个常量会让「改一处影响另一处」
+# 变成看不见的耦。
+CLOSE_REASON_WINDOW_ENDED = "window_ended"
+CLOSE_REASON_EVENT_CANCELLED = "event_cancelled"
+CLOSE_REASON_NO_LONGER_COVERS = "no_longer_covers_now"
+CLOSE_REASON_REGIME_LEFT = "regime_left"
+
+CLOSE_REASON_DISPLAY = {
+    CLOSE_REASON_WINDOW_ENDED: "熔断窗口已结束",
+    CLOSE_REASON_EVENT_CANCELLED: "事件已取消",
+    CLOSE_REASON_NO_LONGER_COVERS: "改期或改档后不再覆盖此刻",
+    CLOSE_REASON_REGIME_LEFT: "阶段已离开高波动",
+}
+
+
+def close_reason_display(reason: str) -> str:
+    """原因码 → 人话。认不出来**原样返回**，不吞成一个「未知」：认不出来只可能是这份词表
+    落后于写入方，那时看得见那个码比看见「未知」有用得多（同 `deactivation_run` 的写法）。
+    """
+    return CLOSE_REASON_DISPLAY.get(reason, reason)
+
+
+# 本模块负责对账的触发源。**不是「所有触发源」**：策略停用决策（第③段）的期望值本模块算
+# 不出来，跳过它，见模块 docstring。
+_OWNED_TRIGGERS = (HaltTrigger.EVENT, HaltTrigger.BLANKET)
+
+
+# --------------------------------------------------------------------------- #
+# 规划：事实 → 期望的那组行（纯函数，不吃 DB、不读时钟）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class PlannedRow:
+    """期望表里应该活着的一行。字段与 `HaltDeclaration` 一一对应（少了 `closed_*`：计划里
+    的行按定义都是活的）。"""
+
+    trigger: HaltTrigger
+    scope: str
+    label: str
+    reason: str
+    opened_at: datetime
+    expires_at: datetime | None
+
+
+def plan_rows(*, now: datetime | None = None) -> list[PlannedRow]:
+    """此刻应有的一组声明行。取数口只有两个：事件表与生效判定。"""
+    at = now or timezone.now()
+    return _plan(
+        _high_impact_events(),
+        at,
+        state=deactivation_run.current_regime_state(now=at),
+    )
+
+
+def _plan(
+    candidates: list[MajorEvent], at: datetime, *, state
+) -> list[PlannedRow]:
+    """``candidates`` 是**所有档位为「高」的事件**（含已取消的，取消的要用来写解除原因），
+    本函数自己挑出该拦的那批。
+
+    刻意把事件列表与 `RegimeState` 当参数传进来而不是自己去读：这样整段规划是**纯函数**，
+    合并与推进的语义能用构造出来的对象直接测，不必先往库里造一批事件——唯一键、生效期
+    边界那些真需要库的性质由 `test_halt_sync.py` 里的 `TestCase` 负责。
+    """
+    rows = _event_rows(candidates, at)
+    blanket = _blanket_row(at, state=state)
+    if blanket is not None:
+        rows.append(blanket)
+    return rows
+
+
+def _high_impact_events() -> list[MajorEvent]:
+    """所有档位为「高」的事件，按窗口起点排好。
+
+    **不按 `status` 过滤**：取消与改期都要读（前者用来写解除原因，后者本来就会从窗口里
+    掉出去）。谁该拦由 `MajorEvent.triggers_halt` 判——它已经是「已排期 ∧ 档位为高」的
+    合取，这里再手写一遍条件就是给「什么算该拦」造第二个答案。
+    """
+    return list(
+        MajorEvent.objects.filter(impact=EventImpact.HIGH.value).order_by("halt_at", "id")
+    )
+
+
+def _event_rows(candidates: list[MajorEvent], at: datetime) -> list[PlannedRow]:
+    """事件熔断层：**每个作用域一行**。
+
+    按作用域分组而不是按事件分组，是因为唯一键的另一半是作用域——两件事件作用域不同就
+    是两行，作用域相同才谈得上合并。
+    """
+    by_scope: dict[str, list[MajorEvent]] = {}
+    for event in candidates:
+        if not event.triggers_halt:
+            continue
+        for scope in _scopes_of(event):
+            by_scope.setdefault(scope, []).append(event)
+
+    rows: list[PlannedRow] = []
+    for scope, group in by_scope.items():
+        segment = _pick_segment(_segments(group), at)
+        if segment is None:
+            continue
+        rows.append(
+            PlannedRow(
+                trigger=HaltTrigger.EVENT,
+                scope=scope,
+                label="、".join(event.name for event in segment),
+                reason=_event_reason(segment),
+                opened_at=segment[0].halt_at,
+                expires_at=max(event.resume_at for event in segment),
+            )
+        )
+    return rows
+
+
+def _scopes_of(event: MajorEvent) -> list[str]:
+    """这个事件压在哪些作用域上。与 `_touches` 互为逆运算——两边共用这一个函数，
+    「写入的作用域」与「解除原因里去认的作用域」就不可能出现两套口径。
+    """
+    if event.scope_kind == EventScope.MARKET.value:
+        return [halt.global_scope()]
+    return [halt.symbol_scope(symbol) for symbol in (event.symbols or [])]
+
+
+def _touches(event: MajorEvent, scope: str) -> bool:
+    return scope in _scopes_of(event)
+
+
+def _segments(group: list[MajorEvent]) -> list[list[MajorEvent]]:
+    """把一组事件按窗口并成若干**互不相接**的段。
+
+    **相接也算并**（`halt_at <= 段末`）：`[10:00,12:00)` 与 `[12:00,14:00)` 之间没有任何
+    一刻是不拦的，拆成两段会凭空造出一个「空隙」，而空隙的后果是把「下一段」提前写进表
+    的时机推迟到上一段结束之后（见模块 docstring 的敞口那一段）。
+
+    `resume_at >= halt_at` 由 `ck_major_event_window_ordered` 保证，所以段的结束不会早于
+    它的开始；`halt_at` 相同的两件事互相包含，同样并。
+    """
+    ordered = sorted(group, key=lambda event: (event.halt_at, event.id or 0))
+    segments: list[list[MajorEvent]] = []
+    end: datetime | None = None
+    for event in ordered:
+        if segments and end is not None and event.halt_at <= end:
+            segments[-1].append(event)
+            end = max(end, event.resume_at)
+        else:
+            segments.append([event])
+            end = event.resume_at
+    return segments
+
+
+def _pick_segment(segments: list[list[MajorEvent]], at: datetime) -> list[MajorEvent] | None:
+    """此刻该写进表里的那一段：**正在拦的那段，没有就取下一段**。
+
+    提前取下一段是这套写法的全部要点（见模块 docstring）：一行只能有一个窗口，而窗口若
+    只覆盖「正在拦」的那段，两段之间任何一轮任务没跑都会留下敞口。取到的那段**必然还没
+    结束**（含 `at` 的段 `end > at`；未来段 `start > at` 且 `end >= start`），所以规划出来
+    的行永远不会是「已经过期」的行。
+    """
+    for segment in segments:
+        start = segment[0].halt_at
+        end = max(event.resume_at for event in segment)
+        if start <= at < end:
+            return segment
+        if start > at:
+            return segment
+    return None
+
+
+def _event_reason(segment: list[MajorEvent]) -> str:
+    """一行声明的依据正文。
+
+    每个事件写两句：事件时刻与熔断窗口，两个时刻都用 `events.format_moment`（北京 + UTC
+    双写）。**复用那个函数而不是自己拼一行**：「事件时刻」在事件库、日报第③段和这里必须
+    是同一句话，各写一遍就是「同一件事三处说法不同」——而这三处的读者恰好是同一批人。
+
+    多事件时把「为什么是一行」写出来：不写的话，用户看到 label 里三个事件名会以为机制把
+    三件事混成了一件，而真相是唯一键只允许同源同作用域活一行。
+    """
+    if len(segment) == 1:
+        header = "高影响事件熔断窗口（档位为「高」的事件才触发熔断）："
+    else:
+        header = (
+            f"{len(segment)} 条高影响事件的窗口在这个作用域上重叠或相接，"
+            "按（触发源 × 作用域）的逻辑合成一行："
+        )
+    lines = [header]
+    for event in segment:
+        lines.append(f"  · {event.name}｜事件时刻 {events.format_moment(event.event_time)}")
+        lines.append(
+            f"    熔断窗口 {events.format_moment(event.halt_at)}"
+            f" → {events.format_moment(event.resume_at)}"
+        )
+    return "\n".join(lines)
+
+
+def _blanket_row(at: datetime, *, state) -> PlannedRow | None:
+    """高波动挡（保命档）：**只在生效中的判定本身就是高波动时写**。
+
+    判据取自 `deactivation.RegimeState.blanket`（``regime == HIGH_VOL``），不走
+    ``deactivation.derive`` 那条路：那条路要读池化表、在池化结论缺失时会给 `needs_review`，
+    而保命档是**阶段本身的性质**，与这一代池化表算出了什么无关（`RegimeState.blanket` 的
+    docstring 明写这一点）。所以只看判定表这一列，答得出就是答得出。
+
+    `expires_at` 恒为 `None`（不定）：它随阶段起落，没有预先知道的截止时刻，失效由「阶段
+    离开高波动」那一轮写出 `closed_at`。
+    """
+    if not state.blanket:
+        return None
+    if state.effective_at is None:
+        # 「阶段是高波动、但不知道它从哪一刻起」是判定表不可能造出来的形状
+        # （`effective_at` 非空），走到这里说明取数坏了。**不用 now() 兜底**：那会把写入方
+        # 自己的钟点混进事实里，而这一行的 `opened_at` 正是「什么时候开始拦的」的唯一答案。
+        raise RuntimeError(
+            "生效判定是高波动，但没有生效时刻——判定表的 effective_at 不该为空"
+        )
+    return PlannedRow(
+        trigger=HaltTrigger.BLANKET,
+        scope=halt.global_scope(),
+        label=BLANKET_LABEL,
+        reason=_blanket_reason(),
+        opened_at=state.effective_at,
+        expires_at=None,
+    )
+
+
+def _blanket_reason() -> str:
+    """保命档那一行的依据。**取自 `slice` 的词表**，不在这里另写一句中文：同一层在日报、
+    `query_halt` 与这条声明里必须同措辞（第①段就定了这条纪律）。
+    """
+    return (
+        f"{REASON_DISPLAY[REASON_HIGH_VOL_BLANKET]}"
+        "——保命档不做适用性判断，与证据无关"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 落库：期望 → 状态表（对账）
+# --------------------------------------------------------------------------- #
+
+
+def sync(*, now: datetime | None = None) -> dict:
+    """跑一轮对账，返回 ``{created, updated, unchanged, closed}``。
+
+    **幂等**：期望值逐字来自事实里存好的时刻，所以连着跑两轮，第二轮一定是
+    `unchanged == 行数`。这一点是这套写法的可测形态，也是 300 秒一轮敢全表重算的前提。
+
+    失败**往上抛**：下一轮 300 秒的对账就是重试（CONTEXT.md:181 把任务按「读安全 / 写危险」
+    区分，而这张表是本模块独占写的、且每次都是全量重算，重试没有副作用）。吞掉异常会让
+    「任务在跑、但表没更新」变成一件看起来正常的事。
+    """
+    at = now or timezone.now()
+    candidates = _high_impact_events()
+    state = deactivation_run.current_regime_state(now=at)
+    planned = {
+        _key(row.trigger, row.scope): row for row in _plan(candidates, at, state=state)
+    }
+
+    summary = {"created": 0, "updated": 0, "unchanged": 0, "closed": 0}
+
+    live = HaltDeclaration.objects.filter(closed_at__isnull=True)
+    for row in live:
+        trigger = halt.trigger_of(row)
+        if trigger not in _OWNED_TRIGGERS:
+            continue
+        desired = planned.pop(_key(trigger, row.scope), None)
+        if desired is None:
+            row.closed_at = at
+            row.closed_reason = _close_reason(row, at, candidates)
+            row.save(update_fields=["closed_at", "closed_reason"])
+            summary["closed"] += 1
+        elif _rewrite(row, desired):
+            summary["updated"] += 1
+        else:
+            summary["unchanged"] += 1
+
+    for desired in planned.values():
+        HaltDeclaration.objects.create(
+            trigger=desired.trigger.value,
+            scope=desired.scope,
+            label=desired.label,
+            opened_at=desired.opened_at,
+            expires_at=desired.expires_at,
+            reason=desired.reason,
+            actor_kind=ACTOR_KIND.value,
+            actor_name=ACTOR_NAME,
+        )
+        summary["created"] += 1
+
+    logger.info("[regime] 停止声明窗口同步：%s", summary)
+    return summary
+
+
+def _key(trigger, scope: str) -> tuple[str, str]:
+    """唯一键的 Python 形态，与 `uniq_live_halt_declaration` 同一口径（触发源 × 作用域）。"""
+    return (getattr(trigger, "value", trigger), scope)
+
+
+def _rewrite(row: HaltDeclaration, desired: PlannedRow) -> bool:
+    """把一行改写成期望的样子；**没变化就一个字段都不碰，返回 False**。
+
+    不比对就写的话，每 300 秒会给每一行来一次无意义的 UPDATE——而这张表的
+    `closed_at` / `closed_reason` 之外没有时间戳，看不出「它上次真的变了是什么时候」。
+    比对 `opened_at` / `expires_at` 是安全的：两者都取自事实（事件的 `halt_at` /
+    `resume_at`、判定的 `effective_at`），逐次重算逐字相同。
+    """
+    if (
+        row.label == desired.label
+        and row.reason == desired.reason
+        and row.opened_at == desired.opened_at
+        and row.expires_at == desired.expires_at
+    ):
+        return False
+    row.label = desired.label
+    row.reason = desired.reason
+    row.opened_at = desired.opened_at
+    row.expires_at = desired.expires_at
+    row.save(update_fields=["label", "reason", "opened_at", "expires_at"])
+    return True
+
+
+def _close_reason(row: HaltDeclaration, at: datetime, candidates: list[MajorEvent]) -> str:
+    """这一行为什么被解除。
+
+    四个码按「先看事实自己，再看是不是有人撤了它」排：
+
+    - 保命档的行没了 → 只可能是阶段离开了高波动（它没有截止时刻）。
+    - `expires_at <= at` → 窗口自己到点了。与 `halt.live_declarations` 的
+      `expires_at__gt` 同一个取等号方向：**截止那一刻已不再拦**，所以那一刻解除。
+    - 有一条**取消掉的**高影响事件压在这个作用域上、且它的窗口还没过 → 是这次取消导致的。
+      加「窗口还没过」这一条，是为了不把「一件早就取消过、窗口也早过了的事」报成现在的原因。
+    - 都不是 → 改期或改档（`HIGH` 降到 `MEDIUM`）之后不再覆盖此刻。
+
+    这是**解释性**的字段，不是判据：判定只读 `closed_at`。所以宁可归到一个说不清的码上，
+    也不为了「报得准」去做第二次求值。
+    """
+    if halt.trigger_of(row) is HaltTrigger.BLANKET:
+        return CLOSE_REASON_REGIME_LEFT
+    if row.expires_at is not None and row.expires_at <= at:
+        return CLOSE_REASON_WINDOW_ENDED
+    cancelled = any(
+        event.status == EventStatus.CANCELLED.value
+        and event.resume_at > at
+        and _touches(event, row.scope)
+        for event in candidates
+    )
+    return CLOSE_REASON_EVENT_CANCELLED if cancelled else CLOSE_REASON_NO_LONGER_COVERS

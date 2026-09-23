@@ -44,8 +44,9 @@ from apps.agent.tools.regime_queries import (
     QueryHaltTool,
     QueryRegimeTool,
 )
-from apps.regime import config, report
+from apps.regime import config, halt, halt_sync, report
 from apps.regime.models import (
+    ActorKind,
     CandidateEvent,
     CandidateOrigin,
     CandidateStatus,
@@ -55,7 +56,11 @@ from apps.regime.models import (
     EventImpact,
     EventScope,
     EventStatus,
+    HaltDeclaration,
+    HaltTrigger,
     MajorEvent,
+    MechanismKind,
+    MechanismMode,
     RegimeJudgement,
     RegimeMechanismSwitch,
     business_midnight,
@@ -73,8 +78,12 @@ NOW = datetime(2026, 9, 23, 4, 0, tzinfo=dt_timezone.utc)
 #: 该有它，「生效中」那一组有它就是一句假话。
 TODAY_DISCLAIMER = "（此刻生效中的仍是上一有效阶段，本条要到生效时刻才咬人）"
 
-#: 保命档那一层在输出里的层标题前缀（`_halt_layers` 与 `_render` 共用的定位串）。
-BLANKET_PREFIX = "高波动档"
+#: 保命档那一层的**特征串**，取触发源的显示名（`HaltTrigger.BLANKET.display` = 「保命档
+#: （高波动）」），不是写入方给的那一列 `label`（`halt_sync.BLANKET_LABEL` = 「高波动」）。
+#: 层的身份是 `HaltDeclaration.trigger` 这一列上的事实，`label` 随数据变——第②c 段之前
+#: 这里用的是 `startswith("高波动档")`，那个前缀随 `label` 一起漂走了。具体的层标题措辞
+#: 由 `test_halt.py::TestVerdict` 钉；这里只用来断言「事件层在场而保命档不在场」。
+BLANKET_MARK = HaltTrigger.BLANKET.display
 
 
 def _frozen(now: datetime = NOW):
@@ -323,12 +332,30 @@ class TestQueryRegime(TestCase):
 
 
 class TestQueryHalt(TestCase):
-    """`query_halt` 返回**全部生效层**，不裁剪（CONTEXT.md:172）。
+    """`query_halt` 返回**全部在拦的层**，不裁剪（CONTEXT.md:172）。
 
-    机制没有一张「halt 状态表」，所以两层都是推出来的——一条事件熔断层（`MajorEvent`
-    的窗口覆盖此刻、档位高、未取消），一条高波动档（生效中那条判定的阶段本身）。
+    第②c 段之后这里列的层**就是 `HaltDeclaration` 里的行**——工具与 `pre_trade_check` 从
+    同一个 ``halt.blocking_declarations`` 出发，所以它不会说出一个订单通路上不存在的层。
+    造数据的方式因此跟着变了：**事件表里有一条高影响事件不等于此刻在拦**，中间那一步
+    （事实 → 声明行）是这一层要钉的东西，所以先塞事实、再跑一轮 `halt_sync.sync(now=NOW)`。
+
     **两层可以同时生效**，所以回显的是一个集合而不是一条（CONTEXT.md:177）。
+
+    声明与开关是**两件事**（`halt.py` 的模块 docstring）：声明说「这个源想拦」，开关说
+    「这个源启用了没有」。所以「事件层真的在拦」要两件都给——下面每条事件用例都先拨开关，
+    否则它会因为「开关关着」而通过，看起来与「事件不该拦」一模一样。
     """
+
+    def _enable_event_breaker(self) -> None:
+        RegimeMechanismSwitch.objects.create(
+            kind=MechanismKind.EVENT_BREAKER.value,
+            from_mode=MechanismMode.SHADOW.value,
+            to_mode=MechanismMode.EXECUTING.value,
+            at=NOW - timedelta(days=1),
+            actor_kind=ActorKind.CLI.value,
+            actor_name="ops",
+            reason="测试",
+        )
 
     def test_nothing_is_blocking(self):
         with _frozen():
@@ -337,7 +364,10 @@ class TestQueryHalt(TestCase):
         self.assertIn("当前没有任何层在拦：事件熔断层与高波动档都没有生效。", text)
         self.assertIn("人工豁免：当前没有在期的人工豁免。", text)
         self.assertIn("机制当前档：Shadow（只记录，不执行）", text)
-        self.assertIn("尚未接线到下单拦截", text)
+        # 第②段把停止判定接到了下单拦截上，所以这句话从「尚未接线」改成了「接线到哪一步」。
+        # 数字取声明表的实数（此处为空表 = 0），与上面两句同源。
+        self.assertIn("停止声明表此刻 0 条在生效", text)
+        self.assertIn("已接到下单拦截", text)
 
     def test_it_echoes_the_current_mode_instead_of_hardcoding_shadow(self):
         """档位那一行取 `RegimeMechanismSwitch.current()`，不写死「Shadow」。
@@ -350,39 +380,111 @@ class TestQueryHalt(TestCase):
             text = QueryHaltTool()._render()
         self.assertIn("机制当前档：Shadow（只记录，不执行）", text)
 
-    def test_a_live_high_impact_event_is_one_layer(self):
-        event = _event("FOMC 议息")
+    # -- 事件层：事实先落成声明，声明才成层 ---------------------------------- #
+
+    def test_an_event_that_was_never_synced_is_not_a_layer(self):
+        """**事件表里有事件 ≠ 此刻在拦。**
+
+        这是第②c 段带来的最锋利的一条：判定函数不读事件表（CONTEXT.md:134），所以一条
+        高影响事件在窗口里、档位为高、开关也拨到了执行态，**只要搬运没跑过，就一层都没有**。
+        这条用例就是那个搬运环节的可执行形态——少了它，`halt_sync` 整个模块坏掉也不一定有
+        人发现：表空着的样子，与「本来就没有事件」一模一样。
+        """
+        self._enable_event_breaker()
+        _event("FOMC 议息")
+        with _frozen():
+            text = QueryHaltTool()._render()
+
+        self.assertIn("当前没有任何层在拦", text)
+        self.assertIn("停止声明表此刻 0 条在生效", text)
+
+    def test_a_synced_event_is_one_layer(self):
+        self._enable_event_breaker()
+        _event("FOMC 议息")
+        with _frozen():
+            halt_sync.sync(now=NOW)
+            text = QueryHaltTool()._render()
+
+        self.assertIn("当前在拦的层：1 层", text)
+        self.assertIn("停止声明表此刻 1 条在生效", text)
+        # 层标题 = `halt.layer_of(row).text` = 「触发源名称（触发源档，作用域 人话）」。
+        # 在这里写死一遍，让措辞漂移在**工具这一侧**也红一次；同一句话的
+        # `pre_trade_check` 那一侧由 `test_halt.py::TestVerdict` 钉。
+        self.assertIn("【第 1 层｜FOMC 议息（事件熔断，作用域 全市场（global））】", text)
+        # 正文第一段是生效期，两个绝对时刻都写出来（`events.format_moment`，与事件库、
+        # 日报第③段同口径）。这里只钉「北京时间」那半句的换算：事件窗口起于 UTC 03:00。
+        self.assertIn("生效期：北京时间 2026-09-23 11:00", text)
+        # 第二段是声明自己落库时写下的依据，不是工具现编的。
+        self.assertIn("高影响事件熔断窗口（档位为「高」的事件才触发熔断）：", text)
+        self.assertNotIn(BLANKET_MARK, text)
+
+    def test_the_layer_title_is_the_same_line_as_the_rejection_reason(self):
+        """层标题与 `pre_trade_check` 的拒绝理由**逐字同源**。
+
+        `_layer_block` 取 `halt.layer_of(row).text` 而不是在这里重拼一遍「触发源 + 作用域」
+        ——理由就是这个断言：用户被拒时看到的那句话，与他自己去查到的，必须是同一句。
+        断言拿 `block_reason` 去比而不是再写死一遍标题串，因为被测的是**两者的同源关系**；
+        标题的具体措辞由上面那条用例钉。
+        """
+        self._enable_event_breaker()
+        _event("FOMC 议息")
+        with _frozen():
+            halt_sync.sync(now=NOW)
+            text = QueryHaltTool()._render()
+            reason = halt.block_reason("BTC/USDT", now=NOW)
+
+        self.assertNotEqual(reason, "")
+        layer_text = reason.removeprefix("停止判定命中：")
+        self.assertIn(f"【第 1 层｜{layer_text}】", text)
+
+    def test_the_event_layer_needs_its_switch(self):
+        """行先写、开关后拨——「声明与开关分开」的可执行形态。
+
+        Shadow 期不写行的话，「出 Shadow」那一刻表是空的：什么都不拦，一直到下一个窗口
+        才有行，等于把出 Shadow 的时点本身变成一段敞口。所以这里断言的是：**行一直在，
+        只是不算数**；开关一拨，同一份行立刻开始拦，不必等下一轮同步。
+        """
+        _event("FOMC 议息")
+        with _frozen():
+            halt_sync.sync(now=NOW)
+            shadow = QueryHaltTool()._render()
+
+        self.assertIn("当前没有任何层在拦", shadow)
+        self.assertIn("停止声明表此刻 0 条在生效", shadow)
+        self.assertEqual(
+            len(halt.live_declarations(now=NOW)), 1, "行是活的，只是开关还没拨"
+        )
+
+        self._enable_event_breaker()
         with _frozen():
             text = QueryHaltTool()._render()
 
         self.assertIn("当前在拦的层：1 层", text)
-        self.assertIn("【第 1 层｜事件熔断层（触发源：FOMC 议息）】", text)
-        self.assertNotIn(BLANKET_PREFIX, text)
+        self.assertIn("停止声明表此刻 1 条在生效", text)
 
-    def test_the_event_layer_body_is_the_daily_report_renderer(self):
-        """层正文逐字交给 `events.describe_event`——与日报第③段是同一个函数。"""
-        from apps.regime.events import describe_event
-
-        event = _event("CPI 公布")
-        with _frozen():
-            text = QueryHaltTool()._render()
-            expected = describe_event(event, now=NOW)
-
-        self.assertIn(expected, text)
+    # -- 保命档 -------------------------------------------------------------- #
 
     def test_a_high_vol_phase_is_the_blanket_layer(self):
+        """保命档**不需要开关**：`HALT_TRIGGER_SWITCH[BLANKET] = None`（「高波动算生效」）。
+
+        拨开关这一条不写进用例的话，「高波动在拦」与「高波动在拦但开关关着」就分不开，
+        而后者在真实运行里根本不存在——那张映射表里 `BLANKET` 的值就是 `None`。
+        """
         _judgement(
             effective_at=business_midnight(RUN_DAY + timedelta(days=1)),
             regime=BaseRegime.HIGH_VOL,
         )
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
 
+        self.assertEqual(RegimeMechanismSwitch.objects.count(), 0)
         self.assertIn("当前在拦的层：1 层", text)
-        self.assertIn("【第 1 层｜高波动档（保命档）】", text)
-        self.assertIn("作用域：全市场（global）", text)
-        self.assertIn("触发源：生效中的判定「高波动」", text)
+        self.assertIn("【第 1 层｜高波动（保命档（高波动），作用域 全市场（global））】", text)
         self.assertIn("保命档不做适用性判断，与证据无关", text)
+        # 不定 = 没有预先知道的截止时刻（`_layer_block` 用 `events.format_moment` 渲染，
+        # None → 「未定」）。保命档的失效由「阶段离开高波动」那一轮写 `closed_at`。
+        self.assertIn("→ 未定", text)
 
     def test_both_layers_can_be_live_at_once(self):
         """**用户眼里始终是一个集合，不是一条流**（CONTEXT.md:177）。
@@ -390,43 +492,69 @@ class TestQueryHalt(TestCase):
         两层同时生效时折成一条，就会让「还剩几层」这个数答不出来——而那正是用户唯一
         能据以判断「我什么时候能开新仓」的东西。
         """
+        self._enable_event_breaker()
         _event("非农")
         _judgement(
             effective_at=business_midnight(RUN_DAY + timedelta(days=1)),
             regime=BaseRegime.HIGH_VOL,
         )
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
 
         self.assertIn("当前在拦的层：2 层", text)
-        self.assertIn("【第 1 层｜事件熔断层（触发源：非农）】", text)
-        self.assertIn("【第 2 层｜高波动档（保命档）】", text)
+        self.assertIn("停止声明表此刻 2 条在生效", text)
+        # **编号按生效时刻排，不按触发源类型排**（`live_declarations` 的
+        # `order_by("opened_at", "id")`）：保命档这一行的 `opened_at` 是日界（UTC 00:00），
+        # 比事件窗口的起点（UTC 03:00）早，所以它在第 1 层。顺序是稳定的，用户两次问到的
+        # 编号不会翻面——这正是不按类型排的意义。
+        self.assertIn("【第 1 层｜高波动（保命档（高波动），作用域 全市场（global））】", text)
+        self.assertIn("【第 2 层｜非农（事件熔断，作用域 全市场（global））】", text)
+
+    # -- 不成为层的事件：每一条都拨了开关，否则会因为别的原因通过 ------------- #
 
     def test_a_medium_impact_event_is_not_a_layer(self):
         """档位不是「高」的事件**不产生熔断**。少这一条的表现是「一条只提醒不熔断的
         事件被报成了在拦」，比漏报更坏。"""
+        self._enable_event_breaker()
         _event("低影响事件", impact=EventImpact.MEDIUM)
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
         self.assertIn("当前没有任何层在拦", text)
+        self.assertIn("停止声明表此刻 0 条在生效", text)
 
     def test_a_cancelled_event_is_not_a_layer(self):
+        self._enable_event_breaker()
         _event("已取消的会议", status=EventStatus.CANCELLED)
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
         self.assertIn("当前没有任何层在拦", text)
+        self.assertIn("停止声明表此刻 0 条在生效", text)
 
     def test_an_event_whose_window_has_passed_is_not_a_layer(self):
+        self._enable_event_breaker()
         _event(
             "上周的事件",
             halt_at=NOW - timedelta(days=3),
             resume_at=NOW - timedelta(days=2),
         )
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
         self.assertIn("当前没有任何层在拦", text)
+        self.assertIn("停止声明表此刻 0 条在生效", text)
 
     def test_an_event_whose_window_has_not_opened_is_not_a_layer(self):
+        """窗口还没开：**行已经在表里了**，只是 `opened_at` 在未来。
+
+        这一条钉的是第②c 段那个「一行 = 这个源在此作用域上此刻的态度」的取舍：下一段窗口
+        在开启前就写进表，所以一段窗口结束到下一段开始之间不会有「表里没窗口」的敞口；
+        代价是这一行在生效前就存在——而 `live_declarations` 的生效期过滤把它挡在门外，
+        所以它此刻拦不住任何东西。
+        """
+        self._enable_event_breaker()
         _event(
             "下周的事件",
             halt_at=NOW + timedelta(days=2),
@@ -434,8 +562,13 @@ class TestQueryHalt(TestCase):
             event_time=NOW + timedelta(days=3),
         )
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
+
+        self.assertEqual(HaltDeclaration.objects.count(), 1, "下一段窗口已经排进表里")
+        self.assertEqual(halt.live_declarations(now=NOW), [], "但它此刻还不生效")
         self.assertIn("当前没有任何层在拦", text)
+        self.assertIn("停止声明表此刻 0 条在生效", text)
 
     # -- 人工豁免（CONTEXT.md:176） ------------------------------------------ #
 
@@ -450,7 +583,8 @@ class TestQueryHalt(TestCase):
         """**人工恢复豁免不穿透保命档，且这条必须能在这条输出里被读出来。**
 
         否则用户会看到一个自己放行过、却又被停的策略，而那与「机制没听见我」在观感上
-        无法区分。
+        无法区分。判据是**保命档那一层真的在拦**（声明表里的 BLANKET 行），不是「生效中的
+        判定是纸面上的高波动」——所以这里要跑一轮 `halt_sync.sync`。
         """
         _exemption(_strategy("甲"))
         _exemption(_strategy("乙"))
@@ -459,8 +593,10 @@ class TestQueryHalt(TestCase):
             regime=BaseRegime.HIGH_VOL,
         )
         with _frozen():
+            halt_sync.sync(now=NOW)
             text = QueryHaltTool()._render()
 
+        self.assertIn("当前在拦的层：1 层", text)
         self.assertIn("2 条在期，但**当前一条都不生效**", text)
         self.assertIn("人工恢复豁免不穿透保命档", text)
 

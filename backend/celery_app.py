@@ -109,6 +109,16 @@ app.conf.beat_schedule = {
         'task': 'apps.regime.tasks.check_report_delivery',
         'schedule': 300.0,
     },
+    # 停止声明窗口同步（第②段单元 ②c）：把事件表与生效判定上的事实对账成
+    # HaltDeclaration 行——声明表是 halt 状态机唯一读的那份状态，判定函数不读事件表。
+    # **固定间隔，不用 crontab**：这条任务只关心「多久跑一次」，不关心「每天几点」。
+    # 间隔就是这套写法的敞口上限：一段窗口结束后、下一段开启前如果窄于一轮（比如两件
+    # 高影响事件挨得极近），那一小段里谁都拦不住——而事件熔断不可人工豁免（见
+    # halt_sync.py 的模块 docstring）。所以这个数是**安全参数**，调稀要按同一句话权衡。
+    'regime-halt-window-sync': {
+        'task': 'apps.regime.tasks.sync_halt_windows',
+        'schedule': 300.0,
+    },
 }
 
 # 使用数据库调度器，支持动态添加/删除定时任务

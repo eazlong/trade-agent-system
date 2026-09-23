@@ -1,4 +1,5 @@
-"""切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）。
+"""切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
++ 停止声明窗口同步（第②段单元 ②c）。
 
 ## 为什么是独立任务
 
@@ -33,6 +34,19 @@
 两者都不挂在 `snapshot_daily_equity` 那条心跳上：那条心跳的顺序与职责被
 `test_timing.py` 逐段钉着（「回退方式 = 删掉一个调用」），而投递与看门狗本来就是独立
 路径，独立成任务才谈得上「一条坏了另一条还在」。
+
+## 窗口同步任务为什么既没有重试、也不发告警
+
+`sync_halt_windows` 是**对账**，不是投递：它每次整表重算事件表与判定表上的事实，写
+`HaltDeclaration` 的那一轮与上一轮之间没有「做过 / 没做过」的区别（见 `halt_sync.py`）。
+所以它不需要 `max_retries`——**下一轮 300 秒的对账就是重试**，再排三次退避重试只是把
+同一件事重做几遍（CONTEXT.md:181 按「读安全 / 写危险」区分新任务，这一条属于「写危险但
+可全量重来」）。异常往上抛，失败可见性走已有的两条路：beat 的任务健康检查（跑了没）与
+日报第④段机制健康（结论新不新）。
+
+**欠账（单元 ②e）**：声明写入失败该发一条**即时**消息（CONTEXT.md:66 的「告警」= 给具体
+某个人的即时消息，日志不算被看见），因为一个「表里没有窗口」的系统看起来与「现在没有
+事件」一模一样。这条归 ②e，与投递失败告警一起做；在那之前这里只有日志。
 """
 
 from __future__ import annotations
@@ -223,6 +237,33 @@ def check_report_delivery(self, run_day=None) -> dict:
             "[regime] 投递看门狗失败，将重试（第 %s 次）", self.request.retries, exc_info=True
         )
         raise self.retry(exc=exc)
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+
+@app.task(acks_late=True)
+def sync_halt_windows() -> dict:
+    """把事件表与生效判定上的事实对账成 `HaltDeclaration` 行（第②段单元 ②c）。
+
+    这一条是**声明表的唯一写入方**：`halt.py` 的判定函数只读状态、不读事件表
+    （CONTEXT.md:134），所以「谁该拦」到「此刻在拦」的搬运全在这里。
+
+    幂等：期望值逐字取自事实里已经存好的时刻（事件的 `halt_at`、判定的 `effective_at`），
+    所以连着跑两轮，第二轮必然是整表空转。beat 每 5 分钟撞一次、手工补跑任意多次，代价
+    都只是几次空转。
+
+    没有 `max_retries`、也不吞异常——理由见模块 docstring（对账的下一次执行就是重试）。
+    beat 用固定 300 秒间隔而不是 crontab：`CELERY_TIMEZONE` 是 UTC，而这条任务只关心
+    「多久跑一次」，不关心「每天几点」（见 `celery_app.py` 的 `beat_schedule`）。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime import halt_sync
+
+    try:
+        # 成功那一轮的日志由 `halt_sync.sync` 自己记（它知道每类改动几条）。
+        return halt_sync.sync()
     finally:
         # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()

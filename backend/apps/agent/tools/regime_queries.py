@@ -3,7 +3,8 @@
 CONTEXT.md 第 183 条把边界钉在**领域对象**上，而不是「一个机制状态工具」：
 
 - ``query_regime``                 生效中与待生效两条判定，各自成组
-- ``query_halt``                   当前在拦的全部层（事件熔断层 / 高波动档），带作用域与触发源
+- ``query_halt``                   当前在拦的全部层（事件熔断层 / 高波动档），带作用域、触发源、
+  生效期与依据；**读的是停止声明表**（第②c 段起，订单通路认的就是这一份）
 - ``query_deactivation_decisions`` 停用决策 + 证据摘要（**按当前用户的活跃会话裁剪**）
 - ``query_events``                 未来 7 天的高影响事件与熔断窗口（**天数写死**）
 
@@ -184,73 +185,27 @@ class QueryRegimeTool(BaseTool):
 # --------------------------------------------------------------------------- #
 
 
-def _event_layer(event, now) -> tuple[str, list[str]]:
-    """事件熔断层的一层。
+def _layer_block(row) -> tuple[str, list[str]]:
+    """一行停止声明 → （层标题，正文）。
 
-    正文逐字交给 ``events.describe_event``——与日报第③段是**同一个函数**，它自己就写了
-    事件名、作用域、事件时刻与熔断窗口（两个绝对时刻都写出来）。所以这一层不再另写一遍
-    「触发源」：名字已经在正文第一行了，重复第二遍只会让「哪一份是权威」变模糊。
+    标题取 ``halt.layer_of(row).text``——**行 → 层的唯一换算口**。这一层从前是「推」出来的
+    （直接读 ``MajorEvent`` 与生效判定），第②c 段起改为读 ``HaltDeclaration``：判定函数
+    只认这张表（CONTEXT.md:134），所以「此刻在拦」的唯一答案就是它。取 ``layer_of`` 而不是
+    在这里重拼一遍「触发源 + 作用域」，是为了让层标题与 ``pre_trade_check`` 的拒绝理由
+    **逐字同源**：用户看到的拒绝理由，与他在工具里查到的东西，必须是同一句话。
 
-    触发源改由**层标题**承载（``事件熔断层（触发源：…）``）——第③段问的是「未来有什么
-    事件」，这一问是「现在谁在拦」，后者要能在列表里一眼扫到是哪条在拦。
+    正文两段：生效期（两个绝对时刻都写出来，用 ``events.format_moment`` 所以与事件库、
+    日报第③段同口径），与声明自己的依据（``reason``，写入方落库时写的那一份）。
     """
-    from apps.regime.events import describe_event
+    from apps.regime import events, halt
 
-    return (f"事件熔断层（触发源：{event.name}）", describe_event(event, now=now).splitlines())
-
-
-def _blanket_layer(state) -> list[str]:
-    """高波动档（保命档）那一层。
-
-    触发源是**生效中那条判定**，不是任何事件、也不是哪一格池化结论：保命档是**阶段本身**
-    的性质（``deactivation.RegimeState.blanket`` 的 docstring 明写这一点），与这一代池化
-    表算出了什么无关。措辞取自 ``slice`` 的词表，不在这里另写一句中文。
-    """
-    from apps.regime import report
-    from apps.regime.slice import REASON_DISPLAY, REASON_HIGH_VOL_BLANKET
-
-    return [
-        "  作用域：全市场（global）",
-        f"  触发源：生效中的判定「{report._regime_display(state.regime)}」"
-        f"（自 {report.format_business(state.effective_at)} 起）",
-        f"  判据：{REASON_DISPLAY[REASON_HIGH_VOL_BLANKET]}"
-        "——保命档不做适用性判断，与证据无关",
+    layer = halt.layer_of(row)
+    body = [
+        f"  生效期：{events.format_moment(layer.opened_at)}"
+        f" → {events.format_moment(layer.expires_at)}"
     ]
-
-
-def _halt_layers(now) -> list[tuple[str, list[str]]]:
-    """当前在拦的层，按「先事件、后保命档」列出。
-
-    机制没有一张「halt 状态表」，所以两层都是**推**出来的——但两条依据都是领域对象自己的
-    属性，不是本模块发明的判据：
-
-    - 事件熔断层：``MajorEvent`` 上 ``halt_at`` / ``resume_at`` 那对**录入时按当时配置
-      算好**的时刻（两列都 ``db_index``，正是为这个窗口查询建的）。三条条件
-      （``status=SCHEDULED`` ∧ ``impact=HIGH`` ∧ 窗口覆盖 ``now``）是
-      ``MajorEvent.triggers_halt`` 的 queryset 写法——**档位不是「高」的事件不产生熔断**，
-      而少这一条的表现是「一条只提醒不熔断的事件被报成了在拦」，比漏报更坏。
-    - 高波动档：生效中那条判定的阶段本身。
-
-    **两层可以同时生效**（CONTEXT.md 第 177 条），所以这里返回的是一个集合，不折成一条。
-    """
-    from apps.regime import deactivation_run
-    from apps.regime.models import EventImpact, EventStatus, MajorEvent
-
-    layers: list[tuple[str, list[str]]] = []
-
-    events = MajorEvent.objects.filter(
-        status=EventStatus.SCHEDULED.value,
-        impact=EventImpact.HIGH.value,
-        halt_at__lte=now,
-        resume_at__gte=now,
-    ).order_by("event_time", "id")
-    for event in events:
-        layers.append(_event_layer(event, now))
-
-    state = deactivation_run.current_regime_state(now=now)
-    if state.blanket:
-        layers.append(("高波动档（保命档）", _blanket_layer(state)))
-    return layers
+    body.extend(f"  {line}" for line in (row.reason or "").splitlines())
+    return (layer.text, body)
 
 
 def _exemption_lines(now, *, blanket_live: bool) -> list[str]:
@@ -273,19 +228,41 @@ def _exemption_lines(now, *, blanket_live: bool) -> list[str]:
     return [f"人工豁免：{count} 条在期（当前没有保命档在拦，豁免照常生效）。"]
 
 
-def _gate_line() -> str:
-    """机制当前档的一行回显。
+def _gate_line(now) -> str:
+    """机制当前档 + 停止声明表此刻的实数。
 
-    没有这一行，「现在在拦什么」会被读成「这些层已经在拦下单了」——而单元 8 里没有任何
-    代码路径把任何一层接到下单通路上（``report._switch_lines`` 把这件事说得更全）。取
-    ``RegimeMechanismSwitch.current()`` 而不是写死「Shadow」：档位一旦切换（出 Shadow 是
-    第②段之后的事），这句话要跟着变。
+    ``now`` 由调用方给（与 ``_exemption_lines`` 同款）：这一行里的条数取自声明表的生效期
+    过滤，而**工具自称的「此刻」必须只有一个**。少了这个入参，上面几层按冻结的时刻算、
+    这一行按墙上时钟算，测试里就会出现「层数 1、声明表 0 条」这种在真实运行中不可能出现
+    的组合，而那种断言红了只会把人引到错的地方。
+
+    没有这一行，「现在在拦什么」会被读成「这些层已经在拦下单了」。第②c 段之后上面列的层
+    **就是**声明表的行（``query_halt`` 与 ``pre_trade_check`` 从同一个 ``blocking_declarations``
+    出发），但两者仍不是同一批：声明表里还有 ``DEACTIVATION``（第③段的停用决策）那一档，
+    它的写入方是停用决策任务、尚未接线。所以报的是**声明表的实数**——上面列了几层、这张表
+    有几条，两者的差额正是「还没接线的那一档」，直接写出来比让人自己去比对强。
+
+    ``blocking_declarations`` 而不是 ``live_declarations``：要报的是真的在拦的条数；少一层
+    开关过滤，就会把「开关关着但行还留着」读成一个正在拦的层。
+
+    两个开关都回显：出 Shadow 那个是机制整体，事件熔断那个直接决定事件层的声明作不作数
+    ——只报前者的话，「声明表非空但开关关着」会被读成「已经在拦」。
+
+    **减仓不受停止判定拦截**：``RiskGuard.pre_trade_check`` 的这一步只管开新仓
+    （``reduce_only`` 的单直接放行）。不说这一句，「停止」会被读成「什么都动不了」，而减仓
+    恰恰是熔断时唯一想让它动起来的事。
     """
-    from apps.regime.models import RegimeMechanismSwitch
+    from apps.regime import halt
+    from apps.regime.models import MechanismKind, RegimeMechanismSwitch
 
+    declared = len(halt.blocking_declarations())
     return (
         f"机制当前档：{RegimeMechanismSwitch.current().display}"
-        "——以上各层尚未接线到下单拦截（事件熔断是第②段、行情阶段 gate 是第③段）。"
+        f"；事件熔断开关："
+        f"{RegimeMechanismSwitch.current(MechanismKind.EVENT_BREAKER).display}"
+        f"；停止声明表此刻 {declared} 条在生效（拦住的是开新仓，减仓放行）"
+        "——停止判定已接到下单拦截（第②段 halt 状态机）：上面列的层就是这张表里的行，"
+        "订单通路认的也是它。（策略停用决策那一档的写入方要到第③段才接线。）"
     )
 
 
@@ -293,9 +270,10 @@ class QueryHaltTool(BaseTool):
     name = "query_halt"
     description = (
         "查询行情阶段机制当前**全部在拦的层**（事件熔断层、高波动档又称保命档），"
-        "每层带作用域与触发源。两层可以同时生效，所以返回的是一个集合而不是一条。"
-        "**不按人裁剪**：用户问的是「现在系统在拦什么」，裁剪会让他怀疑工具在瞒他。"
-        "也会说出在期人工豁免当前是否被保命档压住（豁免不穿透保命档）。只读。"
+        "每层带作用域、触发源、生效期与依据。多层可以同时生效，所以返回的是一个集合而不是"
+        "一条。**读的是停止声明表**——订单通路真正认的那一份，所以这里列出的层就是此刻会"
+        "拦住开新仓的层。**不按人裁剪**：用户问的是「现在系统在拦什么」，裁剪会让他怀疑"
+        "工具在瞒他。也会说出在期人工豁免当前是否被保命档压住（豁免不穿透保命档）。只读。"
     )
 
     @property
@@ -303,16 +281,22 @@ class QueryHaltTool(BaseTool):
         return dict(_EMPTY_SCHEMA)
 
     def _render(self) -> str:
+        from apps.regime import halt
+        from apps.regime.models import HaltTrigger
+
         now = timezone.now()
-        layers = _halt_layers(now)
-        blanket_live = any(label.startswith("高波动档") for label, _ in layers)
+        # **按触发源判，不按层标题的字面前缀判**：层标题是写入方给的 `label`，前缀随数据
+        # 变，而「这一层是不是保命档」是触发源这一列上的事实。
+        rows = halt.blocking_declarations(now=now)
+        blanket_live = any(halt.trigger_of(row) is HaltTrigger.BLANKET for row in rows)
 
         lines: list[str] = []
-        if not layers:
+        if not rows:
             lines.append("当前没有任何层在拦：事件熔断层与高波动档都没有生效。")
         else:
-            lines.append(f"当前在拦的层：{len(layers)} 层（系统级状态，不按人裁剪）")
-            for index, (label, body) in enumerate(layers, start=1):
+            lines.append(f"当前在拦的层：{len(rows)} 层（系统级状态，不按人裁剪）")
+            for index, row in enumerate(rows, start=1):
+                label, body = _layer_block(row)
                 lines.append("")
                 lines.append(f"【第 {index} 层｜{label}】")
                 lines.extend(body)
@@ -320,7 +304,7 @@ class QueryHaltTool(BaseTool):
         lines.append("")
         lines.extend(_exemption_lines(now, blanket_live=blanket_live))
         lines.append("")
-        lines.append(_gate_line())
+        lines.append(_gate_line(now))
         return "\n".join(lines)
 
     async def execute(self, **kwargs) -> ToolResult:
@@ -493,7 +477,7 @@ class QueryDeactivationDecisionsTool(BaseTool):
                 "（退出 Shadow 之后，被停用的也只会是你实际在跑的策略。）"
             )
             lines.append("")
-            lines.append(_gate_line())
+            lines.append(_gate_line(now))
             return "\n".join(lines)
 
         # **不按 `status` 过滤**（初版写的是 `status=SUGGESTED`，一个会长成陷阱的筛子）：
@@ -516,7 +500,7 @@ class QueryDeactivationDecisionsTool(BaseTool):
                 lines.extend(_decision_lines(decision, now=now, blanket_live=blanket_live))
 
         lines.append("")
-        lines.append(_gate_line())
+        lines.append(_gate_line(now))
         return "\n".join(lines)
 
     async def execute(self, user_id: str = "", **kwargs) -> ToolResult:
