@@ -45,12 +45,15 @@ class TestGroupDiscipline(SimpleTestCase):
 
     def test_groups_hold_the_module_constants_themselves(self):
         """GROUPS 必须是常量的同一批对象：若它存的是副本，import 之后改常量
-        （或反之）就会让「快照里的参数」和「判定真正用的参数」变成两套。"""
-        self.assertIs(config.GROUPS["candles"], config.CANDLES)
-        self.assertIs(config.GROUPS["judgement"], config.JUDGEMENT)
-        self.assertIs(config.GROUPS["judgement_lifecycle"], config.JUDGEMENT_LIFECYCLE)
-        self.assertIs(config.GROUPS["evidence"], config.EVIDENCE)
-        self.assertIs(config.GROUPS["news"], config.NEWS)
+        （或反之）就会让「快照里的参数」和「判定真正用的参数」变成两套。
+
+        逐组遍历而不是手列几个：手列的那份会在加分组时**自动漏掉新的那个**，而漏掉的
+        正是这次新加的那一组（`deactivation` 就漏过一次）。分组名与常量名同名的约定
+        也是在这里钉住的——名字对不上的那天，这里会红，而不是快照里悄悄多一份副本。
+        """
+        for name, group in config.GROUPS.items():
+            with self.subTest(group=name):
+                self.assertIs(group, getattr(config, name.upper()))
 
     def test_every_group_can_be_derived_with_replace(self):
         """测试靠 replace 临时改参数（不改全局），判定留痕也靠它。"""
@@ -99,6 +102,7 @@ class TestSnapshot(SimpleTestCase):
             ),
             "judgement_lifecycle": ("min_dwell_days", "stale_after_days"),
             "evidence": ("min_trades", "min_months"),
+            "deactivation": ("exemption_days",),
             "news": (
                 "window_floor_hours",
                 "window_cap_hours",

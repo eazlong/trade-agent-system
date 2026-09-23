@@ -159,6 +159,26 @@ def pending_judgement(
     return _records(symbol).filter(effective_at__gt=now).order_by("effective_at").first()
 
 
+def last_judgement(symbol: str = SYMBOL) -> RegimeJudgement | None:
+    """**最近写下的**那条判定，不论它生效了没有。从未写成功过返回 `None`。
+
+    这是日报第④段「上次判定成功时间」的唯一出处。记录**只在判定成功时**才落行
+    （数据不足走 `skipped`、取数或代码故障往上抛，两种都不写记录），所以「最近一条
+    记录的写入时刻」就是「上次判定成功的时刻」。
+
+    **不能拿 `current_judgement().created_at` 顶替**：今天的判定要到签署日 +2 天的北京
+    08:00 才生效，那之前 `current_judgement()` 返回的还是昨天那条，于是一个**完全健康**
+    的通道会被日报说成「上次成功是昨天」——而「上次成功是昨天」在机制健康那一段里读
+    起来就是「通道出问题了」。两个问题两种读法，这里刻意各留一个函数。
+
+    不跟时钟打交道：`created_at` 是写入时刻，与「现在几点」无关，所以不收 `now`。多一个
+    用不上的参数只会让人以为这条读法有时效语义。`-id` 只是并列时的定序（同一微秒写进
+    两条的概率约为零），取哪条不影响时刻，但影响调用方从返回行上读到的阶段，所以不留给
+    数据库自己挑。
+    """
+    return _records(symbol).order_by("-created_at", "-id").first()
+
+
 def in_force_since(record: RegimeJudgement) -> datetime:
     """`record.effective_regime` 这个阶段是从哪一刻开始生效的。
 

@@ -81,6 +81,55 @@ UTC 开盘日）。不用业务日（`to_business(...).date()`）：两者只在
 而「日期落在哪个阶段」问的是今天。这是一个可翻转的选择，判定点就这一处
 （`_entry_date`），要改就改它一个。
 
+## 载荷里为什么带着逐日曲线与逐笔样本（`merge_inputs`，版本 2）
+
+单元 7 要把同一个（策略 × 阶段）在**多次回测**上的证据合并成一条结论。合并的口径是
+「把样本拼起来重算」，不是「把结论投票」：一笔一笔地投会让一个 5 笔的短窗口与一个
+100 笔的长窗口等价，而回撤尤其不能平均——**平均出来的回撤不是任何一个组合的回撤**
+（它既可能大于也可能小于真值），与 ADR 0002 否掉「把几路信号揉成一个影响分 73」是
+同一条理由。要重算就得有样本，而上面那些指标全是**聚合量**：
+
+| 要被重算的量 | 它需要什么 | 为什么不能从已存的指标反推 |
+|--------------|-----------|--------------------------|
+| 分段回撤 / Calmar / 年化 | 逐日序列 | 回撤是曲线的形状，首末与总和都定不下它 |
+| 胜率 / 单笔均值区间 / 笔数 | 逐笔样本 | `win_rate` 是四舍五入过的比例，反推笔数是个近似 |
+| 覆盖月数（`min_months`） | 每笔的**开仓日** | **完全无法**从任何计数恢复——`months` 只说了有几个 |
+
+于是每格多一个 `merge_inputs`，两个键：
+
+- `daily_return`：`{"YYYY-MM-DD": 当日分摊份额 ÷ 初始资金}`；
+- `trades`：`[[开仓日, 该笔全额 ÷ 初始资金], ...]`，保持成交传入的顺序（`trades`
+  的第二项于是同时给出笔数、胜率、单笔均值区间三个量，开仓日给出覆盖月数）。
+
+**为什么是收益率而不是金额**：一次（策略 × 阶段）的证据来自多份回测，而各份的
+`initial_capital` 不同（`BacktestResult` 里是个没有下界校验的自由字段）。金额直接
+相加等于按各家本金给权重——一份 10 万本金的回测会把一份 1 万本金的回测淹掉，
+而这两份的证据强度本该由**笔数与月数**决定，不由本金决定。归一成收益率之后，
+合并出来的曲线是「这些回测等额并行跑」那条真实轨迹（每条一份名义本金），
+回撤与 Calmar 于是是**某个组合的真实数字**，而不是谁算出来的加权平均。
+
+分母就是 `initial_capital`，而它**可以 ≤ 0**（同一句「没有下界校验」的另一面），
+那时这一节落 `None`：不可用。不挑 `1.0` 顶替（顶替出来的曲线是金额，会把每一份正常
+归一化的样本淹掉），也不抛（一个坏结果会把整批重算拖成毒丸重试）。池化那边必须把
+`None` **计数**出来，理由见 `_merge_inputs`。
+
+代价写在明处：`merge_inputs` 里的量与同格的其他数字**不同量纲**（那些是金额，这些是
+比例）。这是刻意的——它们回答的是不同的问题，池化要的是「再算一遍」的原料，而原料
+必须与本金无关。两个键各自对应上表的一行，谁也不能从谁推出来。
+
+池化**不回头读 `BacktestTrade`**、也不重算标签，就在这些载荷上做纯聚合。理由是审计：
+池化结论要能回答「依据哪几个回测、多少笔交易、什么区间」，而答案必须是**当时物化的
+那份证据**——重新读一遍成交表，读到的可能是回测重跑后的新成交，于是报告引用的数字
+与它引用的证据对不上，且没有任何东西会提示这一点。
+
+**全样本不在这里存**：它是各格 `daily_return` 的**逐日逐元素之和**（`slice_backtest`
+里 `daily[day]` 与 `per_regime_daily[regime][day]` 加的是同一个 `share`，所以这是一条
+恒等式，不是近似）。多存一份就等于给同一个量留了第二个答案，而它会漂。
+
+曲线上的数按 `_ROUND` 落库（与载荷里其余数字同一个精度）。代价是池化算出来的是
+「曲线的数」的和，而不是「各格 `total_pnl`」的和——两者差在 1e-6 的量级上。留下这句
+是为了将来有人对不上账时能一眼看到差异的来源，而不是去怀疑公式。
+
 ## 高波动档不参与适用性判断
 
 CONTEXT.md：高波动是**保命档**，不做适用性判断，一律停开新仓；**证据门槛在高波动档
@@ -112,8 +161,13 @@ from typing import Mapping, Sequence
 from apps.regime import config
 from apps.regime.quant import PRIORITY, BaseRegime, label_series
 
-#: 载荷版本。`metrics` 里的切片结论带它，将来形状变了才分得清新旧。
-SLICE_VERSION = 1
+#: 载荷版本。`metrics` 里的切片结论带它，形状变了才分得清新旧。
+#:
+#: 2：每格多一个 `merge_inputs`（逐日收益率曲线 / 逐笔样本），供单元 7 池化重算。
+#: 进位不是为了标记「算过一次」，而是让 `is_stale` 把存量切片判成陈旧、由重算入口
+#: 刷新一遍——**旧载荷里没有这两样，池化在它上面无论怎么算都是错的**（缺样本会被
+#: 读成「样本薄」还是「没证据」取决于实现，两种都静默）。
+SLICE_VERSION = 2
 
 #: 年化换算用的天数。**自然日而非交易日**：24/7 市场没有收盘、没有交易日边界，
 #: 与 CONTEXT.md 给成功率定的「分母是自然日」同一条口径。365 是个约定值（不追
@@ -136,6 +190,26 @@ REASON_DIRECTION_CONFLICT = "direction_conflict"
 REASON_INCOMPARABLE = "incomparable"
 REASON_HIGH_VOL_BLANKET = "high_vol_blanket_halt"
 REASON_NO_REGIME_DAYS = "no_regime_days"
+
+#: 上面两组的展示名。与 `quant._DISPLAY` 同一约定：**取值是落库契约**（改名等于让新旧
+#: `metrics` 与新旧池化表出现两套键），中文只出现在展示层。放在词表的归属处而不是模型
+#: 里，是为了让「加了一个状态却忘了给它展示名」在 `KeyError` 上立刻响——字典查不到就
+#: 是查不到，不像 `choices` 那样会静默地不校验。
+STATE_DISPLAY = {
+    STATE_FIT: "适用",
+    STATE_UNFIT: "不适用",
+    STATE_NEUTRAL: "中性",
+    STATE_UNKNOWN: "未知",
+    STATE_BLANKET: "保命档",
+}
+
+REASON_DISPLAY = {
+    REASON_INSUFFICIENT: "证据不足",
+    REASON_DIRECTION_CONFLICT: "方向冲突",
+    REASON_INCOMPARABLE: "不可比",
+    REASON_HIGH_VOL_BLANKET: "高波动保命档",
+    REASON_NO_REGIME_DAYS: "窗口内该阶段未出现",
+}
 
 #: 比例与金额在 JSON 里的保留位数。切片是统计量，参与记账的是回测自己的
 #: `equity_curve`——这里多留几位只是为了让两条记录能比对，不是精度承诺。
@@ -407,6 +481,63 @@ def _fitness(cell: dict, full: dict) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# 池化输入
+# --------------------------------------------------------------------------- #
+
+
+def _merge_inputs(
+    daily: Mapping[date, float],
+    entry_dates: Sequence[date],
+    pnls: Sequence[float],
+    initial_capital: float,
+) -> dict | None:
+    """单元 7 池化要重算的那些量的**样本**（不是它们的结论）。见模块 docstring。
+
+    逐日曲线按日期排序落库（`dict` 的插入序于是与构造顺序无关），逐笔样本保持成交
+    传入的顺序——同一批成交必须给出同一份载荷，否则 `sha256` 之类的比对会随机地不
+    相等。
+
+    `entry_dates` 与 `pnls` 由 `slice_backtest` 在同一处成对追加，长度必然相同；
+    `zip(..., strict=True)` 把这个隐式不变量变成一句会响的断言——错位一格的样本会
+    给出「笔数与胜率都对、只有归属月错」的载荷，那种错误在报告里看不出来。
+
+    空样本给的是**空容器**而不是 `None`：「这一格没有交易」与「这一格没算」必须是
+    两件事，而 `None` 会把它们合成一件。
+
+    **`initial_capital <= 0` 时返回 `None`**：归一化没有分母，这份回测给不出与别人
+    同量纲的样本。这里不替它挑一个分母：
+
+    - 挑 `1.0` 会让它的曲线变成**金额**（`Decimal(20,2)` 那两位小数下动辄上万），
+      在池化里把每一份正常归一化的样本淹掉——一个看起来完全正常的池化结论，由一份
+      没人知道有问题的回测决定。
+    - 直接 `ZeroDivisionError` 会让这一个结果把**整批**重算拖成毒丸：切片任务收齐
+      失败后 `retry`（3 次、递增退避），每次重试都要把已经算好的那些重算一遍，而
+      失败的永远只有它一个。
+
+    所以它落成 `None` ——「这份回测的池化样本不可用」，与空容器的「这一格没有交易」
+    分开。池化那边必须把它**计数**出来（「有几个回测的样本不可用」是结论的一部分，
+    与 `attribution.unjudged`、`open_trades_excluded` 是同一条纪律）。
+
+    顺带说明为什么本函数是这条纪律的落点而不是 `_segment_metrics`：那一格自己的
+    指标在 `initial_capital <= 0` 下照样算得出（`_annualized_pct` 返回 `None`、
+    回撤退化成 0），是**结论**层面的退化，与「样本不可用」无关。切片的结论照旧产出，
+    只是这一份不参与池化。
+    """
+    if not initial_capital or initial_capital <= 0:
+        return None
+    capital = float(initial_capital)
+    return {
+        "daily_return": {
+            day.isoformat(): round(daily[day] / capital, _ROUND) for day in sorted(daily)
+        },
+        "trades": [
+            [entry.isoformat(), round(pnl / capital, _ROUND)]
+            for entry, pnl in zip(entry_dates, pnls, strict=True)
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
 
@@ -427,6 +558,14 @@ def _cell(
     空格子必须存在，理由与「判不出来就说判不出来」是同一条：缺失的格子在日报里
     会表现为「这一行没有」，而它有两种完全不同的意思（这个阶段没出现过 / 这个阶段
     出现了但没交易）。四格齐全 + `state` + `reason` 让两种意思各自可读。
+
+    每格除了结论与门槛，还带一份 `merge_inputs`（池化要用的样本，见模块 docstring）
+    ——**空格子也带**（空的那份），这样「这一格没交易」在池化那里与「这份载荷是旧版本、
+    根本没有这个键」仍然长得不一样。
+
+    三种「没有样本」在这里是三个不同的值，别把它们读成同一个：空容器是「这一格没有
+    交易」，`None` 是「这份回测本金 ≤ 0，样本不可用」（见 `_merge_inputs`），而**键
+    不存在**是「这份载荷是版本 1 的，那时还没有这一节」。
     """
     metrics = _segment_metrics(daily, initial_capital)
     months = covered_months(entry_dates)
@@ -454,6 +593,9 @@ def _cell(
             "met": enough,
         },
         **metrics,
+        # 结论是从哪来的。排在结论后面是刻意的：读载荷的人先看到「这格是什么」与
+        # 「门槛是多少」，再看到支撑它的样本。
+        "merge_inputs": _merge_inputs(daily, entry_dates, pnls, initial_capital),
     }
     if pnls:
         cell["win_rate"] = round(wins / len(pnls), _ROUND)
@@ -504,6 +646,12 @@ def slice_backtest(
     Returns:
         可直接存进 `BacktestResult.metrics["regime_slice"]` 的载荷（不含
         `computed_at` / 参数快照 / 标签指纹，那三样由单元 6ii 盖上去）。
+
+    载荷是**自足的**：每格带 `merge_inputs`（池化重算要的样本），而全样本那条曲线
+    等于各格 `merge_inputs["daily_return"]` 的逐日之和——所以单元 7 只靠这些载荷就能
+    拼出池化样本，不必回头读 `BacktestTrade`，也不必重算标签（见模块 docstring）。
+    那条恒等式成立是因为上面 `daily[day]` 与 `per_regime_daily[regime][day]` 加的是
+    同一个 `share`，不是因为两份都被算对了。
 
     门槛那一组数落在 `evidence_threshold` 键上，**不叫 `params`**：单元 6ii 会往同一份
     载荷里盖一个 `config_snapshot`，而它的 `judgement` 组里也有一个 `params`（量化判定的

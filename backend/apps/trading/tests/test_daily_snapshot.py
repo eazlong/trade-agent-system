@@ -400,9 +400,13 @@ class TestTaskWiring(unittest.TestCase):
     def test_task_runs_the_writer(self):
         """任务体必须真的调到写入方，而不是只返回一个空 dict。
 
-        判定也一并替掉：它读日线（DB），而这里是 ``unittest.TestCase``，不该为了
-        一条接线测试去开数据库。判定与快照的先后由 ``apps.regime.tests.test_timing``
-        负责，这里只确认两条职责都被调到、都进了返回值。
+        判定与停用决策推导也一并替掉：两者都读 DB（日线 / 池化表），而这里是
+        ``unittest.TestCase``，不该为一条接线测试去开数据库。三者之间的先后由
+        ``apps.regime.tests.test_timing`` 负责，这里只确认三条职责都被调到、
+        都进了返回值。
+
+        替身打在**源模块**上：任务体是函数内 import（不在 import 期就把交易/判定
+        链路拉起来），``apps.trading.tasks`` 上根本没有这三个名字。
         """
         from apps.trading.tasks import snapshot_daily_equity
 
@@ -417,15 +421,34 @@ class TestTaskWiring(unittest.TestCase):
                 "apps.regime.judgement.run_daily_judgement",
                 new=MagicMock(return_value={"skipped": "no_candles"}),
             ) as judgement,
+            patch(
+                "apps.regime.deactivation_run.run_deactivation",
+                new=MagicMock(
+                    return_value={
+                        "skipped": "no_generation",
+                        "note": "还没有任何一代池化表",
+                    }
+                ),
+            ) as deactivation,
         ):
             payload = snapshot_daily_equity()
 
         writer.assert_awaited_once()
         judgement.assert_called_once()
+        deactivation.assert_called_once()
         self.assertEqual(
             payload,
-            {"users": 1, "written": 1, "regime": {"skipped": "no_candles"}},
-            "返回值是任务健康检查唯一看得到的东西，两条职责都必须在里面",
+            {
+                "users": 1,
+                "written": 1,
+                "regime": {"skipped": "no_candles"},
+                "deactivation": {
+                    "skipped": "no_generation",
+                    "note": "还没有任何一代池化表",
+                },
+            },
+            "返回值是任务健康检查唯一看得到的东西，三条职责都必须在里面；"
+            "`skipped`/`note` 尤其不能丢——「日志不算被看见」，那句话的正经出口是日报",
         )
 
 

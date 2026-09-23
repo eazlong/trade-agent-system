@@ -85,7 +85,18 @@ class Strategy(models.Model):
     name = models.CharField(max_length=128)
     code_path = models.CharField(max_length=256)  # strategies/{id}.py
     git_commit_hash = models.CharField(max_length=40, blank=True)
-    is_active = models.BooleanField(default=False)
+    # 人工总开关：`False` = 已退役，永不被自动停用、也永不被自动恢复（CONTEXT.md 第 106
+    # 条）。注意它**不是**被管策略集合的依据（第 105 条）——集合只看注册表能不能解析到
+    # 实现类。回测自动建出的策略行也走这个默认值，靠迁移 `0006` 与幽灵清理命令回填。
+    is_active = models.BooleanField(
+        default=False,
+        help_text=(
+            "人工总开关：False = 已退役，永不被自动停用、也永不被自动恢复"
+            "（CONTEXT.md 第 106 条）。但它**不是**被管策略集合的依据"
+            "（第 105 条），集合只看注册表能不能解析到实现类。"
+            "回测自动建出的策略行默认 False，需由迁移/管理命令回填。"
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -128,6 +139,11 @@ class LiveSession(models.Model):
         ("error", "异常"),
     ]
     MODE_CHOICES = [("live", "实盘"), ("paper", "模拟")]
+    #: 仍算「活跃」的会话状态（`Order.ACTIVE_STATUSES` 的同一条纪律：每一处「活跃会话」
+    #: 枚举都用这个常量，不许再手抄一份字面量）。口径是「这个会话还在，将来还可能持仓」：
+    #: `pending` 还没启动但会启动，`paused` 只是暂停止损／止盈照样管着仓位，`stopped` /
+    #: `error` 则已经结束了。被管策略集合的第二条判据（CONTEXT.md 第 105 条）读的是它。
+    ACTIVE_STATUSES = ("pending", "running", "paused")
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)

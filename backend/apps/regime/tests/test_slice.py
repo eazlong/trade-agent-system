@@ -672,6 +672,156 @@ class TestPayloadShape(SimpleTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 池化输入（版本 2）
+# --------------------------------------------------------------------------- #
+
+
+class TestMergeInputs(SimpleTestCase):
+    """每格带着「结论是从哪来的」那两样样本，供单元 7 拼起来重算。
+
+    这一节钉的是**可重算性**：池化只靠载荷就能重建出全样本曲线与逐笔统计，不必回头
+    读 `BacktestTrade`、也不必重算标签。载荷里的数都是聚合量，聚合量凑不出样本——
+    这正是它们必须随结论一起落库的原因（见 `slice.py` 模块 docstring）。
+
+    样本是**收益率**（÷ `initial_capital`）而不是金额：一次（策略 × 阶段）的证据来自
+    多份 `initial_capital` 不同的回测，金额相加会按各家本金给权重。所以下面凡是拿样本
+    与同格的金额指标对账，都要先乘回 `CAP`。
+    """
+
+    def _payload(self, trades=None, tags=None, window=SPLIT_WINDOW):
+        return sl.slice_backtest(
+            trades if trades is not None else same_day_trades([6, 8, 10], 100.0),
+            tags if tags is not None else split_tags(),
+            initial_capital=CAP,
+            window=window,
+            params=SMALL,
+        )
+
+    def test_every_cell_carries_its_sample(self):
+        """空格子也带（空的那份）。「没有键」与「没有样本」不能长得一样。"""
+        for name, cell in self._payload()["cells"].items():
+            self.assertEqual(
+                set(cell["merge_inputs"]), {"daily_return", "trades"}, name
+            )
+
+    def test_an_empty_cell_carries_empty_sample_not_none(self):
+        cell = self._payload()["cells"]["uptrend"]  # 窗口内这个阶段没出现过
+        self.assertEqual(cell["merge_inputs"]["daily_return"], {})
+        self.assertEqual(cell["merge_inputs"]["trades"], [])
+
+    def test_capital_at_or_below_zero_yields_no_sample_not_a_substitute(self):
+        """本金 ≤ 0 时这一节是 `None`：不给分母、也不抛。
+
+        `BacktestResult.initial_capital` 没有下界校验（`views.py` 直接
+        `request.data.get("initial_capital", 10000)`），所以 0 与负数是**能**走到这里
+        的输入。三种处理各自的下场写在 `_merge_inputs` 里；这里钉的是选中的那种：
+        `None`，且它**没有**被读成「这一格没有交易」（那是空容器 `{}`/`[]`）。
+
+        同时钉住：切片的**结论**照旧产出——退化的是池化样本，不是这一格的指标。
+        """
+        for capital in (0, -100):
+            with self.subTest(capital=capital):
+                out = sl.slice_backtest(
+                    same_day_trades([6, 8, 10], 100.0),
+                    split_tags(),
+                    initial_capital=capital,
+                    window=SPLIT_WINDOW,
+                    params=SMALL,
+                )
+                for name, cell in out["cells"].items():
+                    self.assertIsNone(cell["merge_inputs"], name)
+                    # 结论与数字照旧：四态照给，笔数照数（这三笔全在 `range` 那格）。
+                    self.assertIn("state", cell)
+                self.assertEqual(out["cells"]["range"]["trades"], 3)
+                self.assertEqual(out["full_sample"]["total_pnl"], 300.0)
+
+    def test_the_daily_series_sums_to_the_cells_own_total_pnl(self):
+        """样本是收益率，所以对账要先乘回本金。"""
+        cell = self._payload()["cells"]["range"]
+        self.assertAlmostEqual(
+            sum(cell["merge_inputs"]["daily_return"].values()),
+            cell["total_pnl"] / CAP,
+            places=6,
+        )
+
+    def test_the_per_trade_samples_are_that_cells_trades(self):
+        """胜率必须能从逐笔样本重算出来——它自己是个四舍五入过的比例，反推是近似。"""
+        cell = self._payload()["cells"]["range"]
+        samples = cell["merge_inputs"]["trades"]
+        self.assertEqual(len(samples), cell["trades"])
+        wins = sum(1 for _, pnl in samples if pnl > 0)
+        self.assertAlmostEqual(wins / len(samples), cell["win_rate"], places=6)
+
+    def test_the_opening_day_of_every_trade_travels_with_it(self):
+        """覆盖月数**无法**从任何计数恢复（`months` 只说有几个），所以带上开仓日。
+
+        开仓日与那笔的收益率成对落库，于是「笔数」「胜率」「覆盖月数」三个量都由这
+        一份样本给出，且三者**必然互相一致**——分开存（比如另存一串月份）就多了一处
+        能漂的地方。
+        """
+        out = self._payload(
+            [trade(0, 0, 10.0), trade(35, 35, 20.0)],
+            tags_of({**{i: RANGE for i in range(2)}, 35: RANGE}),
+            window=(d(0), d(35)),
+        )
+        cell = out["cells"]["range"]["merge_inputs"]
+        self.assertEqual(
+            [iso for iso, _ in cell["trades"]], ["2026-01-01", "2026-02-05"]
+        )
+        self.assertEqual(
+            len({iso[:7] for iso, _ in cell["trades"]}),
+            out["cells"]["range"]["months"],
+        )
+
+    def test_a_trade_held_across_two_regimes_splits_its_amount_in_the_series(self):
+        """跨阶段的一笔同时进两格的日序列（各一半），而只进一格的逐笔样本（全额）。
+
+        两处不对称在池化输入上原样保留：`daily_return` 是「钱赚在哪」，`trades` 是
+        「这笔交易归哪一格」。合成就丢掉了本模块开头那两处刻意的不对称。
+        """
+        out = self._payload([trade(5, 6, 200.0)])
+        self.assertEqual(
+            out["cells"]["downtrend"]["merge_inputs"]["daily_return"],
+            {"2026-01-06": 0.01},
+        )
+        self.assertEqual(
+            out["cells"]["range"]["merge_inputs"]["daily_return"], {"2026-01-07": 0.01}
+        )
+        self.assertEqual(
+            out["cells"]["downtrend"]["merge_inputs"]["trades"], [["2026-01-06", 0.02]]
+        )
+        self.assertEqual(out["cells"]["range"]["merge_inputs"]["trades"], [])
+
+    def test_the_full_sample_curve_is_the_sum_of_the_cells_daily_series(self):
+        """全样本不单独存，因为它是一条恒等式而不是一个近似——存第二份就会漂。
+
+        与旧版（金额）不同，这里不再能要求**精确相等**：曲线上的数是 `_ROUND` 位小数的
+        收益率，逐日相加后再乘回本金，浮点表示误差就在那一档上。`places=6` 正好是
+        `_ROUND`，等式一破到那个量级以上就说明某一格的钱漏进了别处或掉在地上。
+        """
+        out = self._payload(
+            same_day_trades([0, 2, 4], 100.0) + same_day_trades([6, 8, 10], -400.0)
+        )
+        summed: dict[date, float] = {}
+        for cell in out["cells"].values():
+            for iso, ratio in cell["merge_inputs"]["daily_return"].items():
+                day = date.fromisoformat(iso)
+                summed[day] = summed.get(day, 0.0) + ratio
+        amounts = {day: ratio * CAP for day, ratio in summed.items()}
+        self.assertAlmostEqual(
+            sl._segment_metrics(amounts, CAP)["total_pnl"],
+            out["full_sample"]["total_pnl"],
+            places=6,
+        )
+
+    def test_the_sample_survives_json(self):
+        """它跟着载荷进 `BacktestResult.metrics`（JSONField），日期必须是字符串。"""
+        import json
+
+        json.dumps(self._payload()["cells"], ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
 # 标签
 # --------------------------------------------------------------------------- #
 

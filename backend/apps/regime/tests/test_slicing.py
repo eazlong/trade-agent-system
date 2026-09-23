@@ -15,6 +15,10 @@
    等于每次重算都是全表重写。
 5. **投递失败绝不抛**——一次成功的回测不该因为一个附加产物投不出去而被标成失败。
 6. **任务以「一批 id」为形状**——批本身就是那个计数，重投整批是安全的收敛策略。
+7. **重算入口是两段串联：切片 → 池化**（单元 7）。池化读的就是切片落下的载荷，所以它
+   必须排在后面；而它**不能**被切片失败挡住——让一条坏数据否决整张适用性表，比让那张
+   表说明「这一轮少看了几个回测」更坏。范围参数只收窄切片那一段（池化是全表的），
+   `--dry-run` 下两段都不写（既然一行都不写，就该一行都不写）。
 
 载荷形状（`config_snapshot` 只取 judgement + evidence、`tags.symbol` 恒为判定源 BTC）
 也在这里钉住：那两条都是「写错了照样跑」的约定，只有断言能挡住。
@@ -24,6 +28,7 @@ DB 用例用真事务回滚的 `TestCase`；纯逻辑一律 `SimpleTestCase`，�
 
 from __future__ import annotations
 
+import getpass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from io import StringIO
@@ -34,9 +39,10 @@ from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
 from django.core.management import call_command
 
-from apps.regime import config, slicing, tasks
+from apps.regime import config, pool_rebuild, slicing, tasks
 from apps.regime import slice as sl
 from apps.regime.judgement import SYMBOL
+from apps.regime.models import ActorKind, RebuildStatus, RegimePoolRebuild
 from apps.regime.quant import BaseRegime
 
 RANGE = BaseRegime.RANGE
@@ -474,8 +480,12 @@ class _StubbedConnectionReset:
     必要的（见 CLAUDE.md 的长循环连接纪律），所以测试里只换掉它，**另用一条用例断言
     它确实被调到了**，免得把「删掉这行」这种回归一起放行。
 
-    打的是 `django.db.close_old_connections`：两个模块都在函数体内 `from django.db
-    import ...`，模块上没有这个名字可打。
+    打的是 `django.db.close_old_connections`（**定义处**）：受它盖住的模块都在**函数体内**
+    `from django.db import ...`，模块命名空间里没有第二个名字可打。于是这条桩的有效性
+    依赖一件事——**受测模块不许在模块顶部绑定这个名字**。绑了的话它自己那份绑定打不着，
+    真函数照跑，上面那条 `InterfaceError` 会以一种「看哪个测试模块先导入」的方式回来
+    （`recompute_regime_slices` 当初就是这么写坏的）。那条命令的模块 docstring 与调用处
+    各留了一处注释，就是为了挡住下一次。
     """
 
     def setUp(self):
@@ -724,6 +734,41 @@ class TestRecomputeCommand(_StubbedConnectionReset, TestCase):
         self.assertIsNotNone(slicing.stored_slice(a))
         self.assertIsNotNone(slicing.stored_slice(b))
 
+    def test_the_scan_never_hauls_the_heavy_columns(self):
+        """`--all` 跑不跑得动就压在那行 `defer` 上，所以它得有测试看着。
+
+        判据取**行上真的被推迟了哪些列**（`get_deferred_fields`），不取内存、也不取
+        SQL 文本：内存随批量与 GC 浮动，做不了断言；SQL 文本则是绕远路去猜同一件事。
+        这条读法直接问「进到扫描循环里的行，是不是真的没把那四列搬进来」——`defer`
+        被删掉、被 `.only()` 顶掉、或者哪天被挪到只有一条分支生效的位置，它都会红。
+
+        `BacktestResult` 这四个大列（`HEAVY_COLUMNS`）每行约 600 KB，全表 4067 行
+        超过容器 2 GiB 上限，越限的现场是「进程卡住不动」而不是一条报错——所以要一条
+        测试，而不是靠下一个人记得。要往这条扫描里加列，先把那条注释读一遍。
+        """
+        from apps.regime.management.commands.recompute_regime_slices import HEAVY_COLUMNS
+
+        self.make_result()
+        seen: list[set] = []
+        real_is_stale = slicing.is_stale
+
+        def spy(row, tags, params=None):
+            seen.append(row.get_deferred_fields())
+            return real_is_stale(row, tags, params)
+
+        # 打 `is_stale` 而不是打个「顺路看一眼」的桩：它是每一行都要过的那道闸，而且它
+        # 拿到的是**iterator 交出来的那个实例**——正是要断言的对象。
+        with patch("apps.regime.slicing.is_stale", side_effect=spy):
+            self.run_command("--all")
+
+        self.assertTrue(seen, "这次运行一行都没经过扫描循环，下面的断言无意义")
+        missing = [sorted(set(HEAVY_COLUMNS) - deferred) for deferred in seen]
+        self.assertEqual(
+            [m for m in missing if m],
+            [],
+            f"有行没把那四个大列推迟掉：{missing}（见 recompute_regime_slices.HEAVY_COLUMNS）",
+        )
+
     def test_a_second_run_over_the_same_set_skips_everything(self):
         """幂等：反复运行不产生副作用。"""
         self.make_result()
@@ -768,6 +813,10 @@ class TestRecomputeCommand(_StubbedConnectionReset, TestCase):
         self.assertIn("[dry-run]", report)
         result.refresh_from_db()
         self.assertIsNone(slicing.stored_slice(result))
+        # 池化那一段也一行不写。一个「不写库」的开关下面挂两段，第二段偷偷写，
+        # 是那种跑完才发现「dry-run 把表换代了」的故障。
+        self.assertIn("会全表重建池化表", report)
+        self.assertEqual(RegimePoolRebuild.objects.count(), 0)
 
     def test_only_the_named_result_is_touched(self):
         named, other = self.make_result(), self.make_result()
@@ -816,3 +865,73 @@ class TestRecomputeCommand(_StubbedConnectionReset, TestCase):
         with patch("apps.regime.slicing.compute_slice", side_effect=ValueError("坏数据")):
             with self.assertRaises(CommandError):
                 self.run_command("--all")
+
+    # -- 池化那一段（单元 7） --------------------------------------------- #
+
+    def test_a_slice_failure_does_not_stop_the_pool_stage(self):
+        """一条坏切片不该否决整张适用性表：池化天生容忍样本缺口。
+
+        缺口本身是有出口的——没切片的那些进了 `exclusions` 落在这一代上，命令还会
+        额外说一句「这一代是按部分刷新的输入建的」。顺序上池化必须排在抛出之前，
+        否则「切片有一条坏的」就等于「池化表停在上一代」，而那正是这张表最没用的时刻。
+        """
+        self.make_result()
+        out = StringIO()
+
+        with patch("apps.regime.slicing.compute_slice", side_effect=ValueError("坏数据")):
+            with self.assertRaises(CommandError):
+                call_command("recompute_regime_slices", "--all", stdout=out)
+
+        report = out.getvalue()
+        self.assertIn("失败 1", report)
+        self.assertIn("池化：", report)
+        self.assertIn("按部分刷新的输入建的", report)
+
+        generation = RegimePoolRebuild.objects.get()
+        self.assertEqual(generation.status, RebuildStatus.READY.value)
+        self.assertEqual(generation.candidates, 1)
+        self.assertEqual(generation.results_used, 0)
+
+    def test_the_actor_is_recorded_on_the_generation(self):
+        """Q8：重算记录要回答「谁让它重算的」，否则「昨天还好好的」无从追起。"""
+        self.make_result()
+
+        self.run_command("--all", "--actor", "xl")
+
+        generation = RegimePoolRebuild.objects.get()
+        self.assertEqual(generation.actor_kind, ActorKind.CLI.value)
+        self.assertEqual(generation.actor_name, "xl")
+
+    def test_the_actor_defaults_to_the_system_user(self):
+        self.make_result()
+
+        self.run_command("--all")
+
+        self.assertEqual(RegimePoolRebuild.objects.get().actor_name, getpass.getuser())
+
+    def test_the_registry_is_refreshed_at_the_entry_point(self):
+        """注册表的新鲜度由**入口**负责：`apps.ready()` 只在目录当时存在时才 discover。
+
+        长驻进程在 `~/.tradelogx/strategies` 建起来之前就启动的话，整批策略解析不到
+        实现类、全落到「未归类」兜底——池化照跑、日报照出，只有一个数字在说话。
+        """
+        self.make_result()
+
+        with patch.object(pool_rebuild, "ensure_strategies_discovered") as discover:
+            self.run_command("--all")
+
+        discover.assert_called_once_with()
+
+    def test_the_range_parameters_do_not_narrow_the_pool_stage(self):
+        """`--result` 只收窄切片那一段：池化是全表的，少收窄一次就换代换代到一半。"""
+        named, other = self.make_result(), self.make_result()
+
+        report = self.run_command("--result", str(named.id), "--limit", "1")
+
+        self.assertIn("全表重建", report)
+        # 候选数看的是**全部**回测结果，不是被 --result/--limit 收窄后的那一条。
+        self.assertEqual(RegimePoolRebuild.objects.get().candidates, 2)
+        named.refresh_from_db()
+        other.refresh_from_db()
+        self.assertIsNotNone(slicing.stored_slice(named))
+        self.assertIsNone(slicing.stored_slice(other))

@@ -29,6 +29,7 @@ CONTEXT.md 的阈值全枚举，以及每一组落在哪一段（防止「没写
 | `JUDGEMENT` | 判定指标周期、分位阈值、趋势判据 | ✔ 单元 3 |
 | `JUDGEMENT_LIFECYCLE` | 最小持续期、状态过期 | ✔ 本单元 |
 | `EVIDENCE` | 切片证据门槛 | ✔ 本单元 |
+| `DEACTIVATION` | 人工豁免生效期 | ✔ 单元 7 |
 | `BOX` | 箱体判定与高低点结构的参数（约 10 个） | 单元 8（日报要写依据时才定形状） |
 | `NEWS` | 采集窗口、预筛条数、正文截断、白名单源 | ✔ 本单元 |
 | `SHADOW` | Shadow 到期上下限、一致率达标阈值 | 单元 8 |
@@ -242,6 +243,30 @@ class EvidenceConfig:
             raise ValueError(f"min_trades 必须 >= 1，当前 {self.min_trades}")
         if self.min_months < 1:
             raise ValueError(f"min_months 必须 >= 1，当前 {self.min_months}")
+
+
+@dataclass(frozen=True)
+class DeactivationConfig:
+    """停用推导（第①段单元 7）里唯一一个可调的数。
+
+    `exemption_days` 是人工豁免的生效期（自然日）。CONTEXT.md 把它明确划进「与判定
+    参数同一配置面」，所以它在这里而不在豁免模型上：模型上的默认值会让「10 天」出现
+    第二份，而两份会在某次有人改了其中一份之后开始分歧——分歧的表现是「豁免到底
+    多久」，而它恰好是唯一一个让人跳过自动停用的开关，错了没人会发现。
+
+    **生效期在写入豁免时就换算成绝对时刻存下来**（`expires_at`），所以改动这个数
+    **不会**追溯延长或缩短已经发出的豁免。同 `RegimeJudgement` 存 `attribute_date` 的
+    理由：留痕靠记录自己，不靠用今天的规则去反推。生效期因此是「发豁免那一刻的配置」，
+    而不是「查询那一刻的配置」。
+    """
+
+    exemption_days: int = 10
+
+    def __post_init__(self) -> None:
+        if self.exemption_days < 1:
+            raise ValueError(
+                f"exemption_days 必须 >= 1，当前 {self.exemption_days}"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +539,7 @@ CANDLES = CandleConfig()
 JUDGEMENT = JudgementConfig()
 JUDGEMENT_LIFECYCLE = JudgementLifecycleConfig()
 EVIDENCE = EvidenceConfig()
+DEACTIVATION = DeactivationConfig()
 NEWS = NewsConfig()
 
 
@@ -528,6 +554,7 @@ GROUPS: dict[str, Any] = {
     "judgement": JUDGEMENT,
     "judgement_lifecycle": JUDGEMENT_LIFECYCLE,
     "evidence": EVIDENCE,
+    "deactivation": DEACTIVATION,
     "news": NEWS,
 }
 

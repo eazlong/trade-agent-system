@@ -14,22 +14,67 @@ CONTEXT.md 要求切片「必须有全量重算入口」。这个命令就是它
 它的定位是**同步**入口：在管理机上跑完就完了，不投递任务。所以长循环里的连接纪律
 （`close_old_connections()`）必须自带——见 CLAUDE.md。
 
+**自带的方式必须在函数内导入它。** 一行模块级的 `from django.db import close_old_connections`
+会把名字绑死在本模块的命名空间上，于是测试里打桩 `django.db.close_old_connections` 只改了
+定义处、改不到这里——真跑一次就掐掉 `TestCase` 那条测试事务的连接（`CONN_MAX_AGE=0` ⇒
+`close_at` 就是连接建立的时刻，测试事务里 autocommit 恒为 False），之后每一条 ORM 都是
+`InterfaceError: connection already closed`。这个坑的隐蔽之处在于它**取决于导入顺序**：
+哪个测试模块先碰到本命令，决定了这次绑定拿到的是真函数还是桩。
+
 幂等：反复运行不产生副作用，第二次跑会把上一次的全判成「不陈旧」并跳过。
 
-后续（单元 7）池化表的全量重算并入这里，不另开命令（CONTEXT.md）。
+## 池化表重算并入这里（单元 7）
+
+切片跑完接着重建池化表，不另开命令（CONTEXT.md）。两段的关系是**串联而不是并列**：
+池化读的就是切片落下的载荷，所以它必须排在后面，而且在同一个进程里排在这里就不必
+反序列化第二遍。
+
+池化的范围参数一律**不适用**——它是全表的（`pool_rebuild` 收全部回测结果），
+`--result` / `--strategy` / `--limit` 只收窄切片那一段。`--dry-run` 下两段都不写。
+
+切片失败**不阻止**池化：样本收集天生容忍缺口（没有切片的计数进 `exclusions`，落在那
+一代上），而让一条坏数据否决整张适用性表，比让那张表说明「这一轮少看了几个回测」更坏。
+失败仍然以非零退出码收场，并且会额外说一句这次的一代是按**部分刷新**的输入建的。
+
+## 重算差异重放挂在池化之后（单元 7 收尾）
+
+新的一代翻成 `ready` 之后，对每一条生效中的停用决策重放一遍新表，并把「依据已随重算
+失效」摆到人面前（CONTEXT.md 第 118 条）。它排在这里的理由与池化一样是**串联**：重放
+读的就是刚翻出来的那一代。
+
+复用与重复触发那两种收场都**不重放**——没有新表可重放（见 `replay_run` 的模块
+docstring）。`--dry-run` 更不会：上面那道门已经把它挡在池化之前了。
+
+**告警由本命令发**（`_notify_invalidated`），不由重放那一层发。
 """
 
 from __future__ import annotations
 
+import getpass
+
+from asgiref.sync import async_to_sync
 from django.core.management.base import BaseCommand, CommandError
-from django.db import close_old_connections
 from django.db.models import Q
 
 from apps.backtest.models import BacktestResult
-from apps.regime import slicing
+from apps.regime import pool_rebuild, replay, replay_run, slicing
+from apps.regime.models import ActorKind, ReviewVerdict
+from apps.trading import alerts
 
 #: 每多少条断一次旧连接。与 `run_grid_search_task` 的逐组合清理同一个意图。
 BATCH_SIZE = 50
+
+#: `BacktestResult` 上四个又大又用不到的列。切片只读 `metrics` / `start_date` /
+#: `end_date` / `initial_capital` / `strategy`，以及另表的 `trades`——这四列一个都不读。
+#:
+#: **`--all` 跑不跑得动就压在这一行上**：实测每行带上它们的开销约 600 KB，4067 行一次
+#: 拉进内存就是 ~2.4 GB，超过容器 2 GiB 的上限，进程卡在 cgroup 回收里不动（现象是
+#: 「挂了」，实测 283 秒才吐出第一行，整轮永远跑不完）。defer 之后同一批 4067 行的
+#: `is_stale` 扫描是 0.3 秒、峰值 167 MB。
+#:
+#: 想加列进来之前先确认没人读它——`save_slice` 是另起一条 `.only("id", "metrics")` 的
+#: 查询写的，所以 defer 不影响落库。
+HEAVY_COLUMNS = ("equity_curve", "drawdown_curve", "ohlcv_data", "indicator_data")
 
 
 class Command(BaseCommand):
@@ -69,7 +114,13 @@ class Command(BaseCommand):
         parser.add_argument(
             "--dry-run",
             action="store_true",
-            help="只报会重算哪些，不写库",
+            help="只报会重算哪些，不写库（池化那一段也不写）",
+        )
+        parser.add_argument(
+            "--actor",
+            default="",
+            metavar="NAME",
+            help="记进重算记录的触发人，默认取当前系统用户（Q8）",
         )
 
     def handle(self, *args, **options):
@@ -94,6 +145,12 @@ class Command(BaseCommand):
         recomputed = 0
         fresh = 0
         failed: list[str] = []
+
+        # 函数内导入，**不是**模块顶部（与 `apps/regime/tasks.py` 同一写法）：模块级
+        # `from django.db import close_old_connections` 会把名字绑死在本模块上，此后
+        # 打桩 `django.db.close_old_connections` 就到不了这里——而真跑一次会掐掉
+        # `TestCase` 事务那条连接。理由详见模块 docstring。
+        from django.db import close_old_connections
 
         for index, result in enumerate(queryset.iterator(chunk_size=BATCH_SIZE)):
             if index % BATCH_SIZE == 0:
@@ -122,12 +179,176 @@ class Command(BaseCommand):
             f"切片重算：{'待' if dry_run else ''}重算 {recomputed}，"
             f"跳过（不陈旧）{fresh}，失败 {len(failed)}"
         )
+
+        self._rebuild_pool(options, failed)
+
         if failed:
             raise CommandError(f"{len(failed)} 条切片失败，详见上面的 stderr")
 
+    # -- 池化那一段 ------------------------------------------------------ #
+
+    def _rebuild_pool(self, options, failed: list[str]) -> None:
+        """切片跑完接着重建池化表。**同步**，与切片同一段连接纪律之外（一次查询 + 几批写入）。"""
+        if options["dry_run"]:
+            self.stdout.write("[dry-run] 会全表重建池化表（范围参数只作用于切片那一段）")
+            return
+
+        # 注册表是原型归属的唯一出处，而 `apps.ready()` 只在目录当时存在时才 discover。
+        # 这里补一次，否则整批策略会安静地全落到「未归类」。
+        pool_rebuild.ensure_strategies_discovered()
+
+        # 范围参数对这一段**不适用**（见模块 docstring）。无条件说出来，不按「这次有没有
+        # 给范围参数」来判：一个有条件的提示会让人以为「没说就是收窄了」。
+        self.stdout.write("池化：全表重建（范围参数只作用于切片那一段）")
+
+        actor = options["actor"] or getpass.getuser()
+        summary = pool_rebuild.rebuild_pool(
+            actor_kind=ActorKind.CLI.value, actor_name=actor
+        )
+
+        if summary["reused"]:
+            # 复用的代价是这一轮没有记录，所以这句必须说出来（见 pool_rebuild 的模块 docstring）。
+            self.stdout.write(
+                f"池化：输入指纹未变，复用第 {summary['rebuild_id']} 代，未落新记录"
+            )
+        elif summary["duplicate"]:
+            # 不是故障：同一指纹已有一代就绪，那条部分唯一约束按设计拦下了这一次。
+            self.stdout.write(
+                self.style.WARNING(
+                    f"池化：同一输入指纹已有一代就绪（另一进程先一步完成），"
+                    f"本次未替换当前代；这一次留下了 #{summary['rebuild_id']} 这条失败记录"
+                )
+            )
+        else:
+            self.stdout.write(
+                f"池化：新一代 #{summary['rebuild_id']}，候选 {summary['candidates']}，"
+                f"采用 {summary['results_used']}，格子 {summary['cells_total']}，"
+                f"变化 {summary['cells_changed']}"
+            )
+
+        # 排除按切片数、按原因分开报：不报的话「采用 < 候选」这个差就没有出口。
+        excluded = {k: v for k, v in summary["exclusions"].items() if v}
+        if excluded:
+            self.stdout.write(
+                "池化排除：" + "，".join(f"{k} {v}" for k, v in sorted(excluded.items()))
+            )
+
+        if summary["unclassified"]:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"未归类策略 {len(summary['unclassified'])} 条"
+                    f"（{summary['unclassified'][:5]}）：走的是原型兜底，"
+                    "原因多半是描述里没有可识别的原型词，或注册表没发现实现类"
+                )
+            )
+        if summary["needs_review"]:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"待人工复核的格子 {summary['needs_review']} 个（方向冲突，不产生停用建议）"
+                )
+            )
+        if failed:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"注意：{len(failed)} 条切片失败，这一代池化表是按部分刷新的输入建的"
+                )
+            )
+
+        if summary["reused"] or summary["duplicate"]:
+            # 两道门都不重放，理由同一个：**没有新表可重放**。复用那一轮指纹没变 ⇒ 结论
+            # 逐格相同 ⇒ 重放出来的结论必然与上次逐条相同，落下去只是噪声；重复触发那一轮
+            # 没替换当前代，也就没有新表。见 replay_run 的模块 docstring。
+            return
+
+        self._replay_decisions()
+
+    # -- 重算差异重放（单元 7 收尾） ---------------------------------------- #
+
+    def _replay_decisions(self) -> None:
+        """新一代翻完之后，对生效中的停用决策重放一遍新表（CONTEXT.md 第 118 条）。
+
+        「重算不自动恢复任何停用决策」是这份设计的地基，所以这里的产出**只有告知**：
+        一条差异记录 + 一句给人看的话。恢复要走人工豁免命令。
+        """
+        summary = replay_run.run_replay()
+
+        if summary["skipped"]:
+            self.stdout.write(f"重放：{summary['note']}")
+            return
+        if not summary["written"]:
+            self.stdout.write(
+                f"重放：第 {summary['generation_id']} 代，生效中的决策 "
+                f"{summary['decisions']} 条（其中 {summary['already']} 条这一代已评过），"
+                "本轮没有新的重放"
+            )
+            return
+
+        verdicts = summary["verdicts"]
+        self.stdout.write(
+            f"重放：第 {summary['generation_id']} 代，重放 {summary['written']} 条，"
+            f"仍判不适用 {verdicts[ReviewVerdict.STILL_UNFIT.value]}，"
+            f"仍判中性 {verdicts[ReviewVerdict.STILL_NEUTRAL.value]}，"
+            f"依据失效 {verdicts[ReviewVerdict.BECAME_FIT.value]}，"
+            f"与上次结论不同 {summary['changed']}"
+        )
+        self._notify_invalidated(summary["invalidated"])
+
+    def _notify_invalidated(self, invalidated: list[dict]) -> None:
+        """把「依据已随重算失效」告诉受影响的人。
+
+        **告警在这里发，不在 `replay_run` 里发**：`apps/regime/tasks.py` 的纪律是「任务
+        自己不写告警，失败往上抛」，重放那一层同理——它只算差异，投递属于入口。
+
+        触发者就站在 stdout 前面，所以**没有收件人不等于没人看见**——但这句提示必须打
+        出来，否则一次没送出去的告警与一次送出去的告警长得一模一样。CONTEXT.md 说的是
+        「告知触发者与告知受影响用户是同一件事」，这里两句都做到。
+        """
+        if not invalidated:
+            return
+
+        message = replay.format_alert(invalidated)
+        self.stdout.write(message)
+
+        recipients = replay_run.alert_recipients(
+            [item["strategy_id"] for item in invalidated]
+        )
+        if not recipients:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"重放：{len(invalidated)} 条依据失效，但没有活跃实盘会话引用这些策略，"
+                    "没有可通知的收件人（上面那条清单即全部告知）"
+                )
+            )
+            return
+
+        delivered = 0
+        for user_id in recipients:
+            try:
+                # `notify_user` 是 async，这里是同步的管理命令——用 `async_to_sync` 过桥，
+                # 与 `apps/trading/views.py` 的用法一致。
+                if async_to_sync(alerts.notify_user)(user_id, message):
+                    delivered += 1
+                else:
+                    self.stderr.write(
+                        self.style.ERROR(f"重放告警未送达 user={user_id}（无接收人）")
+                    )
+            except Exception as e:  # noqa: BLE001 - 通知失败不得影响重算结果本身
+                self.stderr.write(
+                    self.style.ERROR(f"重放告警投递异常 user={user_id}：{e}")
+                )
+
+        # 一次重放**只发一次**，不做每日节流：重算是人触发的低频动作（CONTEXT.md），
+        # `daily_snapshot` 那套「同一人同一天只告警一次」是给 5 分钟一轮的循环用的。
+        if delivered:
+            self.stdout.write(f"重放：已通知 {delivered} 人")
+
     def _select(self, options):
-        """按范围参数拼查询集。三个参数是**并集**，不互相收窄。"""
-        queryset = BacktestResult.objects.all()
+        """按范围参数拼查询集。三个参数是**并集**，不互相收窄。
+
+        一律 defer 掉 `HEAVY_COLUMNS`（见那份常量的注释）：两条分支都要，所以加在
+        `objects` 这一层，而不是各自补一次。
+        """
+        queryset = BacktestResult.objects.defer(*HEAVY_COLUMNS)
         if options["all"]:
             return queryset.order_by("created_at")
 

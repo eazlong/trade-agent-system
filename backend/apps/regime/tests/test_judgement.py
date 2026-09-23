@@ -40,6 +40,7 @@ from apps.regime.judgement import (
     build_evidence,
     current_judgement,
     in_force_since,
+    last_judgement,
     load_candles,
     pending_judgement,
     run_daily_judgement,
@@ -298,6 +299,43 @@ class TestCurrentAndPendingAreTwoQueries(TestCase):
         now = business_midnight(RUN_DAY + timedelta(days=5))
         self.assertEqual(current_judgement(now=now), self.r24)
         self.assertIsNone(pending_judgement(now=now))
+
+
+class TestLastSuccessIsNotTheInForceOne(TestCase):
+    """日报第④段的「上次判定成功时间」问的是**链路**，不是生效态。"""
+
+    def setUp(self):
+        self.r22 = make_judgement(RUN_DAY, BaseRegime.RANGE)
+        self.r23 = make_judgement(RUN_DAY + timedelta(days=1), BaseRegime.UPTREND)
+
+    def test_a_healthy_channel_is_not_reported_as_stale(self):
+        """判定今天跑成功了，但那条要到后天早上才咬人——这正是要分开的那一格。"""
+        latest = make_judgement(RUN_DAY + timedelta(days=2), BaseRegime.UPTREND)
+        now = business_midnight(RUN_DAY) + timedelta(hours=3)
+
+        self.assertEqual(current_judgement(now=now), self.r22)
+        self.assertEqual(
+            last_judgement(),
+            latest,
+            "最近写下的是这条。拿 `current_judgement().created_at` 顶替，会把一个完全"
+            "健康的通道报成「上次成功还是前天」——而那是机制健康那一段里最像故障的一句话",
+        )
+
+    def test_it_answers_before_anything_is_in_force(self):
+        """`now` 早于所有 `effective_at` 时生效态是空，但链路照答。"""
+        now = business_midnight(RUN_DAY) - timedelta(days=1)
+        self.assertIsNone(current_judgement(now=now))
+        self.assertEqual(last_judgement(), self.r23)
+
+
+class TestLastSuccessWithNoRecords(TestCase):
+    """独立成类：这条要的是**一条记录都没有**，与上面那两条不共用 `setUp`。"""
+
+    def test_never_judged_is_none(self):
+        self.assertIsNone(
+            last_judgement(),
+            "一条记录都没有时必须返回 None。回落成「现在」等于宣布通道刚刚成功过",
+        )
 
 
 class TestTheQueryComparesTheMomentNotTheDate(TestCase):

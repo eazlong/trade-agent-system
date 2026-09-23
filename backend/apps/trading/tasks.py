@@ -14,6 +14,11 @@
 
 净值快照这条心跳还顺带驱动**行情阶段判定**（第①段单元 4）：同一类「5 分钟一轮 +
 幂等 + 无需在日界准确跑」的调度，理由与回退方式见 ``apps.regime.judgement``。
+
+判定之后再顺带驱动**停用决策推导**（第①段单元 7）。排在判定之后是硬要求：推导读的是
+判定刚落下的那条「当前生效阶段」。这一轮**不重建池化表**——重算是人触发的低频动作
+（CONTEXT.md 第 118 条），日报只读「当前一代」。回退方式与判定一样：删掉
+``_derive_deactivation`` 这一个调用，前两段职责各自完好。
 """
 
 import asyncio
@@ -97,4 +102,46 @@ def snapshot_daily_equity(self) -> dict:
 
     if not payload["regime"].get("skipped"):
         logger.info("[snapshot_daily_equity] 行情阶段判定 %s", payload["regime"])
+
+    return _derive_deactivation(payload)
+
+
+def _derive_deactivation(payload: dict) -> dict:
+    """跑停用决策推导，挂进 `payload["deactivation"]`（第①段单元 7）。
+
+    **为什么还是搭在这条心跳上、为什么排在判定之后**：与判定同一个理由——同一类「5 分钟
+    一轮 + 幂等 + 无需在日界准确跑」的调度。排在判定之后的理由更硬：推导读的是判定刚落下的
+    那条「当前生效阶段」（`deactivation_run.current_regime_state`），先跑会永远慢一拍——
+    而且慢的那一拍**看起来完全正常**，只是每天晚一天停用。
+
+    **这一轮不重建池化表**（CONTEXT.md 第 118 条）：重算是人触发的低频动作，日报只读
+    「当前一代」。所以「池化表还没建过」是一种**合法收场**而非故障——推导会以
+    `skipped="no_generation"` 加一句话回来（见 `deactivation_run` 的模块 docstring）。
+
+    **注册表发现不在这里补**：`deactivation_run.managed_set()` 已经补过，而它是「解析得到
+    实现类」的唯一出处。这里再补一遍就是第二处定义，迟早会漂。
+
+    推导失败（不是数据不足）才往上抛：心跳 5 分钟后再来一次，`update_or_create` 幂等，
+    重试无副作用；吞掉异常则会让停用决策静默死掉。**冷启动 / 状态过期 / 没有池化表**三种
+    收场都不抛——它们是「什么都不动」，不是失败——但每一种都带着一句给人看的话
+    （`note`），所以这里照样往日志里写一遍：**日志不算被看见**，那句话的正经出口是日报，
+    这里只是不让它在任务层就消失。
+    """
+    from apps.regime.deactivation_run import run_deactivation
+
+    try:
+        payload["deactivation"] = run_deactivation()
+    except Exception as e:  # noqa: BLE001
+        logger.error("[snapshot_daily_equity] 停用决策推导失败: %s", e, exc_info=True)
+        raise
+    finally:
+        # 长时间运行/反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+    summary = payload["deactivation"]
+    if summary["skipped"]:
+        logger.info("[snapshot_daily_equity] 停用决策：%s", summary["note"])
+    else:
+        logger.info("[snapshot_daily_equity] 停用决策 %s", summary)
+
     return payload

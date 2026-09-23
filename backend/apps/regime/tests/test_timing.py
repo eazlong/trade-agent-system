@@ -7,7 +7,8 @@
    少了这条，签署日 / 运行日 / 生效时刻就会错开半天，而错开的表现是切片把结论归到
    相邻的一天——完全看不出来。
 2. 判定挂在那条既有的 5 分钟心跳上（`snapshot_daily_equity`），所以日界之后必然很快
-   出结论，且心跳的既有职责（日度权益快照）不被新职责顶掉。
+   出结论，且心跳的既有职责（日度权益快照）不被新职责顶掉——停用决策推导也搭在同一条
+   心跳上，并且**排在判定之后**（它读的是判定刚落下的那条「当前生效阶段」）。
 3. 心跳的节拍足够密，日界不会被跳过。
 
 时区这条特别容易在后面被「简化」掉：把 `BUSINESS_TIMEZONE` 设成 UTC 能让所有
@@ -115,37 +116,55 @@ class TestSignedCandleIsTheLastClosedOne(TestCase):
         self.assertEqual(latest_complete_date(late), RUN_DAY - timedelta(days=1))
 
 
+def run_heartbeat(*, judgement_error=None, deactivation_error=None):
+    """跑一次 `snapshot_daily_equity` 的任务体，返回按序记录的事件名。
+
+    三个被调用方都是**函数内 import**（任务模块不在 import 期就把交易/判定链路拉起来），
+    所以替身要打在**源模块**上，而不是 ``tasks`` 模块的属性上——``tasks`` 上根本没有
+    这些名字。
+
+    `run_deactivation` 也一定要换成替身，而不是让它真跑：它内部会走
+    `deactivation_run.managed_set()` → `ensure_strategies_discovered()`，那是**进程级
+    副作用**，会把宿主机那份策略目录拖进注册表，让本模块的结论取决于运行环境。
+    """
+    from apps.regime import deactivation_run, judgement
+    from apps.trading import daily_snapshot, tasks
+
+    events: list[str] = []
+    snapshot = MagicMock()
+    snapshot.as_dict.return_value = {}
+
+    async def fake_snapshot():
+        events.append("snapshot")
+        return snapshot
+
+    def fake_judgement(*args, **kwargs):
+        events.append("judgement")
+        if judgement_error is not None:
+            raise judgement_error
+        return {"skipped": "no_candles"}
+
+    def fake_deactivation(*args, **kwargs):
+        events.append("deactivation")
+        if deactivation_error is not None:
+            raise deactivation_error
+        # `skipped` 恒存在于真实返回值里（这是它刻意与判定不同的地方），替身照抄这一形状。
+        return {"skipped": "no_generation", "note": "还没有任何一代池化表", "targets": 0}
+
+    with (
+        patch.object(daily_snapshot, "write_daily_snapshots", new=fake_snapshot),
+        patch.object(judgement, "run_daily_judgement", new=fake_judgement),
+        patch.object(deactivation_run, "run_deactivation", new=fake_deactivation),
+    ):
+        payload = tasks.snapshot_daily_equity.run()
+    return events, payload
+
+
 class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
     """判定挂在既有的 5 分钟心跳上（对 CONTEXT.md 字面要求的一处有意偏离）。"""
 
     def _run_task(self):
-        """跑一次 `snapshot_daily_equity` 的任务体，返回按序记录的事件名。
-
-        两个被调用方都是**函数内 import**（本模块的既有风格：任务模块不在 import
-        期就把交易/判定链路拉起来），所以替身要打在**源模块**上，而不是 ``tasks``
-        模块的属性上——``tasks`` 上根本没有这两个名字。
-        """
-        from apps.regime import judgement
-        from apps.trading import daily_snapshot, tasks
-
-        events: list[str] = []
-        snapshot = MagicMock()
-        snapshot.as_dict.return_value = {}
-
-        async def fake_snapshot():
-            events.append("snapshot")
-            return snapshot
-
-        def fake_judgement(*args, **kwargs):
-            events.append("judgement")
-            return {"skipped": "no_candles"}
-
-        with (
-            patch.object(daily_snapshot, "write_daily_snapshots", new=fake_snapshot),
-            patch.object(judgement, "run_daily_judgement", new=fake_judgement),
-        ):
-            tasks.snapshot_daily_equity.run()
-        return events
+        return run_heartbeat()[0]
 
     def test_the_heartbeat_runs_the_daily_judgement(self):
         self.assertIn("judgement", self._run_task())
@@ -157,7 +176,9 @@ class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
         吞掉这一次快照。快照本来就是 5 分钟一轮的幂等写入，晚一轮无所谓，但顺序反过来
         等于让新机制有能力打断一条已在生产上运行的链路——没有理由付这个代价。
         """
-        self.assertEqual(self._run_task(), ["snapshot", "judgement"])
+        self.assertEqual(
+            self._run_task(), ["snapshot", "judgement", "deactivation"]
+        )
 
     def test_a_failing_judgement_still_stops_the_task(self):
         """判定抛异常时任务必须失败（而不是被吞掉）。
@@ -180,6 +201,41 @@ class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 tasks.snapshot_daily_equity.run()
+
+
+class TestDeactivationRidesTheSameHeartbeat(TestCase):
+    """停用决策推导搭在同一条心跳上，且**排在判定之后**（第①段单元 7）。"""
+
+    def test_the_heartbeat_runs_the_deactivation(self):
+        self.assertIn("deactivation", run_heartbeat()[0])
+
+    def test_the_deactivation_runs_after_the_judgement(self):
+        """顺序有硬理由：推导读的是判定刚落下的那条「当前生效阶段」。
+
+        反过来会永远慢一拍，而慢的那一拍**看起来完全正常**——只是每天晚一天停用。
+        """
+        events, _ = run_heartbeat()
+        self.assertLess(events.index("judgement"), events.index("deactivation"))
+
+    def test_the_summary_lands_in_the_payload(self):
+        """`skipped` 与 `note` 必须从任务返回值里出得来。
+
+        「日志不算被看见」——三种「什么都不动」的收场（冷启动 / 状态过期 / 没有池化表）
+        全靠这句话往日报上传；任务层把它丢了，日报就只能显示「今天没有建议」。
+        """
+        _, payload = run_heartbeat()
+        self.assertEqual(payload["deactivation"]["skipped"], "no_generation")
+        self.assertTrue(payload["deactivation"]["note"])
+
+    def test_a_failing_deactivation_still_stops_the_task(self):
+        """推导抛异常时任务必须失败（而不是被吞掉）。
+
+        失败是**期望**行为：心跳 5 分钟后再来一次，写入是幂等的 `update_or_create`，
+        可以无脑重试；吞掉异常则会让停用决策静默死掉。判定失败与推导失败是**两件事**，
+        所以两条用例各自的替身要能单独抛。
+        """
+        with self.assertRaises(RuntimeError):
+            run_heartbeat(deactivation_error=RuntimeError("boom"))
 
 
 class TestTheBeatIsDenseEnoughForTheDayBoundary(TestCase):
