@@ -18,12 +18,29 @@ class TestRiskGuardL2(unittest.TestCase):
     def setUp(self):
         self.guard = RiskGuard(mode="trading")
         RiskGuard._instance = None
+        # 第②段给前置校验加了第 0 步（halt 状态机），它是唯一真读库的一步，而
+        # `unittest.TestCase` 里库访问是被禁的（碰一下就是 RuntimeError，进而 fail-closed
+        # 拒单）。本类测的是**后面四步**，所以默认把它桩成「没有层在拦」。
+        # 第 0 步自己的行为在 `test_guard_halt.py`。
+        self._patch_halt_clear()
+
+    def _patch_halt_clear(self):
+        patcher = patch.object(
+            self.guard, "_halt_block_reason", AsyncMock(return_value="")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         RiskGuard._instance = None
 
     def test_pre_trade_check_passes_without_user(self):
-        """无 user_id 时直接通过"""
+        """无 user_id 时直接通过**后面四步**（它们都是按人的额度）。
+
+        注意「直接通过」不再等于「什么都不查」：第 0 步的停止判定仍然会跑（它不按人
+        裁剪），这里由 `setUp` 把它桩成「没有层在拦」。无 user_id 时停止判定的行为在
+        `test_guard_halt.py::test_a_blocking_declaration_rejects_even_without_a_user`。
+        """
         request = OrderRequest(
             exchange="binance",
             symbol="BTCUSDT",
@@ -183,10 +200,15 @@ class TestRiskGuardL2(unittest.TestCase):
         self.assertEqual(result, (True, "OK"))
 
     def test_pre_trade_check_order(self):
-        """校验按正确顺序执行（次数→仓位→回撤；熔断器已不在链上）。
+        """校验按正确顺序执行（停止判定→次数→仓位→回撤；熔断器已不在链上）。
 
-        顺序本身是契约：次数与仓位是**免费**的本地判定，回撤要查净值快照。
-        贵的放后面，被前面的条件拒掉时就不必付它的代价。
+        顺序本身是契约：
+
+        * 停止判定排最前，且**必须在 ``user_id`` 判空之前**——它问的是「系统还让不让开
+          新仓」，不按人裁剪（见 ``pre_trade_check`` docstring 与
+          `test_guard_halt.py` 里那条无 user_id 的用例）。
+        * 次数与仓位是**免费**的本地判定，回撤要查净值快照。贵的放后面，被前面的条件
+          拒掉时就不必付它的代价。
         """
         request = OrderRequest(
             exchange="binance",
@@ -197,6 +219,10 @@ class TestRiskGuardL2(unittest.TestCase):
             price=Decimal("50000"),
         )
         call_order = []
+
+        async def track_halt(*a):
+            call_order.append("halt")
+            return ""
 
         async def track_count(*a):
             call_order.append("count")
@@ -210,12 +236,13 @@ class TestRiskGuardL2(unittest.TestCase):
             call_order.append("drawdown")
             return True, ""
 
-        with patch.object(self.guard, "_get_daily_trade_count", track_count):
-            with patch.object(self.guard, "_check_position_limit", track_pos):
-                with patch.object(self.guard, "_check_drawdown", track_drawdown):
-                    asyncio.run(self.guard.pre_trade_check(request, "user123"))
+        with patch.object(self.guard, "_halt_block_reason", track_halt):
+            with patch.object(self.guard, "_get_daily_trade_count", track_count):
+                with patch.object(self.guard, "_check_position_limit", track_pos):
+                    with patch.object(self.guard, "_check_drawdown", track_drawdown):
+                        asyncio.run(self.guard.pre_trade_check(request, "user123"))
 
-        self.assertEqual(call_order, ["count", "position", "drawdown"])
+        self.assertEqual(call_order, ["halt", "count", "position", "drawdown"])
 
 
 class TestRiskGuardLifecycle(unittest.TestCase):

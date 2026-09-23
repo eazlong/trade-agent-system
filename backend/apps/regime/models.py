@@ -802,6 +802,40 @@ class ArchetypeOverride(models.Model):
 # --------------------------------------------------------------------------- #
 
 
+class MechanismKind(str, Enum):
+    """切换流水说的是**哪一个开关**（CONTEXT.md:179 的三个开关）。
+
+    三个开关的审计形状完全一样（谁、什么时候、为什么、从哪档到哪档），所以共用一张流水表
+    加一列 `kind`，而不是三张表（Q4）：三张表就是三份重复的迁移与三份重复的读写，而
+    「这一行属于哪个开关」正是加这一列之前缺的那个信息。
+
+    它与 `MechanismMode` 是**两个正交的轴**：`mode` 说这一档是 Shadow 还是执行态，`kind`
+    说这是哪个开关的档。一行流水 = 一个开关的一次切换。
+
+    **默认档是 `MECHANISM`**：加这一列之前那张表里的行（一条都没有）与零参调用点问的
+    都是「机制整体」这件事，默认值让它们不必改。
+    """
+
+    MECHANISM = "mechanism"  # 出 Shadow（判定 + 切片 + 自动停用）
+    EVENT_BREAKER = "event_breaker"  # 事件熔断
+    REGIME_GATE = "regime_gate"  # 行情阶段 gate
+
+    @property
+    def display(self) -> str:
+        return _MECHANISM_KIND_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_MECHANISM_KIND_DISPLAY = {
+    MechanismKind.MECHANISM: "出 Shadow（判定 + 切片 + 自动停用）",
+    MechanismKind.EVENT_BREAKER: "事件熔断",
+    MechanismKind.REGIME_GATE: "行情阶段 gate",
+}
+
+
 class MechanismMode(str, Enum):
     """机制当前处在哪一档。
 
@@ -847,10 +881,25 @@ class RegimeMechanismSwitch(models.Model):
     留痕四件事：什么时候、谁、从哪档到哪档、为什么。`reason` 必填而不是备注，因为
     CONTEXT.md:161 的「自熔断退回 Shadow 后再回执行态，必须显式记录『这次是自熔断后的
     恢复』」最终就落在这个字段上；允许留空的字段拦不住「忘了写原因」。
+
+    **`kind` 是第②段（Q4）加的**：加之前这张表只记「从哪档到哪档」，读的人无法回答「这是
+    哪个开关切了」——而 CONTEXT.md:179 要求日报第④段把三个开关**各自**的当前状态与最近
+    一次生效时间列出来。第②段自身仍然一行都不写（事件熔断的开关默认关），行由第②段之后
+    的接线路径写。
     """
 
     from_mode = models.CharField("切换前档位", max_length=16, choices=MechanismMode.choices())
     to_mode = models.CharField("切换后档位", max_length=16, choices=MechanismMode.choices())
+
+    # 这一行说的是哪个开关（`MechanismKind`）。默认 `mechanism` 并回填既有行：加这一列之前
+    # 那张表里唯一可能存在的语义就是「机制整体」。
+    kind = models.CharField(
+        "开关",
+        max_length=16,
+        choices=MechanismKind.choices(),
+        default=MechanismKind.MECHANISM.value,
+        db_index=True,
+    )
 
     at = models.DateTimeField("切换时刻（UTC）", db_index=True)
 
@@ -873,16 +922,146 @@ class RegimeMechanismSwitch(models.Model):
         return f"{self.at:%Y-%m-%d} {self.from_mode}→{self.to_mode} by {self.actor_name}"
 
     @classmethod
-    def latest(cls) -> "RegimeMechanismSwitch | None":
-        """最近一次切换；从未切换过返回 `None`。"""
-        return cls.objects.order_by("-at", "-id").first()
+    def latest(
+        cls, kind: "MechanismKind | str | None" = None
+    ) -> "RegimeMechanismSwitch | None":
+        """某一个开关最近一次切换；从未切换过返回 `None`。
+
+        `kind` 省略时问的是 `MECHANISM` 那个开关，不是「流水里最新的一行」：三个开关各
+        有各的档，跨开关取最新会把「事件熔断刚打开」读成「机制整体出 Shadow 了」。
+        零参调用点（日报第④段、``regime_queries._gate_line``）在加这一列之前问的正是
+        「机制整体」这件事，默认值让它们不必改。
+        """
+        return (
+            cls.objects.filter(kind=MechanismKind(kind or MechanismKind.MECHANISM).value)
+            .order_by("-at", "-id")
+            .first()
+        )
 
     @classmethod
-    def current(cls) -> MechanismMode:
-        """当前档位。按 `at` 而不是按 id 排序：切换时刻是可回填的既有事实（补录一次
-        历史切换），而 id 只反映写入顺序，两者在补录时会给出相反的答案。"""
-        row = cls.latest()
+    def current(cls, kind: "MechanismKind | str | None" = None) -> MechanismMode:
+        """该开关的当前档位。按 `at` 而不是按 id 排序：切换时刻是可回填的既有事实（补录
+        一次历史切换），而 id 只反映写入顺序，两者在补录时会给出相反的答案。"""
+        row = cls.latest(kind)
         return MechanismMode(row.to_mode) if row is not None else MechanismMode.SHADOW
+
+
+class HaltTrigger(str, Enum):
+    """一条停止声明是**谁投的触发源**。
+
+    ADR 0001 把停止的语义从「谁在拦」改成「谁投的触发源」，所以排查一次停用时必须能回答
+    是哪个源、什么时候、依据什么——这一列就是那个「哪个源」。
+
+    它与 `MechanismKind` **不是同一套词汇**，也不该合并：`MechanismKind` 是「这个自动行为
+    整体有没有被打开」（开关），`HaltTrigger` 是「这一条声明是谁投的」（源）。两者是多对
+    一，但**不是每个源都挂在某个开关下**：第③段的 `regime_gate` 开关管辖策略停用决策这一
+    条线，而保命档**没有开关**（映射到 `None`）——「高波动算生效」，它不由任何人确认。
+    映射写在 `apps/regime/halt.py::HALT_TRIGGER_SWITCH`，因为「哪个开关管哪条线」是状态机
+    的判据，不是这张表的形状。
+    """
+
+    BLANKET = "blanket"  # 保命档（高波动）
+    EVENT = "event_breaker"  # 事件熔断
+    DEACTIVATION = "deactivation"  # 策略停用决策（第③段）
+
+    @property
+    def display(self) -> str:
+        return _HALT_TRIGGER_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(t.value, t.display) for t in cls]
+
+
+_HALT_TRIGGER_DISPLAY = {
+    HaltTrigger.BLANKET: "保命档（高波动）",
+    HaltTrigger.EVENT: "事件熔断",
+    HaltTrigger.DEACTIVATION: "策略停用决策",
+}
+
+
+class HaltDeclaration(models.Model):
+    """**一组停止声明**——halt 状态机唯一的可持久化的状态（CONTEXT.md:130/:132）。
+
+    形状的每一条都对应一句已经定死的裁决：
+
+    - **不是一行布尔，是一组声明**，唯一键为（触发源 × 作用域），**每行带自己的生效期**
+      （CONTEXT.md:130）。「当前是否拦」= 存在任一命中的生效行（`halt.halt_layers`）。
+      一行布尔表达不了「事件熔断只拦 DOGE/USDT、同时保命档拦全场」这种叠加。
+    - **一行说的是「这个源在这个作用域上当前的态度」**，不是「某一次触发」。所以同一源
+      同一作用域上两件重叠的事件**不会**各占一行——那确实是两次触发，但对下单来说它们
+      是同一件事，而唯一键刻意不让它们分开：拆成多行之后「解除」就必须一次终结多行，
+      而 CONTEXT.md:130 明说解除只终结自己那一行。合并写法的代价是 `label`/`reason`
+      要把同时生效的事件都写进去，这份合并在写入方（窗口同步任务）做。它每次重算整张
+      事件表，本来就知道当前一共有哪些事件在窗口里。
+    - **作用域三档，优先级 global > symbol > strategy**，由 `halt.py` 求值。存成字符串
+      而不是三列（`scope_kind` + `symbol` + `strategy_id`），是因为它是**声明的一部分而
+      不是被查询的维度**：判定函数一次只按「有没有命中」取一次，从来不按作用域列做聚合。
+    - **解除只终结自己那一行**，不动别人——所以解除是写 `closed_at` 而**不是删行**：删掉
+      之后「这条声明存在过」这件事就没了，而 ADR 0001 要求排查停用原因时能回答「依据
+      什么」。同理，行不因会话消失而删除（CONTEXT.md:131），失效是**求值**的结果。
+    - **持久化，扛过进程重启**（CONTEXT.md:132）。所以它是一张表，不是进程内状态。
+
+    **唯一性只约束「还没解除的行」**（`uniq_live_halt_declaration` 带 `closed_at IS NULL`
+    条件）：同一个（触发源 × 作用域）可以先后开很多次，但同一时刻只能有一条活着。写成
+    无条件唯一的话，第二次开启会撞上一条早已解除的行——那只剩下「改历史」或「删行」两条
+    路，两条都把「这条声明存在过」抹掉。
+
+    **开关不在这张表里。** 「这个源有没有被打开」是另一件事，查的是
+    `RegimeMechanismSwitch`（`halt.HALT_TRIGGER_SWITCH` 给出对应关系），由 `halt_layers`
+    在求值时一并读。两件事分开的理由：关掉开关之后那些行**必须留着**——它们是「这个源
+    触发过什么」的记录，而关掉开关只该让它们不再作数，不该抹掉。若把开关状态也写进行
+    （比如解除掉），开关一开一关就会在流水里制造一堆「声明—解除」的假历史。
+
+    **写入方是窗口同步任务**（`apps/regime/halt_sync.py`，第②c 段）：它每 300 秒整表重算
+    一轮，按（触发源 × 作用域）对账。两件只由这条接线决定、别处看不出来的事：
+
+    - **一行窗口的推进是原地改写**，不关一行再开一行。关开一次会在流水里留下「声明—解除」
+      的假历史，而这张表是排查停用原因的依据（与上面「开关不在这张表里」同一条理由）。
+    - **还没生效的行，它的窗口可以被无痕改写**（事件改期就会改）。这是（触发源 × 作用域）
+      唯一键换来的代价：一行只能有一个窗口，于是写入方把「下一段」也提前写进这一行
+      （不提前写的话，两段之间任何一轮任务没跑都会留下敞口，而事件熔断不可人工豁免）。
+      那一段还没生效时它长什么样只由事件表决定，而事件表那边的改动自己有流水。
+    """
+
+    trigger = models.CharField("触发源", max_length=32, choices=HaltTrigger.choices())
+
+    # 「global」/「symbol:<品种>」/「strategy:<id>」，格式与求值见 `halt.py`。
+    scope = models.CharField("作用域", max_length=128, db_index=True)
+
+    label = models.CharField("触发源名称", max_length=128)
+
+    opened_at = models.DateTimeField("生效起始（UTC）", db_index=True)
+    # 空 = 不定（保命档随阶段起落，没有预先知道的截止时刻）。**不是「永久」**：它的失效
+    # 由解除写 `closed_at` 完成，而不是靠一个很远的日期。
+    expires_at = models.DateTimeField("生效截止（UTC，空=不定）", null=True, blank=True, db_index=True)
+
+    closed_at = models.DateTimeField("解除时刻（UTC，空=生效中）", null=True, blank=True, db_index=True)
+    closed_reason = models.CharField("解除原因", max_length=64, blank=True, default="")
+
+    reason = models.TextField("声明依据（必填）")
+
+    actor_kind = models.CharField("触发方类别", max_length=16, choices=ActorKind.choices())
+    actor_name = models.CharField("触发方", max_length=128)
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_halt_declarations"
+        verbose_name = "停止声明"
+        verbose_name_plural = "停止声明"
+        ordering = ["-opened_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["trigger", "scope"],
+                condition=models.Q(closed_at__isnull=True),
+                name="uniq_live_halt_declaration",
+            )
+        ]
+
+    def __str__(self) -> str:
+        state = "生效中" if self.closed_at is None else f"已解除({self.closed_reason})"
+        return f"{self.trigger}@{self.scope} {self.label} {state}"
 
 
 class ShadowDailyRecord(models.Model):

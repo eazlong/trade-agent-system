@@ -215,6 +215,14 @@ class TestRejectIsVisible(unittest.IsolatedAsyncioTestCase):
             quantity=Decimal("0.001"),
             price=None,
         )
+        # 第②段给前置校验加了第 0 步（halt 状态机），它是唯一真读库的一步，而没有数据库
+        # 的测试里它必然抛错、进而 fail-closed 拒单。本类测的是**后面四步的拒绝也要被
+        # 看见**，所以把第 0 步桩成放行；第 0 步自己的行为在 `test_guard_halt.py`。
+        patcher = patch.object(
+            self.guard, "_halt_block_reason", AsyncMock(return_value="")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _patch_notify(self, delivered=True, error=None):
         mock = AsyncMock(return_value=delivered, side_effect=error)

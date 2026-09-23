@@ -2,10 +2,14 @@
 RiskGuard - 风控守卫
 
 前置校验（pre_trade_check）：
-- 熔断器检查（circuit breaker）
+- 停止判定（halt 状态机，ADR 0001）——**只管开新仓，减仓放行**
 - 单笔仓位上限
 - 最大回撤限制
 - 日内交易次数
+
+熔断器（circuit breaker）**不在前置校验链上**：ADR 0001 把它降级成 halt 状态机的一个
+触发源，于是「它自己的状态能不能拒单」这个问题的答案是不能——否则就存在一个绕过 halt
+状态机的隐藏停机开关。见 `pre_trade_check` 里第 1 步的注释。
 
 实时监控（monitor loop）：
 - 浮亏超阈值预警
@@ -29,6 +33,12 @@ if TYPE_CHECKING:
 from apps.riskguard.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+#: 停止判定查不出来时的拒单理由（Q2 定死的 fail-closed 口径）。
+#:
+#: 写成模块常量而不是就地拼串，是因为它会被测试与告警文案引用——两处各拼一遍迟早
+#: 会漂，而「理由文案变了」这种事不会有人报上来。
+HALT_LOOKUP_FAILED_REASON = "熔断状态查询失败，按保守方向处理"
 
 
 class RiskGuard:
@@ -85,21 +95,57 @@ class RiskGuard:
         返回 (approved, reason)，approved=False 时 OrderExecutor 禁止下单。
 
         校验顺序：
-        1. 熔断器检查
+        0. 停止判定（halt 状态机；**只拦开新仓，减仓单连查都不查**）
+        1. 熔断器检查（已禁用，ADR 0001）
         2. 日内交易次数
         3. 仓位上限
         4. 日内回撤
+
+        **第 0 步排在 ``user_id`` 判空之前**，这是它与后面四步的根本区别：后面四步问的
+        都是「这个人还能不能下单」（次数、仓位、回撤都是按人的额度），而停止判定问的是
+        「这个系统此刻还让不让开新仓」——它不按人裁剪（CONTEXT.md:172）。放在判空之后
+        的话，任何拿不到 ``user_id`` 的调用点（纸面交易、内部路径）都能绕过熔断，
+        而熔断恰恰是最不该有例外的那个。
         """
         logger.info(f"[RiskGuard] pre_trade_check: {request.symbol} {request.side}")
+
+        # 0. 停止判定（halt 状态机，第②段接线）
+        if request.reduce_only:
+            # 减仓单整段跳过，连查都不查：熔断想停的是「加仓」，而减仓是熔断时唯一想让它
+            # 动起来的事（CONTEXT.md:47）。查了再放行也能得到同样的结果，但那会让下面
+            # 「查询失败按保守方向处理」不得不为减仓再写一条例外——例外写在判定里，
+            # 不如写在入口。
+            logger.info("[RiskGuard] step 0: 减仓单（reduce_only），跳过停止判定")
+        else:
+            logger.info("[RiskGuard] step 0: halt 状态机判定")
+            try:
+                halt_reason = await self._halt_block_reason(request)
+            except Exception:  # noqa: BLE001 - 查不出来时的取向由下面这行决定
+                # **fail-closed**：查不到状态就按「可能在拦」处理。反方向（查不到就放行）
+                # 会让「数据库挂了」变成一次无声的机制失效——而那正是熔断最需要生效的时刻。
+                halt_reason = HALT_LOOKUP_FAILED_REASON
+                logger.error(
+                    "[RiskGuard] step 0 停止判定查询失败，按保守方向处理（拒开仓）",
+                    exc_info=True,
+                )
+            if halt_reason:
+                logger.warning(f"[RiskGuard] REJECTED: {halt_reason}")
+                # 无 user_id 时不走 `_reject`：那条路要发通知，而「发给谁」这里答不出来。
+                # 判定的结果不变（仍然是拒绝），只是没人可告知。
+                if user_id:
+                    return await self._reject(user_id, halt_reason)
+                return False, halt_reason
 
         if not user_id:
             return True, "OK"
 
-        # 1. 熔断器检查（已禁用）
-        # logger.info(f"[RiskGuard] step 1: circuit breaker check")
-        # if await self._is_circuit_open(user_id):
-        #     logger.warning(f"[RiskGuard] REJECTED: 熔断器触发，今日禁止交易")
-        #     return False, "熔断器触发，今日禁止交易"
+        # 1. 熔断器检查（已禁用——ADR 0001 把它降级成 halt 状态机的一个**触发源**）
+        #
+        # 这里**刻意保持禁用**，而且不是「暂时」：熔断器状态若能拒单，就等于存在一个绕过
+        # halt 状态机的隐藏停机开关——用户看到的拒单理由会是「熔断」，而框架的停机口径
+        # 在声明表里，两边对不上。要它重新具备停机能力，路径是让它去投递声明，不是在这
+        # 里加回一个 if。`apps/riskguard/tests/test_guard.py` 有一条测试钉的就是「它根本
+        # 没被问过」，而不是「它打开时不拒单」。
         logger.info(f"[RiskGuard] step 1: circuit breaker (disabled)")
 
         # 2. 日内交易次数
@@ -128,6 +174,26 @@ class RiskGuard:
             return await self._reject(user_id, reason)
 
         return True, "OK"
+
+    async def _halt_block_reason(self, request: "OrderRequest") -> str:
+        """这一张单此刻有没有被停止声明挡住；挡住时返回拒绝理由，空串 = 放行。
+
+        **这是第 0 步唯一的取数口，故意留成一个方法**：`pre_trade_check` 的调用方遍布
+        下单通路（executor / paper_trader / strategy_engine），而在没有数据库的测试里
+        它是唯一需要被打桩的地方。把 `db_async(...)` 直接写在 `pre_trade_check` 里，
+        每个测前置校验的用例都得去 patch `apps.regime.halt.halt_layers`——那是拿被测
+        对象的内部结构当接口。
+
+        判定本身一行都不在这里：它全在 `apps.regime.halt`（唯一的停止抽象，ADR 0001）。
+        这里只负责把**一张单**翻译成那两个参数。``strategy_id`` 传 ``None``——第②段的
+        下单通路上拿不到它（策略档的声明要到第③段才会从 `live_session_id` 带下来），
+        而 `halt._matches` 对「调用方没给 id」的判据是**策略档行不认它生效**：宁可第③段
+        接漏时表现为「策略停用没生效」（池化日报里看得见），也不要表现为「全场莫名停摆」。
+        """
+        from apps.regime import halt
+
+        verdict = await db_async(halt.halt_layers)(request.symbol, None)
+        return verdict.reason
 
     async def _reject(self, user_id: str, reason: str) -> Tuple[bool, str]:
         """拒绝下单**并让用户看见**，然后返回 (False, reason)。

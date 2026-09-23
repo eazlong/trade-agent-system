@@ -81,6 +81,7 @@ from apps.regime.models import (
     EventImpact,
     EventStatus,
     MajorEvent,
+    MechanismKind,
     MechanismMode,
     RegimeJudgement,
     RegimeMechanismSwitch,
@@ -861,12 +862,18 @@ def _section_health(
 
     lines.extend(_switch_lines())
 
-    # 「是否触发过自熔断」在单元 8 里只能由切换流水回答：自熔断的收场是「退回 Shadow」，
-    # 而那条路径的第②段实现会在流水里留一条 to_mode=shadow 的行。这里只读，不推断。
+    # 「是否触发过自熔断」只能由切换流水回答：自熔断的收场是「退回 Shadow」，那条路径会在
+    # 流水里留一条 to_mode=shadow 的行。这里只读，不推断。
+    #
+    # **必须限定 `kind`（第②段 Q4 之后）**：加这一列之前只有「机制整体」一种语义，所以
+    # 「有一条退回 Shadow 的行」与「机制自熔断过」是同一句话。加列之后就不同了——人工把
+    # 事件熔断那个开关关掉同样是一条 to_mode=shadow 的行，而那不是自熔断（自熔断说的是
+    # 机制整体不可信）。少这一条限定，日报会把一次例行的人工关开关报成自熔断。
     back = [
         row
         for row in RegimeMechanismSwitch.objects.filter(
-            to_mode=MechanismMode.SHADOW.value
+            kind=MechanismKind.MECHANISM.value,
+            to_mode=MechanismMode.SHADOW.value,
         ).order_by("-at", "-id")[:1]
     ]
     if back:
@@ -918,29 +925,45 @@ def _section_health(
     return "\n".join(lines)
 
 
+# 三个开关，按「机制整体 → 事件熔断 → 行情阶段 gate」的顺序列出。顺序固定：日报是逐日
+# 对照读的，顺序一变，昨天的第 2 行与今天的第 2 行就不是同一件事。
+_SWITCH_KINDS = (
+    MechanismKind.MECHANISM,
+    MechanismKind.EVENT_BREAKER,
+    MechanismKind.REGIME_GATE,
+)
+
+
 def _switch_lines() -> list[str]:
-    """三个开关的当前状态 + 各自最近一次生效时间（CONTEXT.md 第 179 条）。
+    """三个开关各自的当前档 + 各自最近一次生效时间（CONTEXT.md 第 179 条）。
 
-    **这里如实说出「各自最近一次生效时间」在数据上取不到**，而不是编三个时间出来：
-    `RegimeMechanismSwitch` 一张表只记「从哪档到哪档」，没有「是哪一个开关」这一列，而
-    单元 8 又刻意一行都不写。三个开关的独立化发生在第②③段，届时那张表要么加一列、
-    要么各自成表——那是那一步的决定，不是这一步能替它做的。
+    「各自最近一次生效时间」在第②段之前答不出来——那张表没有「是哪一个开关」这一列，
+    而当时又一行都不写，所以只能如实说「无流水可查」。第②段给
+    `RegimeMechanismSwitch` 加了 `kind`（Q4），三个开关从此各查各的流水。
 
-    所以本段给的是**能回答的那两件事**：当前档（`RegimeMechanismSwitch.current()`，查
-    流水而不是写死 Shadow）+ 流水里事实存在的切换记录。三个开关分开列出来，是因为
-    「哪些自动行为是活着的」必须能一眼读到，而不是靠读代码推断。
+    每一档都走 `current(kind)` 而不是写死 Shadow：开关一旦被人打开（②f 的上线确认
+    入口），这句话要跟着变——写死的话，命令落了库而日报仍报 Shadow，两边都「正常」。
+
+    末一行说的是**保命档不在三个开关里**：它是阶段本身的性质（高波动一到就生效），
+    没有哪个人点头才让它生效（CONTEXT.md 第 179 条的三个开关对应的是三条**自动行为**，
+    而保命档不需要被「启用」）。不写这一行，读日报的人会以为高波动档也要等某个开关。
     """
-    latest = RegimeMechanismSwitch.latest()
-    current = RegimeMechanismSwitch.current()
-    lines = [
-        f"机制当前档：{current.display}"
-        + (f"（最近一次切换 {format_business(latest.at)}）" if latest else "（无切换流水）"),
-        "三个开关（各自独立、各自人工确认）——单元 8 没有任何代码路径能打开其中任何一个：",
-        "  出 Shadow（判定 + 切片 + 自动停用）：未打开",
-        "  事件熔断：未打开（第②段接线）",
-        "  行情阶段 gate：未打开（第③段接线）",
-        "  最近一次生效时间：无流水可查（切换记录里一行都没有）",
-    ]
+    lines: list[str] = []
+
+    master = RegimeMechanismSwitch.latest(MechanismKind.MECHANISM)
+    lines.append(
+        f"机制当前档：{RegimeMechanismSwitch.current(MechanismKind.MECHANISM).display}"
+        + (f"（最近一次切换 {format_business(master.at)}）" if master else "（无切换流水）")
+    )
+
+    lines.append("三个开关（各自独立、各自人工确认）：")
+    for kind in _SWITCH_KINDS:
+        row = RegimeMechanismSwitch.latest(kind)
+        lines.append(
+            f"  {kind.display}：{RegimeMechanismSwitch.current(kind).display}"
+            + (f"（最近一次生效 {format_business(row.at)}）" if row else "（无切换流水）")
+        )
+    lines.append("  保命档（高波动）：不在这三个开关里——高波动一到就生效，不需要人工确认。")
     return lines
 
 

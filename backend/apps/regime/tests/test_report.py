@@ -46,9 +46,17 @@ from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 
 from apps.agent import event_commands
-from apps.common.time_utils import business_tz
+from apps.common.time_utils import business_tz, format_business
 from apps.regime import config, deactivation, deactivation_run, judgement, report
-from apps.regime.models import NO_ESCALATION_DISPLAY, DailyReport, business_midnight
+from apps.regime.models import (
+    NO_ESCALATION_DISPLAY,
+    ActorKind,
+    DailyReport,
+    MechanismKind,
+    MechanismMode,
+    RegimeMechanismSwitch,
+    business_midnight,
+)
 from apps.regime.tests.test_shadow import (
     RUN_DAY,
     SYMBOL,
@@ -313,14 +321,39 @@ class TestPureRendering(TestCase):
         self.assertEqual(report._quant_lines(SimpleNamespace(evidence={})), [])
 
     def test_switch_lines_admits_what_it_cannot_know(self):
-        # 「三个开关各自最近一次生效时间」在数据上取不到（切换流水没有「哪个开关」这一列，
-        # 单元 8 又一行都不写）。**如实说取不到，不编三个时间出来。**
+        # 第②段给切换流水加了 `kind` 之后，「各自最近一次生效时间」从「取不到」变成了
+        # **一个开关查一次**——但这里一行流水都没有，所以三行都只能如实说「无切换流水」。
+        # 断言按条数而不是按整段文本：三行各查各的这件事，只有数一数才看得出来；只断言
+        # 「无切换流水」在不在的话，三个开关塌成一行也照样通过。
         body = "\n".join(report._switch_lines())
-        self.assertIn("三个开关", body)
-        self.assertIn("无流水可查", body)
-        self.assertIn("出 Shadow", body)
+        self.assertIn("三个开关（各自独立、各自人工确认）：", body)
+        self.assertEqual(body.count("无切换流水"), 4)  # 机制整体 1 + 三个开关各 1
+        for kind in report._SWITCH_KINDS:
+            self.assertIn(f"  {kind.display}：", body)
+        self.assertIn("出 Shadow（判定 + 切片 + 自动停用）", body)
         self.assertIn("事件熔断", body)
         self.assertIn("行情阶段 gate", body)
+        # 保命档**不在这三个开关里**：它是阶段本身的性质，不需要人工确认。不写这一行，
+        # 读日报的人会以为高波动档也要等某个开关被打开。
+        self.assertIn("保命档（高波动）：不在这三个开关里", body)
+
+    def test_switch_lines_reads_each_switch_separately(self):
+        # 三个开关各查各的流水：只切一个，另外两行必须还是「无切换流水」。写成一个查询
+        # 的话，一次人工关掉事件熔断会被读成「机制整体」也动过。
+        RegimeMechanismSwitch.objects.create(
+            kind=MechanismKind.EVENT_BREAKER.value,
+            from_mode=MechanismMode.SHADOW.value,
+            to_mode=MechanismMode.EXECUTING.value,
+            at=NOW,
+            actor_kind=ActorKind.CLI,
+            actor_name="ops",
+            reason="事件熔断上线",
+        )
+        body = "\n".join(report._switch_lines())
+
+        self.assertEqual(body.count("无切换流水"), 3)  # 机制整体 + 另两个开关
+        self.assertIn(f"  事件熔断：执行态（最近一次生效 {format_business(NOW)}）", body)
+        self.assertIn("机制当前档：Shadow（只记录，不执行）", body)
 
     def test_render_body_omits_the_change_section_when_it_is_empty(self):
         sections = {name: "内容" for name in report.SECTIONS}
