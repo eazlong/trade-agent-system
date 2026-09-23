@@ -1,0 +1,1092 @@
+"""五段日报的生成与落库（第①段单元 8iii）。
+
+CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。要点按重要性排：
+
+## 报的是「今天刚产出、明日 08:00 才生效」的那条，不是此刻生效中的那条
+
+一天可见期的全部价值就是「异常在生效前被拦下」，而日报是用户**唯一**能看到待生效结论的
+地方——只报当前生效态，等于让可见期只存在于代码里。所以第①段必须读 `effective_at`
+（= `business_midnight(run_day + 1)`，也就是「自明日 08:00 起生效」那句话的字面出处），
+**必须明写生效时刻**，否则「今日判定」这个词就在撒谎：此刻咬人的是另一条。
+
+代价是第①②段读起来是未来时。这与「停自动、恢复人工」是同一种时间观：机制先把话说出来，
+再动手。
+
+## 一行一天，且只在今天有结论（或等到了截止时刻）之后才写
+
+日报是一份**发给人的消息**，不是心跳日志：一天发两版会让人以为机制改主意了。判据与
+`apps.regime.shadow` 同源——那张表已经替本模块解决了「数据晚到几分钟」这个时序问题
+（业务日 D 的第一轮心跳恰好撞上 D−1 那根日线的收盘，判定会先回 `stale_candles`），
+所以本模块**不重复判断**，只读 `judgement` 的返回值：有结论就写，没结论就等。
+
+等多久是这条规则唯一需要第二个出口的地方。判定的失败分两类，出口也分两个：
+
+- **数据类失败**（`skipped`：日线没到、预热未满）——判定任务正常返回，只是没有结论。
+  等到 `config.REPORT` 的业务日界 + `watchdog_hour:watchdog_minute`，照发一份写着
+  「今日判定缺失，处于保持的上一有效状态」的日报。**沉默必须能被识别为异常**，而一份
+  永不出现的日报与「今天没什么事」在聊天窗口里长得一样。
+- **故障类失败**（抛异常）——`apps.trading.tasks` 的这条链路直接中断，本模块根本不被
+  调用。这一类的兜底是单元 8iv 的独立看门狗（「当天日报在固定时刻仍未成功投递则升级
+  告警」）。**这不是漏洞，是那句「独立」的全部含义**：让日报自己报告「日报没发出去」，
+  等于让一个哑掉的东西开口说话。
+
+截止时刻与看门狗时刻**共用同一个数**（`watchdog_hour` / `watchdog_minute`）：它问的是
+「到了这个点日报该到了没有」。于是有一条跨单元的接线约束——**8iv 的看门狗 beat 条目
+必须排在这个时刻之后的某一分钟**，否则它会对着同一轮 tick 正要投递的那份日报告警。
+
+## 五段落成 `sections`，正文是它的渲染结果，不另存一份
+
+`body` 不做成列：它就是 `sections` 拼起来的那段文字，两份正文迟早会漂开，而日报的正文
+恰好是**给人看的那一份**。分段落库还让「第①段说了什么」可以被定向引用，不必去解析正文。
+
+## 第②段是结构化的，其余四段是文本
+
+第②段要按人裁剪（「停用段只含你实际受影响的策略」），裁剪意味着**从条目里挑**，而一段
+拼好的文本挑不出条目来。所以第②段以结构化的 `change` 落在 `landscape` 里，渲染发生在
+**裁剪之后**（`render_change`）。其余四段对所有人相同，直接是文本。
+
+## 受众与裁剪
+
+受众是所有 `is_active` 用户（CONTEXT.md 第 173 条）。判定是有用的公共信息，而「一个你没
+在跑的策略被停了」纯属噪声——噪声会让人开始忽略日报，那时「必发」就只剩形式。所以：
+
+- 第①②③④⑤段对所有人相同；
+- 第②段只保留与**该用户活跃会话**相关的条目；筛完为空则**整节不出现**（无活跃会话者
+  根本看不到这一节）。
+
+裁定「与用户相关」用的是活跃会话（`LiveSession.ACTIVE_STATUSES`），不是策略的
+`is_active`：后者是「这个策略退役了没有」的人工总开关（CONTEXT.md 第 106 条），与
+「谁在跑它」是两件事。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, time, timedelta
+
+from django.utils import timezone
+
+from apps.common.time_utils import business_tz, format_business
+from apps.regime import config, judgement
+from apps.regime.deactivation import BLOCKED_DISPLAY
+from apps.regime.events import describe_candidate, describe_event
+from apps.regime.models import (
+    NO_ESCALATION_DISPLAY,
+    CandidateEvent,
+    CandidateStatus,
+    DailyReport,
+    Escalation,
+    EventImpact,
+    EventStatus,
+    MajorEvent,
+    MechanismMode,
+    RegimeJudgement,
+    RegimeMechanismSwitch,
+)
+from apps.regime.quant import BaseRegime
+from apps.trading.models import LiveSession, Strategy
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# 段落名与标题
+# --------------------------------------------------------------------------- #
+
+SECTION_TODAY = "today"
+SECTION_CHANGE = "change"
+SECTION_EVENTS = "events"
+SECTION_HEALTH = "health"
+SECTION_DELIVERY = "delivery"
+
+#: 段落顺序 = 五段在正文里的顺序。**这是一份契约**：`sections` 是落库的 JSON，8v 的只读
+#: 工具与审计会按键取段，所以键名与顺序都不要顺手改。
+SECTIONS = (
+    SECTION_TODAY,
+    SECTION_CHANGE,
+    SECTION_EVENTS,
+    SECTION_HEALTH,
+    SECTION_DELIVERY,
+)
+
+_SECTION_TITLES = {
+    SECTION_TODAY: "一、今日判定",
+    SECTION_CHANGE: "二、相对昨日的变化",
+    SECTION_EVENTS: "三、未来 {horizon} 天的高影响事件",
+    SECTION_HEALTH: "四、机制健康",
+    SECTION_DELIVERY: "五、昨日日报的投递结果",
+}
+
+#: 判定层 `skipped` 的展示名。**缺失也是一种结论**，要说出是哪一种缺失——「不知道」与
+#: 「数据还没到」对读的人是两件事，前者要人去看，后者等一下就好。
+_SKIP_DISPLAY = {
+    "no_candles": "日线库为空（回填任务没跑过）",
+    "stale_candles": "日线还没到签署日（数据管道比日界慢）",
+    "empty_series": "日线序列为空",
+    "undecidable": "量化判不出来（预热未满，或分位窗口还没攒满 250 日）",
+}
+
+#: 写库的收场。
+OUTCOME_CREATED = "created"
+#: 当天已有一份日报（心跳 5 分钟一轮，绝大多数 tick 走到这里是这一种）。
+OUTCOME_KEPT = "kept"
+#: 还没有结论，也还没到截止时刻——不是失败，是「再等等」。
+OUTCOME_WAITING = "waiting"
+
+#: 判定层 `evidence["decision"]["action"]` 的取值之一：量化判出的候选阶段被**持续期**拦下，
+#: 于是沿用了当前阶段。与 `judgement._DECISION_CARRIED` 是同一个字面量——那边是私有名，
+#: 这里照抄一份并把耦合写在明面上：两处必须一起改，而 `test_report.py` 钉着这个等式。
+ACTION_CARRIED = "carried"
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+
+
+def write_daily_report(
+    judgement_result: dict,
+    deactivation: dict,
+    shadow: dict,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """把这一轮的判定 / 推导 / Shadow 摘要落成当天的日报，返回一行摘要。
+
+    三个参数依次是 `run_daily_judgement()` / `run_deactivation()` /
+    `write_shadow_record()` 的返回值（任务层放在 `payload` 里）。**本模块不重新取数**：
+    日报与 Shadow 记录必须说同一件事，两处各取一次就会在日界附近各说各话。
+
+    不抛异常的那一半与 `shadow.write_shadow_record` 同一纪律：判定没有结论**不是本层的
+    失败**，照写（这正是「沉默必须能被识别为异常」的落点）。数据库故障才抛，往上给任务
+    健康检查。
+    """
+    now = now or timezone.now()
+    symbol = (
+        judgement_result.get("symbol")
+        or shadow.get("symbol")
+        or deactivation.get("symbol")
+        or config.CANDLES.symbol
+    )
+    run_day = _run_day(judgement_result, shadow, now)
+
+    existing = DailyReport.objects.filter(symbol=symbol, run_day=run_day).first()
+    if existing is not None:
+        # 一天一份。心跳五轮一轮，绝大多数 tick 走到这里只确认已有那一份。
+        return _summary(existing, OUTCOME_KEPT)
+
+    if not _ready(judgement_result, run_day, now):
+        return {
+            "symbol": symbol,
+            "run_day": run_day.isoformat(),
+            "outcome": OUTCOME_WAITING,
+            "written": False,
+            "sections": {},
+            "note": "今日判定尚无结论，且未到日报截止时刻，本轮不写日报",
+        }
+
+    # 三值所抄的那一行判定：第①段的依据数字只存在于它的 `evidence` 里，外键也指向它。
+    # 只查一次，组稿与落库共用。**不向 Shadow 摘要要**——它返回的那张摘要里没有外键，
+    # 而「外键非空 ⟺ 三值非空」这条不变量在两处各判一次迟早会漂开。
+    record = _judgement_row(symbol, judgement_result)
+    sections, landscape = _compose(
+        symbol, run_day, judgement_result, deactivation, record, now=now
+    )
+    row, created = DailyReport.objects.get_or_create(
+        symbol=symbol,
+        run_day=run_day,
+        defaults={
+            "judgement": record,
+            **_inline_values(judgement_result),
+            "deactivation_skipped": deactivation.get("skipped") or "",
+            "judgement_missing": not judgement_result.get("base_regime"),
+            "sections": sections,
+            "landscape": landscape,
+            "note": _note(judgement_result, deactivation, landscape),
+        },
+    )
+    if created:
+        logger.info("[regime] 日报落库 %s", _summary(row, OUTCOME_CREATED))
+    return _summary(row, OUTCOME_CREATED if created else OUTCOME_KEPT)
+
+
+# --------------------------------------------------------------------------- #
+# 什么时候可以写
+# --------------------------------------------------------------------------- #
+
+
+def _ready(judgement_result: dict, run_day: date, now: datetime) -> bool:
+    """今天这份日报该不该写了。
+
+    两条路（见模块 docstring）：判定出了结论，或者等到了截止时刻。截止时刻按**业务时区**
+    解读——`watchdog_hour` 是给人看的钟点（「早九点还没收到就该响了」），不是 UTC 小时。
+
+    截止时刻早于业务日界（北京 08:00）时，`deadline <= 日界` 恒真，于是当天第一轮心跳
+    就会写一份「判定缺失」——那是配置写错了，不是时序问题。这里不拦，但 `ReportConfig`
+    的 docstring 与它的默认值（9 点）已经把正常形状说清楚了。
+    """
+    if judgement_result.get("base_regime"):
+        return True
+    return now >= _deadline(run_day)
+
+
+def _deadline(run_day: date) -> datetime:
+    """当天日报的截止时刻（绝对时刻）。"""
+    return datetime.combine(
+        run_day,
+        time(config.REPORT.watchdog_hour, config.REPORT.watchdog_minute),
+        tzinfo=business_tz(),
+    )
+
+
+def _run_day(judgement_result: dict, shadow: dict, now: datetime) -> date:
+    """这一份日报记在哪个业务日。
+
+    判定层的 `run_day` 是权威（它决定 `effective_at`，也就是判定记录的唯一键），Shadow
+    摘要是同一口径的二手来源。两者都缺席时（测试、数据订正）才回落到本地时刻——回落值
+    可能与判定层不一致，所以缺席要留痕。
+    """
+    for source, key in ((judgement_result, "run_day"), (shadow, "run_day")):
+        raw = source.get(key)
+        if raw:
+            return date.fromisoformat(raw)
+    logger.warning("[regime] 判定与 Shadow 摘要都没有 run_day，按本地时刻推断日报运行日")
+    from apps.common.time_utils import to_business
+
+    return to_business(now).date()
+
+
+# --------------------------------------------------------------------------- #
+# 组稿
+# --------------------------------------------------------------------------- #
+
+
+def _compose(
+    symbol: str,
+    run_day: date,
+    judgement_result: dict,
+    deactivation: dict,
+    record: RegimeJudgement | None,
+    *,
+    now: datetime,
+) -> tuple[dict, dict]:
+    """把五段组出来，返回 `(sections, landscape)`。
+
+    `record` 由调用方查好后传进来（第①段的依据数字与外键用的是同一行，查一次就够）。
+
+    `landscape` 是 Q3 要求的结构化快照：`DeactivationDecision` 的行是**原地更新**的
+    （同一策略 × 阶段只有一行，`last_confirmed_at` 天天往前走），所以「昨天的建议清单」
+    只能靠当天那一份快照回答，明天再去读决策表读到的已经不是昨天的世界了。
+    """
+    landscape = _landscape(symbol, run_day, judgement_result, deactivation)
+    sections = {
+        SECTION_TODAY: _section_today(judgement_result, record, symbol),
+        SECTION_CHANGE: render_change(landscape[SECTION_CHANGE]),
+        SECTION_EVENTS: _section_events(now=now),
+        SECTION_HEALTH: _section_health(
+            symbol, judgement_result, deactivation, now=now
+        ),
+        SECTION_DELIVERY: _section_delivery(symbol, run_day),
+    }
+    return sections, landscape
+
+
+def _inline_values(judgement_result: dict) -> dict:
+    """三值内联副本。与 `ShadowDailyRecord` 同一取舍：日报要能**独立**回答「那天判的是
+    什么」，判定记录被数据订正过之后，一份审计文件跟着改就成了改历史。"""
+    return {
+        "base_regime": judgement_result.get("base_regime") or "",
+        "escalation": judgement_result.get("escalation") or "",
+        "effective_regime": judgement_result.get("effective_regime") or "",
+    }
+
+
+def _judgement_row(symbol: str, judgement_result: dict) -> RegimeJudgement | None:
+    """三值所抄的那一行判定。
+
+    第①段的**依据数字**（分位、斜率、分离度）只存在于这一行的 `evidence` 里——判定层的
+    返回值故意不带它们（那会让每次心跳都多背一坨只在落库时用一次的数据）。所以这是本模块
+    唯一必须下钻的一次查询，查询键与 `judgement._record_once` 的唯一约束是同一对。
+    """
+    raw = judgement_result.get("effective_at")
+    if not raw:
+        return None
+    try:
+        at = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        logger.warning("[regime] 判定返回值的 effective_at 解析不了：%r", raw)
+        return None
+    return RegimeJudgement.objects.filter(symbol=symbol, effective_at=at).first()
+
+
+# --------------------------------------------------------------------------- #
+# 第一段：今日新判定
+# --------------------------------------------------------------------------- #
+
+
+def _section_today(
+    judgement_result: dict, record: RegimeJudgement | None, symbol: str
+) -> str:
+    """第①段。**必须明写生效时刻**（CONTEXT.md 第 173 条）。"""
+    lines = [f"标的：{symbol}"]
+    if not judgement_result.get("base_regime"):
+        return "\n".join(
+            [*lines, *_missing_judgement_lines(judgement_result, record, symbol)]
+        )
+
+    effective = _regime_display(judgement_result.get("effective_regime"))
+    base = _regime_display(judgement_result.get("base_regime"))
+    lines.append(f"今日判定：{effective}")
+
+    raw_effective_at = judgement_result.get("effective_at")
+    if raw_effective_at:
+        lines.append(f"生效时刻：{format_business(_parse(raw_effective_at))}")
+    lines.append("（此刻生效中的仍是上一有效阶段，本条要到生效时刻才咬人）")
+
+    escalation = judgement_result.get("escalation") or ""
+    if escalation:
+        lines.append(
+            f"基础阶段：{base}；被抬升为 {effective}"
+            f"（抬升标志：{_escalation_display(escalation)}）"
+        )
+    elif base != effective:
+        lines.append(f"基础阶段：{base}")
+
+    decision = (record.evidence or {}).get("decision") if record else None
+    decision = decision or {}
+    if decision.get("action") == ACTION_CARRIED:
+        days = decision.get("in_force_days")
+        lines.append(
+            "维持不变：量化判出的候选阶段是 "
+            f"{_regime_display((record.evidence or {}).get('quant', {}).get('regime'))}，"
+            f"但当前阶段只站了 {days} 个自然日（不足 "
+            f"{config.JUDGEMENT_LIFECYCLE.min_dwell_days} 天），本次沿用 {effective}"
+        )
+
+    numbers = _quant_lines(record)
+    if numbers:
+        lines.append("依据：")
+        lines.extend(numbers)
+    return "\n".join(lines)
+
+
+def _missing_judgement_lines(
+    judgement_result: dict, record: RegimeJudgement | None, symbol: str
+) -> list[str]:
+    """判定缺失时的第①段正文。
+
+    措辞照 CONTEXT.md 第 173 条的原话：「今日判定缺失，处于保持的上一有效状态」。再补一句
+    原因——「不知道」和「数据还没到」对读的人是两件事。上一有效状态从库里读，不猜。
+
+    `symbol` 必须由调用方给：`judgement.current_judgement(None)` 会去查 `symbol=NULL`，
+    那永远查不到，于是「库里有生效判定」会被读成「冷启动」——一个自洽的错答案。
+    """
+    if record is not None and record.base_regime:
+        # 走到这里说明返回值说没结论、库里那条却有——口径已经漂开，照实说，别掩盖。
+        logger.warning(
+            "[regime] 判定返回值无结论，但记录 %s 有三值，第①段按记录写", record.pk
+        )
+        return [f"今日判定：{_regime_display(record.effective_regime)}（记录口径）"]
+
+    skipped = judgement_result.get("skipped") or ""
+    reason = _SKIP_DISPLAY.get(skipped, skipped or "未说明")
+    lines = [f"今日判定缺失（{reason}），处于保持的上一有效状态。"]
+
+    current = judgement.current_judgement(symbol)
+    if current is None:
+        lines.append("库中还没有任何生效过的判定（冷启动）。")
+    else:
+        lines.append(
+            f"当前生效：{_regime_display(current.effective_regime)}，"
+            f"自 {format_business(current.effective_at)} 起"
+        )
+    latest = judgement.last_judgement(symbol)
+    if latest is not None and (current is None or latest.pk != current.pk):
+        # 「最近写下的」与「生效中的」不是同一条时才补这一句。它是不是已经咬了人，上面
+        # 那一行已经说了（生效时刻写在那儿）；这里只补「机制上一次成功是什么时候」。
+        lines.append(
+            f"最近写下的一条是 {format_business(latest.created_at)} 那次"
+            f"（运行日 {latest.run_day}，自 {format_business(latest.effective_at)} 起生效）"
+        )
+    return lines
+
+
+def _quant_lines(record: RegimeJudgement | None) -> list[str]:
+    """依据的具体数字（CONTEXT.md 第 173 条：分位/斜率，不是「市场波动加大」这类话）。
+
+    全部从判定记录自己的 `evidence` 里读——那是判定当时亲手写下的原话。取不到就**不写**，
+    不拿别的量凑：一句编出来的「依据」比没有依据更坏。
+    """
+    if record is None:
+        return []
+    quant = (record.evidence or {}).get("quant") or {}
+    lines: list[str] = []
+
+    atr_pct = quant.get("atr_pct")
+    rank = quant.get("atr_pct_rank")
+    sample = quant.get("quantile_sample")
+    if atr_pct is not None:
+        text = f"  ATR% {_num(atr_pct)}"
+        if rank is not None:
+            text += (
+                f"，{sample or config.JUDGEMENT.quantile_window_days} 日分位 {_pct(rank)}"
+            )
+            if rank >= config.JUDGEMENT.high_vol_quantile:
+                # 阈值是**分位**的阈值（判据就是「ATR% 分位 > 80%」），拿来比的是分位这
+                # 个数，不是 ATR% 本身——两个量纲差着一个数量级，混起来会把「今天波动
+                # 很大」判成常态化。比较发生在 `rank is not None` 里面，因为分位算不出来
+                # 时这个判据压根没有取值。
+                text += "（高于高波动阈值）"
+        lines.append(text)
+
+    slow = quant.get("ema_slow")
+    if slow is not None:
+        lines.append(
+            f"  EMA{config.JUDGEMENT.ema_fast_period} {_num(quant.get('ema_fast'))} / "
+            f"EMA{config.JUDGEMENT.ema_slow_period} {_num(slow)}，"
+            f"斜率 {_num(quant.get('ema_slope'), digits=6)}"
+        )
+
+    separation = quant.get("separation")
+    if separation is not None:
+        lines.append(f"  分离度 (EMA快−EMA慢)/ATR = {_num(separation, digits=3)}")
+    return lines
+
+
+def _num(value: object, *, digits: int = 4) -> str:
+    if value is None:
+        return "未算"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _pct(value: object) -> str:
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _parse(raw: str) -> datetime:
+    return datetime.fromisoformat(raw)
+
+
+def _regime_display(value: object) -> str:
+    """slug → 中文展示名。取不到展示名时原样回显 slug，**不猜**。"""
+    if not value:
+        return "（无）"
+    try:
+        return BaseRegime(value).display
+    except ValueError:
+        return str(value)
+
+
+def _escalation_display(value: object) -> str:
+    """抬升标志 slug → 中文展示名，与 `_regime_display` 同一纪律。
+
+    展示名的出处是模型层自己给的（`NO_ESCALATION_DISPLAY` 的 docstring 明写「查询/日报要
+    显示『无抬升』时用它，不要就地写中文」），所以这里不另写一份映射。**原本这里写的是
+    裸 slug**：`Escalation` 是 `str` 枚举，`f"{escalation}"` 不报错、只是把「news」端到
+    用户眼前——而这一段的全部意义就是回答「今天为什么更保守」。
+    """
+    if not value:
+        return NO_ESCALATION_DISPLAY
+    try:
+        return Escalation(value).display
+    except ValueError:
+        return str(value)
+
+
+# --------------------------------------------------------------------------- #
+# 第二段：相对昨日的变化（结构化 + 按人裁剪）
+# --------------------------------------------------------------------------- #
+
+
+def _landscape(
+    symbol: str,
+    run_day: date,
+    judgement_result: dict,
+    deactivation: dict,
+) -> dict:
+    """今天这一份快照。第②段的比对基准就是它（Q3）。
+
+    ## 底料是**当天推导产出的建议清单**，不是决策表
+
+    两处都能拿到「策略 × 阶段」，选这里有两个各自独立的理由：
+
+    1. `DeactivationDecision` 的行**只会**是 `suggested`（`DecisionStatus` 的另外两个
+       取值是第③段 gate 层写的），所以那张表在单元 8 里**只增不减**——拿它做今昨差异，
+       「将解除」永远不可能出现，而那正是第②段的一半。当天推导的清单则会随着池化表换代
+       而变化，缩得下去。
+    2. 这一天**到底说了什么**只有清单记得：决策行是滚动的，明天再读读到的已经不是今天的
+       世界。`ShadowDailyRecord.suggestions` 与这里是同一份底料（同一次调用的同一个
+       `payload`），所以日报第②段与 Shadow 记录不会在日界附近各说各话。
+
+    ## 键是「层」
+
+    `by_regime` 的键是建议里的 `regime`（阶段 slug），值是那一层的策略清单——CONTEXT.md
+    第 173 条要的「将新停用 / 将解除〈某层〉」里的「层」正是它。`state` 一并冻结：「为什么
+    这天说它不适用」在决策行被后世覆盖之后就只剩这一份了。
+
+    被豁免的（`exempt`）照落在清单里：豁免改变的是「这条建议会不会真咬人」，不是「机制
+    说过什么」。第②段按结构做差，把这两件事混起来会让「豁免到期」看起来像「新停用」。
+    """
+    suggestions = list(deactivation.get("suggestions") or [])
+    names = _strategy_names([s.get("strategy_id") for s in suggestions])
+
+    by_regime: dict[str, list[dict]] = {}
+    for item in suggestions:
+        sid = item.get("strategy_id")
+        if not sid:
+            continue
+        by_regime.setdefault(item.get("regime") or "", []).append(
+            {
+                "strategy_id": str(sid),
+                "name": names.get(str(sid)) or "",
+                "state": item.get("state") or "",
+                "reason": item.get("reason") or "",
+                "source": item.get("source") or "",
+                "running": bool(item.get("running")),
+                "exempt": bool(item.get("exempt")),
+                "created": bool(item.get("created")),
+            }
+        )
+    for entries in by_regime.values():
+        # 顺序不稳会让「今天和昨天有什么不同」多出一堆假的差异。
+        entries.sort(key=lambda e: e["strategy_id"])
+
+    return {
+        "symbol": symbol,
+        "run_day": run_day.isoformat(),
+        "regime": judgement_result.get("effective_regime") or "",
+        "regime_display": _regime_display(judgement_result.get("effective_regime"))
+        if judgement_result.get("effective_regime")
+        else "",
+        "blocked": deactivation.get("skipped") or "",
+        "generation_id": deactivation.get("generation_id"),
+        "managed": deactivation.get("managed"),
+        "unresolved_count": len(deactivation.get("unresolved") or []),
+        "unmanaged_count": len(deactivation.get("unmanaged") or []),
+        "needs_review": deactivation.get("needs_review"),
+        "missing_cells": deactivation.get("missing_cells"),
+        "by_regime": by_regime,
+        "count": len(suggestions),
+        SECTION_CHANGE: _change(
+            by_regime,
+            today_blocked=deactivation.get("skipped") or "",
+            symbol=symbol,
+            run_day=run_day,
+        ),
+    }
+
+
+def _strategy_names(strategy_ids: list) -> dict[str, str]:
+    """建议里只有策略 id，日报要给人看名字。一次查询，不逐条问。"""
+    wanted = [sid for sid in strategy_ids if sid]
+    if not wanted:
+        return {}
+    rows = Strategy.objects.filter(id__in=wanted).values_list("id", "name")
+    return {str(pk): name for pk, name in rows}
+
+
+def _change(
+    by_regime: dict, *, today_blocked: str, symbol: str, run_day: date
+) -> dict:
+    """第②段的结构化内容：与**上一份日报**的 `by_regime` 做差。
+
+    为什么读上一份日报而不是「昨天的 Shadow 记录」：`ShadowDailyRecord.suggestions` 是
+    那一轮推导的原始产物，而这里的比对要的是「机制**对外承诺过**的清单」——日报是那份
+    承诺。两者在正常日子里相同，在推导被阻塞的日子里不同，而正是那种日子里比对最容易
+    读错（见下面 `blocked` 的处理）。
+
+    `blocked` 的三态是这段的核心：本轮的推导没产出建议时，今天的集合是**空**的，直接做差
+    会把「这轮没说话」读成「把这些全解除了」。同理，上一份日报本身是阻塞日时，它那份空
+    集合不代表「那天没有建议」，拿它当基准会凭空造出一堆「将停用」。
+    """
+    prev = (
+        DailyReport.objects.filter(symbol=symbol, run_day__lt=run_day)
+        .order_by("-run_day")
+        .only("run_day", "landscape")
+        .first()
+    )
+
+    if today_blocked:
+        return {
+            "status": "blocked",
+            "note": (
+                f"本轮推导未产出停用建议（{BLOCKED_DISPLAY.get(today_blocked, today_blocked)}），"
+                "故本日不做今昨比对——空集合不等于「全解除」"
+            ),
+            "baseline_run_day": prev.run_day.isoformat() if prev else None,
+            "items": [],
+        }
+    if prev is None:
+        return {
+            "status": "first",
+            "note": "无昨日日报可比对，这是首次",
+            "baseline_run_day": None,
+            "items": [],
+        }
+
+    prev_landscape = prev.landscape or {}
+    prev_by_regime = prev_landscape.get("by_regime") or {}
+    if prev_landscape.get("blocked"):
+        return {
+            "status": "blocked",
+            "note": (
+                f"上一份日报（{prev.run_day}）那天推导被阻塞"
+                f"（{BLOCKED_DISPLAY.get(prev_landscape.get('blocked'), prev_landscape.get('blocked'))}），"
+                "它那份清单是空的但不代表「那天没有建议」，故不做比对"
+            ),
+            "baseline_run_day": prev.run_day.isoformat(),
+            "items": [],
+        }
+
+    items = diff_regimes(prev_by_regime, by_regime)
+    if not items:
+        note = f"与 {prev.run_day} 的日报相比无变化"
+        if prev.run_day != run_day - timedelta(days=1):
+            note = (
+                f"与上一份日报（{prev.run_day}，距今 "
+                f"{(run_day - prev.run_day).days} 天）相比无变化"
+            )
+        return {
+            "status": "unchanged",
+            "note": note,
+            "baseline_run_day": prev.run_day.isoformat(),
+            "items": [],
+        }
+    return {
+        "status": "diff",
+        "note": f"与上一份日报（{prev.run_day}）相比：{_change_headline(items)}",
+        "baseline_run_day": prev.run_day.isoformat(),
+        "items": items,
+    }
+
+
+def diff_regimes(prev_by_regime: dict, today_by_regime: dict) -> list[dict]:
+    """两天的「层 → 建议集合」做差，返回预告条目（层粒度，CONTEXT.md 第 173 条）。
+
+    - `halt`：今天有、上一份没有 → 「将停用〈层〉」
+    - `release`：上一份有、今天没有 → 「将解除〈层〉」
+
+    只在**同一层内**比对策略。跨层搬动一条策略在数据上是「解除 + 停用」两件事，报成一件
+    会掩盖「它其实换了个阶段继续被停着」，而那句话正是读的人要的判断。
+    """
+    items: list[dict] = []
+    for regime in sorted(set(prev_by_regime) | set(today_by_regime)):
+        prev_ids = {e["strategy_id"] for e in prev_by_regime.get(regime, [])}
+        today_entries = today_by_regime.get(regime, [])
+        today_ids = {e["strategy_id"] for e in today_entries}
+        added = [e for e in today_entries if e["strategy_id"] not in prev_ids]
+        removed = [e for e in prev_by_regime.get(regime, []) if e["strategy_id"] not in today_ids]
+        if added:
+            items.append(_change_item("halt", regime, added))
+        if removed:
+            items.append(_change_item("release", regime, removed))
+    return items
+
+
+def _change_item(kind: str, regime: str, entries: list[dict]) -> dict:
+    return {
+        "kind": kind,
+        "regime": regime,
+        "regime_display": _regime_display(regime),
+        "strategies": [
+            {
+                "strategy_id": e["strategy_id"],
+                "name": e.get("name") or "",
+                "running": bool(e.get("running")),
+                "exempt": bool(e.get("exempt")),
+            }
+            for e in sorted(entries, key=lambda e: e["strategy_id"])
+        ],
+    }
+
+
+def _change_headline(items: list[dict]) -> str:
+    parts = [
+        f"{'将新停用' if item['kind'] == 'halt' else '将解除'}"
+        f"「{item['regime_display']}」{len(item['strategies'])} 个"
+        for item in items
+    ]
+    return "；".join(parts)
+
+
+def render_change(
+    change: dict | None, *, strategy_ids: set[str] | None = None
+) -> str:
+    """把结构化第②段渲染成文本，`strategy_ids` 非空时顺带按人裁剪。
+
+    **裁剪发生在渲染之前**：`strategy_ids=None` 表示「不裁」（存档那一份、以及日志）；
+    传一个集合表示「只留与这些策略有关的条目」（某个用户那一份）。筛完没有条目时返回
+    **空串**，由调用方决定连标题一起省掉——无活跃会话的人不该看到这一节。
+
+    取的是「预告口径」而不是陈述口径（CONTEXT.md 第 173 条）：这些变化**将在明日 08:00
+    生效**，所以写「将停用」，不写「已停用」。此刻被停的与这里写的不是同一批，混起来
+    就正好是本机制从头到尾在防的那种「两个入口两种说法」。
+    """
+    if not change:
+        return ""
+    status = change.get("status")
+    if status in ("first", "blocked", "unchanged"):
+        return change.get("note") or ""
+
+    lines: list[str] = []
+    for item in change.get("items") or []:
+        entries = item.get("strategies") or []
+        if strategy_ids is not None:
+            entries = [e for e in entries if e.get("strategy_id") in strategy_ids]
+        if not entries:
+            continue
+        verb = "将新停用" if item["kind"] == "halt" else "将解除"
+        names = "、".join(_entry_label(e) for e in entries)
+        lines.append(f"{verb}「{item['regime_display']}」：{names}")
+    if not lines:
+        return ""
+    lines.append("（以上自明日 08:00 起生效）")
+    return "\n".join(lines)
+
+
+def _entry_label(entry: dict) -> str:
+    name = entry.get("name") or entry.get("strategy_id", "")[:8]
+    marks = []
+    if entry.get("exempt"):
+        marks.append("人工豁免中")
+    if entry.get("running") is False:
+        marks.append("未在跑")
+    return f"{name}（{'，'.join(marks)}）" if marks else name
+
+
+# --------------------------------------------------------------------------- #
+# 第三段：未来 N 天的高影响事件
+# --------------------------------------------------------------------------- #
+
+
+def _section_events(*, now: datetime) -> str:
+    """第③段。查询形状与 `apps.agent.event_commands._list` **逐字同源**：两处回答的是
+    同一个问题，口径不同就会出现「日报说有 2 条、追问时工具说有 5 条」。
+
+    天数取 `config.REPORT.event_horizon_days`，**不吃参数**（CONTEXT.md 第 183 条）。
+    起点是 `now` 而不是运行日：同源那一份用的是 `now`，两处口径必须逐字一致。
+    """
+    horizon = config.REPORT.event_horizon_days
+    until = now + timedelta(days=horizon)
+    lines = [f"未来 {horizon} 天（截至 {format_business(until)}）："]
+
+    upcoming = list(
+        MajorEvent.objects.filter(
+            status=EventStatus.SCHEDULED.value,
+            event_time__lte=until,
+            resume_at__gte=now,
+        ).order_by("event_time", "id")
+    )
+    high = [e for e in upcoming if e.impact == EventImpact.HIGH.value]
+    if high:
+        lines.append(f"会触发熔断的（档位「高」）：{len(high)} 条")
+        lines.extend(describe_event(event, now=now) for event in high)
+    else:
+        lines.append("会触发熔断的（档位「高」）：没有")
+
+    others = len(upcoming) - len(high)
+    if others:
+        # 不静默略过：录进来的事件在日报里查不到，人会以为系统把那条吃了。
+        lines.append(f"另有 {others} 条档位非「高」的事件不产生熔断，用 /event list 查看。")
+
+    lines.extend(_candidate_lines(now=now))
+    return "\n".join(lines)
+
+
+def _candidate_lines(*, now: datetime) -> list[str]:
+    """候选事件单列一节，落在第③段末尾。
+
+    候选**不产生任何动作**，转正需人工重新给出时间/档位/作用域（CONTEXT.md 第 94 条）。
+    `describe_candidate` 与 `describe_event` 结构上可分辨（候选没有「熔断窗口」那一行），
+    所以这里不必再写一遍「这不是熔断」——但一行总括要说，因为日报是许多人第一次听说
+    「候选」这个词的地方。
+    """
+    pending = list(
+        CandidateEvent.objects.filter(
+            status=CandidateStatus.PENDING.value
+        ).order_by("-raised_at", "-id")
+    )
+    if not pending:
+        return ["待人工处置的候选事件：没有"]
+    return [
+        f"待人工处置的候选事件：{len(pending)} 条（**不产生任何熔断**，"
+        "转正需人工重新给出时间/档位/作用域）",
+        *(describe_candidate(candidate, now=now) for candidate in pending),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 第四段：机制健康
+# --------------------------------------------------------------------------- #
+
+
+def _section_health(
+    symbol: str,
+    judgement_result: dict,
+    deactivation: dict,
+    *,
+    now: datetime,
+) -> str:
+    """第④段：上次判定成功时间 + 三个开关 + 是否触发过自熔断 + 未归类策略计数。
+
+    「上次判定成功时间」的唯一出处是 `judgement.last_judgement()`——**最近写下的那条，
+    不论生效了没有**。不能拿 `current_judgement().created_at` 顶替：那读的是「正在生效的
+    那条是什么时候写的」，而它对「机制多久没出结论了」这个问题给的是错的答案（详见
+    `apps.regime.judgement.last_judgement` 的 docstring）。
+    """
+    lines: list[str] = []
+
+    last = judgement.last_judgement(symbol)
+    if last is None:
+        lines.append("上次判定成功：从未（判定任务没有写完过任何一条记录）")
+    else:
+        lines.append(
+            f"上次判定成功：{format_business(last.created_at)}"
+            f"（运行日 {last.run_day}，结论 {_regime_display(last.effective_regime)}）"
+        )
+
+    lines.extend(_switch_lines())
+
+    # 「是否触发过自熔断」在单元 8 里只能由切换流水回答：自熔断的收场是「退回 Shadow」，
+    # 而那条路径的第②段实现会在流水里留一条 to_mode=shadow 的行。这里只读，不推断。
+    back = [
+        row
+        for row in RegimeMechanismSwitch.objects.filter(
+            to_mode=MechanismMode.SHADOW.value
+        ).order_by("-at", "-id")[:1]
+    ]
+    if back:
+        lines.append(
+            f"自熔断：触发过（最近一次 {format_business(back[0].at)}，"
+            f"{back[0].actor_name}：{back[0].reason}）"
+        )
+    else:
+        lines.append("自熔断：未触发过（切换流水里没有一条退回 Shadow 的记录）")
+
+    if judgement_result.get("base_regime"):
+        lines.append("本轮判定：已出结论")
+    else:
+        skipped = judgement_result.get("skipped") or ""
+        lines.append(
+            f"本轮判定：未出结论（{_SKIP_DISPLAY.get(skipped, skipped or '未说明')}）"
+        )
+    derivation = deactivation.get("skipped") or ""
+    lines.append(
+        "本轮推导：" + (BLOCKED_DISPLAY.get(derivation, derivation) or "正常，已产出建议")
+    )
+    note = (deactivation.get("note") or "").strip()
+    if note and note != BLOCKED_DISPLAY.get(derivation, ""):
+        lines.append(f"  推导备注：{note}")
+
+    managed = deactivation.get("managed")
+    if managed is not None:
+        text = f"被管策略：{managed} 个（其中在跑 {deactivation.get('running')} 个）"
+        unmanaged = deactivation.get("unmanaged") or []
+        if unmanaged:
+            # 「未归类」的幽灵策略行是回测自动建出来的，日报只给它们一个数，不给动作
+            # （CONTEXT.md 第 105 条）。数要报，否则「被管集合怎么会变」无处可问。
+            text += f"；未归类 {len(unmanaged)} 个（不产生任何动作）"
+        unresolved = deactivation.get("unresolved") or []
+        if unresolved:
+            text += f"；实现类解析不到 {len(unresolved)} 个"
+        lines.append(text)
+        # 「结论在、动作不在」的那些也要报数：`needs_review` 判为不适用但依据方向冲突，
+        # 于是它既不在建议清单里、也不该被当成「这轮没事」。不报，它就只存在于任务日志里，
+        # 而日志不算被看见。
+        review = deactivation.get("needs_review")
+        if review:
+            lines.append(f"  待人工复核：{review} 条（判为不适用但依据方向冲突，本轮不动手）")
+        missing = deactivation.get("missing_cells")
+        if missing:
+            lines.append(f"  当前代缺格：{missing} 条（策略 × 阶段在池化表里没有这一格）")
+
+    lines.append(_event_library_line(now=now))
+    return "\n".join(lines)
+
+
+def _switch_lines() -> list[str]:
+    """三个开关的当前状态 + 各自最近一次生效时间（CONTEXT.md 第 179 条）。
+
+    **这里如实说出「各自最近一次生效时间」在数据上取不到**，而不是编三个时间出来：
+    `RegimeMechanismSwitch` 一张表只记「从哪档到哪档」，没有「是哪一个开关」这一列，而
+    单元 8 又刻意一行都不写。三个开关的独立化发生在第②③段，届时那张表要么加一列、
+    要么各自成表——那是那一步的决定，不是这一步能替它做的。
+
+    所以本段给的是**能回答的那两件事**：当前档（`RegimeMechanismSwitch.current()`，查
+    流水而不是写死 Shadow）+ 流水里事实存在的切换记录。三个开关分开列出来，是因为
+    「哪些自动行为是活着的」必须能一眼读到，而不是靠读代码推断。
+    """
+    latest = RegimeMechanismSwitch.latest()
+    current = RegimeMechanismSwitch.current()
+    lines = [
+        f"机制当前档：{current.display}"
+        + (f"（最近一次切换 {format_business(latest.at)}）" if latest else "（无切换流水）"),
+        "三个开关（各自独立、各自人工确认）——单元 8 没有任何代码路径能打开其中任何一个：",
+        "  出 Shadow（判定 + 切片 + 自动停用）：未打开",
+        "  事件熔断：未打开（第②段接线）",
+        "  行情阶段 gate：未打开（第③段接线）",
+        "  最近一次生效时间：无流水可查（切换记录里一行都没有）",
+    ]
+    return lines
+
+
+def _event_library_line(*, now: datetime) -> str:
+    """事件库衰减（CONTEXT.md 第 80 条：超过 14 天无新事件入库要告警）。
+
+    放在第④段而不是第③段：这是**机制自身的健康**信号，不是「未来有什么事件」。两处都写
+    会让同一件事有两个出口，而它们迟早会不一致。
+    """
+    limit = config.EVENTS.coverage_decay_days
+    newest = MajorEvent.objects.order_by("-created_at").only("created_at").first()
+    candidate = (
+        CandidateEvent.objects.order_by("-created_at").only("created_at").first()
+    )
+    stamps = [row.created_at for row in (newest, candidate) if row is not None]
+    if not stamps:
+        return f"事件库：从未录入过任何事件（上限 {limit} 天无新事件即衰减告警）"
+    latest = max(stamps)
+    age = (now - latest).days
+    text = f"事件库：最近入库 {format_business(latest)}（距今 {age} 天，上限 {limit} 天）"
+    if age > limit:
+        text += "——⚠ 已超过上限，事件情报可能已经衰减"
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# 第五段：昨日日报的投递结果
+# --------------------------------------------------------------------------- #
+
+
+def _section_delivery(symbol: str, run_day: date) -> str:
+    """第⑤段：昨日日报的投递结果。
+
+    这一段的全部意义是让「机制昨晚哑了一回」第二次出现时有人能看见——所以它读的是**昨天
+    那一行自己**，不是「今天有没有收到」。缺昨日那一行时照实说缺，并点出「缺」本身意味着
+    什么：判定任务昨天也跑过而这里空着，那是生成环节的问题，不是正常。
+
+    **本单元只生成与落库，不投递。** 投递通路与投递记录是单元 8iv（CONTEXT.md 第 175
+    条），那时 `DailyReport` 才长出 `delivered_at` / `delivery_error` /
+    `delivery_attempts`，本段也才第一次有真结果可报。在那之前这里如实说「没有投递结果
+    可比对」——**不能因为「反正列还没建」就把这一节渲染成「已投递」**：一份永远显示成功
+    的投递报告，与一个哑掉却从不报警的看门狗是同一类东西，而这一整条主线的起点正是
+    「沉默必须能被识别为异常」。
+    """
+    prev_day = run_day - timedelta(days=1)
+    prev = (
+        DailyReport.objects.filter(symbol=symbol, run_day=prev_day)
+        .only("created_at")
+        .first()
+    )
+    if prev is None:
+        return (
+            f"昨日（{prev_day}）没有日报可查。"
+            "若昨天的判定任务跑过，这本身就是生成环节的问题，不是正常状态。"
+        )
+    return (
+        f"昨日日报生成于 {format_business(prev.created_at)}。"
+        "投递结果：本单元（8iii）只生成与落库、尚未接投递通路，没有投递记录可比对；"
+        "投递与独立的投递看门狗是单元 8iv。"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 渲染与裁剪
+# --------------------------------------------------------------------------- #
+
+
+def render_body(sections: dict, *, symbol: str, run_day: date) -> str:
+    """把五段拼成一份正文。落库的 `sections` 是分段的那一份，正文是它的渲染结果。
+
+    空段照样出标题并写「（本节无内容）」：**缺一节与「这一节没有内容」必须能被区分**，
+    否则读者不知道是机制没话说还是渲染漏了。
+    """
+    horizon = config.REPORT.event_horizon_days
+    lines = [f"行情阶段日报 ｜ {symbol} ｜ 运行日 {run_day}"]
+    for name in SECTIONS:
+        if name == SECTION_CHANGE:
+            title = _SECTION_TITLES[name]
+            body = (sections or {}).get(name) or ""
+            if not body:
+                # 无活跃会话的用户不该看到停用段——**整节不出现**，不留空标题。
+                continue
+        else:
+            title = _SECTION_TITLES[name].format(horizon=horizon)
+            body = (sections or {}).get(name) or "（本节无内容）"
+        lines.extend(["", f"【{title}】", body])
+    return "\n".join(lines)
+
+
+def crop_for(report: DailyReport, strategy_ids: set[str]) -> dict:
+    """某一行的五段裁成某个用户该看的样子，返回**新的 `sections`**。
+
+    判定段（以及③④⑤）对所有人相同——判定是有用的公共信息。停用段只含「你实际受影响的
+    策略」（CONTEXT.md 第 173 条）：一个你没在跑的策略被停了纯属噪声，而噪声会让人开始
+    忽略日报，那时「必发」就只剩形式。
+
+    一个**空集合**就是「这个人没有任何活跃会话」——那时整节都不出现（`render_change` 返回
+    空串，这里把键删掉），而**不是**出现一节写着「无变化」：后者会被读成「机制看了我的
+    策略，说没事」，而事实是机制压根没在管他。所以不需要第二个「要不要这一段」的开关，
+    「筛完为空就整节不出现」这一条规则同时覆盖了这两种情形。
+    """
+    sections = dict(report.sections or {})
+    change = (report.landscape or {}).get(SECTION_CHANGE)
+    render = render_change(change, strategy_ids=set(strategy_ids or ()))
+    if render:
+        sections[SECTION_CHANGE] = render
+    else:
+        sections.pop(SECTION_CHANGE, None)
+    return sections
+
+
+def user_affected_strategy_ids(user_id) -> set[str]:
+    """这个用户**实际在跑**的策略 id。
+
+    裁的是活跃会话（`LiveSession.ACTIVE_STATUSES`），不是策略的 `is_active`：后者是
+    「这个策略退役了没有」的人工总开关（CONTEXT.md 第 106 条），与「谁在跑它」是两件事。
+    """
+    return {
+        str(sid)
+        for sid in LiveSession.objects.filter(
+            user_id=user_id,
+            status__in=LiveSession.ACTIVE_STATUSES,
+        )
+        .values_list("strategy_id", flat=True)
+        .distinct()
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 摘要
+# --------------------------------------------------------------------------- #
+
+
+def _note(judgement_result: dict, deactivation: dict, landscape: dict) -> str:
+    """这一份日报为什么长这样，一句话。给日志与任务返回值用。"""
+    if judgement_result.get("base_regime"):
+        head = f"判定出结论（{judgement_result.get('effective_regime')}）"
+    else:
+        head = (
+            f"今日判定缺失（{judgement_result.get('skipped') or '未说明'}），"
+            "处于保持的上一有效状态"
+        )
+    change = landscape.get(SECTION_CHANGE) or {}
+    return f"{head}；{change.get('note') or '无今昨比对'}"
+
+
+def _summary(row: DailyReport, outcome: str) -> dict:
+    change = (row.landscape or {}).get(SECTION_CHANGE) or {}
+    return {
+        "symbol": row.symbol,
+        "run_day": row.run_day.isoformat(),
+        "outcome": outcome,
+        "written": outcome == OUTCOME_CREATED,
+        "judgement_missing": row.judgement_missing,
+        "suggested_count": (row.landscape or {}).get("count", 0),
+        "change_status": change.get("status"),
+        "note": row.note,
+    }

@@ -20,10 +20,15 @@
 （CONTEXT.md 第 118 条），日报只读「当前一代」。回退方式与判定一样：删掉
 ``_derive_deactivation`` 这一个调用，前两段职责各自完好。
 
-最后把这一轮的判定与推导落成**当天那一条 Shadow 记录**（第①段单元 8i）。它是前两段的
+接着把这一轮的判定与推导落成**当天那一条 Shadow 记录**（第①段单元 8i）。它是前两段的
 **下游**，不是并列的一段：要落的建议清单正是推导的产物，挂在上游会永远写空。它也确实是
-第①段唯一的产出——Shadow 期机制不施加任何动作，能留下的就是这些行。回退方式同前：删掉
-``_record_shadow`` 这一个调用，前面各段职责各自完好。
+第①段在**机制侧**唯一的产出——Shadow 期机制不施加任何动作，能留下的就是这些行。回退方式
+同前：删掉 ``_record_shadow`` 这一个调用，前面各段职责各自完好。
+
+最后落**当天那一条日报**（第①段单元 8iii）。它又是 Shadow 的下游：第②段与 Shadow 的建议
+清单同源，而且还要读昨天那份日报的结构化快照做差——两天的差要到「今天也说完了」才成立。
+回退方式同前：删掉 ``_generate_report`` 这一个调用。**「每天固定一条、必发」由它保住**：
+它是第①段唯一直接说给用户听的东西（CONTEXT.md 第 173 条）。
 """
 
 import asyncio
@@ -110,7 +115,9 @@ def snapshot_daily_equity(self) -> dict:
 
     _derive_deactivation(payload)
 
-    return _record_shadow(payload)
+    _record_shadow(payload)
+
+    return _generate_report(payload)
 
 
 def _derive_deactivation(payload: dict) -> dict:
@@ -178,5 +185,46 @@ def _record_shadow(payload: dict) -> dict:
     finally:
         # 长时间运行/反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()
+
+    return payload
+
+
+def _generate_report(payload: dict) -> dict:
+    """把这一轮的各段产物落成当天的日报（第①段单元 8iii）。
+
+    **为什么排在 Shadow 之后**：第②段与 Shadow 的建议清单同源（都是这一轮推导的产物），
+    而且还要读**昨天那份日报的结构化快照**做差。排在最末就是「这一轮能说的话都说完之后
+    再说」。
+
+    **为什么判定没有结论时照样往下走**：日报是「每天固定一条、必发」，判定缺失正是它要
+    写出来的事情之一（第①段明写「今日判定缺失，处于保持的上一有效状态」）。**写不写由
+    ``apps.regime.report`` 决定**：有结论就写，没结论就等到截止时刻再写——在那之前每 5
+    分钟一轮都还有机会等到结论，而先写一条「判定缺失」会把当天这条**永久钉死**
+    （一天一条是唯一约束），后面等到结论也改不回来。
+
+    真正写不进去（DB 故障）才往上抛，与前两段同一种处置：心跳 5 分钟后再来一次，
+    ``get_or_create`` 幂等，重试无副作用；吞掉异常则会让这张表静默停在某一天，而
+    「这张表停在某一天」正是它要负责发现的事情。
+    """
+    from apps.regime.report import write_daily_report
+
+    try:
+        payload["report"] = write_daily_report(
+            payload.get("regime") or {},
+            payload.get("deactivation") or {},
+            payload.get("shadow") or {},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("[snapshot_daily_equity] 日报生成失败: %s", e, exc_info=True)
+        raise
+    finally:
+        # 长时间运行/反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+    summary = payload["report"]
+    if summary.get("written"):
+        logger.info("[snapshot_daily_equity] 日报 %s", summary)
+    else:
+        logger.info("[snapshot_daily_equity] 日报未写：%s", summary.get("note"))
 
     return payload

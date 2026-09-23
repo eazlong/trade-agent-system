@@ -1470,3 +1470,151 @@ class CandidateEvent(models.Model):
         from django.utils import timezone as _tz
 
         return (now or _tz.now()) >= self.expires_at
+
+
+# --------------------------------------------------------------------------- #
+# 每日日报（第①段单元 8iii）
+#
+# 本段只有「落库的形状」：内容怎么组稿、按人怎么裁剪，全在 `apps.regime.report`。
+# 投递与投递看门狗是单元 8iv，所以这里**没有**投递那几列——先记「说了什么」，
+# 再说「送到了没」；把两者塞进同一次写入，会让「今天日报没生成」与「生成了没送出去」
+# 在库里长得一样，而这两件事的处置完全不同（前者是判定任务的问题，后者是投递通路）。
+# --------------------------------------------------------------------------- #
+
+
+class DailyReport(models.Model):
+    """一天一条的日报（CONTEXT.md 第 173 条）。
+
+    ## 为什么它是一张表，而不是一条日志
+
+    日报被定为**每天固定一条、必发**（沉默必须能被识别为异常）。这句话落库才有意义：
+    只有存下来，「今天没有日报」才是一个可以被查询的事实，而不是一个只能靠回忆判断的
+    感觉。投递看门狗（8iv）判的就是「今天这张表里有没有一行成功投递」——它读的必须
+    是**这张表**，不能是日报自己发的消息（CONTEXT.md:175「看门狗不能靠日报自己告警」）。
+
+    ## 为什么 `landscape` 要落一份结构化快照
+
+    `DeactivationDecision` 的行是**原地更新**的（同一（策略 × 阶段）一行，
+    `last_confirmed_at` 天天往前走，单元 7 的决定）。于是「昨天建议停谁」这个问题的
+    答案会随着时间被改写——今天去读决策表，读到的是今天的世界，不是昨天那句话。
+    第②段的今昨做差要的恰恰是**两天各自说了什么**，所以每天把当时的推导结论
+    （每层 → 建议集合，含状态）整份冻在这里。这与 `ShadowDailyRecord.suggestions`
+    冻结清单是同一条纪律的两个粒度：那边冻一天的清单，这边冻一天的世界。
+
+    缺了它，第②段的做差会退化成「把今天的世界与今天的世界相减」，永远得零——
+    而那看起来像「机制很稳定」。
+
+    ## 为什么 `sections` 与正文分开
+
+    `sections` 是**结构化的五段**（每段是一段文字，第②段另附条目），`landscape` 是
+    做差用的原料。正文（渲染出来的那一条消息）**不落库**：它是 `sections` 的函数，
+    落一份就等于承认两份真相，而裁剪还是按人做的——同一个 `sections` 对每个人渲染出
+    不同的正文。落库里的是「机制今天说了什么」，发出的是「你该看到哪一部分」。
+
+    ## 三值内联 + 外键，与 `ShadowDailyRecord` 同取舍
+
+    抄一份三值到本地，`judgement` 外键留作下钻，可空 + `SET_NULL`。理由那一整段在
+    `ShadowDailyRecord` 里写过了，这里不重复；两处取舍必须一致，否则同一天的两张表
+    会对「那天是量化判的还是要资讯抬的」给出两种读法。
+
+    ## `judgement_missing` 为什么是一列
+
+    判定任务失败或数据不足时日报**照发**，第①段明写「今日判定缺失，处于保持的上一
+    有效状态」（CONTEXT.md:83）。这件事必须是一列而不是「三值为空即视为缺失」：
+    「判定跑了、结论是空的」与「判定压根没跑」在库里都是空三值，而前者是算法的事、
+    后者是任务的事。用一列显式的布尔把当时的语义钉住——库里没有第二处能补出这个区分。
+    """
+
+    symbol = models.CharField("标的", max_length=32)
+
+    #: **运行日**（业务时区的自然日）：与 `ShadowDailyRecord.run_day` 同一个东西、
+    #: 同一个名字。日报第①段报的是「今天刚产出、明日 08:00 才生效」的那条判定，
+    #: 所以按天对齐两张表时用的是运行日，不是签署日（`RegimeJudgement.attribute_date`）。
+    run_day = models.DateField("运行日（业务时区的自然日）", db_index=True)
+
+    judgement = models.ForeignKey(
+        "regime.RegimeJudgement",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="daily_reports",
+        verbose_name="三值所抄的那条判定（下钻用）",
+    )
+
+    base_regime = models.CharField(
+        "基础阶段（内联副本）",
+        max_length=16,
+        choices=[(m.value, m.display) for m in BaseRegime],
+        blank=True,
+        default="",
+    )
+    escalation = models.CharField(
+        "抬升标志（内联副本）",
+        max_length=16,
+        choices=Escalation.choices(),
+        blank=True,
+        default="",
+    )
+    effective_regime = models.CharField(
+        "生效阶段（内联副本）",
+        max_length=16,
+        choices=[(m.value, m.display) for m in BaseRegime],
+        blank=True,
+        default="",
+    )
+
+    #: 推导那一层的收场（`deactivation_run` 的 `skipped`：cold_start / stale_state /
+    #: no_generation，或空串表示正常推了）。日报第④段要**数**「判定跑了但机制没表态」
+    #: 的天数，靠解析自由文本做不到——同 `ShadowDailyRecord.derivation_skipped`。
+    deactivation_skipped = models.CharField(
+        "推导收场（空 = 正常推导）", max_length=32, blank=True, default=""
+    )
+
+    #: True = 今天到截止时刻仍没有判定结论，日报照发并明写「今日判定缺失」。
+    judgement_missing = models.BooleanField("今日判定缺失（照发）", default=False)
+
+    #: 五段的结构化内容：键是段名（today / change / events / health / delivery），
+    #: 值是渲染好的那一段文字；第②段另带结构化条目，供按人裁剪。正文不落这里。
+    sections = models.JSONField("五段内容（结构化）", default=dict)
+
+    #: 当天的推导世界（每层 → 建议集合，含状态）。第②段今昨做差的**原料**：没有它，
+    #: 做差只能拿两份都会被改写的决策行去比，等于永远比出「无变化」（见类 docstring）。
+    landscape = models.JSONField("当天推导结论快照（做差用）", default=dict)
+
+    note = models.TextField("给人看的一句话（为什么这一行是这样）", blank=True, default="")
+
+    created_at = models.DateTimeField("生成时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_daily_reports"
+        verbose_name = "每日日报"
+        verbose_name_plural = "每日日报"
+        ordering = ["-run_day", "symbol"]
+        constraints = [
+            # 一天一条。这个唯一键是「沉默可被识别」的前提：判断「今天有没有日报」
+            # 就是一次按 (symbol, run_day) 的存在性查询，多出第二行会让它问错问题。
+            # 写入方因此不新建第二行（同一天的心跳重复走到这里只确认已有那一行）。
+            models.UniqueConstraint(
+                fields=["symbol", "run_day"],
+                name="uniq_daily_report_symbol_run_day",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.symbol} {self.run_day} "
+            f"{self.effective_regime or '（无结论）'}"
+            f"{'｜判定缺失' if self.judgement_missing else ''}"
+        )
+
+    @property
+    def regime_display(self) -> str:
+        """生效阶段的中文名；无结论时给「（无结论）」而不是空串——日报若把空串印出来，
+        读者看到的是一个没有内容的段落，而不是「今天没有结论」这句话。"""
+        if not self.effective_regime:
+            return "（无结论）"
+        return BaseRegime(self.effective_regime).display
+
+    @property
+    def escalation_display(self) -> str:
+        return Escalation(self.escalation).display if self.escalation else NO_ESCALATION_DISPLAY

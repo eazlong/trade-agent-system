@@ -693,19 +693,30 @@ class ShadowConfig:
 
 @dataclass(frozen=True)
 class ReportConfig:
-    """日报的投递看门狗时刻（CONTEXT.md 第 175 条）。
+    """日报的形状与投递看门狗（CONTEXT.md 第 80、175、183 条）。
 
-    **日报什么时候发不由这个数决定**：它由判定任务驱动，判定任务确定结束（成功或最终
-    失败）之后才发，不固定钟点。这个数只决定「到了这个点还没成功投递就升级告警」——
-    所以它是**看门狗**的时刻，不是发送时刻，取名与用途必须一致，否则下一个人会照着它
-    去改发送逻辑。
+    **日报什么时候发不由 `watchdog_hour` 决定**：它由判定任务驱动，判定任务确定结束
+    （成功或最终失败）之后才发，不固定钟点。这个数只决定「到了这个点还没成功投递就
+    升级告警」——所以它是**看门狗**的时刻，不是发送时刻，取名与用途必须一致，否则
+    下一个人会照着它去改发送逻辑。
 
     时刻按**业务时区（北京时间）**解读：这个字段是给人看的钟点（「早九点还没收到日报
     就该响了」），而系统里所有的绝对时刻都存 UTC。口径写在 `apps/common/time_utils.py`。
+
+    `event_horizon_days`（7）是第③段「未来 N 天的高影响事件」的那个 N。它进统一配置面
+    是 CONTEXT.md 第 80 条点名的（「`query_events` 的查询天数」），而它同时是
+    `apps/agent/event_commands.py` 里 `/event list` 的默认天数——**三处必须是同一个数**，
+    否则「我在命令里查了没有」与「日报里没有」会变成两句不同的话，而两条消息都不会
+    提到这个差别。守卫这一条的是 `apps/regime/tests/test_report.py` 里的一条断言。
+
+    **它不是给 Agent 传参用的旋钮**（CONTEXT.md 第 183 条）：`query_events` 工具不吃
+    天数参数，读的就是这个数。进配置面是为了「改了就一定看得见」（跟 `shadow` 那组
+    同一个理由），不是为了让它可被调用方覆盖。
     """
 
     watchdog_hour: int = 9
     watchdog_minute: int = 0
+    event_horizon_days: int = 7
 
     def __post_init__(self) -> None:
         if not 0 <= self.watchdog_hour <= 23:
@@ -713,6 +724,12 @@ class ReportConfig:
         if not 0 <= self.watchdog_minute <= 59:
             raise ValueError(
                 f"watchdog_minute 落在 [0, 59]，当前 {self.watchdog_minute}"
+            )
+        if self.event_horizon_days < 1:
+            raise ValueError(
+                f"event_horizon_days 必须 >= 1，当前 {self.event_horizon_days}"
+                "——0 会让第③段每次都报「未来 0 天内没有事件」，"
+                "而那与「真的没有事件」在日报上一模一样"
             )
 
 

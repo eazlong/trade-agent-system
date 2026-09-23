@@ -139,7 +139,7 @@ class TestSnapshot(SimpleTestCase):
                 "min_agreement_rate",
                 "max_trigger_rate",
             ),
-            "report": ("watchdog_hour", "watchdog_minute"),
+            "report": ("watchdog_hour", "watchdog_minute", "event_horizon_days"),
             # 单元 8ii 的一组。它进快照的理由与 `box`/`shadow`/`report` 同类：**不参与
             # 任何判定**（四个分钟数只在录入端算一次窗口，两个天数是时效），但「同一个
             # `event_time` 配不同的窗口就是两个不同的熔断区间」，所以它同样是历史记录
@@ -269,13 +269,20 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.SHADOW.max_trigger_rate, 0.10)
 
     def test_report_defaults(self):
-        """日报看门狗的时刻（CONTEXT.md 第 175 条）。
+        """日报看门狗的时刻 + 事件视野天数（CONTEXT.md 第 80、175、183 条）。
 
-        这是**当天日报最晚该到几点**的判据：到点还没投递成功才升级告警。定得早会
+        前者是**当天日报最晚该到几点**的判据：到点还没投递成功才升级告警。定得早会
         在判定还没跑完时误报，定得晚会把「今天的日报没送到」压到第二天。
+
+        后者（`event_horizon_days`）是「未来 N 天的高影响事件」的那个 N。它进统一
+        配置面是 CONTEXT.md 第 80 条点名的（「`query_events` 的查询天数」），而
+        `query_events` 工具不吃天数参数（第 183 条）——所以这个数**同时**决定日报
+        第③段与工具输出，两处必须同一个数。与 `/event list` 的默认天数的一致性由
+        `apps/regime/tests/test_report.py` 那条跨模块断言守着，这里只钉字面值。
         """
         self.assertEqual(config.REPORT.watchdog_hour, 9)
         self.assertEqual(config.REPORT.watchdog_minute, 0)
+        self.assertEqual(config.REPORT.event_horizon_days, 7)
 
     def test_events_defaults(self):
         """事件熔断的窗口形状（CONTEXT.md 第 147、152 条），字面钉死。

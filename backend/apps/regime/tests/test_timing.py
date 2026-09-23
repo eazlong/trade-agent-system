@@ -7,8 +7,10 @@
    少了这条，签署日 / 运行日 / 生效时刻就会错开半天，而错开的表现是切片把结论归到
    相邻的一天——完全看不出来。
 2. 判定挂在那条既有的 5 分钟心跳上（`snapshot_daily_equity`），所以日界之后必然很快
-   出结论，且心跳的既有职责（日度权益快照）不被新职责顶掉——停用决策推导也搭在同一条
-   心跳上，并且**排在判定之后**（它读的是判定刚落下的那条「当前生效阶段」）。
+   出结论，且心跳的既有职责（日度权益快照）不被新职责顶掉——停用决策推导、Shadow 每日
+   记录、日报都搭在同一条心跳上，顺序是**上下游**而不是并列的：判定 → 推导（读判定刚
+   落下的「当前生效阶段」）→ Shadow（要落的建议清单正是推导的产物）→ 日报（第②段与
+   Shadow 同源，还要读昨天那份日报做差）。
 3. 心跳的节拍足够密，日界不会被跳过。
 
 时区这条特别容易在后面被「简化」掉：把 `BUSINESS_TIMEZONE` 设成 UTC 能让所有
@@ -116,10 +118,16 @@ class TestSignedCandleIsTheLastClosedOne(TestCase):
         self.assertEqual(latest_complete_date(late), RUN_DAY - timedelta(days=1))
 
 
-def run_heartbeat(*, judgement_error=None, deactivation_error=None, shadow_error=None):
+def run_heartbeat(
+    *,
+    judgement_error=None,
+    deactivation_error=None,
+    shadow_error=None,
+    report_error=None,
+):
     """跑一次 `snapshot_daily_equity` 的任务体，返回按序记录的事件名。
 
-    四个被调用方都是**函数内 import**（任务模块不在 import 期就把交易/判定链路拉起来），
+    五个被调用方都是**函数内 import**（任务模块不在 import 期就把交易/判定链路拉起来），
     所以替身要打在**源模块**上，而不是 ``tasks`` 模块的属性上——``tasks`` 上根本没有
     这些名字。
 
@@ -129,8 +137,11 @@ def run_heartbeat(*, judgement_error=None, deactivation_error=None, shadow_error
 
     `write_shadow_record` 同理换成替身：它要读判定记录、写 Shadow 记录（本模块只关心
     **调度顺序**，让它真跑等于把 DB 拉进来，而它的正确性由 `test_shadow.py` 自己盯）。
+    `write_daily_report` 也一样——本单元只关心它**排在哪**，一天一条写成什么样由
+    `test_report.py` 盯。**而且它非换不可**：这一段的 `finally` 里有
+    `close_old_connections()`，让真的写一次会把本用例所处的事务连接在断言之前收掉。
     """
-    from apps.regime import deactivation_run, judgement, shadow
+    from apps.regime import deactivation_run, judgement, report, shadow
     from apps.trading import daily_snapshot, tasks
 
     events: list[str] = []
@@ -160,11 +171,18 @@ def run_heartbeat(*, judgement_error=None, deactivation_error=None, shadow_error
             raise shadow_error
         return {"outcome": "created", "note": "替身"}
 
+    def fake_report(*args, **kwargs):
+        events.append("report")
+        if report_error is not None:
+            raise report_error
+        return {"written": True, "outcome": "created", "note": "替身"}
+
     with (
         patch.object(daily_snapshot, "write_daily_snapshots", new=fake_snapshot),
         patch.object(judgement, "run_daily_judgement", new=fake_judgement),
         patch.object(deactivation_run, "run_deactivation", new=fake_deactivation),
         patch.object(shadow, "write_shadow_record", new=fake_shadow),
+        patch.object(report, "write_daily_report", new=fake_report),
     ):
         payload = tasks.snapshot_daily_equity.run()
     return events, payload
@@ -180,14 +198,18 @@ class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
         self.assertIn("judgement", self._run_task())
 
     def test_the_existing_snapshot_duty_runs_first(self):
-        """既有职责先跑，新职责后跑。
+        """既有职责先跑，新职责后跑；新职责之间按上下游排。
 
         判定失败会往上抛（真故障必须被任务健康检查看见），若它排在快照之前就会连带
         吞掉这一次快照。快照本来就是 5 分钟一轮的幂等写入，晚一轮无所谓，但顺序反过来
         等于让新机制有能力打断一条已在生产上运行的链路——没有理由付这个代价。
+
+        后三段之间的顺序各有硬理由（见各自用例），这里把整条链一次钉死：任何一段被挪
+        到上游，都会有下游拿到「上一轮的世界」而**看起来完全正常**。
         """
         self.assertEqual(
-            self._run_task(), ["snapshot", "judgement", "deactivation", "shadow"]
+            self._run_task(),
+            ["snapshot", "judgement", "deactivation", "shadow", "report"],
         )
 
     def test_a_failing_judgement_still_stops_the_task(self):
@@ -292,6 +314,55 @@ class TestShadowRidesTheSameHeartbeat(TestCase):
         """
         with self.assertRaises(RuntimeError):
             run_heartbeat(shadow_error=RuntimeError("boom"))
+
+
+class TestTheReportRidesTheSameHeartbeat(TestCase):
+    """日报搭在同一条心跳上，且**排在 Shadow 之后**（第①段单元 8iii）。"""
+
+    def test_the_heartbeat_writes_the_daily_report(self):
+        self.assertIn("report", run_heartbeat()[0])
+
+    def test_the_report_runs_after_the_shadow_record(self):
+        """顺序有硬理由：第②段与 Shadow 的建议清单**同源**（都是这一轮推导的产物），
+        而且还要读**昨天那份日报的结构化快照**做差——两天的差要到「今天也说完了」
+        才成立。
+
+        反过来排就会拿「上一轮的世界」去做差，而那种错位看起来完全正常：日报每天照出，
+        只是第②段永远比实际晚一拍。
+        """
+        events, _ = run_heartbeat()
+        self.assertLess(events.index("shadow"), events.index("report"))
+
+    def test_the_summary_lands_in_the_payload(self):
+        """摘要必须从任务返回值里出得来。
+
+        「日志不算被看见」——日报是第①段唯一**直接说给用户听**的东西，任务层把摘要
+        丢了，投递那一环就没有东西可投。
+        """
+        _, payload = run_heartbeat()
+        self.assertTrue(payload["report"]["written"])
+        self.assertTrue(payload["report"]["note"])
+
+    def test_a_conclusion_less_judgement_still_reaches_the_report(self):
+        """判定没有结论时**照发**：那是「今天没有结论」，不是本层的失败。
+
+        日报一天一条、必发——「沉默必须能被识别为异常」。判定缺失正是它要写出来的事情
+        之一（第①段明写「今日判定缺失，处于保持的上一有效状态」）。至于「有结论就写、
+        没结论就等到截止时刻再写」这条闸门，由 ``test_report.py`` 盯。
+        """
+        events, payload = run_heartbeat()
+        self.assertIn("report", events)
+        self.assertEqual(payload["regime"]["skipped"], "no_candles")
+
+    def test_a_failing_report_writer_still_stops_the_task(self):
+        """写入失败（DB 故障）时任务必须失败（而不是被吞掉）。
+
+        失败是**期望**行为：心跳 5 分钟后再来一次，`get_or_create` 幂等，可以无脑重试；
+        吞掉异常则会让这张表静默停在某一天，而「这张表停在某一天」正是它要负责发现的
+        事情。
+        """
+        with self.assertRaises(RuntimeError):
+            run_heartbeat(report_error=RuntimeError("boom"))
 
 
 class TestTheBeatIsDenseEnoughForTheDayBoundary(TestCase):
