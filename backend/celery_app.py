@@ -85,6 +85,30 @@ app.conf.beat_schedule = {
         'task': 'apps.trading.tasks.snapshot_daily_equity',
         'schedule': 300.0,
     },
+    # 日报投递（第①段单元 8iv）：把当天那一份日报按人裁剪后送到每个 is_active 用户。
+    # 幂等（已送达的人不重投），所以密一点只是几次空转。
+    # 5 分钟一轮而不是 60 秒：日报是日频产物，投递滞后一轮心跳（≤5 分钟）无所谓，
+    # 真正的及时性靠任务内的重试（60 秒起、翻倍）保证，不靠 beat 的密度。
+    # **间隔与 report.WATCHDOG_GRACE 是一对**：宽限期必须比「本条间隔 + 心跳间隔」
+    # 之和大（心跳是喂日报的那个写入者），否则看门狗会早于「投递最晚什么时候才轮到」
+    # 动手，而抢跑的表现是每天一条假告警。把这两条 beat 调**密**不违例，调稀就违例。
+    # test_delivery.py::test_the_grace_covers_the_two_intervals_it_bounds 钉着这一条。
+    'regime-report-deliver': {
+        'task': 'apps.regime.tasks.deliver_report',
+        'schedule': 300.0,
+    },
+    # 日报投递看门狗（第①段单元 8iv）：当天日报过了 report.REPORT 的截止时刻
+    # （+ WATCHDOG_GRACE）还是 delivered_at 为空，就升级告警。
+    # **与投递任务分开一条 beat 条目是必须的**：合成一条等于让看门狗去报自己的失败——
+    # 它恰好是失败的那一个时，它不会响（CONTEXT.md:175）。
+    # 一天绝大多数轮次是「未到截止时刻」或「已投递」，都是不写一行、不发一条的空转。
+    # 不用 crontab 表达式把「北京 09:00」翻成 UTC 小时：判定链路之所以反复强调
+    # 「北京 08:00 == 日线换线」，就是因为口译钟点的地方只能有一处，而
+    # CELERY_TIMEZONE 是 UTC——`crontab(hour=9)` 会在北京 17:00 触发。
+    'regime-report-delivery-watchdog': {
+        'task': 'apps.regime.tasks.check_report_delivery',
+        'schedule': 300.0,
+    },
 }
 
 # 使用数据库调度器，支持动态添加/删除定时任务

@@ -1,4 +1,4 @@
-"""切片任务（第①段单元 6ii）：回测落库后的独立轻量收尾。
+"""切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）。
 
 ## 为什么是独立任务
 
@@ -21,6 +21,18 @@
 任务自己**不写告警**（CONTEXT.md：新任务不自己发告警）。失败往上抛：Celery 会重试
 （3 次、间隔递增），重试仍失败则任务标 FAILURE。批内单条失败也走同一条路——整批重投，
 代价是几轮白干，换来的是「不必为坏数据单开一条错误分支」。
+
+## 日报投递与投递看门狗为什么也在这里、也各自是一条任务
+
+它们是**两条互相独立的路径**（CONTEXT.md:175）：投递任务负责「把日报送到」，
+看门狗负责「送到没有」。合成一条就等于让看门狗去报自己的失败——而它恰好是失败的那一
+个时，它不会响。**投递任务失败不触发告警**（同上那条纪律：任务自己的故障往上抛，
+交给 beat 的任务健康检查）；看门狗要说的不是「我失败了」，而是「今天这份日报没到你
+手上」——那是一件关于世界的事实，且它是唯一说得出这句话的东西。
+
+两者都不挂在 `snapshot_daily_equity` 那条心跳上：那条心跳的顺序与职责被
+`test_timing.py` 逐段钉着（「回退方式 = 删掉一个调用」），而投递与看门狗本来就是独立
+路径，独立成任务才谈得上「一条坏了另一条还在」。
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from celery_app import app
 logger = logging.getLogger(__name__)
 
 #: 重试次数。CONTEXT.md 给判定任务定的是「有限重试、间隔递增」，切片同款。
+#: （名字里的 `SLICE` 是历史：这两个常量现在是本模块所有任务共用的重试参数。）
 MAX_SLICE_RETRIES = 3
 
 #: 首次重试的等待秒数；`retry_backoff=True` 会在此基础上翻倍。
@@ -136,3 +149,80 @@ def compute_regime_slice_task(self, result_ids, only_stale: bool = True) -> dict
         len(summary["missing"]),
     )
     return summary
+
+
+@app.task(
+    bind=True,
+    max_retries=MAX_SLICE_RETRIES,
+    default_retry_delay=RETRY_BACKOFF_SECONDS,
+    retry_backoff=True,
+    acks_late=True,
+)
+def deliver_report(self, run_day=None) -> dict:
+    """把当天那份日报投给每个 `is_active` 用户（第①段单元 8iv）。
+
+    Args:
+        run_day: 运行日（`date` 或 ISO 字符串）。beat 不传——**按业务时区的自然日算**，
+            口径在 `report._as_run_day` 一处。留这个入参是为了能手动补投某一天。
+
+    幂等：已成功送达的人不再重投（`report.deliver_daily_report`）。所以这个任务天然可以
+    被重复投递、被 beat 每 5 分钟撞一次、被重试三次——代价都只是几次没有收件人的空转。
+
+    **不吞异常**：DB 故障往上抛，走 Celery 的有限重试与任务健康检查。这一层不写告警
+    （CONTEXT.md：新任务不自己发告警）；「用户没收到日报」那句话由看门狗说。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime.report import deliver_daily_report
+
+    try:
+        summary = deliver_daily_report(run_day)
+        logger.info("[regime] 日报投递任务 %s", summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[regime] 日报投递失败，将重试（第 %s 次）", self.request.retries, exc_info=True
+        )
+        raise self.retry(exc=exc)
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+
+@app.task(
+    bind=True,
+    max_retries=MAX_SLICE_RETRIES,
+    default_retry_delay=RETRY_BACKOFF_SECONDS,
+    retry_backoff=True,
+    acks_late=True,
+)
+def check_report_delivery(self, run_day=None) -> dict:
+    """投递看门狗：当天日报到点还没投出去就升级告警（第①段单元 8iv）。
+
+    它**只读**：不写 `DailyReport` 的投递明细（那是投递任务的账），也不改任何状态。
+    唯一的副作用是往外发一条消息，且同一运行日只成功发一次
+    （`report._alerted_on`）。
+
+    一天绝大多数轮次走到的是「未到截止时刻」或「已投递」，都是干净的空转。
+
+    **不吞异常**：这里读不到库就没法判「投出去了没有」，往上抛让 beat 的任务健康检查
+    看得见——**这条路径自己哑掉，是它自己发现不了的**（CONTEXT.md:180 承认的那条缝，
+    由「日报本身是否到达」在第⑤段兜底）。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime.report import check_report_delivery as run_check
+
+    try:
+        summary = run_check(run_day)
+        if summary.get("escalated"):
+            logger.warning("[regime] 投递看门狗已升级告警 %s", summary)
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "[regime] 投递看门狗失败，将重试（第 %s 次）", self.request.retries, exc_info=True
+        )
+        raise self.retry(exc=exc)
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()

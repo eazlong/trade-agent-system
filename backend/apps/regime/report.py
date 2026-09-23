@@ -1,4 +1,4 @@
-"""五段日报的生成与落库（第①段单元 8iii）。
+"""五段日报的生成与落库（第①段单元 8iii）+ 投递与投递看门狗（第①段单元 8iv）。
 
 CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。要点按重要性排：
 
@@ -31,8 +31,8 @@ CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。�
   等于让一个哑掉的东西开口说话。
 
 截止时刻与看门狗时刻**共用同一个数**（`watchdog_hour` / `watchdog_minute`）：它问的是
-「到了这个点日报该到了没有」。于是有一条跨单元的接线约束——**8iv 的看门狗 beat 条目
-必须排在这个时刻之后的某一分钟**，否则它会对着同一轮 tick 正要投递的那份日报告警。
+「到了这个点日报该到了没有」。看门狗不挂 crontab，而是固定间隔轮询 + 在函数里比这个
+时刻（`check_report_delivery`），口径因此只有 `_deadline` 一处。
 
 ## 五段落成 `sections`，正文是它的渲染结果，不另存一份
 
@@ -61,12 +61,14 @@ CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
 
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from apps.common.time_utils import business_tz, format_business
+from apps.common.time_utils import business_tz, format_business, to_business
 from apps.regime import config, judgement
 from apps.regime.deactivation import BLOCKED_DISPLAY
 from apps.regime.events import describe_candidate, describe_event
@@ -250,8 +252,15 @@ def _run_day(judgement_result: dict, shadow: dict, now: datetime) -> date:
         if raw:
             return date.fromisoformat(raw)
     logger.warning("[regime] 判定与 Shadow 摘要都没有 run_day，按本地时刻推断日报运行日")
-    from apps.common.time_utils import to_business
+    return _business_day(now)
 
+
+def _business_day(now: datetime) -> date:
+    """这个绝对时刻落在哪个**业务日**（业务时区的自然日）。
+
+    与 `business_midnight` 是同一个口径的两面：日界是业务时区的 08:00（== 日线换线），
+    所以「今天的日报」按业务日算，不按进程时区的自然日算。
+    """
     return to_business(now).date()
 
 
@@ -969,17 +978,24 @@ def _section_delivery(symbol: str, run_day: date) -> str:
     那一行自己**，不是「今天有没有收到」。缺昨日那一行时照实说缺，并点出「缺」本身意味着
     什么：判定任务昨天也跑过而这里空着，那是生成环节的问题，不是正常。
 
-    **本单元只生成与落库，不投递。** 投递通路与投递记录是单元 8iv（CONTEXT.md 第 175
-    条），那时 `DailyReport` 才长出 `delivered_at` / `delivery_error` /
-    `delivery_attempts`，本段也才第一次有真结果可报。在那之前这里如实说「没有投递结果
-    可比对」——**不能因为「反正列还没建」就把这一节渲染成「已投递」**：一份永远显示成功
-    的投递报告，与一个哑掉却从不报警的看门狗是同一类东西，而这一整条主线的起点正是
-    「沉默必须能被识别为异常」。
+    **它是回复式的，这正是看门狗存在的理由**（CONTEXT.md:175）：本段说「昨天那份没投
+    出去」，只有在**今天这一份投得出去**时才说得到人。明天也失败，沉默就自我延续——
+    没有任何东西会响。所以本段照实报，但**不承担**发现连续失败的职责：那是
+    `check_report_delivery` 的事，它读同一张表的 `delivered_at`，不等这一段的文字。
+
+    空集受众（一个 `is_active` 用户都没有）按「没投出去」记，不按「投出去了」记——
+    把空集当成功会让本段永远报「已投递」，而它恰恰是一份永远显示成功的投递报告。
     """
     prev_day = run_day - timedelta(days=1)
     prev = (
         DailyReport.objects.filter(symbol=symbol, run_day=prev_day)
-        .only("created_at")
+        .only(
+            "created_at",
+            "delivered_at",
+            "delivery_attempts",
+            "delivery_error",
+            "delivery",
+        )
         .first()
     )
     if prev is None:
@@ -987,10 +1003,24 @@ def _section_delivery(symbol: str, run_day: date) -> str:
             f"昨日（{prev_day}）没有日报可查。"
             "若昨天的判定任务跑过，这本身就是生成环节的问题，不是正常状态。"
         )
+    results = prev.delivery or {}
+    if prev.delivered_at is not None:
+        return (
+            f"昨日日报生成于 {format_business(prev.created_at)}，"
+            f"投递成功于 {format_business(prev.delivered_at)}"
+            f"（共 {len(results)} 人，用了 {prev.delivery_attempts} 轮）。"
+        )
+    if not results:
+        return (
+            f"昨日日报生成于 {format_business(prev.created_at)}，"
+            "但没有 is_active 用户，无处可投——按「没投出去」记，不按「投出去了」记。"
+        )
     return (
-        f"昨日日报生成于 {format_business(prev.created_at)}。"
-        "投递结果：本单元（8iii）只生成与落库、尚未接投递通路，没有投递记录可比对；"
-        "投递与独立的投递看门狗是单元 8iv。"
+        f"昨日日报生成于 {format_business(prev.created_at)}，**至今未投递成功**"
+        f"（共 {len(results)} 人，已尝试 {prev.delivery_attempts} 轮）。"
+        f"最近一次失败：{prev.delivery_error or '未说明'}。"
+        "这一条已由独立的投递看门狗在昨日截止时刻升级告警，不等本段——"
+        "本段只在「今天这份投得出去」时才说得到人。"
     )
 
 
@@ -1058,6 +1088,314 @@ def user_affected_strategy_ids(user_id) -> set[str]:
         .values_list("strategy_id", flat=True)
         .distinct()
     }
+
+
+# --------------------------------------------------------------------------- #
+# 投递（第①段单元 8iv）
+# --------------------------------------------------------------------------- #
+
+#: 逐人明细里 `ok=False` 时那句 `error`。失败只有一种可观测的形状（出站口返回未送达），
+#: 所以措辞也只有这一种——把它写宽（「网络错误」之类）就是替出站口猜原因。
+_DELIVERY_FAILED = "出站通知口返回未送达（推送通路失败，或接收人为空）"
+
+#: 看门狗比日报截止时刻晚多久才动手。**三个心跳**（`snapshot-daily-equity` 五分钟一轮）：
+#:
+#: 截止那一刻心跳才**被允许**写日报（`_ready` 判的是 `now >= deadline`），写完还要等
+#: 下一轮投递任务才送出去，而投递任务与心跳是两条独立的 beat 条目、先后不保证——所以
+#: 「到点」之后至少有两个写入者要走，留三个心跳的余量。同刻去判「没投出去」等于拿
+#: 看门狗去抢它盯的那个写入者，而抢跑制造的是**每天必然出现**的假告警；假告警的真实
+#: 代价是真告警跟着一起被忽略。
+#:
+#: 晚三个心跳在这里不损失什么：「今天这份日报有没有送到」等到 09:15 与等到 09:00 没有
+#: 区别，那是一条日频结论，不是一条行情信号。
+#:
+#: **它与 beat 的间隔是一对**：余量必须大于投递任务与心跳两条 beat 条目各自的间隔之和。
+#: `test_delivery.py` 钉着这一条——把 beat 调密不违例，调稀就会违例。
+WATCHDOG_GRACE = timedelta(minutes=15)
+
+#: 同一运行日只**成功**告警一次。与 `daily_snapshot._alerted_on` 同一条理由：本任务
+#: 五分钟一轮，日报持续投不出去时逐轮告警会变成骚扰，而骚扰的结果是用户把通知静音——
+#: 那又回到「沉默」了。只在**真的有人被通知到**时才记账（同那处的取舍）：没人听见的
+#: 喊话不算喊过，下一轮还得喊。进程重启会让这本账清零，代价是重新喊一遍，可接受。
+_alerted_on: dict[date, bool] = {}
+
+
+def deliver_daily_report(
+    run_day: date | str | None = None, *, now: datetime | None = None
+) -> dict:
+    """把今天那一份日报投给每个 `is_active` 用户，回一行摘要。**幂等**。
+
+    投递口是 ``apps.trading.alerts.notify_user``——本仓库唯一的出站通知口，
+    **不新增第二个投递机制**（CONTEXT.md:175「不新建告警系统」）。正文按人裁剪
+    （`crop_for` + `user_affected_strategy_ids`）：同一份 `sections` 对每个人渲染出不同
+    正文，这正是正文不落库的原因（见模型 docstring）。
+
+    投递记录落回 `DailyReport` 自己的那一行（三列标量 + `delivery` 明细），理由与不变式
+    写在模型 docstring 里；这里只负责**算一次**：`delivered_at` 非空 ⟺ 明细里至少有一格
+    且每格都 `ok`。
+
+    **已成功的人不重投**：明细是只增不改的账。同一个人重投一份日报是纯骚扰，而骚扰的
+    结果是他不再看日报——那正是「必发」要避免的。
+
+    **入参是运行日而不是日报摘要**：要投的那一份按 `(symbol, run_day)` 现查。这样投递
+    与「日报是谁、以什么形状写出来的」解耦——投递任务与看门狗因此可以共用一个签名，
+    而摘要形状将来变了也不会把投递带塌。
+
+    `now` 只在置 `delivered_at` 时用一次，其余判断都用库里的状态，所以重入安全。
+    """
+    now = now or timezone.now()
+    day = _as_run_day(run_day, now)
+    symbol = judgement.SYMBOL
+
+    row = DailyReport.objects.filter(symbol=symbol, run_day=day).first()
+    if row is None:
+        return {
+            "symbol": symbol,
+            "run_day": day.isoformat(),
+            "attempted": False,
+            "reason": "no_report",
+            "delivered": False,
+            "note": "今天这一份还没写出来（判定没结论，且未到截止时刻）",
+        }
+    if row.delivered_at is not None:
+        return _delivery_summary(row, attempted=False, reason="already_delivered")
+
+    # 正文在这里**同步**渲染好，只把「发」那一步交给 async：裁剪要查活跃会话，那是裸的
+    # 同步查询，不能出现在 `async def` 里（CLAUDE.md：绝不在 async 上下文里写裸的同步
+    # 数据库查询）。渲染也不该放进去——它是 DB 查询，不是 IO。
+    pending = [
+        (str(user.pk), _body_for(row, user.pk, symbol, day))
+        for user in get_user_model().objects.filter(is_active=True)
+        if not (row.delivery or {}).get(str(user.pk), {}).get("ok")
+    ]
+    results = dict(row.delivery or {})
+    if pending:
+        results.update(asyncio.run(_send_to_each(pending)))
+
+    row.delivery = results
+    if pending:
+        # 「轮」= 「真的投了一轮」。没有受众时这一列不动——把「无处可投」记成第 288 轮
+        # 会让第⑤段那句「已尝试 N 轮」变成一句自己都解释不了的数字。
+        row.delivery_attempts += 1
+    row.delivery_error = _delivery_error(results)
+    if results and all(entry.get("ok") for entry in results.values()):
+        row.delivered_at = now
+    row.save(
+        update_fields=[
+            "delivery",
+            "delivery_attempts",
+            "delivery_error",
+            "delivered_at",
+        ]
+    )
+    outcome = _delivery_summary(row, attempted=bool(pending), reason="")
+    logger.info("[regime] 日报投递 %s", outcome)
+    return outcome
+
+
+def _as_run_day(run_day: date | str | None, now: datetime) -> date:
+    """运行日：给了就用，没给就按业务时区的自然日算。
+
+    「没给」是 beat 的常态——投递任务与看门狗都不持有运行日，它们只知道「现在」。
+    """
+    if run_day:
+        return date.fromisoformat(run_day) if isinstance(run_day, str) else run_day
+    return _business_day(now)
+
+
+def _body_for(row: DailyReport, user_id, symbol: str, run_day: date) -> str:
+    """这一份日报对**这个人**的正文。逐人不同，所以不落库。"""
+    return render_body(
+        crop_for(row, user_affected_strategy_ids(user_id)),
+        symbol=symbol,
+        run_day=run_day,
+    )
+
+
+async def _send_to_each(pending: list[tuple[str, str]]) -> dict:
+    """逐人投一遍，返回**本轮新投的**那些格子。
+
+    收的是一串 `(user_id, 正文)`——渲染已经在同步世界里做完，这里只剩等待，所以不会
+    在 async 上下文里碰数据库。
+    """
+    from apps.trading.alerts import notify_user
+
+    sent: dict[str, dict] = {}
+    for user_id, body in pending:
+        ok = bool(await notify_user(user_id, body))
+        sent[user_id] = {
+            "ok": ok,
+            "at": timezone.now().isoformat(),
+            "error": "" if ok else _DELIVERY_FAILED,
+        }
+    return sent
+
+
+def _delivery_error(results: dict) -> str:
+    """最近一轮的失败，一句话。空 = 全部送达。"""
+    if not results:
+        return "没有 is_active 用户，这份日报无处可投"
+    failed = [key for key, entry in results.items() if not entry.get("ok")]
+    if not failed:
+        return ""
+    return (
+        f"{len(failed)}/{len(results)} 人未送达："
+        f"{results[failed[0]].get('error') or '未说明'}"
+    )
+
+
+def _delivery_summary(row: DailyReport, *, attempted: bool, reason: str = "") -> dict:
+    results = row.delivery or {}
+    return {
+        "symbol": row.symbol,
+        "run_day": row.run_day.isoformat(),
+        "attempted": attempted,
+        "reason": reason,
+        "targets": len(results),
+        "delivered_count": sum(1 for e in results.values() if e.get("ok")),
+        "attempts": row.delivery_attempts,
+        "delivered": row.delivered_at is not None,
+        "delivered_at": row.delivered_at.isoformat() if row.delivered_at else None,
+        "error": row.delivery_error,
+        "note": row.delivery_error or "全部送达",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 投递看门狗（第①段单元 8iv）
+# --------------------------------------------------------------------------- #
+
+
+def check_report_delivery(
+    run_day: date | str | None = None, *, now: datetime | None = None
+) -> dict:
+    """投递看门狗：当天日报到点还没投出去，就升级告警。**只读，什么都不写回。**
+
+    ## 为什么它必须独立于日报
+
+    第⑤段的自报是**回复式**的（下一条日报里说上一条坏了），它对「连续失败」完全无用，
+    而连续失败恰恰是它最该发现的形态——明天也失败，沉默就自我延续，没有任何东西会响。
+    所以这条路径读的是 `DailyReport` 表本身（`delivered_at`），**不是日报自己发了什么**
+    （CONTEXT.md:175）。两条路径因此互相独立：一条坏了，另一条还在。
+
+    ## 它与「新任务不自己发告警」不冲突
+
+    那条纪律管的是**任务自己的故障**（要往上抛，交给任务健康检查）；这里要说的是一件
+    **关于世界的事实**（今天的日报没到），本任务本身没有出错。所以：本任务自己的异常
+    照旧往上抛（`apps.regime.tasks` 里那层不吞），而这条升级消息走已有的出站通知口
+    （`notify_user`），没新造告警系统。
+
+    ## 它自己哑掉怎么办
+
+    beat 任务的死活目前没有第二个观察者——这是 CONTEXT.md:180 承认的那条缝。它靠另一条
+    路径兜底：日报本身每天必到，用户**收到**日报就是「投递通路还活着」的日常证据，而
+    看门狗只在日报没到时才响。「看门狗与日报同时哑」只有第⑤段（下一天）能说出来。
+
+    ## 「今天」与「到点」的口径
+
+    运行日按**业务时区**的自然日取（`_business_day`），「到点」= 日报截止时刻
+    (`_deadline`) + `WATCHDOG_GRACE`。两者都从 `config.REPORT` 的同一对字段来，
+    所以改配置不会只改到一处。
+
+    **不用 crontab 表达式定时**：本仓 Celery 的 `TIME_ZONE` / `CELERY_TIMEZONE` 都是
+    UTC，`crontab(hour=9)` 会在北京 17:00 触发，而把北京钟点翻译成 UTC 表达式等于把
+    「09:00 是给人看的钟点」这条口径复制到第二个地方。改成固定间隔轮询 + 在函数里按
+    业务时区判时刻，口径就只有一处。
+    """
+    now = now or timezone.now()
+    day = _as_run_day(run_day, now)
+    moment = _deadline(day) + WATCHDOG_GRACE
+    if now < moment:
+        return {
+            "checked": False,
+            "escalated": False,
+            "reason": "before_deadline",
+            "run_day": day.isoformat(),
+            "note": f"未到 {format_business(moment)}，本轮不判",
+        }
+
+    row = (
+        DailyReport.objects.filter(symbol=judgement.SYMBOL, run_day=day)
+        .only("symbol", "run_day", "created_at", "delivered_at", "delivery_attempts", "delivery_error")
+        .first()
+    )
+    if row is not None and row.delivered_at is not None:
+        return {
+            "checked": True,
+            "escalated": False,
+            "reason": "delivered",
+            "run_day": day.isoformat(),
+            "note": f"已投递（{format_business(row.delivered_at)}）",
+        }
+
+    users = list(get_user_model().objects.filter(is_active=True))
+    if not users:
+        # 「告警」是给具体某个人的即时消息。没有人可给时它就不是一条告警，
+        # 也不是一个该被记进 `_alerted_on` 的日子——将来有人了还得能响。
+        return {
+            "checked": True,
+            "escalated": False,
+            "reason": "no_recipients",
+            "run_day": day.isoformat(),
+            "note": "没有 is_active 用户，这条消息无人可给",
+        }
+    if _alerted_on.get(day):
+        return {
+            "checked": True,
+            "escalated": False,
+            "reason": "already_alerted",
+            "run_day": day.isoformat(),
+            "note": "今日已成功告警过一次，不重复",
+        }
+
+    text = _escalation_text(row, day, moment)
+    delivered = asyncio.run(_alert_each([str(u.pk) for u in users], text))
+    if any(delivered):
+        _alerted_on[day] = True
+    logger.warning("[regime] 日报投递看门狗升级告警（%s 人，送达 %s）", len(users), sum(delivered))
+    return {
+        "checked": True,
+        "escalated": True,
+        "reason": "no_report" if row is None else "undelivered",
+        "run_day": day.isoformat(),
+        "recipients": len(users),
+        "delivered_count": sum(1 for d in delivered if d),
+        "note": text,
+    }
+
+
+async def _alert_each(user_ids: list[str], text: str) -> list[bool]:
+    """逐个投同一句话。**没有裁剪**——这条消息对所有人一样，它说的是机制本身的状态，
+    不是「你的策略怎么了」。"""
+    from apps.trading.alerts import notify_user
+
+    return [bool(await notify_user(user_id, text)) for user_id in user_ids]
+
+
+def _escalation_text(row: DailyReport | None, run_day: date, moment: datetime) -> str:
+    """升级告警的正文。两种收场要分得开——「没生成」与「生成了没投出去」是两条不同的
+    故障路径，读到的人要去查的地方不一样，混成一句「日报没到」等于把诊断成本推给他。"""
+    head = (
+        "⚠️ 今日行情阶段日报没有投递成功\n"
+        f"运行日：{run_day}\n"
+        f"截至：{format_business(moment)}"
+    )
+    if row is None:
+        middle = (
+            "今天的日报**根本没有生成**——到点为止日报表里没有这一天的行，也就谈不上"
+            "投递。是生成那一段（心跳链路）没写成，不是投递这一段的问题。"
+        )
+    else:
+        middle = (
+            f"今天的日报生成于 {format_business(row.created_at)}，但至今没有投递成功"
+            f"（已尝试 {row.delivery_attempts} 轮）。\n"
+            f"最近一次失败：{row.delivery_error or '未说明'}"
+        )
+    tail = (
+        "\n\n这条消息来自**独立的投递看门狗**，不是日报自己——"
+        "日报发不出去的时候，它报不了自己。"
+    )
+    return f"{head}\n\n{middle}{tail}"
 
 
 # --------------------------------------------------------------------------- #

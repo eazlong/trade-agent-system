@@ -712,22 +712,61 @@ class TestTheHealthSection(TestCase):
 
 
 class TestTheDeliverySection(TestCase):
-    def test_it_says_plainly_that_delivery_is_not_wired_yet(self):
-        # **不能因为「反正列还没建」就把这一节渲染成「已投递」**：一份永远显示成功的投递
-        # 报告，与一个哑掉却从不报警的看门狗是同一类东西。
-        DailyReport.objects.create(
-            symbol=SYMBOL, run_day=RUN_DAY - timedelta(days=1), note="昨天那份"
-        )
+    """第⑤段读的是**昨天那一行自己**，而且要按三种收场分得开。
+
+    **它是回复式的**——只在今天这份投得出去时才说得到人，所以它报什么都救不了连续失败；
+    第⑤段与看门狗是两条路径，这里钉的是「第⑤段如实说」，看门狗自己由
+    `test_delivery.py` 盯。
+    """
+
+    def _yesterday(self, **over) -> DailyReport:
+        fields = {
+            "symbol": SYMBOL,
+            "run_day": RUN_DAY - timedelta(days=1),
+            "note": "昨天那份",
+        }
+        fields.update(over)
+        return DailyReport.objects.create(**fields)
+
+    def _body(self) -> str:
         report.write_daily_report(concluded_payload(), derivation(), {}, now=NOW)
         row = DailyReport.objects.get(symbol=SYMBOL, run_day=RUN_DAY)
-        body = row.sections[report.SECTION_DELIVERY]
-        self.assertIn("尚未接投递通路", body)
-        self.assertIn("单元 8iv", body)
+        return row.sections[report.SECTION_DELIVERY]
+
+    def test_a_delivered_yesterday_is_reported_as_delivered(self):
+        self._yesterday(
+            delivery={"u1": {"ok": True, "at": "", "error": ""}},
+            delivery_attempts=2,
+            delivered_at=NOW - timedelta(days=1),
+        )
+        body = self._body()
+        self.assertIn("投递成功于", body)
+        self.assertIn("共 1 人，用了 2 轮", body)
+        self.assertNotIn("未投递成功", body)
+
+    def test_an_empty_audience_counts_as_not_delivered(self):
+        # **空集不能算成功**：一份永远显示「已投递」的投递报告，与一个哑掉却从不报警的
+        # 看门狗是同一类东西。
+        self._yesterday(delivery={}, delivery_attempts=0)
+        body = self._body()
+        self.assertIn("无处可投", body)
+        self.assertIn("按「没投出去」记", body)
+
+    def test_an_undelivered_yesterday_points_at_the_watchdog(self):
+        self._yesterday(
+            delivery={"u1": {"ok": False, "at": "", "error": "出站通知口返回未送达"}},
+            delivery_attempts=7,
+            delivery_error="1/1 人未送达：出站通知口返回未送达",
+        )
+        body = self._body()
+        self.assertIn("至今未投递成功", body)
+        self.assertIn("已尝试 7 轮", body)
+        self.assertIn("出站通知口返回未送达", body)
+        # 它必须说清「这句话不该由我来发现」——否则读者会以为第⑤段就是那条告警通路。
+        self.assertIn("独立的投递看门狗", body)
 
     def test_a_missing_yesterday_is_called_out_as_a_generation_problem(self):
-        report.write_daily_report(concluded_payload(), derivation(), {}, now=NOW)
-        row = DailyReport.objects.get(symbol=SYMBOL, run_day=RUN_DAY)
-        body = row.sections[report.SECTION_DELIVERY]
+        body = self._body()
         self.assertIn("没有日报可查", body)
         self.assertIn("生成环节的问题", body)
 
