@@ -116,18 +116,21 @@ class TestSignedCandleIsTheLastClosedOne(TestCase):
         self.assertEqual(latest_complete_date(late), RUN_DAY - timedelta(days=1))
 
 
-def run_heartbeat(*, judgement_error=None, deactivation_error=None):
+def run_heartbeat(*, judgement_error=None, deactivation_error=None, shadow_error=None):
     """跑一次 `snapshot_daily_equity` 的任务体，返回按序记录的事件名。
 
-    三个被调用方都是**函数内 import**（任务模块不在 import 期就把交易/判定链路拉起来），
+    四个被调用方都是**函数内 import**（任务模块不在 import 期就把交易/判定链路拉起来），
     所以替身要打在**源模块**上，而不是 ``tasks`` 模块的属性上——``tasks`` 上根本没有
     这些名字。
 
     `run_deactivation` 也一定要换成替身，而不是让它真跑：它内部会走
     `deactivation_run.managed_set()` → `ensure_strategies_discovered()`，那是**进程级
     副作用**，会把宿主机那份策略目录拖进注册表，让本模块的结论取决于运行环境。
+
+    `write_shadow_record` 同理换成替身：它要读判定记录、写 Shadow 记录（本模块只关心
+    **调度顺序**，让它真跑等于把 DB 拉进来，而它的正确性由 `test_shadow.py` 自己盯）。
     """
-    from apps.regime import deactivation_run, judgement
+    from apps.regime import deactivation_run, judgement, shadow
     from apps.trading import daily_snapshot, tasks
 
     events: list[str] = []
@@ -151,10 +154,17 @@ def run_heartbeat(*, judgement_error=None, deactivation_error=None):
         # `skipped` 恒存在于真实返回值里（这是它刻意与判定不同的地方），替身照抄这一形状。
         return {"skipped": "no_generation", "note": "还没有任何一代池化表", "targets": 0}
 
+    def fake_shadow(*args, **kwargs):
+        events.append("shadow")
+        if shadow_error is not None:
+            raise shadow_error
+        return {"outcome": "created", "note": "替身"}
+
     with (
         patch.object(daily_snapshot, "write_daily_snapshots", new=fake_snapshot),
         patch.object(judgement, "run_daily_judgement", new=fake_judgement),
         patch.object(deactivation_run, "run_deactivation", new=fake_deactivation),
+        patch.object(shadow, "write_shadow_record", new=fake_shadow),
     ):
         payload = tasks.snapshot_daily_equity.run()
     return events, payload
@@ -177,7 +187,7 @@ class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
         等于让新机制有能力打断一条已在生产上运行的链路——没有理由付这个代价。
         """
         self.assertEqual(
-            self._run_task(), ["snapshot", "judgement", "deactivation"]
+            self._run_task(), ["snapshot", "judgement", "deactivation", "shadow"]
         )
 
     def test_a_failing_judgement_still_stops_the_task(self):
@@ -236,6 +246,52 @@ class TestDeactivationRidesTheSameHeartbeat(TestCase):
         """
         with self.assertRaises(RuntimeError):
             run_heartbeat(deactivation_error=RuntimeError("boom"))
+
+
+class TestShadowRidesTheSameHeartbeat(TestCase):
+    """Shadow 每日记录搭在同一条心跳上，且**排在推导之后**（第①段单元 8i）。"""
+
+    def test_the_heartbeat_writes_the_shadow_record(self):
+        self.assertIn("shadow", run_heartbeat()[0])
+
+    def test_the_shadow_record_runs_after_the_deactivation(self):
+        """顺序有硬理由：要落的建议清单正是推导的产物。
+
+        **它是推导的下游，不是并列的一段**——挂在推导之前只会永远写空清单。而且这条
+        顺序看不出问题：空清单和「今天确实没有建议」在表里长得一模一样。
+        """
+        events, _ = run_heartbeat()
+        self.assertLess(events.index("deactivation"), events.index("shadow"))
+
+    def test_the_summary_lands_in_the_payload(self):
+        """摘要必须从任务返回值里出得来。
+
+        「日志不算被看见」——判定层没出结论、推导层三种「什么都不动」的收场，全靠这句
+        话往日报上传；任务层把它丢了，日报就只能显示「今天没有记录」。
+        """
+        _, payload = run_heartbeat()
+        self.assertEqual(payload["shadow"]["outcome"], "created")
+        self.assertTrue(payload["shadow"]["note"])
+
+    def test_a_judgement_without_a_conclusion_still_writes_a_row(self):
+        """判定没有结论时**不抛**：那是「今天没有结论」，不是本层的失败。
+
+        判定层已经把收场说清楚了（`stale_candles` / `no_candles` / `undecidable`），
+        这一层照落一行——「判定跑了但机制没表态」正是这张表要能数出来的东西。
+        """
+        events, payload = run_heartbeat()
+        self.assertIn("shadow", events)
+        self.assertEqual(payload["regime"]["skipped"], "no_candles")
+
+    def test_a_failing_shadow_writer_still_stops_the_task(self):
+        """写入失败（DB 故障）时任务必须失败（而不是被吞掉）。
+
+        失败是**期望**行为：心跳 5 分钟后再来一次，占位行补写是幂等的，可以无脑重试；
+        吞掉异常则会让这张表静默停在某一天，而「这张表停在某一天」正是它要负责发现的
+        事情。
+        """
+        with self.assertRaises(RuntimeError):
+            run_heartbeat(shadow_error=RuntimeError("boom"))
 
 
 class TestTheBeatIsDenseEnoughForTheDayBoundary(TestCase):

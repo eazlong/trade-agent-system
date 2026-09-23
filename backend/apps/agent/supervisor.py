@@ -48,18 +48,50 @@ PAUSE_TTL = PAUSE_TTL
 SLASH_COMMANDS = {
     "/new": "_handle_new_session",
     "/cancel": "_handle_cancel",
+    "/event": "_handle_event",
 }
 
-# 中文别名 → 标准命令
+# 收参数的命令。`/new` 与 `/cancel` 不收，所以默认是不收：只有列在这里的命令才会
+# 拿到命令词之后的那一段。写成一张显式清单而不是靠 `inspect.signature` 去猜——
+# 「这条命令收不收参数」是一条契约，不是实现细节。
+COMMANDS_WITH_ARGS = {"/event"}
+
+# 中文别名 → 标准命令。
+#
+# **别名只做整串精确匹配，不做前缀匹配。** 「取消」是一个会出现在正常句子里的词
+# （「把刚才那个取消了吧」），按前缀认会把人话劫持成命令，而且是在意图解析之前被
+# 劫持——用户看不出来发生了什么。
 COMMAND_ALIASES = {
     "新建会话": "/new",
     "取消": "/cancel",
 }
 
+#: 命令 → 一句话说明（用于未知命令时的提示）
+COMMAND_HINTS = {
+    "/new": "新建会话，清除对话历史",
+    "/cancel": "取消当前工作流",
+    "/event": "维护重大事件（录入 / 改档 / 改期 / 取消 / 候选转正），不带参数看用法",
+}
+
 # 可用命令列表（用于错误提示）
 AVAILABLE_COMMANDS = "\n".join(
-    f"  {cmd}" for cmd in sorted(SLASH_COMMANDS.keys())
+    f"  {cmd}  {COMMAND_HINTS.get(cmd, '')}".rstrip()
+    for cmd in sorted(SLASH_COMMANDS.keys())
 )
+
+
+def _split_command(text: str) -> tuple[str, str]:
+    """`"/event add 高 …"` → `("/event", "add 高 …")`。
+
+    **只切一刀，剩下的原样交给 handler。** 原来这里只取 `split()[0]`、参数被无声
+    丢掉（CONTEXT.md 第 119 条点名的毛病）：`/event add …` 会被当成一个不带参数的
+    `/event` 执行，看起来就像命令不生效。怎么读那一段是各命令自己的事——事件命令
+    认选项与位置参数，别的命令可能什么都不收。
+    """
+    parts = text.split(maxsplit=1)
+    head = parts[0].lower()
+    tail = parts[1].strip() if len(parts) > 1 else ""
+    return head, tail
 
 
 # ------------------------------------------------------------------ #
@@ -161,19 +193,21 @@ class SupervisorAgent(BaseAgent):
         text = message.payload.get("text", "").strip()
 
         # ========== 斜杠命令分发 ==========
-        # 中文别名 → 标准命令
+        # 中文别名 → 标准命令（整串精确匹配，见 COMMAND_ALIASES）
         normalized = COMMAND_ALIASES.get(text, text)
         if normalized.startswith("/"):
-            cmd = normalized.split()[0].lower()
+            cmd, args = _split_command(normalized)
             handler_name = SLASH_COMMANDS.get(cmd)
             if handler_name:
                 handler = getattr(self, handler_name)
+                if cmd in COMMANDS_WITH_ARGS:
+                    return await handler(message, args)
                 return await handler(message)
             # 未识别的斜杠命令
             return AgentResult(
                 task_id=message.task_id,
-                success=False,
-                error=f"未知命令: {cmd}\n可用命令:\n{AVAILABLE_COMMANDS}",
+                success=True,
+                data=f"未知命令: {cmd}\n可用命令:\n{AVAILABLE_COMMANDS}",
             )
 
         session_mgr = get_session_manager()
@@ -258,6 +292,19 @@ class SupervisorAgent(BaseAgent):
             success=True,
             data="✅ 工作流已取消。",
         )
+
+    async def _handle_event(self, message: AgentMessage, args: str) -> AgentResult:
+        """`/event …`：重大事件的人工维护入口（CONTEXT.md 第 152 条走 slash，不引入 admin）。
+
+        **分发发生在意图解析之前**，所以到达 `events.py` 的落款始终是「人敲的」——
+        `events.py` 那条「提升为『高』必须人工」的判据认的正是这个。
+
+        按需引入：supervisor 是每条消息都会走的模块，没有理由让它的导入期顺带把
+        regime 的模型层也拉起来。
+        """
+        from .event_commands import handle_event_command
+
+        return await handle_event_command(message, args)
 
     # ------------------------------------------------------------------ #
     #  会话状态 handlers                                                   #

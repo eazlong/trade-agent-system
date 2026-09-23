@@ -30,10 +30,10 @@ CONTEXT.md 的阈值全枚举，以及每一组落在哪一段（防止「没写
 | `JUDGEMENT_LIFECYCLE` | 最小持续期、状态过期 | ✔ 本单元 |
 | `EVIDENCE` | 切片证据门槛 | ✔ 本单元 |
 | `DEACTIVATION` | 人工豁免生效期 | ✔ 单元 7 |
-| `BOX` | 箱体判定与高低点结构的参数（约 10 个） | 单元 8（日报要写依据时才定形状） |
+| `BOX` | 箱体判定与高低点结构的参数（约 10 个） | ✔ 单元 8 |
 | `NEWS` | 采集窗口、预筛条数、正文截断、白名单源 | ✔ 本单元 |
-| `SHADOW` | Shadow 到期上下限、一致率达标阈值 | 单元 8 |
-| `REPORT` | 日报投递看门狗时刻 | 单元 8 |
+| `SHADOW` | Shadow 到期上下限、一致率达标阈值 | ✔ 单元 8 |
+| `REPORT` | 日报投递看门狗时刻 | ✔ 单元 8 |
 | `EVENT` | 事件窗口与全局上下限、事件库衰减告警、候选失效期 | 第②段 |
 | `DERISK` | 滑点上限、减仓分片数上限 | 第②段 |
 | `SELF_FUSE` | 自熔断频率 | 第②段 |
@@ -45,9 +45,35 @@ CONTEXT.md 的阈值全枚举，以及每一组落在哪一段（防止「没写
 不在此处预置空壳。
 
 `BOX` 是同一个理由的另一种形态：形状是已知的（`detect_box_range` 的入参就摆在那里），
-但**约 10 个数值没有一个是现在能给出理由的**，而且**基础阶段不依赖它**——「箱体震荡」
-是四档里的兜底，检不检出箱体都落到它。所以箱体与高低点结构只在日报要写依据时才需要，
-届时按日报真正要回答的问题去定参数，而不是现在照着函数签名誊一遍。
+而且**基础阶段不依赖它**——「箱体震荡」是四档里的兜底，检不检出箱体都落到它。它只在
+日报要写依据时才需要（「判为箱体，且确实检出 [a, b]」对「判为箱体，但未见成形箱体」），
+所以它的每一个数都是**描述性**的，不是信号：没有哪个数会让哪条策略被停掉。这一点决定了
+它的默认值怎么取，见 `BoxConfig` 的 docstring。
+
+## `BOX` 不能「照着函数签名誊一遍」：那个函数的默认值是**不可用的**
+
+原本的打算是「默认值逐字抄 `detect_box_range`，表示不调参」。写下才发现抄不了：
+`max_width_abs` 与 `max_width_pct` 的默认值**都是 `None`**，而
+`_validate_box_range_params` 的第一条校验是「必须传入 `max_width_abs` 或 `max_width_pct`
+之一」——即 `detect_box_range(klines)` 这个调用**必然抛 ValueError**。逐字抄的结果是一个
+import 时就炸的 `BoxConfig()`，或者一个一调用就炸的配置。
+
+所以这一组有**一个**数不是函数默认值：`max_width_pct`，取 `0.30`。出处不是发明：本仓库
+里已有调用点的取值集合是 `0.01`–`0.50`（`apps/strategy_engine/tests/` 与
+`apps/agent/tools/test_box_range.py`），而 `0.30` 是**被当作「宽到不成为约束」用的**那个
+——`test_box_range_real_market.py` 把它跟 `upper_max_discard_pct=0.0` 配在一起，测的是
+粗筛参数，宽度上限在那里只是背景。
+
+沿用同一个用法：这里的宽度上限**不该是那个在做判断的东西**，做判断的是函数自身的结构
+要求（几个 pivot、每个碰几次、离窗口极值的距离）。理由是这个数不参与档位归属：
+「箱体震荡」是四档的兜底，收不放宽都不会让哪条策略被停或不停，它只决定日报第①段写
+「判为箱体，且确实检出 [a, b]」还是「判为箱体，但未见成形箱体」。既然唯一后果是一句话的
+强度，就取宽的一侧：偏紧会让日报在最像箱体的那些天里说不成形，而那条句子长得跟「今天
+确实没有箱体」一模一样，没人会去查。
+
+`max_width_abs` 保持 `None`（不启用）：绝对宽度随标的价格量级而变，对 BTC 而言「$5000」
+在 3 万和 12 万时完全是两件事，而相对宽度没有这个问题。两个都设会被函数自己的校验拦下
+（二选一），`BoxConfig.__post_init__` 提前到 import 时拦同一件事。
 
 ## `NEWS` 的白名单源：可达性取决于代理，第一类因此换了形态
 
@@ -267,6 +293,77 @@ class DeactivationConfig:
             raise ValueError(
                 f"exemption_days 必须 >= 1，当前 {self.exemption_days}"
             )
+
+
+@dataclass(frozen=True)
+class BoxConfig:
+    """箱体判定的参数（`detect_box_range` 的入参，第①段单元 8）。
+
+    **它不参与档位归属。** 「箱体震荡」是四档里的兜底，无论检不检出箱体，判不出趋势
+    与高波动时都落到它。所以这里每个数的作用只有一处：日报第①段写依据时，说清楚那天
+    的「箱体震荡」是「确实检出 [a, b] 一个成形箱体」还是「只是没判出别的」。既然唯一
+    后果是一句话的强度，`max_width_pct` 就取宽的一侧（见模块 docstring）。
+
+    字段与默认值**逐一对应函数签名**，唯一例外是与 `None` 有关的三个：
+
+    - `max_width_abs` / `max_width_pct`：函数要求**二选一**，两个都是 `None` 时它直接
+      抛错。所以本组必须给出一个，`__post_init__` 把函数那条校验提前到 import 时——
+      逐字誊抄函数默认值会得到一个 import 就炸（或一调用就炸）的配置，
+      模块 docstring 记了这件事。
+    - `min_width_abs`：保持 `None`（不启用绝对下限），理由与 `max_width_abs` 对称。
+
+    `kwargs()` 把 `None` 丢掉再交给函数：丢与不丢在**函数语义**上等价（它的默认值就是
+    `None`），区别只在调用点读起来是「这一项没配」而不是「这一项配成了 None」。真正
+    会因缺项而失败的那一项（宽度上限）由 `__post_init__` 拦在更早的地方。
+    """
+
+    # -- 宽度上下限：二选一的那个「一」在这里 -- #
+    max_width_abs: float | None = None
+    max_width_pct: float | None = 0.30
+    min_width_abs: float | None = None
+    min_width_pct: float | None = 0.005
+
+    # -- 高低点结构 -- #
+    pivot_window: int = 2
+    min_gap_bars: int = 3
+    min_pivots: int = 2
+    min_touches: int = 2
+
+    # -- 波动与时长 -- #
+    atr_period: int = 14
+    min_duration_bars: int | None = 12
+
+    # -- 粗筛：上/下沿离窗口极值超过这个比例就丢弃该候选 -- #
+    upper_max_discard_pct: float = 0.15
+    lower_max_discard_pct: float = 0.15
+
+    def __post_init__(self) -> None:
+        if (self.max_width_abs is None) == (self.max_width_pct is None):
+            raise ValueError(
+                "max_width_abs 与 max_width_pct 必须二选一"
+                f"（当前 abs={self.max_width_abs}, pct={self.max_width_pct}）"
+                "——这是 detect_box_range 自己的要求，"
+                "而逐字誊抄它的默认值恰好会踩中这一条"
+            )
+        for name in ("max_width_abs", "max_width_pct", "min_width_abs", "min_width_pct"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} 必须为正数，当前 {value}")
+        for name in ("pivot_window", "min_gap_bars", "min_pivots", "min_touches", "atr_period"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} 必须 >= 1，当前 {getattr(self, name)}")
+        if self.min_duration_bars is not None and self.min_duration_bars < 1:
+            raise ValueError(
+                f"min_duration_bars 必须 >= 1 或为 None，当前 {self.min_duration_bars}"
+            )
+        for name in ("upper_max_discard_pct", "lower_max_discard_pct"):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} 落在 [0, 1]，当前 {value}")
+
+    def kwargs(self) -> dict[str, Any]:
+        """交给 `detect_box_range` 的关键字参数（丢掉 `None`，见类 docstring）。"""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
 
 # --------------------------------------------------------------------------- #
@@ -535,12 +632,171 @@ class NewsConfig:
         return tuple(m.value for m in NewsSourceKind if m in covered)
 
 
+# --------------------------------------------------------------------------- #
+# Shadow 与日报（第①段单元 8）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ShadowConfig:
+    """Shadow 期的到期条件与出 Shadow 的成功标准（CONTEXT.md 第 159–164 条）。
+
+    这些数是**承诺**，不是调优旋钮：它们定义「机制被验证到什么程度才算数」，而验证
+    一旦开始就不能改——改了等于把已经跑过的那段重新解释一遍。所以它们跟别的分组一样
+    只读、进快照，出 Shadow 的那一刻用的是**当时写下的那套数**。
+
+    三个自然日的数各管一件事，缺一不可：
+
+    - `min_natural_days`（20）与 `min_event_windows`（3）是**触发器**：至少 20 个自然日
+      **且**至少经历 3 次高影响事件窗口，两个都满足才谈出 Shadow。只要其中一个，会得到
+      一段「20 天里一次事件都没有」或「3 次事件挤在 6 天里」的验证——前者没验到事件
+      那一路，后者没验到日常那一路。
+    - `expiry_cap_days`（60）是**兜底**：事件可能很久不来，不能因为「还没遇到 3 次事件」
+      就无限期 Shadow 下去。到期只说明「可以谈了」，不说明「达标了」。
+
+    `min_agreement_rate`（0.80）与 `max_trigger_rate`（0.10）是 CONTEXT.md 第 163 条
+    成功标准①②的**阈值**（第 164 条要求它们进统一配置面）。
+
+    `0.80` 这个数需要一句解释：四档均匀分布下随机一致率是 0.25，但真实市场里「箱体
+    震荡」（兜底档）占多数，于是随机基线会被抬高——一个永远答「箱体震荡」的退化机制
+    也能拿到不低的一致率。所以**单看 ① 不够**，第 164 条把「系统性错向」单列成不达标
+    条件正是为了堵住这条路：一致率只看「对了几次」，错向看的是「错的都往同一侧错」。
+    两条一起才拦得住退化机制。
+
+    触发频率按**自然日**计（CONTEXT.md 原话），不是按判定次数：心跳每 5 分钟一轮，
+    按次数算出来的「%」是心跳频率的函数，与机制行为无关。
+    """
+
+    min_natural_days: int = 20
+    min_event_windows: int = 3
+    expiry_cap_days: int = 60
+    min_agreement_rate: float = 0.80
+    max_trigger_rate: float = 0.10
+
+    def __post_init__(self) -> None:
+        for name in ("min_natural_days", "min_event_windows", "expiry_cap_days"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} 必须 >= 1，当前 {getattr(self, name)}")
+        if self.expiry_cap_days < self.min_natural_days:
+            # 下限高于上限的配置是自相矛盾的：任何时候都判不出「可以谈了」，
+            # 而它看起来跟「还没到期」一模一样。
+            raise ValueError(
+                f"expiry_cap_days（{self.expiry_cap_days}）不能小于 "
+                f"min_natural_days（{self.min_natural_days}）"
+                "——那等于永远不出 Shadow，且症状与「还没到期」无法区分"
+            )
+        for name in ("min_agreement_rate", "max_trigger_rate"):
+            value = getattr(self, name)
+            if not 0.0 < value <= 1.0:
+                raise ValueError(f"{name} 落在 (0, 1]，当前 {value}")
+
+
+@dataclass(frozen=True)
+class ReportConfig:
+    """日报的投递看门狗时刻（CONTEXT.md 第 175 条）。
+
+    **日报什么时候发不由这个数决定**：它由判定任务驱动，判定任务确定结束（成功或最终
+    失败）之后才发，不固定钟点。这个数只决定「到了这个点还没成功投递就升级告警」——
+    所以它是**看门狗**的时刻，不是发送时刻，取名与用途必须一致，否则下一个人会照着它
+    去改发送逻辑。
+
+    时刻按**业务时区（北京时间）**解读：这个字段是给人看的钟点（「早九点还没收到日报
+    就该响了」），而系统里所有的绝对时刻都存 UTC。口径写在 `apps/common/time_utils.py`。
+    """
+
+    watchdog_hour: int = 9
+    watchdog_minute: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.watchdog_hour <= 23:
+            raise ValueError(f"watchdog_hour 落在 [0, 23]，当前 {self.watchdog_hour}")
+        if not 0 <= self.watchdog_minute <= 59:
+            raise ValueError(
+                f"watchdog_minute 落在 [0, 59]，当前 {self.watchdog_minute}"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# 重大事件（第①段单元 8ii）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class EventsConfig:
+    """事件熔断的窗口形状与两条时效（CONTEXT.md 第 147、152、154 条）。
+
+    **本组里没有任何一个数是「要不要熔断」的判据**：那是三档 impact 加上人录进来的
+    `event_time`，两者都是事实。这里全是**形状**参数，它们的共同特征是「改了会让已入库
+    的事件含义变化」——同一个 `event_time` 配不同的窗口就是两个不同的熔断区间，所以
+    它跟别的分组一样只读、进快照。
+
+    前半段（四个分钟数）**只在录入端参与计算**：`apps.regime.events.resolve_window()`
+    在录入那一刻用它算出这条事件的停/恢复时刻，同时校验收窄/放宽的覆盖值必须落在全局
+    上下限内。第②段只读算好的结果——判据留在录入端，是为了让「这个窗口凭什么这么长」
+    在**录入那一刻**就被人看见，而不是等到窗口开启时才由一段没人读的日志说出来。
+
+    **默认窗口不是对称的**（前 2 小时、后 1 小时），这是刻意的：事件前的价格行为是
+    预期驱动的（提前离场有意义），事件后的第一小时是价格发现最乱的一段（进场没有意义），
+    而再往后就是在拿「我不确定」当理由长期停摆。上下限（15 分钟 ~ 24 小时）拦的是
+    另一种错误：一个手滑多打一个 0 的覆盖值会把单条事件变成三天停摆。
+
+    `candidate_expiry_days`（14）与 `coverage_decay_days`（14）数的是两件不同的事，
+    所以是两个字段而不是一个——它们现在恰好相等，将来也会各自漂开：
+
+    - 前者是**候选事件的失效期**（CONTEXT.md 第 37 条）：到期未确认即丢弃。它是一条
+      硬规则的时长，写进 `CandidateEvent.expires_at`。
+    - 后者是**覆盖率衰减的提醒阈值**（CONTEXT.md 第 152 条）：超过这么多天没有新事件
+      入库，日报第③段与告警都要说。它**只能用来提醒，不能用来判故障**——日历型事件
+      靠人录，而平静期可以持续很久，把它当故障判据会得到一份在平静期天天响的告警。
+    """
+
+    default_halt_before_minutes: int = 120
+    default_resume_after_minutes: int = 60
+    window_floor_minutes: int = 15
+    window_cap_minutes: int = 1440
+    candidate_expiry_days: int = 14
+    coverage_decay_days: int = 14
+
+    def __post_init__(self) -> None:
+        for name in (
+            "default_halt_before_minutes",
+            "default_resume_after_minutes",
+            "window_floor_minutes",
+            "window_cap_minutes",
+            "candidate_expiry_days",
+            "coverage_decay_days",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} 必须 >= 1，当前 {getattr(self, name)}")
+        if self.window_floor_minutes > self.window_cap_minutes:
+            # 上下限反过来 ⇒ 所有覆盖值都被拒，而症状是「覆盖功能坏了」而不是
+            # 「参数配错了」——下一个读日志的人会去查入口代码。
+            raise ValueError(
+                f"window_floor_minutes（{self.window_floor_minutes}）不能大于 "
+                f"window_cap_minutes（{self.window_cap_minutes}）"
+                "——那会让每一个覆盖值都落不进去"
+            )
+        for name in ("default_halt_before_minutes", "default_resume_after_minutes"):
+            value = getattr(self, name)
+            if not self.window_floor_minutes <= value <= self.window_cap_minutes:
+                raise ValueError(
+                    f"{name}（{value}）必须落在 "
+                    f"[{self.window_floor_minutes}, {self.window_cap_minutes}] 之内"
+                    "——默认窗口自己越界的话，所有不写覆盖值的事件都会带着一个"
+                    "系统自己都不接受的长度入库"
+                )
+
+
 CANDLES = CandleConfig()
 JUDGEMENT = JudgementConfig()
 JUDGEMENT_LIFECYCLE = JudgementLifecycleConfig()
 EVIDENCE = EvidenceConfig()
 DEACTIVATION = DeactivationConfig()
+BOX = BoxConfig()
 NEWS = NewsConfig()
+SHADOW = ShadowConfig()
+REPORT = ReportConfig()
+EVENTS = EventsConfig()
 
 
 # --------------------------------------------------------------------------- #
@@ -555,7 +811,11 @@ GROUPS: dict[str, Any] = {
     "judgement_lifecycle": JUDGEMENT_LIFECYCLE,
     "evidence": EVIDENCE,
     "deactivation": DEACTIVATION,
+    "box": BOX,
     "news": NEWS,
+    "shadow": SHADOW,
+    "report": REPORT,
+    "events": EVENTS,
 }
 
 #: 派生属性（`asdict` 里没有，但同样是「当时生效的参数」）按分组点名补进快照。

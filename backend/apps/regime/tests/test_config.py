@@ -114,6 +114,44 @@ class TestSnapshot(SimpleTestCase):
                 "sources",
                 "kinds_covered",
             ),
+            # 单元 8i 的三组。它们进快照的理由与别组略有不同：前两组**不参与任何
+            # 判定**（`box` 只给日报第①段写一句依据的强弱，`shadow` 是出 Shadow 的
+            # 达标门槛，`report` 是日报看门狗的时刻），但它们同样会被写进历史记录，
+            # 所以「改了就一定看得见」这条一样适用。
+            "box": (
+                "max_width_abs",
+                "max_width_pct",
+                "min_width_abs",
+                "min_width_pct",
+                "pivot_window",
+                "min_gap_bars",
+                "min_pivots",
+                "min_touches",
+                "atr_period",
+                "min_duration_bars",
+                "upper_max_discard_pct",
+                "lower_max_discard_pct",
+            ),
+            "shadow": (
+                "min_natural_days",
+                "min_event_windows",
+                "expiry_cap_days",
+                "min_agreement_rate",
+                "max_trigger_rate",
+            ),
+            "report": ("watchdog_hour", "watchdog_minute"),
+            # 单元 8ii 的一组。它进快照的理由与 `box`/`shadow`/`report` 同类：**不参与
+            # 任何判定**（四个分钟数只在录入端算一次窗口，两个天数是时效），但「同一个
+            # `event_time` 配不同的窗口就是两个不同的熔断区间」，所以它同样是历史记录
+            # 的一部分——改了就一定看得见。
+            "events": (
+                "default_halt_before_minutes",
+                "default_resume_after_minutes",
+                "window_floor_minutes",
+                "window_cap_minutes",
+                "candidate_expiry_days",
+                "coverage_decay_days",
+            ),
         }
         snap = config.full_snapshot()
         self.assertEqual(set(snap), set(expected))
@@ -216,6 +254,43 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.NEWS.body_max_chars, 2000)
         self.assertEqual(config.NEWS.fetch_timeout_seconds, 20.0)
         self.assertEqual(config.NEWS.max_items_per_source, 40)
+
+    def test_shadow_defaults(self):
+        """出 Shadow 的达标门槛（CONTEXT.md 第 159、163 条），字面钉死。
+
+        这四个数是**成功标准本身**：改了它们等于改了「机制算不算合格」。尤其
+        `max_trigger_rate`——它的单位是**自然日**而不是次数，写成次数会让一条密集
+        触发的机制在算术上仍然达标。
+        """
+        self.assertEqual(config.SHADOW.min_natural_days, 20)
+        self.assertEqual(config.SHADOW.min_event_windows, 3)
+        self.assertEqual(config.SHADOW.expiry_cap_days, 60)
+        self.assertEqual(config.SHADOW.min_agreement_rate, 0.80)
+        self.assertEqual(config.SHADOW.max_trigger_rate, 0.10)
+
+    def test_report_defaults(self):
+        """日报看门狗的时刻（CONTEXT.md 第 175 条）。
+
+        这是**当天日报最晚该到几点**的判据：到点还没投递成功才升级告警。定得早会
+        在判定还没跑完时误报，定得晚会把「今天的日报没送到」压到第二天。
+        """
+        self.assertEqual(config.REPORT.watchdog_hour, 9)
+        self.assertEqual(config.REPORT.watchdog_minute, 0)
+
+    def test_events_defaults(self):
+        """事件熔断的窗口形状（CONTEXT.md 第 147、152 条），字面钉死。
+
+        四个分钟数是**录入那一刻**用来算停/恢复时刻的，所以这几个数一改，之后录入的
+        每一条事件的熔断区间就跟着变；上下限则是覆盖值的护栏。默认窗口刻意不对称
+        （前 2 小时 / 后 1 小时）——写成对称的 `120/120` 会让事件后多停一小时，而那
+        一小时正是价格发现结束、噪音最大的一段，停在那里没有理由。
+        """
+        self.assertEqual(config.EVENTS.default_halt_before_minutes, 120)
+        self.assertEqual(config.EVENTS.default_resume_after_minutes, 60)
+        self.assertEqual(config.EVENTS.window_floor_minutes, 15)
+        self.assertEqual(config.EVENTS.window_cap_minutes, 1440)
+        self.assertEqual(config.EVENTS.candidate_expiry_days, 14)
+        self.assertEqual(config.EVENTS.coverage_decay_days, 14)
 
 
 class TestNewsWhitelist(SimpleTestCase):
@@ -399,6 +474,44 @@ class TestSelfValidation(SimpleTestCase):
             config.NewsSource(name="  ", url="https://example.com", kind=config.NewsSourceKind.MACRO)
         with self.assertRaises(ValueError):
             config.NewsSource(name="x", url="ftp://example.com", kind=config.NewsSourceKind.MACRO)
+
+    def test_events_window_bounds_cannot_be_inverted(self):
+        """上下限反过来 ⇒ 每个覆盖值都被拒，而症状是「覆盖功能坏了」而不是「参数配错了」。"""
+        with self.assertRaises(ValueError) as ctx:
+            config.EventsConfig(window_floor_minutes=60, window_cap_minutes=30)
+        self.assertIn("window_floor_minutes", str(ctx.exception))
+
+    def test_events_defaults_must_fit_inside_the_bounds(self):
+        """默认窗口自己越界的话，所有不写覆盖值的事件都会带着一个系统自己都不接受的长度入库。"""
+        with self.assertRaises(ValueError) as ctx:
+            config.EventsConfig(
+                default_halt_before_minutes=5,
+                window_floor_minutes=15,
+                window_cap_minutes=1440,
+            )
+        self.assertIn("default_halt_before_minutes", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            config.EventsConfig(
+                default_resume_after_minutes=2880,
+                window_floor_minutes=15,
+                window_cap_minutes=1440,
+            )
+        self.assertIn("default_resume_after_minutes", str(ctx.exception))
+
+    def test_events_counts_must_be_positive(self):
+        """0 天的失效期 = 候选事件一落库就已过期；0 分钟的下限 = 窗口退化成一个点。"""
+        for name in (
+            "default_halt_before_minutes",
+            "default_resume_after_minutes",
+            "window_floor_minutes",
+            "window_cap_minutes",
+            "candidate_expiry_days",
+            "coverage_decay_days",
+        ):
+            with self.subTest(field=name):
+                with self.assertRaises(ValueError):
+                    replace(config.EVENTS, **{name: 0})
 
     def test_a_valid_derivation_passes_validation(self):
         """replace 派生也会过 __post_init__，好编辑不该被拦。"""

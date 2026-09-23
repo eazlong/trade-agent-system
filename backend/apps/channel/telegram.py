@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 # Telegram API 限制 4096 字符，留余量给格式化
 _TG_MAX_LENGTH = 4000
 
+#: 兜底消息处理器收什么。**故意不带 `~filters.COMMAND`**：带上它，任何没有单独注册
+#: `CommandHandler` 的斜杠消息都会被 Telegram 这一层直接丢掉，Agent 永远看不到——
+#: `/start`、`/status`、`/stop`、`/help` 各自有处理器，但 `/new`、`/cancel`、`/event …`
+#: 走的是 SupervisorAgent 的命令表，得先让它们进来。CONTEXT.md 第 119 条把这条通路列为
+#: v1 前置：只改 Agent 的命令表在 Telegram 上不生效，坏掉的样子是**一条命令发出去、
+#: 什么都没发生**。
+#:
+#: 顺序上也不靠它兜住已注册的那四个：同一 group 内 Python-Telegram-Bot 只让**第一个
+#: 命中**的处理器跑，而 `_register_handlers` 先注册 `CommandHandler`。
+_MESSAGE_FILTER = filters.TEXT
+
 
 class TelegramChannel(BaseChannel):
     """Phase 1 Channel：Telegram Bot"""
@@ -44,6 +55,14 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 logger.error(f"Failed to send photo: {e}")
 
+    def _register_handlers(self, app) -> None:
+        """把处理器挂上去。抽出来是为了让「哪条消息落到哪个处理器」可以被测到。"""
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("stop", self._cmd_stop))
+        app.add_handler(CommandHandler("help", self._cmd_help))
+        app.add_handler(MessageHandler(_MESSAGE_FILTER, self._on_message))
+
     async def start(self) -> None:
         from django.conf import settings
 
@@ -52,13 +71,7 @@ class TelegramChannel(BaseChannel):
         if proxy:
             builder = builder.proxy(proxy).get_updates_proxy(proxy)
         self._app = builder.build()
-        self._app.add_handler(CommandHandler("start", self._cmd_start))
-        self._app.add_handler(CommandHandler("status", self._cmd_status))
-        self._app.add_handler(CommandHandler("stop", self._cmd_stop))
-        self._app.add_handler(CommandHandler("help", self._cmd_help))
-        self._app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
-        )
+        self._register_handlers(self._app)
         logger.info("[TelegramChannel] starting polling")
         await self._app.initialize()
         await self._app.start()
@@ -108,6 +121,11 @@ class TelegramChannel(BaseChannel):
             "/status — 查看当前框架运行状态\n"
             "/stop   — 停止所有运行中的框架\n"
             "/help   — 显示本帮助\n"
+            "\n以下命令由 Agent 处理（与直接发消息走同一条通路）：\n"
+            "/new    — 新建会话\n"
+            "/cancel — 取消当前任务\n"
+            "/event  — 重大事件维护（录入 / 改档 / 改期 / 取消 / 候选转正或否决 / 列表）\n"
+            "          直接发 /event 看用法\n"
             "\n直接发送消息即可与Agent交互。"
         )
         await update.message.reply_text(help_text)

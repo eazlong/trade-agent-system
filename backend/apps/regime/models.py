@@ -356,10 +356,21 @@ class ActorKind(str, Enum):
     行的 `actor_name` 是写死的任务名，`cli` 行的是 `getpass.getuser()`——一个可能被
     `--actor` 覆盖、也可能随容器里的 `USER` 环境变量变化的字符串。要看「人做了什么」
     就得先能把这批人挑出来，靠解析自由文本做不到。
+
+    `CHAT` 是单元 8ii 加的第三种（事件维护走 slash 命令，CONTEXT.md:152「不引入 Django
+    admin」）。**它不与 `CLI` 合并**：聊天渠道的人没有 `getpass.getuser()`，能拿到的只有
+    平台侧的 sender id，而那个 id 与系统用户名**指的不是同一个东西**——合并的话，
+    「谁干的」这一栏会混进两种互不可比的标识。`actor_name` 的取值口径因此按 kind 走：
+    `cli` 是系统用户名、`task` 是写死的任务名、`chat` 是平台 sender id。
+
+    **每加一个成员都要动两张表**（`RegimePoolRebuild` 与 `RegimeMechanismSwitch` 的
+    `choices` 会一起进迁移）。这是刻意付的代价：`choices` 只是校验面，合出来的是
+    「谁干的」这一套词汇——分成两套枚举会让同一件事在两张表里叫两个名字。
     """
 
     CLI = "cli"
     TASK = "task"
+    CHAT = "chat"
 
     @property
     def display(self) -> str:
@@ -370,7 +381,11 @@ class ActorKind(str, Enum):
         return [(m.value, m.display) for m in cls]
 
 
-_ACTOR_KIND_DISPLAY = {ActorKind.CLI: "命令行", ActorKind.TASK: "定时任务"}
+_ACTOR_KIND_DISPLAY = {
+    ActorKind.CLI: "命令行",
+    ActorKind.TASK: "定时任务",
+    ActorKind.CHAT: "聊天渠道",
+}
 
 
 class RegimePoolRebuild(models.Model):
@@ -780,3 +795,678 @@ class ArchetypeOverride(models.Model):
 
     def __str__(self) -> str:
         return f"{self.strategy_id} → {self.archetype}"
+
+
+# --------------------------------------------------------------------------- #
+# 机制运行状态与 Shadow 每日记录（单元 8）
+# --------------------------------------------------------------------------- #
+
+
+class MechanismMode(str, Enum):
+    """机制当前处在哪一档。
+
+    分界是**机制有没有对市场施加动作**，不是「跑没跑起来」：Shadow 期判定、推导、
+    日报全都照跑，只是不执行（CONTEXT.md:172「Shadow 期不执行任何市场动作 = 机制不
+    施加动作」）。所以这一档说的不是健康状况，拿它当健康指标会读出反的结论。
+    """
+
+    SHADOW = "shadow"
+    EXECUTING = "executing"
+
+    @property
+    def display(self) -> str:
+        return _MECHANISM_MODE_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_MECHANISM_MODE_DISPLAY = {
+    MechanismMode.SHADOW: "Shadow（只记录，不执行）",
+    MechanismMode.EXECUTING: "执行态",
+}
+
+
+class RegimeMechanismSwitch(models.Model):
+    """机制在 Shadow / 执行态之间的每一次切换，只增不改。
+
+    形状是**流水**而不是一行「当前状态」，这是刻意的。一行状态表 + 一张流水表就是两份
+    可以互相矛盾的真相，而它们的分歧（「状态说 shadow，最后一条流水说 executing」）恰好
+    出现在切换写了一半的时候；只有流水时，这种分歧不存在。于是：
+
+    - **当前档 = 最后一条的 `to_mode`**（`current()`）；
+    - **一条流水都没有 = `SHADOW`**。机制出厂就在 Shadow，这是一个不需要被写下来的
+      事实——为它落一行「初始切换」只会让「切过几次」多算一次。
+
+    **单元 8 没有任何代码路径会创建这张表的行**，所以当前档恒为 `SHADOW`。「出 Shadow」
+    是一个要人确认的动作（CONTEXT.md:160），它属于第③段。这里刻意把读取实现成「查流水」
+    而不是写死 `SHADOW`：写死的话，第③段那条命令落了库而日报仍报 shadow，两边都「正常」，
+    只能靠人去比对才发现——那正是本仓库反复避免的失败形状。
+
+    留痕四件事：什么时候、谁、从哪档到哪档、为什么。`reason` 必填而不是备注，因为
+    CONTEXT.md:161 的「自熔断退回 Shadow 后再回执行态，必须显式记录『这次是自熔断后的
+    恢复』」最终就落在这个字段上；允许留空的字段拦不住「忘了写原因」。
+    """
+
+    from_mode = models.CharField("切换前档位", max_length=16, choices=MechanismMode.choices())
+    to_mode = models.CharField("切换后档位", max_length=16, choices=MechanismMode.choices())
+
+    at = models.DateTimeField("切换时刻（UTC）", db_index=True)
+
+    # 复用 `ActorKind`：切换的两个来源正是「人敲的命令」与「机制自己（自熔断）」，与
+    # 重算记录的触发方是同一组分别。再开一个枚举会让「谁干的」出现两套词汇。
+    actor_kind = models.CharField("触发方类别", max_length=16, choices=ActorKind.choices())
+    actor_name = models.CharField("触发方", max_length=128)
+
+    reason = models.TextField("切换原因（必填）")
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_mechanism_switches"
+        verbose_name = "机制档位切换记录"
+        verbose_name_plural = "机制档位切换记录"
+        ordering = ["-at", "-id"]
+
+    def __str__(self) -> str:
+        return f"{self.at:%Y-%m-%d} {self.from_mode}→{self.to_mode} by {self.actor_name}"
+
+    @classmethod
+    def latest(cls) -> "RegimeMechanismSwitch | None":
+        """最近一次切换；从未切换过返回 `None`。"""
+        return cls.objects.order_by("-at", "-id").first()
+
+    @classmethod
+    def current(cls) -> MechanismMode:
+        """当前档位。按 `at` 而不是按 id 排序：切换时刻是可回填的既有事实（补录一次
+        历史切换），而 id 只反映写入顺序，两者在补录时会给出相反的答案。"""
+        row = cls.latest()
+        return MechanismMode(row.to_mode) if row is not None else MechanismMode.SHADOW
+
+
+class ShadowDailyRecord(models.Model):
+    """Shadow 期的每日一条记录（CONTEXT.md:162）。
+
+    这张表存在的理由不是「留个日志」：Shadow 期机制不施加任何动作，于是机制**唯一**
+    的产出就是这些行。三件事都要靠它回答，缺一个这张表就得重做：
+
+    1. **成功标准①②**（CONTEXT.md:163）：一致率的比对要拿「机制当天说了什么」，触发
+       频率要拿「一年里有几天真的会施加动作」——两者都必须按**天**取到，而不是按心跳
+       的 5 分钟一拍取到（心跳频次是调度参数，把它算进成功率里会让指标随调度改变）。
+    2. **自熔断频率条款**（CONTEXT.md:167「连续 3 个月触发频率 > 20%」）的数据来源就是
+       这张表。Shadow 期没有真实施加，所以「触发」只能读成「当天本来会施加」——也就是
+       `suggested_count > 0` 的天数占比。
+    3. **日报第②段的今昨比对**：昨天的建议集合与今天的做差（Q3）。
+
+    ## 三值内联复制，而不是只留一个外键
+
+    基础阶段 / 抬升标志 / 生效阶段**照抄一份**在本地（`judgement` 外键同时留作下钻）。
+    CONTEXT.md:162 明确要求记录里同时留下这三个值，理由与 `RegimeJudgement` 存三值
+    同源：合成或省略一个，就再也回答不了「那天那个阶段是量化判出来的，还是资讯抬上来的」。
+    外键**可空**且用 `SET_NULL`（与 `DeactivationDecision.exemption` 同一取舍）：三值是
+    自足的，外键是一条线索而不是一条约束——判定记录永久保留，但让一条审计记录跟着它
+    一起不可删，是把「保留」变成了「不许动」。
+
+    外键指向的**就是三值抄来的那一行**，所以「外键非空 ⟺ 三值非空」。不指向「当天生效
+    的判定」：今天的判定按次日业务日界生效，于是今天生效的那条永远是昨天判的，指向它等于
+    让外键与三值天天差一天——那种错位处处自洽，最难查（写入方的取数见
+    `apps.regime.shadow`）。
+
+    ## 一行一天，但「还没有结论」不算结论
+
+    唯一键保证一天一条；哪一轮心跳的那一条见 `apps.regime.shadow`。判据是**这一行里有
+    没有结论**：空三值的行是「截至那一刻还没有结论」的占位，可以被当天后续的心跳补写成
+    结论行；有结论的行是定论，此后任何心跳都不改写它。所以读者看这张表时要问的不是
+    「谁写的」，而是「这一行有没有结论」——`base_regime` 为空即**那一天机制最终没有出
+    结论**（判定层的失败或数据不足，CONTEXT.md:83 的「保持上一有效状态」）。
+
+    ## 建议为什么落成冻结清单，而不是引用决策行
+
+    `DeactivationDecision` 的行是**原地更新**的（同一策略 × 阶段只有一行，
+    `last_confirmed_at` 天天往前走）。今天的记录若只存决策 id，明天那条决策被改一次
+    豁免、后天的「昨天建议了什么」就跟着变了——而第②段的今昨做差正是要发现这种变化。
+    所以建议在这里**冻结**：当天的策略 id / 层 / 状态原样写进 JSON，此后谁都不改它。
+    第②段（或任何读者）拿两天的清单做差，比的是两天的世界，不是同一个会动的东西。
+
+    `suggested_count` 是同一行内 `suggestions` 长度的显式副本，**不算第二份真相**：
+    它不描述世界，只描述这一行自己，且写入时与清单同生共死。留它的唯一理由是让
+    「哪些天本来会施加动作」是一次 `filter(suggested_count__gt=0)` 而不是一次 JSON
+    长度运算——自熔断条款要按 3 个月滚动扫，这句话会被执行很多次。
+
+    `executed` 照落而**恒为 False**（CONTEXT.md:162「实际是否执行=否」）。不用「没有
+    执行记录」来表达「没执行」：两者在读的人眼里一模一样，而其中一个是当时的承诺，
+    另一个是数据的缺口。
+    """
+
+    symbol = models.CharField("标的", max_length=32)
+    #: **不叫 `attribute_date`**，尽管 `RegimeJudgement` 用的是那个名字：那边是**签署日**
+    #: （判定所依据的那条已收盘日线，运行日的前一天），这边是**运行日**。两张表的日期
+    #: 看着能等值 join 而实际差一天，是最容易静默错位的一类 bug（第②段的今昨做差正是
+    #: 按天对齐的）。用 `run_day` 这个词——它与 `RegimeJudgement.run_day` 属性是**同一个
+    #: 东西**，也与判定返回值里的 `run_day` 同一个名字。
+    run_day = models.DateField("运行日（业务时区的自然日）", db_index=True)
+
+    judgement = models.ForeignKey(
+        "regime.RegimeJudgement",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="shadow_records",
+        verbose_name="三值所抄的那条判定（下钻用）",
+    )
+
+    base_regime = models.CharField(
+        "基础阶段（内联副本）",
+        max_length=16,
+        choices=[(m.value, m.display) for m in BaseRegime],
+        blank=True,
+        default="",
+    )
+    escalation = models.CharField(
+        "抬升标志（内联副本）",
+        max_length=16,
+        choices=Escalation.choices(),
+        blank=True,
+        default="",
+    )
+    effective_regime = models.CharField(
+        "生效阶段（内联副本）",
+        max_length=16,
+        choices=[(m.value, m.display) for m in BaseRegime],
+        blank=True,
+        default="",
+    )
+
+    #: 推导那一层的收场（`deactivation_run` 的 `skipped`：cold_start / stale_state /
+    #: no_generation，或空串表示正常推了）。用短代码而不是并进 `note`：日报第④段要**数**
+    #: 「判定跑了但机制没表态」的天数，靠解析自由文本做不到。
+    derivation_skipped = models.CharField(
+        "推导收场（空 = 正常推导）", max_length=32, blank=True, default=""
+    )
+    note = models.TextField("给人看的一句话（为什么这一行是这样）", blank=True, default="")
+
+    suggestions = models.JSONField("当天的建议清单（冻结）", default=list)
+    suggested_count = models.IntegerField("建议条数（本行清单长度的副本）", default=0)
+
+    executed = models.BooleanField("实际是否执行（第①段恒为否）", default=False)
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_shadow_daily_records"
+        verbose_name = "Shadow 每日记录"
+        verbose_name_plural = "Shadow 每日记录"
+        ordering = ["symbol", "-run_day"]
+        constraints = [
+            # 一天一条。这个唯一键是这张表能被当作「逐日序列」使用的前提：日报的今昨
+            # 比对、频率条款的占比，分母都是「天数」，多出第二行就会静默地把某一天数两遍。
+            # 因此写入方**不新建第二行**（心跳 5 分钟一轮，一天里绝大多数 tick 走到那里
+            # 只会确认已有那一行）——但一天之内哪一轮心跳的内容留下来，不是「第一条」
+            # 那么简单：见上面那一段与 `apps.regime.shadow`。
+            models.UniqueConstraint(
+                fields=["symbol", "run_day"],
+                name="uniq_shadow_daily_symbol_run_day",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.symbol} {self.run_day} "
+            f"{self.effective_regime or '（无结论）'} 建议{self.suggested_count}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 重大事件与候选事件（第①段单元 8ii）
+#
+# 本段的边界（CONTEXT.md 的「第②段才做窗口与减仓」）：这里**只有维护入口的形状**——
+# 一行是一条被人工录入或被确认过的事实，外加一条「谁在什么时候改了它」的流水。
+# 窗口怎么被读取、熔断期内谁被停、减仓怎么叠，全是第②段的事，本模块一行都不写。
+# --------------------------------------------------------------------------- #
+
+
+class EventImpact(str, Enum):
+    """事件的冲击档位。**只有「高」触发熔断**（CONTEXT.md 第 147 条）。
+
+    三档而不是两档：要表达「这件事值得写在日报里、但不值得停掉全场」，需要一个中间档。
+    而「要不要熔断」这件事**不是一个可配的阈值**——它是一个定义：高 = 足以在数小时内
+    造成全市场 >5% 波动。把这条定义留在枚举上而不是配置里，是因为它一旦可调，「昨天
+    这条事件为什么熔断了」就变成一个随配置漂移的问题。
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @property
+    def display(self) -> str:
+        return _EVENT_IMPACT_DISPLAY[self]
+
+    @property
+    def triggers_halt(self) -> bool:
+        """本档是否触发熔断。写成属性而不是让调用方比字符串——那等于把这条规则
+        复制到每一个读它的地方，而第②段与日报是两个读它的地方。"""
+        return self is EventImpact.HIGH
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_EVENT_IMPACT_DISPLAY = {
+    EventImpact.HIGH: "高",
+    EventImpact.MEDIUM: "中",
+    EventImpact.LOW: "低",
+}
+
+
+class EventScope(str, Enum):
+    """事件的作用域：全市场，还是指定的品种列表。
+
+    **必填，且没有「默认全市场」这条退路**（CONTEXT.md 第 147 条）：作用域决定了谁在
+    窗口里被停，而「忘了填」与「确实影响全市场」在库里长得一模一样——一条本该只停
+    SOL 的事件真按全市场执行，症状是「那天什么都被停了」，而那看起来像一次保守的胜利。
+    """
+
+    MARKET = "market"
+    SYMBOLS = "symbols"
+
+    @property
+    def display(self) -> str:
+        return _EVENT_SCOPE_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_EVENT_SCOPE_DISPLAY = {
+    EventScope.MARKET: "全市场",
+    EventScope.SYMBOLS: "指定品种",
+}
+
+
+class EventStatus(str, Enum):
+    """重大事件的生命周期。**只有两个取值，且没有「已结束」**。
+
+    取消是**改状态**而不是删行：删掉之后「这条事件曾经存在过、后来被人取消了」就再也
+    答不出来，而窗口期内取消、窗口期后取消、从未生效过的取消是三件不同的事，它们的
+    区别全靠这一行还在。至于「结束」——那是时间的函数（`resume_at` 过了就结束了），
+    存下来只会多一份可以与时刻表矛盾的真相。
+    """
+
+    SCHEDULED = "scheduled"
+    CANCELLED = "cancelled"
+
+    @property
+    def display(self) -> str:
+        return _EVENT_STATUS_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_EVENT_STATUS_DISPLAY = {
+    EventStatus.SCHEDULED: "已排期",
+    EventStatus.CANCELLED: "已取消",
+}
+
+
+class EventChangeKind(str, Enum):
+    """一次维护动作的种类。流水条目用它来回答「刚才那条命令干了什么」。
+
+    `IMPACT_CHANGED` 同时覆盖升档与降档：命令只有「提升为高」一条（CONTEXT.md 第 149
+    条要求提升必须人工），但流水要是不记降档，一次「高 → 中」就会在历史里消失——
+    而那正是「这条事件当初为什么熔断过」的答案。免得读者靠 before/after 两个 JSON 去
+    猜是哪一档在动。
+    """
+
+    CREATED = "created"
+    RESCHEDULED = "rescheduled"
+    IMPACT_CHANGED = "impact_changed"
+    CANCELLED = "cancelled"
+
+    @property
+    def display(self) -> str:
+        return _EVENT_CHANGE_KIND_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_EVENT_CHANGE_KIND_DISPLAY = {
+    EventChangeKind.CREATED: "录入",
+    EventChangeKind.RESCHEDULED: "改期",
+    EventChangeKind.IMPACT_CHANGED: "改档",
+    EventChangeKind.CANCELLED: "取消",
+}
+
+
+class MajorEvent(models.Model):
+    """一条**人工录入**（或经人工确认从候选转正）的重大事件（CONTEXT.md 第 147 条）。
+
+    第一版只做**日历型**：时间能提前确定的事件。突发型那类「发生的一刻才知道」的事
+    不在这里——它的形状是「事后立刻停」，与本表的「提前排一个窗口」是两套东西，塞进
+    同一张表会让 `event_time` 同时表示「将要发生」和「已经发生」，而这两种时刻在读取
+    端的处理正好相反。
+
+    ## 窗口在录入那一刻算好，并**存下来**
+
+    `halt_at` / `resume_at` 是录入时按当时的 `config.EVENTS` 算出来的绝对时刻，存成列
+    而不是每次查询现算。理由与 `DeactivationExemption.expires_at` 同源：**改配置不得
+    追溯改变一条已入库事件的窗口**。同一个 `event_time` 配不同的窗口就是两个不同的熔断
+    区间；现算的话，某天有人把默认前 2 小时调成 4 小时，昨天那条事件的窗口就跟着变了，
+    而它当时可能已经执行过动作——「那天为什么从 10:00 就停了」从此答不出来。
+
+    单事件覆盖（`halt_before_minutes` / `resume_after_minutes`）只在录入端参与计算，
+    落库时**与算出来的时刻一起留下**（见 `apps.regime.events.resolve_window`）：只存
+    覆盖值的话，读的人仍然要拿今天的上下限去反推当时是否合法。
+
+    ## 为什么 `symbols` 用 JSON 而不是一张关联表
+
+    品种列表是这条事件的**一个属性**，不是一份会被别处引用的实体——没有「SOL 这个品种」
+    这张表可挂，而挂到 `LiveSession` 上等于说「事件的作用域由当前在跑的会话决定」，
+    那是反的。存成 JSON 列表的代价是查不了「哪些事件影响 SOL」这种反查；本段的读取
+    路径（第②段的窗口判定、日报的「未来 N 条」）都是「先取事件、再问它影不影响谁」，
+    方向正好是顺的。
+    """
+
+    name = models.CharField("事件名称", max_length=128)
+
+    scope_kind = models.CharField(
+        "作用域种类", max_length=16, choices=EventScope.choices()
+    )
+    #: 全市场时是空列表。**空列表与「没填」不是一回事**：作用域种类已经回答了「是不是
+    #: 全市场」，这里为空只表示「不需要逐品种列出」。
+    symbols = models.JSONField("作用域品种列表（全市场时为空）", default=list)
+
+    #: 事件本身的绝对时刻。**存 UTC、录入按北京时间解释**（CONTEXT.md 第 149 条），
+    #: 解释动作在 `apps.regime.events.parse_business_time`，模型只收算好的时刻。
+    event_time = models.DateTimeField("事件时刻（UTC）", db_index=True)
+
+    impact = models.CharField("冲击档位", max_length=16, choices=EventImpact.choices())
+
+    halt_at = models.DateTimeField("停止时刻（录入时按当时配置算好）", db_index=True)
+    resume_at = models.DateTimeField("恢复时刻（录入时按当时配置算好）", db_index=True)
+
+    status = models.CharField(
+        "状态", max_length=16, choices=EventStatus.choices(), default=EventStatus.SCHEDULED.value
+    )
+
+    created_by = models.CharField("录入人", max_length=128)
+    note = models.TextField("备注", blank=True, default="")
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        db_table = "regime_major_events"
+        verbose_name = "重大事件"
+        verbose_name_plural = "重大事件"
+        # 按事件时刻排：读这张表的两个地方（第②段的窗口判定、日报的「未来 7 天」）问的
+        # 都是「接下来会发生什么」，按 `event_time` 排是这个问题的自然索引。
+        ordering = ["event_time", "id"]
+        constraints = [
+            # 窗口必须自洽。反过来的窗口不会报错，只会让「停」与「恢复」两条流水在
+            # 日志里前后颠倒——而读取端届时会各自按自己的顺序解释它，两边都「正常」。
+            models.CheckConstraint(
+                check=models.Q(resume_at__gte=models.F("halt_at")),
+                name="ck_major_event_window_ordered",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event_time:%Y-%m-%d %H:%M} {self.name}（{self.impact_display}）"
+
+    @property
+    def impact_display(self) -> str:
+        return EventImpact(self.impact).display
+
+    @property
+    def status_display(self) -> str:
+        return EventStatus(self.status).display
+
+    @property
+    def triggers_halt(self) -> bool:
+        """这条事件是否会开启熔断窗口。**取消掉的事件仍然返回 False**——把它并进
+        调用方的判据里，是为了让「已取消的事件不产生窗口」只有一处实现。"""
+        return (
+            self.status == EventStatus.SCHEDULED.value
+            and EventImpact(self.impact).triggers_halt
+        )
+
+    def applies_to(self, symbol: str) -> bool:
+        """这条事件是否作用到某个品种上。全市场恒真。"""
+        if self.scope_kind == EventScope.MARKET.value:
+            return True
+        return symbol in (self.symbols or [])
+
+    @property
+    def scope_display(self) -> str:
+        if self.scope_kind == EventScope.MARKET.value:
+            return EventScope.MARKET.display
+        return "、".join(self.symbols or [])
+
+
+class MajorEventChange(models.Model):
+    """重大事件的维护流水，**只增不改**。
+
+    形状与 `RegimeMechanismSwitch` 同源（流水而非一行「当前状态」）：`MajorEvent` 那一行
+    本身是会被改的（改期、改档、取消），而「谁在什么时候把它改成了什么」必须留在不会被
+    下一次修改覆盖的地方。
+
+    为什么不能只靠 `updated_at`：它回答得了「什么时候被改过」，回答不了**改了什么**，
+    也回答不了「改之前是什么」。而这三件事有两件被 CONTEXT.md 直接点名——第 149 条
+    「提升为『高』必须人工，需要留痕」、第 154 条「事件改期与取消必须走命令并留痕」。
+    留痕的对象是**动作**，不是行的最后状态。
+
+    `before` / `after` 只装**被改动的键**，不整行快照：整行快照会让「这条流水改了什么」
+    需要读者自己对照两行 JSON 求差，而求差的那个读者（人）正是这条流水存在的理由。
+    只装被改动的键，也让「改期」与「改档」在同一条流水里天然可分辨。
+    """
+
+    event = models.ForeignKey(
+        MajorEvent,
+        on_delete=models.CASCADE,
+        related_name="changes",
+        verbose_name="所属事件",
+    )
+
+    kind = models.CharField("动作", max_length=24, choices=EventChangeKind.choices())
+
+    #: 动作发生的绝对时刻。用独立字段而不是复用 `created_at`：补录一条历史动作时，
+    #: 两者会不同——而「这条改期是什么时候批的」问的是前者。
+    at = models.DateTimeField("动作时刻（UTC）", db_index=True)
+
+    actor_kind = models.CharField("触发方类别", max_length=16, choices=ActorKind.choices())
+    actor_name = models.CharField("触发方", max_length=128)
+
+    before = models.JSONField("改动前（只含被改动的键）", default=dict)
+    after = models.JSONField("改动后（只含被改动的键）", default=dict)
+
+    note = models.TextField("备注", blank=True, default="")
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_major_event_changes"
+        verbose_name = "重大事件维护流水"
+        verbose_name_plural = "重大事件维护流水"
+        ordering = ["-at", "-id"]
+
+    def __str__(self) -> str:
+        return f"#{self.event_id} {self.kind} by {self.actor_name}"
+
+
+class CandidateOrigin(str, Enum):
+    """候选事件的提出方。**两个取值不是分类，是两条不能合并的溯源。**
+
+    CONTEXT.md 第 94 条要的是「Agent 的建议与资讯的建议走同一条出口」——同一条出口指的
+    是**确认流程**相同，不是来源相同。合并成一个「系统建议」会让「这条是谁提的」在库里
+    消失，而日报第③段末尾那一节要按来源分开列：资讯提的带着原文链接，Agent 提的带着
+    当时那句对话。
+    """
+
+    NEWS = "news"
+    AGENT = "agent"
+
+    @property
+    def display(self) -> str:
+        return _CANDIDATE_ORIGIN_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_CANDIDATE_ORIGIN_DISPLAY = {
+    CandidateOrigin.NEWS: "资讯判定",
+    CandidateOrigin.AGENT: "Agent 建议",
+}
+
+
+class CandidateStatus(str, Enum):
+    """候选事件的归宿。CONTEXT.md 第 37 条：**唯一出路是转正或失效丢弃**。"""
+
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    DISCARDED = "discarded"
+
+    @property
+    def display(self) -> str:
+        return _CANDIDATE_STATUS_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(m.value, m.display) for m in cls]
+
+
+_CANDIDATE_STATUS_DISPLAY = {
+    CandidateStatus.PENDING: "待确认",
+    CandidateStatus.CONFIRMED: "已转正",
+    CandidateStatus.DISCARDED: "已丢弃",
+}
+
+
+#: 丢弃原因的取值。**写得下、问得出**就够了，所以是短代码而不是又一张枚举：
+#: `EXPIRED` 是 14 天到了没人确认（自动），“rejected” 是人看了一眼说不要。
+#: 两者的区别在日报里很要紧——前者说明**没人看**，后者说明**看过了**。
+CANDIDATE_DISCARD_EXPIRED = "expired"
+CANDIDATE_DISCARD_REJECTED = "rejected"
+_CANDIDATE_DISCARD_REASON_DISPLAY = {
+    CANDIDATE_DISCARD_EXPIRED: "到期未确认",
+    CANDIDATE_DISCARD_REJECTED: "人工否决",
+}
+
+
+class CandidateEvent(models.Model):
+    """一条**尚未入库**的建议事件（CONTEXT.md 第 37、94 条）。
+
+    **它没有窗口、不产生任何熔断**——这一点是这张表与 `MajorEvent` 的分界线，也是它
+    存在的理由：把「有人觉得下周有个大事」与「一条已经排期的熔断事件」放进同一张表，
+    读的人就再也分不清「这条会不会真的停我」。所以它连 `halt_at` 都没有一列，要转正
+    必须由人把时间、冲击档位、作用域**重新说一遍**（`events.confirm_candidate`）。
+
+    14 天失效期写在 `expires_at` 上（写入时按当时的 `config.EVENTS.candidate_expiry_days`
+    换算成绝对时刻），理由与 `DeactivationExemption.expires_at` 相同：改配置不得追溯
+    延长或缩短一条已经提出的候选。**「到期」本身不删除任何行**，只把状态改成
+    `discarded`——「这条建议提过、没人理它」正是覆盖率衰减的一个证据（第④段的提醒要靠
+    它），删掉就等于把「机制提过但没人看」这件事抹了。
+
+    `news_item` 只在 `origin=news` 时非空，用 `SET_NULL`：资讯条目永久保留，但让一条
+    候选跟着它一起不可删，是把「保留」变成「不许动」——同 `ShadowDailyRecord.judgement`
+    的取舍。
+    """
+
+    name = models.CharField("推测的事件名称", max_length=128)
+
+    origin = models.CharField("提出方", max_length=16, choices=CandidateOrigin.choices())
+
+    #: 推测时刻，**可空**：资讯里常常只说「下周」或「月末」，说不出具体钟点。
+    #: 为它编一个时间等于给一个未知量填一个看起来像事实的数。
+    guessed_time = models.DateTimeField("推测时刻（UTC，可空）", null=True, blank=True)
+
+    #: 提出日期（业务日）。与可空的 `guessed_time` 分开：日报那一节要按「什么时候提的」
+    #: 排序与计龄，而那一列不能因为事件时间未知就变成空的。
+    raised_at = models.DateField("提出日期（业务日）")
+    raised_by = models.CharField("提出方标识（资讯源名 / sender id）", max_length=128)
+
+    news_item = models.ForeignKey(
+        "regime.NewsItem",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="candidate_events",
+        verbose_name="来源资讯条目",
+    )
+    note = models.TextField("备注（推测依据）", blank=True, default="")
+
+    expires_at = models.DateTimeField("失效时刻（写入时按当时配置换算）", db_index=True)
+
+    status = models.CharField(
+        "状态",
+        max_length=16,
+        choices=CandidateStatus.choices(),
+        default=CandidateStatus.PENDING.value,
+    )
+    decided_at = models.DateTimeField("处置时刻（UTC）", null=True, blank=True)
+    decided_by = models.CharField("处置人", max_length=128, blank=True, default="")
+    discard_reason = models.CharField(
+        "丢弃原因（expired / rejected）", max_length=16, blank=True, default=""
+    )
+
+    #: 转正后产生的重大事件。存外键而不是反过来在 `MajorEvent` 上存候选 id：一条候选
+    #: 至多转正一次（转正即终态），而反过来会让人以为一条事件只能有一个来源。
+    confirmed_event = models.ForeignKey(
+        MajorEvent,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="confirmed_from",
+        verbose_name="转正后的重大事件",
+    )
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_candidate_events"
+        verbose_name = "候选事件（未入库）"
+        verbose_name_plural = "候选事件（未入库）"
+        ordering = ["-raised_at", "-id"]
+        constraints = [
+            # 终态不可回退：转正过的候选不能再被丢弃，否则同一条建议会同时说着
+            # 「已转正」和「已丢弃」，而日报第③段两个集合都读。写成蕴含式
+            # （「不是已转正」或「有指向的事件」），而不是把它拆成两条状态机规则。
+            models.CheckConstraint(
+                check=(
+                    ~models.Q(status=CandidateStatus.CONFIRMED.value)
+                    | models.Q(confirmed_event__isnull=False)
+                ),
+                name="ck_candidate_confirmed_has_event",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.raised_at} {self.name}（{self.status_display}）"
+
+    @property
+    def status_display(self) -> str:
+        return CandidateStatus(self.status).display
+
+    @property
+    def discard_reason_display(self) -> str:
+        return _CANDIDATE_DISCARD_REASON_DISPLAY.get(self.discard_reason, self.discard_reason)
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == CandidateStatus.PENDING.value
+
+    def is_expired(self, now=None) -> bool:
+        """是否已过失效期。**只回答事实，不改状态**——到期改成 `discarded` 是一次
+        写入，由每日的清理动作做（`events.expire_candidates`）。查询端用得到这个判断，
+        因为「今天过期的」与「今天被丢弃的」之间隔着一次任务运行。"""
+        from django.utils import timezone as _tz
+
+        return (now or _tz.now()) >= self.expires_at

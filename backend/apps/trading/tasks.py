@@ -19,6 +19,11 @@
 判定刚落下的那条「当前生效阶段」。这一轮**不重建池化表**——重算是人触发的低频动作
 （CONTEXT.md 第 118 条），日报只读「当前一代」。回退方式与判定一样：删掉
 ``_derive_deactivation`` 这一个调用，前两段职责各自完好。
+
+最后把这一轮的判定与推导落成**当天那一条 Shadow 记录**（第①段单元 8i）。它是前两段的
+**下游**，不是并列的一段：要落的建议清单正是推导的产物，挂在上游会永远写空。它也确实是
+第①段唯一的产出——Shadow 期机制不施加任何动作，能留下的就是这些行。回退方式同前：删掉
+``_record_shadow`` 这一个调用，前面各段职责各自完好。
 """
 
 import asyncio
@@ -103,7 +108,9 @@ def snapshot_daily_equity(self) -> dict:
     if not payload["regime"].get("skipped"):
         logger.info("[snapshot_daily_equity] 行情阶段判定 %s", payload["regime"])
 
-    return _derive_deactivation(payload)
+    _derive_deactivation(payload)
+
+    return _record_shadow(payload)
 
 
 def _derive_deactivation(payload: dict) -> dict:
@@ -143,5 +150,33 @@ def _derive_deactivation(payload: dict) -> dict:
         logger.info("[snapshot_daily_equity] 停用决策：%s", summary["note"])
     else:
         logger.info("[snapshot_daily_equity] 停用决策 %s", summary)
+
+    return payload
+
+
+def _record_shadow(payload: dict) -> dict:
+    """把这一轮的判定与推导落成当天的 Shadow 记录（第①段单元 8i）。
+
+    **为什么排在这两段之后**：要落的建议清单就是推导的产物（见 `apps.regime.shadow` 的
+    模块 docstring），先写会永远写空。
+
+    **为什么判定没有结论时不抛**：那是「今天没有结论」，不是这几层的失败——判定层已经
+    把收场说清楚了（`stale_candles` / `no_candles` / `undecidable`），这一层照落一行，
+    把「判定跑了但机制没表态」留下来。真正写不进去（DB 故障）才往上抛：心跳 5 分钟后再来
+    一次，`get_or_create` + 占位行补写是幂等的，重试无副作用；吞掉异常则会让这张表静默
+    停在某一天，而「这张表停在某一天」正是它要负责发现的事情。
+    """
+    from apps.regime.shadow import write_shadow_record
+
+    try:
+        payload["shadow"] = write_shadow_record(
+            payload.get("regime") or {}, payload.get("deactivation") or {}
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("[snapshot_daily_equity] Shadow 记录写入失败: %s", e, exc_info=True)
+        raise
+    finally:
+        # 长时间运行/反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
 
     return payload
