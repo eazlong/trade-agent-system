@@ -1,6 +1,6 @@
 ---
 name: supervisor
-tools: [get_system_status, submit_scheduled_task, submit_recurring_task, cancel_scheduled_task, list_scheduled_tasks, get_task_result, add_signal_monitor, list_signal_monitors, delete_signal_monitor]
+tools: [get_system_status, submit_scheduled_task, submit_recurring_task, cancel_scheduled_task, list_scheduled_tasks, get_task_result, add_signal_monitor, list_signal_monitors, delete_signal_monitor, query_regime, query_halt, query_deactivation_decisions, query_events]
 description: 解析用户意图并编排工作流。
 ---
 
