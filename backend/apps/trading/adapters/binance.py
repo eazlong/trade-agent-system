@@ -246,7 +246,16 @@ class BinanceAdapter(BaseExchangeAdapter):
         async def attempt() -> httpx.Response:
             await self._ensure_client_for_current_loop()
             client = self._ensure_connected()
-            target = f"{path}?{self._sign(params or {})}" if signed else path
+            if signed:
+                target = f"{path}?{self._sign(params or {})}"
+            elif params:
+                # 未签名请求也要把参数带上。此前 `signed=False` 会把 params 整个丢掉，
+                # 而当时唯一的调用方（exchangeInfo）恰好不带参数，所以从未显形——
+                # 按 symbol 取中间价（/ticker/bookTicker）是第一个带参数的未签名调用，
+                # 丢参数的后果是查到全市场盘口、再被解析成「取价失败」。
+                target = f"{path}?{urlencode(sorted(params.items()))}"
+            else:
+                target = path
             # 用 getattr 分发到 get/post/delete（而非 client.request）：与既有调用风格、
             # 既有测试的 mock 断言保持一致，自愈改造不动其他任何地方。
             send = getattr(client, method.lower())
@@ -390,7 +399,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             logger.warning(f"Failed to set leverage for {symbol}: {resp.status_code} - {resp.text}")
 
     async def _load_symbol_rules(self) -> None:
-        """拉取并缓存 exchangeInfo 精度规则（stepSize / tickSize / minQty）。"""
+        """拉取并缓存 exchangeInfo 精度规则（stepSize / tickSize / minQty / minNotional）。"""
         try:
             resp = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
             if resp.status_code != 200:
@@ -407,6 +416,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                 step_size = "1"
                 tick_size = "0.01"
                 min_qty = "0"
+                min_notional = "0"
                 for f in s.get("filters", []):
                     ftype = f.get("filterType")
                     if ftype == "LOT_SIZE":
@@ -414,10 +424,17 @@ class BinanceAdapter(BaseExchangeAdapter):
                         min_qty = f.get("minQty", "0")
                     elif ftype == "PRICE_FILTER":
                         tick_size = f.get("tickSize", "0.01")
+                    elif ftype == "MIN_NOTIONAL":
+                        # 减仓分片要用：每片名义价值低于它会被交易所拒（-4164）。
+                        # 这里只**读**，不参与下单校验——市价单没有 price，拿不到名义
+                        # 价值，在这儿加一道硬校验等于给普通下单路径加一个只在限价单
+                        # 上生效的判据（CONTEXT.md:127 要的只是「补读取」）。
+                        min_notional = f.get("notional", "0")
                 rules[symbol] = {
                     "stepSize": Decimal(step_size),
                     "tickSize": Decimal(tick_size),
                     "minQty": Decimal(min_qty),
+                    "minNotional": Decimal(min_notional),
                 }
             self._symbol_rules = rules
             logger.info(f"exchangeInfo cached for {len(rules)} symbols")
@@ -497,6 +514,11 @@ class BinanceAdapter(BaseExchangeAdapter):
             params["timeInForce"] = "GTC"
         if request.client_order_id:
             params["newClientOrderId"] = request.client_order_id
+        if request.reduce_only:
+            # 只减不增：减仓路径的唯一安全保证。币安在合约侧按「不得超过当前持仓」
+            # 执行，超出部分直接拒单——本地记账与交易所分叉时，这是唯一能拦住
+            # 「减仓反而反向开仓」的一层（CONTEXT.md:47/:48）。
+            params["reduceOnly"] = "true"
         if request.stop_loss:
             params["stopPrice"] = str(request.stop_loss)
             params["workType"] = "STOP"
@@ -547,12 +569,89 @@ class BinanceAdapter(BaseExchangeAdapter):
     }
 
     async def cancel_order(self, exchange_order_id: str, symbol: str) -> bool:
+        # `symbol.upper().replace("/", "")`：与 place_order / fetch_order /
+        # find_order_by_client_id 三处一致。原先只有这一处漏了 replace，传
+        # 'BTC/USDT' 会被交易所当成非法符号（-1121）而这里只表现为 False，看不出
+        # 原因。此前无生产调用方所以没暴露，而撤单正是 halt 的第一步。
         resp = await self._request(
             "DELETE",
             "/fapi/v1/order",
-            {"symbol": symbol.upper(), "orderId": exchange_order_id},
+            {
+                "symbol": symbol.upper().replace("/", ""),
+                "orderId": exchange_order_id,
+            },
         )
         return resp.status_code == 200
+
+    async def fetch_open_orders(self, symbol: str) -> list[OrderResponse]:
+        """枚举该品种当前未成交的挂单（/fapi/v1/openOrders）。
+
+        **空列表只表示「确实一张都没有」**：任何取不到清单的情况都抛错，绝不返回空
+        列表——halt 的撤单步骤若把「没查到」当成「没有挂单」，就会在真的挂着开仓单时
+        报告「市场上没有需要撤的单」，而那份报告正是用户据以相信敞口已经收住的东西。
+        """
+        resp = await self._request(
+            "GET",
+            "/fapi/v1/openOrders",
+            {"symbol": symbol.upper().replace("/", "")},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Binance openOrders {resp.status_code}: {(resp.text or '')[:300]}"
+            )
+        payload = resp.json()
+        if not isinstance(payload, list):
+            # 币安正常返回数组；回来了 dict 说明是错误体（限额/权限），不能当成「没有挂单」
+            raise RuntimeError(
+                f"Binance openOrders 响应不是订单数组：{str(payload)[:300]}"
+            )
+        return [self._order_response_from_raw(item) for item in payload]
+
+    async def fetch_mid_price(self, symbol: str) -> Optional[Decimal]:
+        """该品种的中间价 (best bid + best ask) / 2（/fapi/v1/ticker/bookTicker）。
+
+        **取不到返回 None，绝不返回 0**（见基类 docstring）：滑点记录是「减仓成本
+        失控」的唯一告警依据，把取价失败按 0 记成「滑点完美」比不记还坏。
+        买卖价任一缺失、非正、或买价高于卖价（盘口交叉）都归入「取不到」。
+        """
+        resp = await self._request(
+            "GET",
+            "/fapi/v1/ticker/bookTicker",
+            {"symbol": symbol.upper().replace("/", "")},
+            signed=False,
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                f"Binance bookTicker {symbol} 取价失败：{resp.status_code} "
+                f"{(resp.text or '')[:200]}"
+            )
+            return None
+        try:
+            data = resp.json()
+            bid = Decimal(str(data["bidPrice"]))
+            ask = Decimal(str(data["askPrice"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as e:
+            logger.warning(f"Binance bookTicker {symbol} 响应无法解析：{e!r}")
+            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            logger.warning(
+                f"Binance bookTicker {symbol} 盘口不可用：bid={bid} ask={ask}"
+            )
+            return None
+        return (bid + ask) / 2
+
+    async def min_notional(self, symbol: str) -> Decimal:
+        """该品种的最小名义价值（exchangeInfo 的 ``MIN_NOTIONAL.notional``）。
+
+        规则尚未加载时先加载；**加载失败会抛**（``_load_symbol_rules`` 不为 -1111
+        那类错误吞异常），调用方据此知道「这个数不知道」，而不是拿到一个 0 就当
+        「交易所什么都收」。
+        """
+        if self._symbol_rules is None:
+            await self._load_symbol_rules()
+        rules = self._symbol_rules or {}
+        rule = rules.get(symbol.upper().replace("/", ""))
+        return rule["minNotional"] if rule else Decimal("0")
 
     async def fetch_order(
         self, exchange_order_id: str, symbol: str

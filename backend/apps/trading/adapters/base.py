@@ -29,6 +29,14 @@ class OrderRequest:
     # 适配器（`OrderExecutor._resolve_adapter`）——按交易所名解析在同交易所有两个
     # 账户时会拿到另一个账户的余额当分母，于是仓位上限是用别人的钱算出来的。
     exchange_account_id: Optional[str] = None
+    # 只减不增。**自动减仓的硬前置**：本地没有持仓表，持仓只存在于交易所侧，一旦
+    # 本地记的「持仓多少」与交易所实际分叉，按本地账算出的「一半」可能大于实际持仓，
+    # 于是一次「减仓」反而反向开仓、把敞口加大——熔断动作自己制造风险。交给交易所
+    # 强制只减不增，是唯一能保证这件事的手段（CONTEXT.md:47/:48/:128）。
+    #
+    # 这里只是**标志**，翻译成本地约束是各交易所适配层的事（币安 → `reduceOnly`）。
+    # 在适配层翻译接通之前，任何路径都不得开启自动减仓。
+    reduce_only: bool = False
 
 
 @dataclass
@@ -130,6 +138,27 @@ class BaseExchangeAdapter(ABC):
         """撤销指定订单"""
 
     @abstractmethod
+    async def fetch_open_orders(self, symbol: str) -> list[OrderResponse]:
+        """枚举该品种在交易所侧**当前未成交**的挂单。
+
+        halt 生效时要一并撤掉市场上的开仓挂单，而挂单清单**只能来自交易所侧**：
+        本地 `Order` 表里 `status` 非终态的行既可能已经被撤/已成交而本地还不知道，
+        也漏得掉别的入口下的单。用本地账去撤单会撤错对象（CONTEXT.md:122）。
+
+        **这里刻意是抽象方法而不是像 ``find_order_by_client_id`` 那样给个会抛的默认
+        实现**：那条路是「没有它也能对账」（退化成「不知道」），而这条是保命档的必经
+        之路——能力缺失只允许表现为「这次枚举失败、本次未能枚举挂单」这一条明确的
+        记录，不允许表现为「这个方法不存在所以没人想到要撤单」。
+
+        Args:
+            symbol: 本地交易对符号（如 'DOGE/USDT'，由适配器归一化）
+
+        Returns:
+            未成交挂单列表；**空列表只能表示「确实一张都没有」**，
+            枚举失败必须抛错——两者的区别就是「撤干净了」与「没查」的区别。
+        """
+
+    @abstractmethod
     async def fetch_order(
         self, exchange_order_id: str, symbol: str
     ) -> OrderFill:
@@ -176,3 +205,34 @@ class BaseExchangeAdapter(ABC):
     @abstractmethod
     async def get_balance(self) -> dict[str, Decimal]:
         """获取账户余额，key 为资产名称，value 为数量"""
+
+    @abstractmethod
+    async def fetch_mid_price(self, symbol: str) -> Optional[Decimal]:
+        """取该品种的**中间价** ``(best bid + best ask) / 2``（只读）。
+
+        减仓滑点的参考价就是它：滑点定义为「成交均价相对**动作发起时刻中间价**的偏离」
+        （CONTEXT.md:53）。**刻意不用 ``markPrice``**——标记价是交易所的合约估值口径
+        （含资金费率等的平滑），不是「此刻能在市场上成交的价格」，拿它当基线算出的
+        滑点不反映真实成交代价（CONTEXT.md:129）。
+
+        Returns:
+            中间价；**取不到时必须返回 ``None``**，绝不许返回 ``Decimal("0")``。
+            ``None`` 的含义是「本次不判定滑点」并留一条显式记录，而不是「滑点为 0」——
+            把取不到按 0 处理，会让一次失败的取价变成一次「滑点完美」的假记录，
+            而这条记录正是「减仓成本失控」的唯一告警依据。
+        """
+
+    async def min_notional(self, symbol: str) -> Decimal:
+        """该品种的**最小名义价值**（交易所约束，只读）。
+
+        减仓分片的前提：每片的名义价值不得低于交易所最小额，否则整片会被交易所拒绝
+        （币安 -4164），而「分片」这件事的意义正是把一次大额减仓拆成若干张能成交的单
+        （CONTEXT.md:127）。
+
+        Returns:
+            最小名义价值（计价币数量）。默认 ``Decimal("0")`` 表示**本适配器不声明该
+            约束**——调用方据此不降片。注意它是「我们不知道」，不是「交易所一定接受」：
+            这两者混淆的后果与 ``fetch_mid_price`` 返回 0 是同一类。适配器若声明了该
+            约束，就必须返回真实值。
+        """
+        return Decimal("0")

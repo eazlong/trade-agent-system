@@ -152,6 +152,10 @@ class TestSnapshot(SimpleTestCase):
                 "candidate_expiry_days",
                 "coverage_decay_days",
             ),
+            # 第②段 ②a 的一组。它是「减仓动作怎么花钱」的两个边界，**不参与任何
+            # 开新仓的判定**（拦不拦由事件窗口决定），但它决定一次减仓的切法与成本
+            # 判据，所以要跟着动作的记录一起被冻下来。
+            "derisk": ("slippage_limit_pct", "reduce_shard_count"),
         }
         snap = config.full_snapshot()
         self.assertEqual(set(snap), set(expected))
@@ -298,6 +302,22 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.EVENTS.window_cap_minutes, 1440)
         self.assertEqual(config.EVENTS.candidate_expiry_days, 14)
         self.assertEqual(config.EVENTS.coverage_decay_days, 14)
+
+    def test_derisk_defaults(self):
+        """自动减仓的两个成本边界（CONTEXT.md 第 126、127、129 条），字面钉死。
+
+        `slippage_limit_pct` 的 0.5% 是 CONTEXT.md 点名的那个数。它是**分数口径**
+        （0.005 = 0.5%）——所以这条断言同时钉住口径：哪天有人把它改成 `0.5`（想写
+        「0.5 个百分数」），这里立刻红，而不是让减仓的告警线悄悄放宽 100 倍。
+
+        `reduce_shard_count` 的默认值 3 **不是 CONTEXT.md 给的**：设计只定了「分片数
+        进统一配置面」与「它是上限、可降片」，没定数。取 3 的理由是它落在「降一次
+        市价冲击」与「子单数别太多（每多一片就多一张可能被拒的单）」之间，而它是
+        上限——真正决定切几片的是每片的名义价值。这条断言的作用与别处一样：改动
+        看得见。
+        """
+        self.assertEqual(config.DERISK.slippage_limit_pct, Decimal("0.005"))
+        self.assertEqual(config.DERISK.reduce_shard_count, 3)
 
 
 class TestNewsWhitelist(SimpleTestCase):
@@ -519,6 +539,28 @@ class TestSelfValidation(SimpleTestCase):
             with self.subTest(field=name):
                 with self.assertRaises(ValueError):
                     replace(config.EVENTS, **{name: 0})
+
+    def test_derisk_slippage_limit_must_be_a_proper_fraction(self):
+        """滑点上限落在开区间 (0, 1) 之外 ⇒ 这条告警线要么恒真要么恒假。
+
+        两个方向的坏法不一样，所以两个方向都要钉：取 0（或负数）会让**第一次**减仓就
+        判超限、自动减仓被永久暂停在它最被需要的时刻；取 >= 1（100%）则这条线永远越
+        不过，而它存在的唯一意义就是在成本失控时叫停——一个恒假判据比没有判据更坏，
+        因为「从没触发过」会被读成「成本一直很干净」。
+        """
+        for bad in ("0", "-0.1", "1", "1.5"):
+            with self.subTest(slippage_limit_pct=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    replace(config.DERISK, slippage_limit_pct=Decimal(bad))
+                self.assertIn("slippage_limit_pct", str(ctx.exception))
+
+    def test_derisk_shard_count_must_stay_in_range(self):
+        """0 片 = 减仓动作静默不执行；手滑多打一个 0 则每片跌到交易所最小额以下、张张被拒。"""
+        for bad in (0, 11, -1):
+            with self.subTest(reduce_shard_count=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    replace(config.DERISK, reduce_shard_count=bad)
+                self.assertIn("reduce_shard_count", str(ctx.exception))
 
     def test_a_valid_derivation_passes_validation(self):
         """replace 派生也会过 __post_init__，好编辑不该被拦。"""
