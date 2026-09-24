@@ -84,6 +84,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Iterable
 
 from django.utils import timezone
 
@@ -161,7 +162,7 @@ def plan_rows(*, now: datetime | None = None) -> list[PlannedRow]:
     """此刻应有的一组声明行。取数口只有两个：事件表与生效判定。"""
     at = now or timezone.now()
     return _plan(
-        _high_impact_events(),
+        high_impact_events(),
         at,
         state=deactivation_run.current_regime_state(now=at),
     )
@@ -184,12 +185,16 @@ def _plan(
     return rows
 
 
-def _high_impact_events() -> list[MajorEvent]:
+def high_impact_events() -> list[MajorEvent]:
     """所有档位为「高」的事件，按窗口起点排好。
 
     **不按 `status` 过滤**：取消与改期都要读（前者用来写解除原因，后者本来就会从窗口里
     掉出去）。谁该拦由 `MajorEvent.triggers_halt` 判——它已经是「已排期 ∧ 档位为高」的
     合取，这里再手写一遍条件就是给「什么算该拦」造第二个答案。
+
+    **公开**：`reduce_run` 要问「此刻真压在某个作用域上的事件是谁」，而它问的那一批与
+    本模块写声明行时看的那一批必须是同一批——另写一条 `impact="high"` 的查询，分歧的
+    表现是「声明写出来了、减仓不动」，两边看起来都正常。
     """
     return list(
         MajorEvent.objects.filter(impact=EventImpact.HIGH.value).order_by("halt_at", "id")
@@ -236,7 +241,13 @@ def _scopes_of(event: MajorEvent) -> list[str]:
     return [halt.symbol_scope(symbol) for symbol in (event.symbols or [])]
 
 
-def _touches(event: MajorEvent, scope: str) -> bool:
+def touches(event: MajorEvent, scope: str) -> bool:
+    """这个事件压在 ``scope`` 这个作用域上吗。与 ``_scopes_of`` 互为逆运算。
+
+    **公开**：写侧（本模块挑该拦的事件、写解除原因）与读侧（`reduce_run`——「此刻到底
+    有没有事件压在这个作用域上」）问的是同一个问题。各写一份的话，分歧会落在最不该
+    出错的地方：声明行写着「熔断中」，而减仓那一侧认不出这是哪个事件，于是一动不动。
+    """
     return scope in _scopes_of(event)
 
 
@@ -353,7 +364,11 @@ def _blanket_reason() -> str:
 # --------------------------------------------------------------------------- #
 
 
-def sync(*, now: datetime | None = None) -> dict:
+def sync(
+    *,
+    now: datetime | None = None,
+    extra_open: Iterable[HaltDeclaration] | None = None,
+) -> dict:
     """跑一轮对账，返回 ``{created, updated, unchanged, closed}``。
 
     **幂等**：期望值逐字来自事实里存好的时刻，所以连着跑两轮，第二轮一定是
@@ -362,27 +377,81 @@ def sync(*, now: datetime | None = None) -> dict:
     失败**往上抛**：下一轮 300 秒的对账就是重试（CONTEXT.md:181 把任务按「读安全 / 写危险」
     区分，而这张表是本模块独占写的、且每次都是全量重算，重试没有副作用）。吞掉异常会让
     「任务在跑、但表没更新」变成一件看起来正常的事。
+
+    ``extra_open`` 是**同一次调度内、本函数读表之后**由别的写方插进来的活行（②d 的减仓
+    认领行就是这种）。它们必须在**同一轮**参与对账，见 `_reconcile`。
     """
     at = now or timezone.now()
-    candidates = _high_impact_events()
+    candidates = high_impact_events()
     state = deactivation_run.current_regime_state(now=at)
     planned = {
         _key(row.trigger, row.scope): row for row in _plan(candidates, at, state=state)
     }
+    return _reconcile(planned, at, candidates, extra_open=extra_open)
 
+
+def _reconcile(
+    planned: dict[tuple[str, str], PlannedRow],
+    at: datetime,
+    candidates: list[MajorEvent],
+    *,
+    extra_open: Iterable[HaltDeclaration] | None = None,
+) -> dict:
+    """期望的一组行 → 状态表，返回 ``{created, updated, unchanged, closed}``。
+
+    ## 为什么 ``extra_open`` 是**对的**做法，而不是给测试开的方便门
+
+    本函数按唯一键（触发源 × 作用域）对账，而 ``planned`` 只包含**本模块**认得的那两个
+    触发源（``_OWNED_TRIGGERS``）。别的写方往这张表插的行一旦不在 ``live`` 里被看见，
+    ``planned`` 里剩下的那个键就会被无条件 ``create()``，撞上唯一键
+    ``uniq_live_halt_declaration`` —— 那是一条 ``UniqueViolation``，而且在「事件窗口刚
+    打开、②d 刚认领」这个**每次减仓都会走到**的时刻稳定复现。
+
+    ## 为什么是「传进来」而不是「本函数自己重读一次表」
+
+    ``sync`` 读表与写表之间隔着 ``_plan`` 的取数（事件表 + 判定表）。再读一次表只是把
+    窗口缩短，并没有消掉它；而调用方（``sync_halt_windows``）恰恰**知道**自己在这次调度
+    里刚插了哪几行——它手上有那些对象。所以这个参数是「把已知事实说清楚」，不是「补一个
+    竞态修补」。时序上仍然是：②d 的认领行先落库，本函数随后在**同一轮**里把它当活行看。
+    """
     summary = {"created": 0, "updated": 0, "unchanged": 0, "closed": 0}
 
-    live = HaltDeclaration.objects.filter(closed_at__isnull=True)
+    # 先按 id 去重：调用方既可能在 ``extra_open`` 里传进来一行**已经在表里**的（它自己
+    # 也是从表里读的），也可能传进来一行还没落库的（``pk is None``，例如纯规划出来的行）。
+    # 后者的存在是这套写法必须容下的，见参数说明。
+    live: list[HaltDeclaration] = []
+    seen: set = set()
+    for row in list(HaltDeclaration.objects.filter(closed_at__isnull=True)) + list(
+        extra_open or []
+    ):
+        marker = row.pk if row.pk is not None else id(row)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        live.append(row)
+
     for row in live:
         trigger = halt.trigger_of(row)
         if trigger not in _OWNED_TRIGGERS:
             continue
         desired = planned.pop(_key(trigger, row.scope), None)
         if desired is None:
+            # 还没落库的行（``pk is None``）在这里没有可改的东西——它的 ``closed_at``
+            # 只存在于内存里，写下去只会造一行没有 pk 的新记录。调用方传进来的活行按
+            # 定义都是「刚刚写进去的」，所以这条分支只可能是它自己搞错了。
+            if row.pk is None:
+                logger.warning(
+                    "[regime] 对账时收到一行未落库的声明（触发源 %s，作用域 %s），跳过",
+                    trigger.value,
+                    row.scope,
+                )
+                continue
             row.closed_at = at
             row.closed_reason = _close_reason(row, at, candidates)
             row.save(update_fields=["closed_at", "closed_reason"])
             summary["closed"] += 1
+        elif row.pk is None:
+            continue
         elif _rewrite(row, desired):
             summary["updated"] += 1
         else:
@@ -455,7 +524,7 @@ def _close_reason(row: HaltDeclaration, at: datetime, candidates: list[MajorEven
     cancelled = any(
         event.status == EventStatus.CANCELLED.value
         and event.resume_at > at
-        and _touches(event, row.scope)
+        and touches(event, row.scope)
         for event in candidates
     )
     return CLOSE_REASON_EVENT_CANCELLED if cancelled else CLOSE_REASON_NO_LONGER_COVERS

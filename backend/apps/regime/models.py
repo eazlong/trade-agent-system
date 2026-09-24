@@ -1837,3 +1837,349 @@ class DailyReport(models.Model):
     @property
     def escalation_display(self) -> str:
         return Escalation(self.escalation).display if self.escalation else NO_ESCALATION_DISPLAY
+
+
+# --------------------------------------------------------------------------- #
+# 减仓执行（第②段单元 ②d）
+# --------------------------------------------------------------------------- #
+
+
+class ReduceStatus(str, Enum):
+    """一条减仓记录的收场。
+
+    ``CLAIMED`` 之外的每一个值都是**终态**。它们分成三类事实，分错类会让记录说假话，
+    而记录是给人看的那一份，也是通知里被引用的那一份：
+
+    - **减了**：``SUCCEEDED``（全部子单成交）、``PARTIAL``（有成交，也有确定没成交的）。
+    - **一笔都没减**：``FAILED``（每张子单都有确定结论，就是没成交）与 ``NO_OP``
+      （**压根没有该减的东西**：本就没有持仓、减半取整成 0、低于交易所最小起订量）。
+      这两者必须分开：``FAILED`` 的显示是「减仓失败」，把「空仓」或「取整成 0」记成
+      事故，后果是有人半夜去查一场不存在的故障，同时把真正该看的失败淹掉。
+    - **不知道**：``UNSETTLED``。存在的理由与机械层（``apps/trading/reduce.py`` 的
+      ``SHARD_STATUS_UNFINISHED``）逐字相同，只是抬到了记录这一层：一张子单发满了允许
+      的次数仍然没有结论时，交易所侧**可能还挂着一张活单**。折进 ``PARTIAL``（「减了
+      一部分」）或 ``FAILED``（「确定没成交」）都是在说假话。
+
+    ``UNSETTLED`` 与 ``FAILED`` 必须分开还有一层：下一步的动作相反。前者必须先去看
+    那张单还在不在（CONTEXT.md:124 没有「补回」，所以多减不可逆），后者可以按「这一次
+    没减成」处置。
+    """
+
+    CLAIMED = "claimed"  # 已认领（下单之前就落的行，见 `RegimeReduceRecord` docstring）
+    SUCCEEDED = "succeeded"  # 全部子单成交
+    PARTIAL = "partial"  # 有子单成交、也有**确定**失败或被拒的
+    FAILED = "failed"  # 一张都没成交，且每张都有确定的结论
+    NO_OP = "no_op"  # 无可减（不是失败，也不是减了）
+    UNSETTLED = "unsettled"  # 至少一张子单没有结论：交易所侧可能仍有活单
+
+    @property
+    def display(self) -> str:
+        return _REDUCE_STATUS_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(s.value, s.display) for s in cls]
+
+    @property
+    def is_terminal(self) -> bool:
+        """除了 ``CLAIMED`` 都是终态。它是**认领**而不是「进行中」的进度标记：这张行在
+        下第一张子单之前就写好了，所以它存在的时间窗正是「可能要下、也可能下不成」的那
+        一段（见 `RegimeReduceRecord` 关于「写不进去就不减」的那一段）。"""
+        return self is not ReduceStatus.CLAIMED
+
+
+_REDUCE_STATUS_DISPLAY = {
+    ReduceStatus.CLAIMED: "已认领（进行中）",
+    ReduceStatus.SUCCEEDED: "已减仓",
+    ReduceStatus.PARTIAL: "部分减仓",
+    ReduceStatus.FAILED: "减仓失败（确定未成交）",
+    ReduceStatus.NO_OP: "无需减仓（无可减）",
+    ReduceStatus.UNSETTLED: "未得出结论（可能仍有活单）",
+}
+
+
+class SlippageBasis(str, Enum):
+    """``slippage_pct`` 是怎么来的——或者为什么没有这个数。
+
+    三个值对应三种**不同的事实**，而它们都可以表现为「没有一个滑点数」：
+
+    * ``MID`` —— 以动作发起时刻的中间价为基准算出来了。**只有这一种会有数**。
+    * ``NO_FILL`` —— 一张都没成交，无从算起（没有成交价可以加权）。
+    * ``UNAVAILABLE`` —— 基准价取不到，按 CONTEXT.md:129「本次不判定滑点」处理。
+
+    后两者都必须留下**显式记录**而不是留空：留空与「没跑到」在库里长得一样，而
+    「没跑到」正是上一次事故的形状。将 ``UNAVAILABLE`` 按 0 处理更糟——0 的含义是
+    「滑点完美」，那是一条假的好消息，而滑点是减仓成本失控的唯一告警依据。
+    """
+
+    MID = "mid"
+    NO_FILL = "no_fill"
+    UNAVAILABLE = "unavailable"
+
+    @property
+    def display(self) -> str:
+        return _SLIPPAGE_BASIS_DISPLAY[self]
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(b.value, b.display) for b in cls]
+
+
+_SLIPPAGE_BASIS_DISPLAY = {
+    SlippageBasis.MID: "以动作发起时刻中间价为基准",
+    SlippageBasis.NO_FILL: "本次无成交，无从计算",
+    SlippageBasis.UNAVAILABLE: "基准价取不到，本次不判定滑点",
+}
+
+
+class RegimeReduceRecord(models.Model):
+    """一次减仓动作的**幂等记录**（CONTEXT.md:116、第②段单元 ②d）。
+
+    这是本机制里唯一记录「真的动过市场」的表。事件的成交后果不可回滚、CONTEXT.md:124
+    也明写没有「补回」，所以这张表要能独立回答三个问题：**为什么减**、**减了多少**、
+    **可不可以再减一次**。
+
+    ## 为什么唯一键里是「事件」而不是「第几次动作」
+
+    幂等键的语义是（交易所账户 × 事件 × 品种）（ADR 0003）：同一件事对同一个账户的同一个
+    品种只该减一次。用「本日第 N 次」或者动作序号做键，重放一次任务就会多减一次——
+    而重放是常态（任务重试、进程重启、调度补跑），多减是不可逆的。
+
+    **「第 N 次」在唯一键之外单独存一列**（``ordinal``）。它是给人读的数字（CONTEXT.md:151
+    要求告警里写「本日第 N 次熔断」），不是去重的依据：把它放进键里，同一天第二件事件
+    会让第一件的记录被当成「另一件事」而允许再减一次——去重的语义就没了。
+
+    ## 为什么认领行在**下单之前**写
+
+    CONTEXT.md:116 把这条钉死了：**记录写失败等同于「没有减仓」，必须告警**。反过来读就是
+    「没有记录就不许减」。所以顺序只能是先写一行 ``CLAIMED``、再撤单、再下单；写不进去
+    就**这一轮不减**并告警（``reduce_run`` 的收场）。反过来（先减后记）在任务崩在下单与
+    写库之间时，会留下一笔无人知道的减仓——而没有任何本地痕迹能证明它发生过。
+
+    ## 一笔记录对应（账户 × 事件 × 品种），不是一次动作的全部
+
+    一次事件熔断会对多个品种各减一次，于是落多行，行与行之间靠 ``(event, business_day)``
+    归成一次。``baseline_qty``（当天该品种的基准持仓）**在这一天的第一行冻结**，之后每行
+    照抄：分母一旦逐行各算一次，同一天第二次减仓的「已减至基准的 X%」就会拿减完的仓位
+    当基准，报出一个永远接近 100% 的数字——而这看起来像「机制很克制」。
+
+    ## 三组「计划 / 实际」分开存
+
+    ``planned_qty``（打算减多少）、``qty_before``/``qty_after``（交易所侧读到的前后持仓）、
+    ``sub_orders``（每张子单的下场）。三者必须分开：计划与实际的差正是「这一次减成了没有」
+    的答案，而把它们合成一个字段之后，未成交与没下单在库里长得一模一样。
+
+    ## 「一笔都没减」也必须有落点
+
+    ``reduce_qty`` 取整成 0、低于最小起订量、账户该品种本就没有持仓——三种情形都会走到
+    「不减」，而它们**不是失败**：写一行终态 ``FAILED`` 会把它记成事故，写一行
+    ``SUCCEEDED`` 会把没减记成减了。它们各是一行 ``reason`` 说清缘由的终态记录，通知里
+    照实说「无可减」。**有记录**这件事比「有没有减」更重要：没有记录，下一次调度会再算
+    一遍同样的结论，而人永远不知道机制为什么按兵不动。
+    """
+
+    exchange_account = models.ForeignKey(
+        "exchange.ExchangeAccount",
+        on_delete=models.PROTECT,
+        related_name="reduce_records",
+        verbose_name="交易所账户",
+    )
+
+    # PROTECT 而不是 CASCADE：事件可以被取消、可以改期，但不该被删；而一旦有人删了它，
+    # 这笔真实的减仓就失去了「为什么减」的唯一依据。留不住依据的记录比没有记录更危险。
+    event = models.ForeignKey(
+        MajorEvent,
+        on_delete=models.PROTECT,
+        related_name="reduce_records",
+        verbose_name="触发本次减仓的事件",
+    )
+
+    symbol = models.CharField("品种（交易所口径，如 DOGEUSDT）", max_length=32)
+
+    #: **业务时区**的自然日（北京时间）。不是 UTC 日：CONTEXT.md:151 的「本日第 N 次」
+    #: 与「基准」都是给人看的当日口径，而人与日报都按业务时区生活。口径换算统一走
+    #: `apps/common/time_utils.py`，此处不自己算。
+    business_day = models.DateField("业务日（业务时区的自然日）", db_index=True)
+
+    #: 本业务日该账户第几次**熔断事件**（不是第几次动作，见类 docstring）。
+    ordinal = models.PositiveIntegerField("本日第 N 次熔断（事件计数）")
+
+    status = models.CharField(
+        "收场",
+        max_length=16,
+        choices=ReduceStatus.choices(),
+        default=ReduceStatus.CLAIMED.value,
+        db_index=True,
+    )
+
+    #: 当天该品种的基准持仓，**由该日第一行冻结**，其余行照抄（见类 docstring）。
+    baseline_qty = models.DecimalField(
+        "基准持仓（当日首行冻结）", max_digits=20, decimal_places=8, null=True, blank=True
+    )
+    #: 计划减仓数量（取整、降片**之后**真正要发的总量）。与 `qty_before - qty_after`
+    #: 分开：那个差是「减成了多少」，这个是「打算减多少」，两者不等正是要看的信号。
+    planned_qty = models.DecimalField(
+        "计划减仓数量", max_digits=20, decimal_places=8, null=True, blank=True
+    )
+    #: 减仓前后交易所侧读到的持仓。取不到时留空（**不是 0**）：0 是一句「仓位已经空了」
+    #: 的断言，而取不到的含义是「不知道」。
+    qty_before = models.DecimalField(
+        "减仓前持仓", max_digits=20, decimal_places=8, null=True, blank=True
+    )
+    qty_after = models.DecimalField(
+        "减仓后持仓（交易所侧重读）", max_digits=20, decimal_places=8, null=True, blank=True
+    )
+
+    #: 每张子单的下场（`apps/trading/reduce.py::ShardResult.as_dict` 的列表）。这是
+    #: 「这一笔到底怎么减的」的原始事实：分了几片、每片发了几次、成交价多少、谁被拒了。
+    sub_orders = models.JSONField("子单下场（逐张）", default=list, blank=True)
+
+    #: 撤单那一半的全貌（`CancelReport.as_dict`：枚举结果 + 逐张撤单下场）。它必须与减仓
+    #: 结果存在同一行里，因为「敞口在窗口内还会不会变大」这个判断同时依赖两者，而分成
+    #: 两处之后，任一处写失败都会让另一处读起来像是完整的。
+    cancel_report = models.JSONField("撤单报告", default=dict, blank=True)
+
+    #: 成交量加权滑点（**正 = 不利**）。非空 ⟺ `slippage_basis == MID`，这条不变式只由
+    #: 写入方算一次（`reduce_run`），读的人不重算。
+    slippage_pct = models.DecimalField(
+        "滑点（正=不利）", max_digits=20, decimal_places=8, null=True, blank=True
+    )
+    slippage_basis = models.CharField(
+        "滑点的来路", max_length=16, choices=SlippageBasis.choices(), blank=True, default=""
+    )
+
+    #: 人读的一句话：为什么减、为什么没减、还差什么。**不放进日志**——「日志不算被看见」
+    #: （CONTEXT.md:66），这一列是通知与日报引用它的那一份。
+    reason = models.TextField("给人看的一句话", blank=True, default="")
+
+    claimed_at = models.DateTimeField("认领时刻（UTC）", auto_now_add=True)
+    #: 空 = 还停在认领态（正在跑，或者跑挂了）。**跑挂了的那一行永远停在这里**，由
+    #: `reduce_run` 的悬挂检查读出来告警并转人工（CONTEXT.md:116「记录写失败等同于没有
+    #: 减仓」的同一族问题：这一行说「可能要减」，而没人知道后来减没减）。
+    finished_at = models.DateTimeField("完成时刻（UTC）", null=True, blank=True, db_index=True)
+
+    class Meta:
+        db_table = "regime_reduce_records"
+        verbose_name = "减仓记录"
+        verbose_name_plural = "减仓记录"
+        ordering = ["-claimed_at", "-id"]
+        constraints = [
+            # （账户 × 事件 × 品种）——ADR 0003 定死的幂等键。无条件唯一：重放一次任务
+            # 撞上同一件事件时，撞键**就是**「这次不该再减」这句结论，不需要第二套判断。
+            models.UniqueConstraint(
+                fields=["exchange_account", "event", "symbol"],
+                name="uniq_regime_reduce_record",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"{self.business_day} #{self.ordinal} {self.symbol} "
+            f"{ReduceStatus(self.status).display}"
+        )
+
+    @property
+    def status_display(self) -> str:
+        return ReduceStatus(self.status).display
+
+    @property
+    def slippage_basis_display(self) -> str:
+        """滑点那件事的一句话。空串（还没算或还没跑到）给「未判定」而不是空回应：
+        通知里少一句话，读起来是「这次没有滑点」，而不是「这次没算」。"""
+        if not self.slippage_basis:
+            return "未判定"
+        return SlippageBasis(self.slippage_basis).display
+
+    @classmethod
+    def baseline_for(cls, account, symbol: str, business_day) -> "Decimal | None":
+        """该日该品种已冻结的基准持仓；今天还一行都没有则返回 ``None``。
+
+        读取规则与写入规则**必须同处一地**：基准的定义是「这一天的第一行取到了什么」，
+        把它写在读取方就等于让同一件事有两个出处，而两处一旦分叉，报出来的百分比会
+        悄悄偏掉（见类 docstring 的「永远接近 100%」）。
+        """
+        row = (
+            cls.objects.filter(
+                exchange_account=account, symbol=symbol, business_day=business_day
+            )
+            .exclude(baseline_qty__isnull=True)
+            .order_by("claimed_at", "id")
+            .first()
+        )
+        return row.baseline_qty if row is not None else None
+
+
+class RegimeReducePause(models.Model):
+    """滑点超限之后的**自动减仓暂停**（CONTEXT.md:129 前半）。
+
+    「单次熔断减仓滑点 > 0.5% 则告警并**暂停自动减仓、转人工**」。暂停的是**下新单**这件
+    事，不是撤单：撤单让敞口变小，暂停它没有任何好处。
+
+    ## 暂停的范围必须与证据的范围同宽
+
+    CONTEXT.md:129 定义滑点时明写「**逐品种**按成交量加权」，所以证据是**品种级**的。
+    范围定在（账户 × 品种）而不是整个账户或整个机制：
+
+    * **更宽**（整个账户 / 全场）——一个流动性差的品种成交得差，会让另一个流动性好的
+      品种也减不掉。而熔断的意义恰恰是「在最需要的时候把敞口降下来」，让一次局部的不良
+      成交把机制整体停下来，是拿它的目的去惩罚它。
+    * **更窄**——没有更窄的了：动作的载体就是（账户 × 品种）。
+
+    账户这一维也是必须的：同一个品种在两个账户上的成交可以不同（费率档位、下单量不同），
+    而「转人工」要落到具体哪个账户上。
+
+    ## 为什么是独立一张表，而不是记录上的一个字段
+
+    它是**跨事件存活**的：暂停一旦发生，后面的每一次减仓都要先读它，直到有人解除。挂在
+    某一条减仓记录上，就只有那一条知道自己被暂停了，而下一次减仓会照常下——那等于没暂停。
+    「还没解除」同样用 `closed_at IS NULL` 表达（同 `HaltDeclaration`），不用一列布尔：
+    布尔留不下「什么时候、因为什么、被谁解除的」。
+
+    ## 解除只走人工
+
+    CONTEXT.md:129 的「转人工」就是解除的方式：机制不自己恢复。没有自动到期，也没有
+    「下一次滑点正常了就自动恢复」——滑点正常只说明这一次好，不说明上一次为什么坏。
+    这条判据（含「不要自动恢复」）写在 `apps/regime/reduce_run.py` 的读取处，因为它是
+    策略层的口径而不是这张表的形状。
+    """
+
+    exchange_account = models.ForeignKey(
+        "exchange.ExchangeAccount",
+        on_delete=models.PROTECT,
+        related_name="reduce_pauses",
+        verbose_name="交易所账户",
+    )
+    symbol = models.CharField("品种（交易所口径）", max_length=32)
+
+    #: 触发时的滑点与基准（`evidence`：滑点、基准价、成交均价、触发它的那条记录 id）。
+    #: 证据与结论分开存：解除的人要先能看见「当时凭什么暂停」，否则他只能凭印象解除。
+    reason = models.TextField("暂停原因（必填）")
+    evidence = models.JSONField("触发证据", default=dict, blank=True)
+
+    opened_at = models.DateTimeField("暂停起始（UTC）", db_index=True)
+    closed_at = models.DateTimeField("解除时刻（UTC，空=生效中）", null=True, blank=True, db_index=True)
+    closed_reason = models.CharField("解除原因", max_length=64, blank=True, default="")
+
+    actor_kind = models.CharField("触发方类别", max_length=16, choices=ActorKind.choices())
+    actor_name = models.CharField("触发方", max_length=128)
+
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        db_table = "regime_reduce_pauses"
+        verbose_name = "自动减仓暂停"
+        verbose_name_plural = "自动减仓暂停"
+        ordering = ["-opened_at", "-id"]
+        constraints = [
+            # 同（账户 × 品种）同一时刻只能有一条活着。解除后可以再暂停（冻结流水），
+            # 所以条件唯一而不是无条件——无条件唯一会让第二次暂停只能去改第一条的历史。
+            models.UniqueConstraint(
+                fields=["exchange_account", "symbol"],
+                condition=models.Q(closed_at__isnull=True),
+                name="uniq_live_reduce_pause",
+            )
+        ]
+
+    def __str__(self) -> str:
+        state = "生效中" if self.closed_at is None else f"已解除({self.closed_reason})"
+        return f"{self.symbol} {state}"

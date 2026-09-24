@@ -29,6 +29,7 @@ from .base import (
     OrderResponse,
     OrderFill,
     Position,
+    SymbolRules,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,6 +339,13 @@ class BinanceAdapter(BaseExchangeAdapter):
             avg_price=Decimal(data["avgPrice"]) if data.get("avgPrice") else None,
             fee=None,
             raw=data,
+            symbol=str(data.get("symbol", "") or ""),
+            side=str(data.get("side", "") or "").lower(),
+            # **委托量**（origQty），不是成交量（executedQty）：撤单要报的是
+            # 「撤掉了多大一张单」，而 `filled_qty` 已经在上面单独给了。
+            quantity=(
+                Decimal(data["origQty"]) if data.get("origQty") is not None else None
+            ),
         )
 
     async def _reconcile_order(
@@ -652,6 +660,28 @@ class BinanceAdapter(BaseExchangeAdapter):
         rules = self._symbol_rules or {}
         rule = rules.get(symbol.upper().replace("/", ""))
         return rule["minNotional"] if rule else Decimal("0")
+
+    async def symbol_rules(self, symbol: str) -> Optional[SymbolRules]:
+        """该品种的申报精度（``LOT_SIZE`` 的 ``stepSize`` / ``minQty``）。
+
+        ``min_notional`` 的同款形态：规则尚未加载时先加载，**加载失败会抛**；
+        规则表里没有这个品种则返回 ``None``——「我们不知道」，不是「随便切」。
+
+        **与 ``place_order`` 的拒绝保持一致**：``place_order`` 在同样的两种情形下
+        会直接 ``RuntimeError`` 拒单（见那里的注释）。所以减仓分片拿到 ``None`` 时
+        的正确反应不是「自己去猜一个精度」，而是「本次不下这一片」。
+
+        取整口径与本适配器内部的 ``_normalize_quantity`` 逐字一致（``ROUND_DOWN``
+        + ``quantize(step)``）——但它仍留在本方法之外：**这个方法只回答「规则是
+        什么」，不替调用方取整**。取整是调用方要自己做、并且要留痕的事。
+        """
+        if self._symbol_rules is None:
+            await self._load_symbol_rules()
+        rules = self._symbol_rules or {}
+        rule = rules.get(symbol.upper().replace("/", ""))
+        if not rule:
+            return None
+        return SymbolRules(step_size=rule["stepSize"], min_qty=rule["minQty"])
 
     async def fetch_order(
         self, exchange_order_id: str, symbol: str

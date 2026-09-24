@@ -49,6 +49,16 @@ class OrderResponse:
     avg_price: Optional[Decimal]
     fee: Optional[Decimal]
     raw: dict  # 交易所原始响应，便于调试
+    # 方向与**委托量**（不是成交量）。下单路径用不上它们（请求里就有），``fetch_open_orders``
+    # 却非有不可：撤单步骤要判「这张挂单是不是开仓意图」——判据是「方向与当前持仓相反」，
+    # 没有方向这一列就判不了，只能去 ``raw`` 里翻交易所字段名，而那是把交易所的键名
+    # 漏进判定逻辑（CONTEXT.md:122 的撤单判据属于机制语义，不是交易所细节）。
+    #
+    # 默认空值是为了不改动所有既有构造点；**空方向在 ``reduce.is_opening_order`` 里
+    # 按开仓处理**（fail-closed），所以「没填」不会被读成「平仓，可以不撤」。
+    symbol: str = ""
+    side: str = ""
+    quantity: Optional[Decimal] = None
 
 
 @dataclass
@@ -72,6 +82,27 @@ class OrderFill:
     filled_quantity: Decimal
     avg_fill_price: Optional[Decimal]
     error_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SymbolRules:
+    """一个品种的**申报精度与最小起订量**（交易所约束，只读）。
+
+    减仓分片要回答两个问题：「这一片取整之后是多少」（``step_size``）、
+    「取整之后还收不收」（``min_qty``）。两个都答不出来就不能分片——**猜一个精度**
+    的后果不是下单失败，是数量被悄悄改小或改大。
+
+    字段刻意只有这两个，**不含 ``min_notional``**：那个数已经有自己的公开口
+    （``min_notional()``，带「``Decimal("0")`` = 本适配器不声明该约束」的既有语义）。
+    把一个数搬进两个口，就是在两个地方回答「这个适配器声不声明最小额」，而两者
+    一旦不一致，减仓分片就会按其中一个降片、按另一个不去降。
+
+    **没有 ``min_notional`` 在这里不代表分片不用管它**：调用方仍要单独问一次
+    ``min_notional()``，两处问的是同一个交易所约束的两半。
+    """
+
+    step_size: Decimal
+    min_qty: Decimal
 
 
 class OrderNotFoundError(Exception):
@@ -236,3 +267,24 @@ class BaseExchangeAdapter(ABC):
             约束，就必须返回真实值。
         """
         return Decimal("0")
+
+    async def symbol_rules(self, symbol: str) -> Optional[SymbolRules]:
+        """该品种的申报精度规则（交易所约束，只读）。
+
+        ``min_notional`` 的同款形态，同一条纪律：**取不到时必须返回 ``None``**，
+        绝不许拿一个编出来的 ``step_size`` 顶替。调用方据此知道「这个品种我不敢
+        自己在本地把数量取整」，而不是拿到一个 ``Decimal("1")`` 就以为可以按整数切。
+
+        Returns:
+            ``None`` 表示**本适配器不声明该品种的精度规则**（含「规则表里没有这个
+            品种」与「本适配器压根不解析规则」两种情形）。这与 ``min_notional()``
+            返回 ``Decimal("0")`` 是同一句话的两种写法：**我们不知道**。
+
+        **为什么必须是公开方法**：精度规则是交易所侧的参数，散落在各适配器内部
+            （币安的 ``_symbol_rules``、``_normalize_quantity`` 都是私有的，只在
+            ``place_order`` 内部用）。减仓分片要在**下单之前**知道「这一片取整完还剩
+            多少」，好决定分几片、要不要降片（CONTEXT.md:127）；若在 regime 侧自己
+            解析一份规则，本地就会有两个关于「最小下单量是多少」的答案，而它们分叉
+            的表现是一次分片成功、一次整片被拒。
+        """
+        return None

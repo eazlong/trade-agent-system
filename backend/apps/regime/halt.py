@@ -192,11 +192,24 @@ class HaltVerdict:
         return "停止判定命中：" + "；".join(layer.text for layer in self.layers)
 
 
-def _switch_open(trigger: HaltTrigger, cache: dict[MechanismKind, bool]) -> bool:
-    """这个触发源的开关打开了没有。没有开关的触发源恒为真（保命档）。"""
+def switch_open(
+    trigger: HaltTrigger, cache: dict[MechanismKind, bool] | None = None
+) -> bool:
+    """这个触发源的开关打开了没有。没有开关的触发源恒为真（保命档）。
+
+    **这是「哪个开关管哪条线」的唯一换算口**，所以它是公开的：读侧（``blocking_declarations``
+    ——「此刻挡不挡得住一张单」）与写侧（``reduce_run``——「此刻该不该真的对市场动手」）
+    问的是同一个问题，各自去查一遍 ``HALT_TRIGGER_SWITCH`` 就是给这张表造第二个答案。
+    而这张表里有一处**刻意的不对称**（``BLANKET → None``，见上面的注释），第二个答案
+    分叉的表现就是保命档被某个「默认关」的开关关掉——那正是注释里说要避免的事。
+
+    ``cache`` 是可选的一次求值内共享缓存（按 ``kind`` 缓存）。**不要**在这里做模块级缓存：
+    那一层会变成进程内的开关快照，见模块 docstring 第 3 条（声明与开关都必须现读）。
+    """
     kind = HALT_TRIGGER_SWITCH.get(trigger)
     if kind is None:
         return True
+    cache = {} if cache is None else cache
     if kind not in cache:
         cache[kind] = RegimeMechanismSwitch.current(kind) is MechanismMode.EXECUTING
     return cache[kind]
@@ -229,7 +242,7 @@ def blocking_declarations(*, now: datetime | None = None) -> list[HaltDeclaratio
     return [
         row
         for row in live_declarations(now=now)
-        if _switch_open(trigger_of(row), cache)
+        if switch_open(trigger_of(row), cache)
     ]
 
 

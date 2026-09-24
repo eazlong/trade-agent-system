@@ -1,5 +1,5 @@
 """切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
-+ 停止声明窗口同步（第②段单元 ②c）。
++ 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）。
 
 ## 为什么是独立任务
 
@@ -43,6 +43,26 @@
 同一件事重做几遍（CONTEXT.md:181 按「读安全 / 写危险」区分新任务，这一条属于「写危险但
 可全量重来」）。异常往上抛，失败可见性走已有的两条路：beat 的任务健康检查（跑了没）与
 日报第④段机制健康（结论新不新）。
+
+## 窗口同步任务为什么兼着减仓投递（第②段单元 ②d）
+
+同一轮里，`halt_sync.sync` 之后紧接着 `reduce_run.dispatch`。三件理由，一条代价：
+
+- **撤单先于减仓、同一一次性任务内串行、不并发**（CONTEXT.md:122）。撤单与减仓都在
+  `dispatch` 内部串行；而「窗口开了」这个事实的写入方是 `sync`。拆成两条任务的话，减仓
+  那条要么自己再算一遍「窗口开没开」（第二份判定，与声明行分歧的表现是「写着熔断中、
+  减仓一动不动」），要么依赖另一条任务先跑完——而 beat 不保证两条任务之间的先后。
+- **同一个 `at`**。「窗口此刻开着」（`halt_at <= at < resume_at`）与业务日（「本日第 N 次
+  熔断」）必须出自同一个时刻，否则跨零点的那一轮会出现「按昨天的业务日减、按今天算第几次」。
+  两次 `timezone.now()` 之间的偏移很小，但留着它没有换来任何东西。
+- **「每轮都投」等价于「投一次」**。CONTEXT.md:116 说减仓由一次性任务投递，而这里的
+  「一次性」由 `regime_reduce_records` 的幂等键保证（`claim_record` 的 `get_or_create`），
+  不靠「这条任务只跑一次」——后者在 300 秒一轮的调度里根本表达不出来。
+
+**代价（留给 ②e / ③ 再看）**：有减仓的那一轮不再是 300 秒的事（市价单、分片、子单重试、
+多账户），而 `halt_sync` 里那条「两段窗口之间的小空隙不超过一轮任务间隔」的界是按 300 秒
+写的。跑得比调度间隔长时下一轮会与它重叠：声明对账幂等、减仓有幂等记录，所以重叠不会减
+两次，但「一轮」在两个模块里从此不是同一个长度。
 
 **欠账（单元 ②e）**：声明写入失败该发一条**即时**消息（CONTEXT.md:66 的「告警」= 给具体
 某个人的即时消息，日志不算被看见），因为一个「表里没有窗口」的系统看起来与「现在没有
@@ -244,14 +264,20 @@ def check_report_delivery(self, run_day=None) -> dict:
 
 @app.task(acks_late=True)
 def sync_halt_windows() -> dict:
-    """把事件表与生效判定上的事实对账成 `HaltDeclaration` 行（第②段单元 ②c）。
+    """把事件表与生效判定上的事实对账成 `HaltDeclaration` 行（第②段单元 ②c），
+    并按这批声明投递减仓（第②段单元 ②d）。
 
     这一条是**声明表的唯一写入方**：`halt.py` 的判定函数只读状态、不读事件表
-    （CONTEXT.md:134），所以「谁该拦」到「此刻在拦」的搬运全在这里。
+    （CONTEXT.md:134），所以「谁该拦」到「此刻在拦」的搬运全在这里。减仓接在同一轮里
+    而不是另起一条任务，理由见模块 docstring 的「窗口同步任务为什么兼着减仓投递」。
 
     幂等：期望值逐字取自事实里已经存好的时刻（事件的 `halt_at`、判定的 `effective_at`），
-    所以连着跑两轮，第二轮必然是整表空转。beat 每 5 分钟撞一次、手工补跑任意多次，代价
-    都只是几次空转。
+    所以连着跑两轮，第二轮必然是整表空转。减仓那一侧另有幂等键（`regime_reduce_records`
+    的 `uniq_regime_reduce_record`），所以「跑第二轮」既不会重复写声明，也不会重复减仓。
+    beat 每 5 分钟撞一次、手工补跑任意多次，代价都只是几次空转。
+
+    返回值是 `halt_sync.sync` 的摘要，外加一个 `reduce_rows`（本轮写下的减仓记录条数，
+    空闲轮为 0）。
 
     没有 `max_retries`、也不吞异常——理由见模块 docstring（对账的下一次执行就是重试）。
     beat 用固定 300 秒间隔而不是 crontab：`CELERY_TIMEZONE` 是 UTC，而这条任务只关心
@@ -259,11 +285,23 @@ def sync_halt_windows() -> dict:
     """
     from django.db import close_old_connections
 
-    from apps.regime import halt_sync
+    from apps.regime import halt_sync, reduce_run
 
     try:
         # 成功那一轮的日志由 `halt_sync.sync` 自己记（它知道每类改动几条）。
-        return halt_sync.sync()
+        summary = halt_sync.sync()
+        # ②d：声明行落库之后**紧接着**投递减仓。顺序不能反——`reduce_run` 认「窗口开着」
+        # 靠的正是 `HaltDeclaration`，这一轮刚写的行要在同一轮里被它看见，否则窗口刚开的
+        # 那一轮会整个跳过减仓。两次调用之间不重取 `now`：窗口判定与业务日出自同一时刻
+        # （见模块 docstring 的「窗口同步任务为什么兼着减仓投递」）。
+        #
+        # 不传 `extra_open`：那是给「本函数读表之后由别的写方插进来的 `HaltDeclaration`」
+        # 留的口子（`halt_sync._reconcile` 的 docstring 记着 ②d 那种场景），而 ②d 不写声明
+        # 表——它的认领行是 `RegimeReduceRecord`，且它排在本行之后，所以「它写的行」这件事
+        # 在时序上不存在。为了不存在的行多接线，代价是给 `_reconcile` 一条永远为空的入参。
+        fired = reduce_run.dispatch()
+        summary["reduce_rows"] = fired.get("rows", 0)
+        return summary
     finally:
         # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()
