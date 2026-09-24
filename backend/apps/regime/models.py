@@ -1013,6 +1013,14 @@ class HaltDeclaration(models.Model):
     触发过什么」的记录，而关掉开关只该让它们不再作数，不该抹掉。若把开关状态也写进行
     （比如解除掉），开关一开一关就会在流水里制造一堆「声明—解除」的假历史。
 
+    **本表的读者里有一个人。** 声明行不只是判定函数的输入，它还是「机制此刻在拦什么」对
+    用户唯一说得出口的东西——所以「窗口开了」与「窗口结束了」各要发一条即时消息（第②段
+    单元 ②e，见 `apps/regime/halt_notify.py`）。下面两列就是那条消息的账。**账记在行上、
+    不另开一张订阅表**：「该通知谁」是**求值**出来的（受影响策略的活跃实盘会话），不是谁
+    订了这个窗口——事件熔断不可人工豁免，通知是机制的责任而不是订阅的产物。而账只记
+    「什么时候发的」不记布尔：只记「发过」的话，用户说没收到时答不出话（`DailyReport.delivery`
+    的先例）。
+
     **写入方是窗口同步任务**（`apps/regime/halt_sync.py`，第②c 段）：它每 300 秒整表重算
     一轮，按（触发源 × 作用域）对账。两件只由这条接线决定、别处看不出来的事：
 
@@ -1038,6 +1046,12 @@ class HaltDeclaration(models.Model):
 
     closed_at = models.DateTimeField("解除时刻（UTC，空=生效中）", null=True, blank=True, db_index=True)
     closed_reason = models.CharField("解除原因", max_length=64, blank=True, default="")
+
+    # 「开窗 / 结束」两条即时消息发出去了没有。空 = 还没发（**不是「不用发」**）。
+    # 发送方是 `halt_notify`，写入方是那条窗口同步任务；`halt_sync._rewrite` 在窗口起点被
+    # 改写时把 `opened_notified_at` 清回空（通知讲的是那个起点，起点变了它就过期了）。
+    opened_notified_at = models.DateTimeField("开窗通知时刻（UTC，空=未发）", null=True, blank=True)
+    closed_notified_at = models.DateTimeField("结束通知时刻（UTC，空=未发）", null=True, blank=True)
 
     reason = models.TextField("声明依据（必填）")
 

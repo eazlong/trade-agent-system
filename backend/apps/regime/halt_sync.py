@@ -71,12 +71,19 @@
 **第③段接策略停用决策时，要么把那一档也接进 `_plan`，要么把它从这个跳过名单的语义里显式
 分开**——两条路都行，但必须选一条。
 
-## 一个可见性缺口（第②段有意留着）
+## 失败可见性与那两条即时消息（第②e 段落定）
 
-任务失败**不自己发告警**（CONTEXT.md:66 的「告警」= 给具体某个人的即时消息，日志不算被
-看见；CONTEXT.md:180「不让每个新任务自己写告警」）。它只往上抛，失败可见性走已有的两条路：
-任务健康检查（跑了没）+ 日报第④段机制健康（结论新不新）。而「声明写入失败」该发的那条
-**即时**消息归单元 ②e，见 `tasks.py` 的模块 docstring。
+本模块自己**不发告警**（CONTEXT.md:66 的「告警」= 给具体某个人的即时消息，日志不算被
+看见；CONTEXT.md:180「不让每个新任务自己写告警」）：失败**往上抛**，公开可见性走已有的
+两条路——任务健康检查（跑了没）+ 日报第④段机制健康（结论新不新）。
+
+而给**人**看的两条消息落在调用方（`tasks.sync_halt_windows`），不在本模块：一条是
+「声明写入失败」（②e 的 Q7），另一条是每次窗口开/关的窗口通知。理由与「本层只把待告知
+的名单放进返回值」同源（`replay_run` 的 docstring）：收件人要读 `LiveSession`，那是另一
+件事的取数，不该混进「算差异」这一步。发送方与那两列的账在 `apps/regime/halt_notify.py`。
+
+**本模块唯一替 ②e 做的事**：`_rewrite` 在窗口起点被改写时清掉 `opened_notified_at`。
+这不是发送，是「这一行的事实变了」的一部分，只有本模块知道。
 """
 
 from __future__ import annotations
@@ -486,11 +493,16 @@ def _rewrite(row: HaltDeclaration, desired: PlannedRow) -> bool:
     `closed_at` / `closed_reason` 之外没有时间戳，看不出「它上次真的变了是什么时候」。
     比对 `opened_at` / `expires_at` 是安全的：两者都取自事实（事件的 `halt_at` /
     `resume_at`、判定的 `effective_at`），逐次重算逐字相同。
+
+    **窗口起点被改写时，顺手把开窗通知的账清掉**（`opened_notified_at`，第②e 段）：
+    那条消息讲的就是「从这一刻起开始拦」，起点变了它就过期了。不清的话，改期之后新起点
+    到点不会有任何消息——用户手上留着一条已经不对的时刻，而机制以为通知过了。
     """
+    moved = row.opened_at != desired.opened_at
     if (
         row.label == desired.label
         and row.reason == desired.reason
-        and row.opened_at == desired.opened_at
+        and not moved
         and row.expires_at == desired.expires_at
     ):
         return False
@@ -498,7 +510,11 @@ def _rewrite(row: HaltDeclaration, desired: PlannedRow) -> bool:
     row.reason = desired.reason
     row.opened_at = desired.opened_at
     row.expires_at = desired.expires_at
-    row.save(update_fields=["label", "reason", "opened_at", "expires_at"])
+    fields = ["label", "reason", "opened_at", "expires_at"]
+    if moved:
+        row.opened_notified_at = None
+        fields.append("opened_notified_at")
+    row.save(update_fields=fields)
     return True
 
 

@@ -1,0 +1,337 @@
+"""停止声明的窗口通知（第②段单元 ②e）。
+
+`HaltDeclaration` 是「机制此刻在拦什么」唯一说得出口的东西，而这个模块负责把它
+**说给人听**：窗口开了发一条、窗口结束了发一条。加上 `tasks.sync_halt_windows` 里
+那条「声明写入失败」的即时告警，②e 一共三条消息，共用这里的收件人口径与那一个出口。
+
+## 为什么必须有这一层（而不是日志）
+
+一个「表里没有窗口」的系统与「现在没有事件」的系统，从外面看起来一模一样——用户不看
+日志，而 CONTEXT.md:66 把「告警」定义成**给一个具体的人的即时消息**。事件熔断又**不可
+人工豁免**，所以「窗口开了」这件事如果没有主动说出来，用户遇到的是一个不声不响就不让
+下单的系统。这条对「窗口结束」同样成立：不说的话，用户会以为熔断还在。
+
+## 收件人：受影响策略的活跃实盘会话（不是订阅者）
+
+口径与 `replay_run.alert_recipients` / `deactivation_run.running_strategy_ids` **同一处**
+（`mode="live"` ∧ `LiveSession.ACTIVE_STATUSES`）：作用域 → 该作用域上的活跃实盘策略 →
+这些策略的用户。三件事决定了这个取法：
+
+- **没有订阅表**。「该通知谁」是**求值**出来的，不是谁订了这个窗口。事件熔断不可人工
+  豁免，通知是机制的责任而不是订阅的产物；而一张订阅表会与声明行各自漂移（声明行可以
+  被无痕改写、可以被解除，订阅关系不会跟着动）。
+- **模拟盘不持仓真钱**，所以不在收件人里——与「停用决策不影响模拟盘」同一个理由。
+- **作用域三档共用一条换算**：`global` = 全体活跃实盘会话；`symbol:X` = 这条会话的
+  品种恰好是 `X`；`strategy:<id>` = 那条策略。品种是**逐字比**，不做归一化——声明
+  作用域与 `LiveSession.symbol` 是同一套写法（`BTC/USDT`），换算成交易所口径是
+  `reduce_run.normalize_scope_symbol` 那一步的事，在这里再换一次就是给「这个品种叫
+  什么」造第二个答案（`halt.symbol_scope` 的 docstring 同一条纪律）。
+
+**空收件人是合法的、且必须被如实报出来**（与 `reduce_run` 的减仓通知不同）：第②段整个
+是 Shadow，一条活跃实盘会话都没有是常态。这不是失败，也不该读成「已经通知过了」——
+`notify_pending` 把这类行单独计数（`no_recipients`），调用方把它报出去。
+
+## 账记在行上、只记成功的那一次
+
+`HaltDeclaration.opened_notified_at` / `closed_notified_at`（第②e 段加的）是这两条消息的
+账。规矩只有一条：**送达了才记账**。于是「任务在半路崩了」不会吞掉一条消息——下一轮
+（300 秒后）那一行还在待通知里，重发一遍。这与 `report.deliver_daily_report` 的
+「已成功送达的人不再重投」是同一种写法。
+
+两类「没送成」在**记不记账**上是相反的，因为一件是终局的、一件是可重试的：
+
+- **收件人为空** → 终局：此刻没人受影响，记账，计数 `no_recipients`。不记账的话，一个
+  没人在听的窗口会每 300 秒重试一整段窗口期。
+- **`notify_user` 返回 `False`**（推送通路失败）→ 可重试：**不记账**，下一轮再发。代价是
+  部分成功时（N 个收件人里挂了 1 个）那些已经收到的人会再收到一遍——账是行级的一对
+  时刻，记不出「哪几个人收到了」，而按人记账是另一张表（`DailyReport.delivery` 那样的
+  JSON）。为一条 300 秒重试的窗口通知开那张表不值，重复一条消息的代价比漏掉一条小。
+- **失败不再往上告警**（第②e 段 Q8）：递归告警没有底，通知发不出去这件事只记日志、并把
+  计数放进任务返回值，由 beat 的任务健康检查看见。
+
+## 这一层是同步的，出站那一步是 async
+
+出站口 `alerts.notify_user` 是 async，而调用方（`tasks.sync_halt_windows`）是同步的
+Celery 任务，所以这里用 `asyncio.run` 包一层——与 `report.deliver_daily_report` 同一个
+写法（`report._send_to_each`）。渲染与挑选是**纯函数/普通查询**，测试可以直接调，
+不必绕过 async 那一跳。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any, Sequence
+
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+
+from apps.regime import events, halt, halt_sync
+from apps.regime.models import HaltDeclaration
+from apps.trading.models import LiveSession
+
+logger = logging.getLogger(__name__)
+
+#: 两类窗口消息。字符串也是摘要里的键，别改着玩。
+KIND_OPENED = "opened"
+KIND_CLOSED = "closed"
+
+_SHADOW_NOTE = "当前为 Shadow（只记录、不真拦）：下面这条窗口已记进停止声明，但下单通路尚未按它拦截。"
+
+
+# --------------------------------------------------------------------------- #
+# 收件人
+# --------------------------------------------------------------------------- #
+
+
+def recipients_for_scope(scope: str) -> tuple[str, ...]:
+    """一个作用域上「受影响用户」的收件人，**字符串化**、去重后按 id 排序。
+
+    空元组是**合法**的（见模块 docstring）：它意味着此刻没有活跃实盘会话，而不是
+    「通知失败了」。
+
+    `user_id` 那一列是 UUID，直接 `values_list` 出来的是 UUID 实例。这里统一成 `str`：
+    与 `all_active_user_ids`（同一个模块）和 `reduce_run.recipients_for` 同一形状，而
+    出站口的推送通道本来就把 id 当字符串用（`alerts.notify_user` 里那句 `str(user_id)`）。
+    两个收件人函数返回不同的类型只会让「出去的是什么」这件事多一个说不清的地方。
+    """
+    kind, value = halt.parse_scope(scope)
+    sessions = LiveSession.objects.filter(
+        mode="live", status__in=LiveSession.ACTIVE_STATUSES
+    )
+    if kind == "symbol":
+        sessions = sessions.filter(symbol=value)
+    elif kind == "strategy":
+        sessions = sessions.filter(strategy_id=value)
+    return tuple(
+        str(pk)
+        for pk in sessions.values_list("user_id", flat=True)
+        .distinct()
+        .order_by("user_id")
+    )
+
+
+def all_active_user_ids() -> list[str]:
+    """全体启用用户。**只给「机制自身健康」那类消息用**（第②e 段 Q7）：
+
+    CONTEXT.md:66 把落点分成两类——业务动作失败发给**受影响用户**，机制自身健康发给
+    **全体 `is_active` 用户**。声明写入失败属于后者：它不是「你的单出事了」，而是
+    「机制现在说不出自己在拦什么了」，而这件事对所有人都有后果。
+
+    与 `reduce_run.recipients_for` 的「未归属账户」那一路同一个取法、同一条理由。
+    """
+    return [
+        str(pk)
+        for pk in get_user_model()
+        .objects.filter(is_active=True)
+        .values_list("pk", flat=True)
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 待通知的行（普通查询；「送达了才记账」的记账口就是这里的两个谓词）
+# --------------------------------------------------------------------------- #
+
+
+def pending_opened(*, now: datetime | None = None) -> list[HaltDeclaration]:
+    """窗口起点已到、但还没通知过的行。
+
+    **不要求它还活着**：一个短到「开与关落在同一轮任务之间」的窗口，那一轮如果任务没跑
+    成，下一轮会先补发「已开启」再发「已结束」（`pending_closed` 的谓词要求先有过开窗
+    通知），两条都在、顺序也对。要求活着的话这种窗口会一条消息都不发。
+
+    代价是**上线首轮的一次性补发**：②e 之前就已经在表里的行（①/②c/②d 期间写下的）都
+    没有账，于是各补一条「已开启」。那几条消息说的都是真事（那些窗口确实开着），且只补
+    一次。
+    """
+    at = now or timezone.now()
+    return list(
+        HaltDeclaration.objects.filter(
+            opened_at__lte=at, opened_notified_at__isnull=True
+        ).order_by("opened_at", "id")
+    )
+
+
+def pending_closed(*, now: datetime | None = None) -> list[HaltDeclaration]:
+    """已经解除、但还没通知过的行。
+
+    **要求 `opened_notified_at` 非空**：只有对一个人说过「它开了」，才有资格对他说
+    「它结束了」。这条谓词顺带把上线首轮的补发限制在一处——②e 之前解除掉的历史行没有
+    开窗账，于是不会被补一条莫名其妙的「已结束」。
+    """
+    return list(
+        HaltDeclaration.objects.filter(
+            closed_at__isnull=False,
+            closed_notified_at__isnull=True,
+            opened_notified_at__isnull=False,
+        ).order_by("closed_at", "id")
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 渲染（纯函数——收 `shadow` 而不是自己去读开关，测试不必碰库）
+# --------------------------------------------------------------------------- #
+
+
+def _trigger_display(row: HaltDeclaration) -> str:
+    return halt.trigger_of(row).display
+
+
+def _window_line(row: HaltDeclaration) -> str:
+    """一行说清窗口。**两个时刻都走 `events.format_moment`**：同一个时刻在事件库、日报
+    与这里必须是同一句话（各写一遍就是「同一件事三处说法不同」，而读者是同一批人）。"""
+    start = events.format_moment(row.opened_at)
+    if row.expires_at is None:
+        return f"窗口：{start} 起（截止时刻不定）"
+    return f"窗口：{start} → {events.format_moment(row.expires_at)}"
+
+
+def notify_body(row: HaltDeclaration, kind: str, *, shadow: bool) -> str:
+    """一条窗口消息的正文。``shadow`` 是**发这条消息的此刻**这条线在不在 Shadow。
+
+    Shadow 提示**单独占第一行**（第②e 段 Q6）：不写的话，「窗口已记录」会被读成「已经
+    拦住了」，而 Shadow 期这两件事恰好相反——用户会以为下单被挡住了，实际没有。
+    它说的是「此刻」，不是「窗口开的时候」：开关在这中间被打开过的话，事实以此刻为准。
+    """
+    scope = halt.scope_display(row.scope)
+    lines: list[str] = []
+    if shadow:
+        lines.append(f"⚠️ {_SHADOW_NOTE}")
+    if kind == KIND_OPENED:
+        lines.append(f"🔒 【{_trigger_display(row)}】窗口已开启｜作用域 {scope}")
+        lines.append(_window_line(row))
+        lines.append(f"依据：\n{row.reason}")
+    else:
+        lines.append(f"🔓 【{_trigger_display(row)}】窗口已结束｜作用域 {scope}")
+        lines.append(_window_line(row))
+        lines.append(
+            f"解除：{events.format_moment(row.closed_at)}"
+            f"（{halt_sync.close_reason_display(row.closed_reason)}）"
+        )
+    return "\n".join(lines)
+
+
+def write_failure_body(error: str) -> str:
+    """「声明写入失败」那条消息的正文。
+
+    必须把**后果**写出来，而不只是报一个异常：一个「表里没有窗口」的系统看起来与「现在
+    没有事件」一模一样，而事件熔断不可人工豁免——所以这段文字要说的不是「有个任务挂了」
+    （那是任务健康检查的事），而是「此刻没人知道该不该拦，请人工看一眼」。
+    """
+    return (
+        "🚨 停止声明窗口同步失败：机制此刻说不出自己在拦什么\n"
+        "后果：停止声明表**没有被本轮对账更新**。事件熔断不可人工豁免，所以在这条恢复"
+        "之前，本该被熔断的窗口可能不在表里——表现与「现在没有事件」完全一样，"
+        "日志里看不出来。\n"
+        f"错误：{error}\n"
+        "下一轮（300 秒后）会自动重来；连续失败请人工核对事件表与停止声明表。"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 出站（唯一出口：`alerts.notify_user`）
+# --------------------------------------------------------------------------- #
+
+
+async def _send_to_each(user_ids: Sequence[Any], text: str) -> int:
+    """投给一串人，返回送达人数。写法与 `reduce_run._alert` / `report._alert_each` 同款。"""
+    from apps.trading.alerts import notify_user
+
+    sent = 0
+    for user_id in user_ids:
+        if await notify_user(user_id, text):
+            sent += 1
+    return sent
+
+
+def _mark(row: HaltDeclaration, kind: str, at: datetime) -> None:
+    """记下这一类的通知已送达。**只在送达之后调**。"""
+    field = "opened_notified_at" if kind == KIND_OPENED else "closed_notified_at"
+    setattr(row, field, at)
+    row.save(update_fields=[field])
+
+
+def _shadowed(row: HaltDeclaration) -> bool:
+    """这条线此刻在不在 Shadow。`halt.switch_open` 是「哪个开关管哪条线」的唯一换算口，
+    所以保命档在这里恒为「不在 Shadow」（它没有开关、永远作数）。"""
+    return not halt.switch_open(halt.trigger_of(row))
+
+
+def notify_pending(*, now: datetime | None = None) -> dict:
+    """把该发的窗口消息发出去，返回 ``{opened, closed, failed, no_recipients}``。
+
+    **两批按顺序走**：先开窗、后结束。顺序有意义——`pending_closed` 的谓词要求开窗已
+    记账，所以同一条短窗口在**同一轮**里补发时会先「开启」后「结束」，读起来是顺的。
+    为此结束那一批的查询在开窗那一批**写完之后**才发。
+
+    **不抛异常**：发不出去是「这条消息没送到」，不是「对账失败」——后者才该让任务标
+    FAILURE（`sync` 的异常往上抛）。这里只记日志并把计数放进返回值。
+    """
+    at = now or timezone.now()
+    summary = {"opened": 0, "closed": 0, "failed": 0, "no_recipients": 0}
+
+    # 两批的取数口是**惰性**的（lambda），不是先把两个列表都查出来：`pending_closed`
+    # 的谓词要求 `opened_notified_at` 非空，所以它必须在开窗那一批**写完账之后**才查。
+    # 预先求值的话，同一轮里的短窗口只会发出「已开启」——那条谓词当场失效，而这个 bug
+    # 没有任何外部迹象（`closed` 计数为 0 读起来就是「没有窗口结束」）。
+    for kind, fetch in (
+        (KIND_OPENED, lambda: pending_opened(now=at)),
+        (KIND_CLOSED, lambda: pending_closed()),
+    ):
+        for row in fetch():
+            recipients = recipients_for_scope(row.scope)
+            if not recipients:
+                # 终局：此刻没有人受影响。记账，免得一个没人在听的窗口每 300 秒重试一遍。
+                _mark(row, kind, at)
+                summary["no_recipients"] += 1
+                logger.info(
+                    "[regime] 停止声明窗口通知：%s 无收件人（作用域 %s），只记账",
+                    kind,
+                    row.scope,
+                )
+                continue
+
+            text = notify_body(row, kind, shadow=_shadowed(row))
+            sent = asyncio.run(_send_to_each(recipients, text))
+            if sent == len(recipients):
+                _mark(row, kind, at)
+                summary[kind] += 1
+            else:
+                # 不记账 → 下一轮重发（可能给已收到的人重复一条，见模块 docstring）。
+                summary["failed"] += 1
+                logger.warning(
+                    "[regime] 停止声明窗口通知未送达 kind=%s scope=%s 送达 %s/%s",
+                    kind,
+                    row.scope,
+                    sent,
+                    len(recipients),
+                )
+
+    if summary["opened"] or summary["closed"] or summary["failed"]:
+        logger.info("[regime] 停止声明窗口通知：%s", summary)
+    return summary
+
+
+def alert_declaration_write_failure(error: Exception) -> dict:
+    """声明写入失败 → 全体 `is_active` 用户（第②e 段 Q7）。
+
+    **流程是「发完再往上抛」**，与 `reduce_run._alert` 的「发了就继续」不同：那条路失败
+    的是**一个动作的结果**，任务本身还活得下去；这条说的是**机制说不出自己在拦什么**，
+    对账没完成就该让任务标 FAILURE（下一轮会自动重来，见 `tasks.py` 的模块 docstring）。
+
+    Returns:
+        ``{"recipients": n, "delivered": n}``。发不出去也只记日志——原本那个异常才是要
+        往上抛的东西，替换掉它会让真实故障从任务健康检查里消失（第②e 段 Q8：不递归告警，
+        但也不静默成功）。
+    """
+    text = write_failure_body(str(error))
+    recipients = all_active_user_ids()
+    sent = asyncio.run(_send_to_each(recipients, text))
+    if sent != len(recipients):
+        logger.error(
+            "[regime] 声明写入失败的告警自身未送达：%s/%s（原异常仍往上抛）",
+            sent,
+            len(recipients),
+        )
+    return {"recipients": len(recipients), "delivered": sent}

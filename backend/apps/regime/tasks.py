@@ -1,5 +1,6 @@
 """切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
-+ 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）。
++ 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）
++ 窗口通知与声明写入失败告警（第②段单元 ②e）。
 
 ## 为什么是独立任务
 
@@ -64,9 +65,26 @@
 写的。跑得比调度间隔长时下一轮会与它重叠：声明对账幂等、减仓有幂等记录，所以重叠不会减
 两次，但「一轮」在两个模块里从此不是同一个长度。
 
-**欠账（单元 ②e）**：声明写入失败该发一条**即时**消息（CONTEXT.md:66 的「告警」= 给具体
-某个人的即时消息，日志不算被看见），因为一个「表里没有窗口」的系统看起来与「现在没有
-事件」一模一样。这条归 ②e，与投递失败告警一起做；在那之前这里只有日志。
+## 三条即时消息为什么都挂在这一条任务上（第②段单元 ②e）
+
+声明写入失败、窗口开启、窗口结束——三条都是「给一个具体的人的即时消息」（CONTEXT.md:66
+的「告警」定义），而 ②e 之前，一个「表里没有窗口」的系统看起来与「现在没有事件」一模
+一样。它们全在这一条任务上，因为**它是声明表唯一的写入方**：只有它知道这一轮刚刚把哪
+些行改成了什么样子，也只有它能在写失败时立刻说话。收件人口径、渲染与那唯一一个出口
+（`alerts.notify_user`）都在 `apps/regime/halt_notify.py`；本模块只管**时机**：
+
+- **窗口通知在 `halt_sync.sync()` 之后、`reduce_run.dispatch()` 之前**（②e Q5）。顺序的
+  理由与 ②d 同源——「窗口此刻开着」这个事实的写入方是 `sync`，通知与减仓都读它；而通知
+  排在减仓之前是因为它们**互不相干**：`dispatch` 里那道闸门（②d Q8）问的是「这一轮要不要
+  真对市场动手」，而「窗口开了」这件事永远要说，Shadow 期尤其要说（②e Q6：Shadow 期的
+  消息首行写明「只记录、不真拦」，否则用户会以为下单已经被挡住）。
+- **声明写入失败走 catch → 发 → 再抛**（②e Q7），与 `reduce_run._alert`（发了就继续）
+  不同：失败的是机制本身，对账没完成就该让任务标 FAILURE——下一轮 300 秒的对账就是重试。
+  告警发不出去也只记日志（②e Q8：不递归告警），但**绝不吞掉原异常**——吞掉会让真实故障
+  从 beat 的任务健康检查里消失。
+- **通知失败不改变任务成败**：任务跑成功了、只是有人的消息没送到，那是 `window_notify`
+  里的计数（`failed` / `no_recipients`），随返回值进任务健康检查。窗口通知本身**没有**
+  重试逻辑——「送达了才记账」加上 300 秒一轮的调度就是重试（`halt_notify` 的 docstring）。
 """
 
 from __future__ import annotations
@@ -265,19 +283,24 @@ def check_report_delivery(self, run_day=None) -> dict:
 @app.task(acks_late=True)
 def sync_halt_windows() -> dict:
     """把事件表与生效判定上的事实对账成 `HaltDeclaration` 行（第②段单元 ②c），
-    并按这批声明投递减仓（第②段单元 ②d）。
+    投递减仓（第②段单元 ②d），并发那三条即时消息（第②段单元 ②e）。
 
     这一条是**声明表的唯一写入方**：`halt.py` 的判定函数只读状态、不读事件表
     （CONTEXT.md:134），所以「谁该拦」到「此刻在拦」的搬运全在这里。减仓接在同一轮里
-    而不是另起一条任务，理由见模块 docstring 的「窗口同步任务为什么兼着减仓投递」。
+    而不是另起一条任务，理由见模块 docstring 的「窗口同步任务为什么兼着减仓投递」；
+    窗口通知与失败告警也在这里，理由见「三条即时消息为什么都挂在这一条任务上」。
 
     幂等：期望值逐字取自事实里已经存好的时刻（事件的 `halt_at`、判定的 `effective_at`），
     所以连着跑两轮，第二轮必然是整表空转。减仓那一侧另有幂等键（`regime_reduce_records`
-    的 `uniq_regime_reduce_record`），所以「跑第二轮」既不会重复写声明，也不会重复减仓。
-    beat 每 5 分钟撞一次、手工补跑任意多次，代价都只是几次空转。
+    的 `uniq_regime_reduce_record`）；通知那一侧靠 `HaltDeclaration` 上的两个通知时刻
+    「送达了才记账」。所以「跑第二轮」既不会重复写声明、也不会重复减仓，也不会重复通知
+    （**没送达的会重发**，那是重试而不是重复）。beat 每 5 分钟撞一次、手工补跑任意多次，
+    代价都只是几次空转。
 
-    返回值是 `halt_sync.sync` 的摘要，外加一个 `reduce_rows`（本轮写下的减仓记录条数，
-    空闲轮为 0）。
+    返回值是 `halt_sync.sync` 的摘要，外加 ``reduce_rows``（本轮写下的减仓记录条数，空闲
+    轮为 0）与 ``window_notify``（窗口通知的计数：``opened`` / ``closed`` / ``failed`` /
+    ``no_recipients``）。后两者进 beat 的任务健康检查——**通知发不出去不改变任务成败**
+    （那是「有人没收到消息」，不是「对账没完成」）。
 
     没有 `max_retries`、也不吞异常——理由见模块 docstring（对账的下一次执行就是重试）。
     beat 用固定 300 秒间隔而不是 crontab：`CELERY_TIMEZONE` 是 UTC，而这条任务只关心
@@ -285,11 +308,23 @@ def sync_halt_windows() -> dict:
     """
     from django.db import close_old_connections
 
-    from apps.regime import halt_sync, reduce_run
+    from apps.regime import halt_notify, halt_sync, reduce_run
 
     try:
-        # 成功那一轮的日志由 `halt_sync.sync` 自己记（它知道每类改动几条）。
-        summary = halt_sync.sync()
+        try:
+            # 成功那一轮的日志由 `halt_sync.sync` 自己记（它知道每类改动几条）。
+            summary = halt_sync.sync()
+        except Exception as exc:
+            # ②e Q7：catch → 发 → 再抛。**不吞**：对账没完成，任务就该标 FAILURE。
+            logger.error("[regime] 声明写入失败，已发告警后继续往上抛", exc_info=True)
+            logger.error(
+                "[regime] 声明写入失败告警结果：%s",
+                halt_notify.alert_declaration_write_failure(exc),
+            )
+            raise
+        # ②e Q5：窗口通知排在减仓**之前**，且不受 ②d 那道闸门管——「窗口开了」这件事
+        # 与「这一轮要不要真动手减仓」是两个问题，前者永远要说。
+        summary["window_notify"] = halt_notify.notify_pending()
         # ②d：声明行落库之后**紧接着**投递减仓。顺序不能反——`reduce_run` 认「窗口开着」
         # 靠的正是 `HaltDeclaration`，这一轮刚写的行要在同一轮里被它看见，否则窗口刚开的
         # 那一轮会整个跳过减仓。两次调用之间不重取 `now`：窗口判定与业务日出自同一时刻
