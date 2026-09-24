@@ -116,6 +116,9 @@ class SignalDispatcher:
                 # 带上账户 id：风控按它解析适配器，才不会拿同交易所另一个账户的
                 # 余额来算本单的仓位上限。
                 exchange_account_id=exchange_account_id,
+                # 会话 id 也要带上：停止判定的策略档要靠它换出策略 id。少这一行的表现是
+                # 「停用决策写进了日报，单还是出去了」——不会红任何别的东西。
+                live_session_id=live_session_id,
             )
             approved, reason = await riskguard.pre_trade_check(request, user_id)
             if not approved:

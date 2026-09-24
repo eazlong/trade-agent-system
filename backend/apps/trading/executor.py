@@ -321,6 +321,9 @@ class OrderExecutor:
             # 风控要按**同一个**账户解析：这里传下去的账户 id 就是本单即将使用的那个
             # 适配器，风控拿它算仓位/余额才和下面的下单是同一笔钱。
             exchange_account_id=str(exchange_account_id) if exchange_account_id else None,
+            # 同上，会话 id 是**判定输入**而不是追溯字段：策略档的停止声明要靠它换出
+            # 策略 id，而落库（`_persist_order`）在风控之后，来不及。
+            live_session_id=live_session_id,
         )
         if is_close_position:
             logger.info("[SF-07a][OrderExecutor] close position — skipping RiskGuard")

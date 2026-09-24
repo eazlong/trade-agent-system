@@ -37,6 +37,13 @@ class OrderRequest:
     # 这里只是**标志**，翻译成本地约束是各交易所适配层的事（币安 → `reduceOnly`）。
     # 在适配层翻译接通之前，任何路径都不得开启自动减仓。
     reduce_only: bool = False
+    # 这一单出自哪条实盘会话（`LiveSession.id`）。**它不是流水号，是判定输入**：
+    # 停止判定的策略档钉在 `Strategy.id` 上，而一张单自己只答得出会话 id —— 「会话 →
+    # 策略」的那一跳由 `RiskGuard._halt_block_reason` 完成（见 `_strategy_of_session`）。
+    #
+    # 少了它，策略档的停用永远不生效，而那种失效不会红任何别的东西：日报里写着「已停用」，
+    # 单照常出去。所以它必须随单一路到这里，而不是等到落库时再补——落库在风控之后。
+    live_session_id: Optional[str] = None
 
 
 @dataclass

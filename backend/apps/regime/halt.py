@@ -253,7 +253,8 @@ def _matches(scope: str, symbol: str, strategy_id: str | None) -> bool:
     生效**。不认而不是「认成全市场」，是因为认了就等于「一条针对某个策略的停用把别人的
     单也拦了」；而如果第③段忘了把 id 带下来，这个选择的表现是**停用不生效**——它会在
     池化/停用日报里被看见（策略仍在下单），比「全场莫名停摆」容易得多。
-    第③段接进来时，必须同时把 id 从 ``live_session_id`` 那条路带到这里。
+    id 的来源有两处，都是**同一列**（`LiveSession.strategy_id`）：启动/恢复回显由视图
+    直接传，下单通路由 `RiskGuard._strategy_of_session` 从 `live_session_id` 换出来。
     """
     kind, value = parse_scope(scope)
     if kind == "symbol":
@@ -283,9 +284,9 @@ def halt_layers(
 ) -> HaltVerdict:
     """**下单拦截的判定入口**：这一张单此刻挡不挡得住，被谁挡。
 
-    ``symbol`` 是 ``OrderRequest.symbol``。``strategy_id`` 第②段没有调用方会给
-    （下单通路上拿不到它），先留在签名里——第③段从 ``live_session_id`` 带下来之后，
-    ``_matches`` 里那条策略档判据才会第一次真正生效。
+    ``symbol`` 是 ``OrderRequest.symbol``。``strategy_id`` 第②段没有调用方会给（下单
+    通路上拿不到它），那时恒为 ``None``；第③段接上之后由 `RiskGuard._strategy_of_session`
+    从 ``live_session_id`` 换出来带到这里，``_matches`` 里那条策略档判据才第一次真正生效。
 
     ``now`` 只用于求生效期，**不参与任何别的推断**：判定函数不看「今天是什么阶段」，
     也不看事件表。那些都在写入状态行的时候算完了。

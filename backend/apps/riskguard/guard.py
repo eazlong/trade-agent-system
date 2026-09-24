@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from apps.core.db_utils import db_async
 
 if TYPE_CHECKING:
+    from apps.regime.halt import HaltVerdict
     from apps.trading.adapters.base import OrderRequest
 
 from apps.riskguard.circuit_breaker import CircuitBreaker
@@ -39,6 +40,45 @@ logger = logging.getLogger(__name__)
 #: 写成模块常量而不是就地拼串，是因为它会被测试与告警文案引用——两处各拼一遍迟早
 #: 会漂，而「理由文案变了」这种事不会有人报上来。
 HALT_LOOKUP_FAILED_REASON = "熔断状态查询失败，按保守方向处理"
+
+
+def _strategy_of_session(live_session_id: str | None) -> str | None:
+    """这张单属于哪个策略。**下单通路上「会话 → 策略」的唯一换算口。**
+
+    停止声明的策略档钉在 `Strategy.id` 上（`halt.strategy_scope`），而一张单自己只答
+    得出会话 id——这一跳是两者之间唯一的桥。少了它，策略档的停用永远不生效，而那种
+    失效不会红任何别的东西：日报上写着「已停用」，单照常出去。
+
+    查不出来就返回 ``None``，**既不抛也不按全市场处理**：``None`` 在 `halt._matches`
+    里的语义正是「策略档行不认它生效」，于是退化成**停用没生效**（池化与停用日报里
+    看得见），而不是「全场莫名停摆」。会话行不见了，该管的是那条会话，不是把这一单
+    拦下来。
+
+    查询本身抛（例如 id 根本不是 UUID）**不在这里吞**：那属于「查不出状态」，由
+    `pre_trade_check` 的 fail-closed 兜着，取向与第 0 步其余部分一致。
+    """
+    if not live_session_id:
+        return None
+    from apps.trading.models import LiveSession
+
+    strategy_id = (
+        LiveSession.objects.filter(id=live_session_id)
+        .values_list("strategy_id", flat=True)
+        .first()
+    )
+    return str(strategy_id) if strategy_id else None
+
+
+def _halt_verdict(request: "OrderRequest") -> HaltVerdict:
+    """一张单 + 此刻的声明表 → 停止判定。**同步**，由 `_halt_block_reason` 经 `db_async` 进来。
+
+    两次读库放在**同一次线程切换**里：先由会话换出策略 id，再拿它去求那一组声明。
+    分成两次 `db_async` 的话，中间那一刻正好换了策略，就会出现「拿 A 的身份判 B 的那张
+    单」——而这一层要的恰恰是「此刻的这一张单」。
+    """
+    from apps.regime import halt
+
+    return halt.halt_layers(request.symbol, _strategy_of_session(request.live_session_id))
 
 
 class RiskGuard:
@@ -185,14 +225,12 @@ class RiskGuard:
         对象的内部结构当接口。
 
         判定本身一行都不在这里：它全在 `apps.regime.halt`（唯一的停止抽象，ADR 0001）。
-        这里只负责把**一张单**翻译成那两个参数。``strategy_id`` 传 ``None``——第②段的
-        下单通路上拿不到它（策略档的声明要到第③段才会从 `live_session_id` 带下来），
-        而 `halt._matches` 对「调用方没给 id」的判据是**策略档行不认它生效**：宁可第③段
-        接漏时表现为「策略停用没生效」（池化日报里看得见），也不要表现为「全场莫名停摆」。
+        这里只负责把**一张单**翻译成那两个参数。``strategy_id`` 由
+        `_strategy_of_session` 从 ``request.live_session_id`` 换出来：第②段下单通路上
+        这个字段一直是 ``None``，所以策略档不生效；第③段把它接上之后，`halt._matches`
+        里那条策略档判据才第一次真正生效。
         """
-        from apps.regime import halt
-
-        verdict = await db_async(halt.halt_layers)(request.symbol, None)
+        verdict = await db_async(_halt_verdict)(request)
         return verdict.reason
 
     async def _reject(self, user_id: str, reason: str) -> Tuple[bool, str]:
