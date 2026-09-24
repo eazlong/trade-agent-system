@@ -4,6 +4,12 @@
 **说给人听**：窗口开了发一条、窗口结束了发一条。加上 `tasks.sync_halt_windows` 里
 那条「声明写入失败」的即时告警，②e 一共三条消息，共用这里的收件人口径与那一个出口。
 
+第③段又加了第四条：`tasks.sync_gate` 写失败时的那一条（策略停用档）。它与②e 那条是
+**同一件事的两个档**——同一张表、同一个失败面、同样的受众与流程，只有正文分岔：事件
+熔断不可人工豁免，而策略停用档的豁免**人可以给**。所以这里是两个函数
+（`alert_declaration_write_failure` / `alert_gate_write_failure`）而不是一个带 `body`
+参数的：调用方各认领自己那一档，读代码的人不必跳进来才知道用户会读到哪一段话。
+
 ## 为什么必须有这一层（而不是日志）
 
 一个「表里没有窗口」的系统与「现在没有事件」的系统，从外面看起来一模一样——用户不看
@@ -244,6 +250,30 @@ def write_failure_body(error: str) -> str:
     )
 
 
+def gate_write_failure_body(error: str) -> str:
+    """「策略停用决策档的声明写入失败」那条消息的正文（第③段 Q1）。
+
+    与 `write_failure_body` 是**同一件事的两个档**（同一张表、同一个失败面），所以形状照抄
+    ——要说的不是「有个任务挂了」，而是一个**看起来完全正常的后果**：「表里没有这条声明」
+    与「本阶段没有被判为不适配的策略」在读表的人眼里一模一样。
+
+    换掉的只有那一句：那一档说「事件熔断不可人工豁免」，而**这一档的豁免是人可以给的**
+    （`DeactivationExemption`，写它的是管理命令 `manage_deactivation_exemptions`）。照抄
+    那一句会让读的人以为无路可走，而这里正确的补救动作恰恰是给一次在期豁免把时间买回来
+    ——那条路不受这条故障影响，是这一档与那一档在**能不能救**上的差别。
+    """
+    return (
+        "🚨 停止声明窗口同步失败（策略停用决策档）：机制此刻说不出它在按阶段停谁\n"
+        "后果：策略停用决策的停止声明表**没有被本轮对账更新**。本轮该被拦下的策略此刻"
+        "可能不在表里、开仓不会被拦——表现与「当前阶段没有被判为不适配的策略」完全一样，"
+        "日志里看不出来。\n"
+        f"错误：{error}\n"
+        "下一轮（300 秒后）会自动重来；连续失败请人工核对当前阶段与停止声明表。"
+        "这一档的豁免是人可以给的（管理命令 `manage_deactivation_exemptions`），"
+        "所以真要停手不必等这条恢复——给一次在期豁免即可。"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 出站（唯一出口：`alerts.notify_user`）
 # --------------------------------------------------------------------------- #
@@ -328,19 +358,15 @@ def notify_pending(*, now: datetime | None = None) -> dict:
     return summary
 
 
-def alert_declaration_write_failure(error: Exception) -> dict:
-    """声明写入失败 → 全体 `is_active` 用户（第②e 段 Q7）。
+def _alert_everyone(text: str) -> dict:
+    """把一条「机制自身故障」投给全体 `is_active` 用户，返回 ``{"recipients", "delivered"}``。
 
-    **流程是「发完再往上抛」**，与 `reduce_run._alert` 的「发了就继续」不同：那条路失败
-    的是**一个动作的结果**，任务本身还活得下去；这条说的是**机制说不出自己在拦什么**，
-    对账没完成就该让任务标 FAILURE（下一轮会自动重来，见 `tasks.py` 的模块 docstring）。
+    受众是**全体**而不是受影响的那些人（CONTEXT.md:66 的两类落点之一）：这条消息不是
+    「你的单出事了」，而是「机制此刻说不出自己在拦什么」——那对每个人都有后果。
 
-    Returns:
-        ``{"recipients": n, "delivered": n}``。发不出去也只记日志——原本那个异常才是要
-        往上抛的东西，替换掉它会让真实故障从任务健康检查里消失（第②e 段 Q8：不递归告警，
-        但也不静默成功）。
+    发不出去只记日志（第②e 段 Q8：不递归告警，但也不静默成功）：原本那个异常才是要往上抛
+    的东西，替换掉它会让真实故障从 beat 的任务健康检查里消失。
     """
-    text = write_failure_body(str(error))
     recipients = all_active_user_ids()
     sent = asyncio.run(_send_to_each(recipients, text))
     if sent != len(recipients):
@@ -350,3 +376,27 @@ def alert_declaration_write_failure(error: Exception) -> dict:
             len(recipients),
         )
     return {"recipients": len(recipients), "delivered": sent}
+
+
+def alert_declaration_write_failure(error: Exception) -> dict:
+    """声明写入失败（事件熔断 / 保命档那一档）→ 全体 `is_active` 用户（第②e 段 Q7）。
+
+    **流程是「发完再往上抛」**，与 `reduce_run._alert` 的「发了就继续」不同：那条路失败
+    的是**一个动作的结果**，任务本身还活得下去；这条说的是**机制说不出自己在拦什么**，
+    对账没完成就该让任务标 FAILURE（下一轮会自动重来，见 `tasks.py` 的模块 docstring）。
+
+    Returns:
+        ``{"recipients": n, "delivered": n}``。
+    """
+    return _alert_everyone(write_failure_body(str(error)))
+
+
+def alert_gate_write_failure(error: Exception) -> dict:
+    """声明写入失败（**策略停用决策档**）→ 全体 `is_active` 用户（第③段 Q1）。
+
+    受众与流程与上一条一模一样（同一个失败面、同一条「发完再往上抛」），**只有正文不同**：
+    见 `gate_write_failure_body`。两条分开而不是给上一条加一个 `body=` 参数：调用方
+    （`tasks.sync_halt_windows` / `tasks.sync_gate`）各自认领自己那一档，读 `tasks.py` 的
+    人就看得出来「这条任务失败时用户读到的是哪一段话」。
+    """
+    return _alert_everyone(gate_write_failure_body(str(error)))

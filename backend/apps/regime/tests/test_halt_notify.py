@@ -13,6 +13,10 @@
 活跃实盘会话（求值），失败告警发给全体 `is_active` 用户（机制自身健康）。这两条各有一个
 测试类盯着。
 
+「声明写入失败」这一条到第③段分成了**两个档**（事件熔断 / 策略停用决策），受众与流程
+一模一样、只有正文不同：前者不可人工豁免，后者的豁免人可以给。所以正文那一层有两组
+「说什么」与一组「不说什么」的断言，接线那一层还要钉「哪条任务走哪一档」。
+
 ## 分层的界线
 
 `notify_body` 是纯函数（收 `shadow` 而不是自己去读开关），所以它跑在 `SimpleTestCase` 上
@@ -470,6 +474,36 @@ class TestNotifyBody(SimpleTestCase):
         self.assertIn("事件熔断不可人工豁免", body)
         self.assertIn("could not connect to server", body)
 
+    def test_the_gate_failure_body_points_at_the_way_out(self):
+        """同一张表、同一个失败面，**两个档**（第③段 Q1）。差别只有一句，而那一句是
+        决定性的：事件熔断那一档说「不可人工豁免」，而这一档的豁免**人可以给**
+        （`manage_deactivation_exemptions`）。照抄那一句会让读的人以为无路可走。
+
+        所以这里钉的是**分岔**本身：两段话都点名自己的身份、都说得出后果、都带上错误
+        原文；而「不可人工豁免」这句只许留在事件熔断那一档，补救动作只许出现在这一档。
+        """
+        body = halt_notify.gate_write_failure_body("could not connect to server")
+
+        self.assertIn("策略停用决策档", body)
+        self.assertIn("manage_deactivation_exemptions", body)
+        self.assertIn("could not connect to server", body)
+        # 「不可人工豁免」在这一档是**假话**：说了它，读的人就不会去找那条豁免。
+        self.assertNotIn("不可人工豁免", body)
+        self.assertNotEqual(body, halt_notify.write_failure_body("could not connect to server"))
+
+    def test_the_event_tier_body_does_not_point_at_the_deactivation_exemption(self):
+        """反向：事件熔断那一档**不许**出现策略停用那一路的补救动作。
+
+        两个词表各有一个同名短码那种错（`_close_reason_display`）是「看起来都正常」；
+        这一条错得更钝也更要紧——它会指着一个**不存在的出路**（人工豁免不穿透保命档、
+        事件熔断不可豁免），而照做的人会以为给一次豁免就把事办了。
+        """
+        body = halt_notify.write_failure_body("boom")
+
+        self.assertIn("事件熔断不可人工豁免", body)
+        self.assertNotIn("策略停用决策档", body)
+        self.assertNotIn("manage_deactivation_exemptions", body)
+
 
 class TestShadowFlag(TestCase):
     """`shadow` 由调用方给，但**给出它的那个换算**必须与读侧同一处（`halt.switch_open`）：
@@ -649,6 +683,25 @@ class TestWriteFailureAlert(TestCase):
 
         self.assertEqual(summary, {"recipients": 1, "delivered": 0})
 
+    def test_the_gate_alert_goes_to_every_active_user_with_its_own_body(self):
+        """策略停用决策档那一条（第③段 Q1）：受众与流程与上一条一模一样，**只有正文
+        不同**。受众写错的后果是「机制说不出它在按阶段停谁」只讲给恰好有实盘会话的人听，
+        而那件事对每个人都有后果。
+        """
+        first, second = _user("a@t.local"), _user("b@t.local")
+
+        with _notify(True) as mock:
+            summary = halt_notify.alert_gate_write_failure(RuntimeError("表写不进去"))
+
+        self.assertEqual(summary, {"recipients": 2, "delivered": 2})
+        self.assertEqual(
+            {call.args[0] for call in mock.call_args_list}, {str(first.pk), str(second.pk)}
+        )
+        body = _texts(mock)[0]
+        self.assertIn("策略停用决策档", body)
+        self.assertIn("表写不进去", body)
+        self.assertIn("manage_deactivation_exemptions", body)
+
 
 # --------------------------------------------------------------------------- #
 # 接线：三条消息挂在同一条任务上，各自在对的时机
@@ -782,3 +835,40 @@ class TestTheTaskWiring(TestCase):
                 tasks.sync_halt_windows.run()
 
         self.assertEqual(touched, [])
+
+    def test_the_gate_task_uses_the_gate_body_and_never_the_event_one(self):
+        """`sync_gate` 的失败面与 `sync_halt_windows` 同构（catch → 发 → 再抛），**只有那
+        一档的正文不同**（第③段 Q1）——所以这里同时钉两件事：它走的是 gate 那一条，且它
+        **不走**事件熔断那一条。
+
+        走错的表现很具体：一条说「事件熔断不可人工豁免、请人工核对事件表与停止声明表」的
+        消息，落在一个「人可以给在期豁免」的故障上——读的人会去找事件表，而那条路是对的
+        地方没有这一档的解法。
+        """
+        from apps.regime import tasks
+
+        gate_alerted: list[Exception] = []
+        event_alerted: list[Exception] = []
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("表写不进去")
+
+        with self._patch(
+            **{
+                "apps.regime.gate_run.sync": boom,
+                "apps.regime.halt_notify.alert_gate_write_failure": lambda exc: gate_alerted.append(
+                    exc
+                )
+                or {"recipients": 1, "delivered": 1},
+                "apps.regime.halt_notify.alert_declaration_write_failure": lambda exc: event_alerted.append(
+                    exc
+                )
+                or {"recipients": 1, "delivered": 1},
+            }
+        ):
+            with self.assertRaises(RuntimeError):
+                tasks.sync_gate.run()
+
+        self.assertEqual(len(gate_alerted), 1)
+        self.assertIn("表写不进去", str(gate_alerted[0]))
+        self.assertEqual(event_alerted, [])

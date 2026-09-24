@@ -24,7 +24,10 @@
    `halt_sync._rewrite` 每 300 秒看见一次变化，于是 `opened_notified_at` 被反复清空、
    用户被反复通知同一条窗口开启（Q4）。
 5. **Shadow 档不声明、也不写 status**，但活行照样解除（Q3）。
-6. **冷启动与状态过期时一个字都不动**——那两条不是「按空集解除」。
+6. **三种「什么都不动」各有各的理由**：冷启动与状态过期（`deactivation.BLOCKED_*`）是
+   「说不清现在是什么阶段」；保命档（高波动）是**说得清、而这一层不该动手**——它要是落进
+   逐行判定，每一行都会被判成「阶段离开」而解除，而那是假话（高波动是叠加层，不是离开了
+   原阶段，CONTEXT.md 第 115 条）。三者共同的一点：**都不是「按空集解除」**。
 7. **五个解除原因码**互不重复、取值不飘，且有一处**故意的短码重名**（`regime_left`）：
    它只有在 `halt_notify` 按触发源路由时才是安全的。
 8. **给用户看的那两句话自带主语**：`label` 进下单拒绝理由与 `query_halt`，`reason` 进
@@ -463,7 +466,7 @@ class TestTheShadowBranch(SimpleTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 性质 6：冷启动与状态过期
+# 性质 6：三种「什么都不动」
 # --------------------------------------------------------------------------- #
 
 
@@ -502,6 +505,74 @@ class TestBlockedAndColdStartTouchNothing(SimpleTestCase):
         )
 
         self.assertEqual(plan.blocked, dea.BLOCKED_STALE_STATE)
+
+
+class TestTheBlanketTier(SimpleTestCase):
+    """保命档（高波动）期间声明与解除**两样都不做**。
+
+    高波动是**叠加层**而不是「离开了原阶段」，而逐行判定的尺子是 `regime == 当前阶段`
+    ——高波动一抬上来，每一行都会被判成「阶段离开」：活行被解除、决策行被翻成 `released`。
+    那是假话，而解除不可逆（`CONTEXT.md` 第 115 条；取向与 `deactivation_run
+    .close_left_regime_exemptions` 的第三条停手同构）。保命档那一层自己有全场作用域的
+    声明，所以这一层无事可做。
+    """
+
+    def test_a_blanket_regime_touches_nothing_at_all(self):
+        rows = [
+            row(1, status=g.STATUS_APPLIED),
+            row(2, regime=UPTREND, status=g.STATUS_APPLIED),
+            row(3, status=g.STATUS_SUGGESTED),
+        ]
+        plan = derive(rows, regime=BaseRegime.HIGH_VOL.value)
+
+        # 三条路各试探一种收场：1 该被声明、2 该按 `regime_left` 解除、3 该写 status。
+        # 保命档下三样都不许出现——出现任何一样都是「按阶段比较得出的」那句假话。
+        self.assertEqual(plan.declarations, ())
+        self.assertEqual(plan.statuses, ())
+        self.assertEqual(plan.close_reasons, {})
+        self.assertEqual(plan.blocked, g.BLOCKED_BLANKET)
+        self.assertEqual(plan.note, g.NOTE_BLANKET)
+
+    def test_the_blanket_branch_beats_the_row_by_row_verdict(self):
+        """一行「阶段对、判据仍成立」的活行本该被声明——保命档下它原样留着，
+        **而这不是「没什么可拦」**（`BLOCKED_BLANKET` 非空，页面据此说话）。"""
+        plan = derive([row(1, status=g.STATUS_APPLIED)], regime=BaseRegime.HIGH_VOL.value)
+
+        self.assertNotEqual(plan.blocked, "")
+        self.assertEqual(plan.declarations, ())
+
+    def test_the_shadow_branch_still_wins_when_the_gate_is_closed(self):
+        """开关关着 + 高波动走的是 **Shadow** 那一支，不是这一支。
+
+        Shadow 说的「机制确实不再拦」在高波动期间同样为真，而它要挡的是**按阶段比较得出
+        的理由**——那个比较才是假的。口径不同的表现是：一行活行在这里被解除（`gate_closed`），
+        在开关开着时反而不动。
+        """
+        plan = derive([row(1, status=g.STATUS_APPLIED)], gate_open=False,
+                      regime=BaseRegime.HIGH_VOL.value)
+
+        self.assertEqual(plan.close_reasons, {1: g.CLOSE_GATE_CLOSED})
+        self.assertEqual(plan.blocked, "")
+        self.assertEqual(plan.note, g.NOTE_SHADOW)
+
+    def test_a_round_that_cannot_tell_keeps_talking_about_that(self):
+        """「说不清」排在保命档之前：状态过期时连高波动这个判断本身都是过期的，
+        报成「保命档所以不动手」会把用户支去等一个不一定会来的下一轮。
+        """
+        plan = derive(
+            [row(1)], regime=BaseRegime.HIGH_VOL.value, blocked=dea.BLOCKED_STALE_STATE
+        )
+
+        self.assertEqual(plan.blocked, dea.BLOCKED_STALE_STATE)
+        self.assertIn(dea.BLOCKED_DISPLAY[dea.BLOCKED_STALE_STATE], plan.note)
+
+    def test_the_blanket_code_is_not_one_of_the_cannot_tell_codes(self):
+        """四个码共用 `Confirmation.skipped` 那一格，而页面按码分岔说不同的话：
+        重字的表现是「保命档被报成一次取数故障」，用户会去查一个不存在的故障。
+        """
+        self.assertNotIn(
+            g.BLOCKED_BLANKET, (dea.BLOCKED_COLD_START, dea.BLOCKED_STALE_STATE)
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -545,3 +616,13 @@ class TestWhatTheUserSees(SimpleTestCase):
         后者是排查时最容易误判成 bug 的那一半。"""
         self.assertIn("不再拦", g.NOTE_SHADOW)
         self.assertIn("一个字都不写", g.NOTE_SHADOW)
+
+    def test_the_blanket_note_says_both_halves(self):
+        """保命档的一轮要说清两件事，而两件都与 Shadow 相反：不产出声明，也不解除。
+
+        与 `NOTE_SHADOW` 共用一句话会是错的：那一句说「活行按 gate_closed 解除」，贴到
+        保命档这一轮上正好是本层最不该做的那件事。
+        """
+        self.assertIn("不产出策略档声明", g.NOTE_BLANKET)
+        self.assertIn("不解除", g.NOTE_BLANKET)
+        self.assertNotEqual(g.NOTE_BLANKET, g.NOTE_SHADOW)

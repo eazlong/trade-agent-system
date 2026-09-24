@@ -33,6 +33,13 @@
 什么阶段」，而「说不清就解除」会让状态过期变成一次无声的机制失效——那正是这套机制最
 需要生效的时刻。保持现状（活行继续拦）是这里唯一的保守方向。
 
+**保命档（高波动）期间同样一个字都不动**：高波动是**叠加层**（CONTEXT.md 第 115 条），
+不是「离开了原阶段」——而本层的逐行判定拿的是 `regime == 当前阶段` 这把尺子，高波动一
+抬上来，每一行都会被判成「阶段离开」而解除。那是假话：阶段并没有离开，只是被叠了一层。
+保命档那一层自己有全场作用域的声明（并且它期间整个市场一律停），所以策略档这一层无事
+可做。取向与 `deactivation_run.close_left_regime_exemptions` 的第三条停手完全同构：两个
+方向不对称（误解除不可逆、晚一轮可逆），就往不会造成不可逆损失的那边倒。
+
 ## 五个解除原因码
 
 词表本体在这里（本层是唯一的产出方），展示名在 `gate_switch.py`（Q7）：
@@ -87,6 +94,22 @@ LABEL_PREFIX = "策略停用决策："
 
 #: 机制回 Shadow 时这一层要说的话（进任务摘要与日志）。
 NOTE_SHADOW = "机制在 Shadow 档：不再拦，活行按「机制已回 Shadow」解除；决策行的状态一个字都不写"
+
+#: 当前阶段是保命档（高波动）时这一层要说的话（进任务摘要与日志）。与 `NOTE_SHADOW`
+#: 有着**相反**的取向：Shadow 期是「不声明、但要解除」，保命档期是「声明与解除都不做」。
+#: 两句分开写而不是共用一句，因为它们是两个不同的理由，页面上要能分得清是哪一个。
+NOTE_BLANKET = (
+    "当前阶段是保命档（高波动）：全场停用由保命档那一层负责，本层不产出策略档声明，"
+    "也不解除任何东西（阶段并没有离开，只是被叠了一层）"
+)
+
+#: `GatePlan.blocked` 的第四个码。前三个（`cold_start` / `stale_state` /
+#: `deactivation_run.SKIPPED_NO_GENERATION`）都是「这一轮**说不清**」；这一个不同：
+#: **阶段说得很清楚，是这一层不该动手**。放进同一个字段是因为下游（`gate_run.sync`
+#: 的 `skipped`、确认页的「本轮一个字都不会动」分支）要的语义正是「本轮什么都没做」，
+#: 而那个语义只有一个出处。取值与 `deactivation.BLANKET` 同字而**各定义各的**：那边是
+#: 池化格子的判决词，这边是判定层的收场码，两个词表不是同一个东西（同 Q7 的纪律）。
+BLOCKED_BLANKET = "blanket"
 
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +340,7 @@ def attitude_since(situation: Situation, strategy_id: Any) -> datetime:
 def derive(situation: Situation, decisions: Iterable[DecisionRef]) -> GatePlan:
     """一轮判定。**纯函数**：同样的输入永远给同样的输出，不读时钟、不碰库。
 
-    三条早退分支，每一条都是「什么都不做」而不是「按空集解除」：
+    四条早退分支，每一条都是「什么都不做」而不是「按空集解除」：
 
     1. `blocked` / 冷启动——机制说不清当前是什么阶段。解除了就再也回不来（那段时间事后
        无法重建），而保持现状只是「今晚本不该拦的拦着」。取向与 `_halt_block_reason`
@@ -326,7 +349,13 @@ def derive(situation: Situation, decisions: Iterable[DecisionRef]) -> GatePlan:
        没有「机制开始拦」这个动作，写 `applied`/`released` 都是假历史（Q3）。活行照样要
        解除：回到 Shadow 的意义就是不再拦，留着活行既拦不住（`halt.switch_open` 关着）
        又会让「重新打开开关」那一刻的期望集与现状之间出现一段没人解释的空档。
-    3. 其余：逐行判。
+    3. 当前阶段是保命档（高波动）——**声明与解除都不做**（见模块 docstring）。排在逐行
+       判定之前是必须的：逐行那一支拿 `regime == 当前阶段` 当尺子，高波动一抬上来它会把
+       每一行都判成「阶段离开」并写进 `close_reasons`，于是活行被解除、决策行被翻成
+       `released`——一句假话，而解除的代价是不可逆的。排在第 2 条**之后**：Shadow 那一支
+       说的「机制确实不再拦」在高波动期间同样为真，而它要挡的是**按阶段比较得出的理由**，
+       那个比较才是假的。
+    4. 其余：逐行判。
     """
     rows = tuple(decisions)
 
@@ -342,6 +371,9 @@ def derive(situation: Situation, decisions: Iterable[DecisionRef]) -> GatePlan:
             close_reasons={row.strategy_id: CLOSE_GATE_CLOSED for row in rows},
             note=NOTE_SHADOW,
         )
+
+    if deactivation.is_blanket(situation.regime):
+        return GatePlan(blocked=BLOCKED_BLANKET, note=NOTE_BLANKET)
 
     declarations: list[Declaration] = []
     statuses: list[StatusWrite] = []

@@ -51,9 +51,13 @@
 熔断与保命档，这条管策略停用档（`HaltTrigger.DEACTIVATION`）。分开的理由是「哪一档没对
 上」这件事不能被另一档的成功盖住——两条任务各自的返回值才是人读的那份「这一档刚刚做了
 什么」。同一套「对账不重试」（下一轮就是重试）与「失败往上抛」的纪律照旧；唯一多出来的
-是**写失败时发告警**：声明表说不出自己在拦什么，与 `sync_halt_windows` 里那条
-`alert_declaration_write_failure` 是同一件事（同一张表、同一个失败面），所以共用同一个出
-口，而不是各写一句。
+是**写失败时发告警**：声明表说不出自己在拦什么，与 `sync_halt_windows` 里那条是同一件事
+（同一张表、同一个失败面），所以**受众、流程与那一个出口（`alerts.notify_user`）都共用
+——只有正文分岔**（第③段 Q1）：事件熔断那一档说「不可人工豁免」，这一档的豁免**人可以
+给**（`manage_deactivation_exemptions`）。两条任务各认领自己那一档
+（`alert_declaration_write_failure` / `alert_gate_write_failure`），而不是让一条替另一条
+发话：照抄那一段会让读的人去找一条不存在的出路，而这一档真正能救的那条路（给一次在期
+豁免）只有这一段的正文说得出来。
 
 **它在 Shadow 期也照跑**（`gate_run.sync` 自己认档位）：档位关着时它不拦人，但「阶段换
 了、这批策略不再该停」这个事实仍要落进表里；而阶段说不清的那些轮次里活行一条都不动（连
@@ -368,7 +372,8 @@ def sync_gate() -> dict:
 
     幂等：`gate_run.sync` 的期望值逐字来自库里存好的事实（当前阶段、当前代、声明的
     `opened_at` 是那个唯一常量），所以连着跑两轮，第二轮必然是声明表整表空转、`statuses`
-    为空。返回的就是它的摘要（18 个键，键集在四条路径上一致——它进 Celery 结果与日报）。
+    为空。返回的就是它的摘要（18 个键，键集在四条路径上一致——它进 Celery 结果与任务
+    健康检查）。
 
     **只读的那一半也一样跑。** 档位是 Shadow、阶段还没判出来（`blocked`）时这一轮几乎
     什么都不写，但那是**结论**而不是「可以跳过」：`skipped` 那件事本身要被记下来，否则
@@ -384,10 +389,14 @@ def sync_gate() -> dict:
         except Exception as exc:  # noqa: BLE001
             # 与 `sync_halt_windows` 同一条：写声明失败 = 机制说不出自己在拦什么。发完
             # 再抛——吞掉会让真实故障从任务健康检查里消失。
+            #
+            # 但正文那一档不同（第③段 Q1）：这一档的豁免是**人可以给的**
+            # （`manage_deactivation_exemptions`），而事件熔断那一档不可人工豁免。照抄
+            # 那一段会让读的人以为无路可走，所以走 `alert_gate_write_failure`。
             logger.error("[regime] 行情阶段 gate 对账失败，已发告警后继续往上抛", exc_info=True)
             logger.error(
                 "[regime] 声明写入失败告警结果：%s",
-                halt_notify.alert_declaration_write_failure(exc),
+                halt_notify.alert_gate_write_failure(exc),
             )
             raise
     finally:

@@ -176,7 +176,14 @@ def _regime_display(regime: str | None) -> str:
 
 
 def _skipped_display(code: str) -> str:
-    """`gate.GatePlan.blocked` 的人话。没有当前代与阶段说不清，两种都要说得出原因。"""
+    """`gate.GatePlan.blocked` 的人话。没有当前代、阶段说不清、保命档，三种都要说得出原因。
+
+    最后那个不是「说不清」，是「说得很清楚、但这一层不该动手」（`gate.BLOCKED_BLANKET`），
+    所以它的话来自本模块的 `_BLANKET_HOLD` 而不是 `deactivation.BLOCKED_DISPLAY`——那张表
+    是取数层的收场词表，收的是「取不到数」的两种原因。
+    """
+    if code == gate.BLOCKED_BLANKET:
+        return _BLANKET_HOLD
     if code == deactivation_run.SKIPPED_NO_GENERATION:
         return gate_run.NOTE_NO_GENERATION
     return deactivation.BLOCKED_DISPLAY.get(code, code)
@@ -201,7 +208,9 @@ class Confirmation:
     regime: str | None
     regime_display: str
     regime_effective_at: datetime | None
-    #: 当前阶段是保命档（高波动）。那一层没有开关，本机制在这期间不产出策略档声明。
+    #: 当前阶段是保命档（高波动）。那一层没有开关，本机制在这期间不产出策略档声明
+    #: （`gate.derive` 的第三条早退分支把这句话变成了结构）。注意它说的是**阶段**，
+    #: 「这一轮被保命档挡下」是另一件事——见 `blanket_hold`。
     blanket: bool
     #: 上一有效判定距今几个自然日；冷启动与没有判定时为 `None`。
     age_days: int | None
@@ -228,6 +237,8 @@ class Confirmation:
     #: 而声明行按作用域字符串自立，不会跟着走），所以 `skipped` 时也照报。
     orphan: int
     #: `gate.GatePlan.blocked`：非空 ⇒ 本轮一个字都没动。空串 = 正常一轮。
+    #: 取值是 `deactivation.BLOCKED_*` / `deactivation_run.SKIPPED_NO_GENERATION` /
+    #: `gate.BLOCKED_BLANKET`（最后那个的理由与前几个不同：不是说不清，是不动手）。
     skipped: str
 
     @property
@@ -237,6 +248,20 @@ class Confirmation:
     @property
     def skipped_display(self) -> str:
         return _skipped_display(self.skipped)
+
+    @property
+    def blanket_hold(self) -> bool:
+        """这一轮**被保命档挡下**（`gate.derive` 的第三条早退分支）。
+
+        与 `blanket` 不是同一个问题：`blanket` 说的是**阶段**（当前是不是高波动），这一条
+        说的是**这一轮的结果**。两者在「开关开着 + 高波动」时才同时为真；开关关着时走的是
+        Shadow 那一支（`blanket` 真而 `blanket_hold` 假）——那时按 `gate_closed` 解除活行
+        是**真话**（机制确实不再拦），所以两支不能混。
+
+        页面上分岔的只有「为什么这一轮不动」那几句：保命档不是「算不出该停哪些」，说成
+        后者会让用户去查一条根本不存在的取数故障。
+        """
+        return self.skipped == gate.BLOCKED_BLANKET
 
 
 def confirmation(*, now: datetime | None = None) -> Confirmation:
@@ -313,10 +338,26 @@ _BLANKET_NOTE = (
     "当前阶段是保命档（高波动）：**它期间的全场停用由保命档那一层负责**，与这个开关无关"
     "（那一层没有开关，高波动算生效）。所以下面「该停」一栏是 0，那不是「没什么可拦」。"
 )
+#: `_BLANKET_NOTE` 在**保命档挡下那一轮**的替身。原话指着版面说（「下面『该停』一栏」），
+#: 而那一轮判定层的第三条早退分支把「该停」那一栏整个抽掉了——照原话说，读的人会去找一个
+#: 不在页面上的东西。两句的差别只在最后那一句：前半句（保命档没有开关）两处都成立。
+_BLANKET_NOTE_HOLD = (
+    "当前阶段是保命档（高波动）：**它期间的全场停用由保命档那一层负责**，与这个开关无关"
+    "（那一层没有开关，高波动算生效）。所以本层这一轮一个字都不会动——"
+    "那不是「没什么可拦」，是「这一层不该动手」。"
+)
 #: `_BLANKET_NOTE` 的**摘要版**：同样的一句话要进 `RegimeMechanismSwitch.reason`，而那里
 #: 收不下 markdown 强调符、也收不下换行。措辞对两个方向都成立（「与这个开关无关」在打开
 #: 与关闭方向上都是同一件事实），所以一个常量用在三处，省得三份措辞各自漂。
 _BLANKET_SUMMARY = "保命档（高波动）那一层没有开关：它期间的全场停用与 gate 开关无关"
+#: 保命档挡下的那一轮，`skipped` 一栏要说的话。与 `gate_run.NOTE_NO_GENERATION` 占同一格
+#: （`_skipped_display` 的入参是 `gate.GatePlan.blocked`），但两句说的是两件相反的事：
+#: 那一句是「没法问」，这一句是「问得清、这一层就是不动手」。所以不共用一句话——用户按
+#: 「没法问」去查取数层，查到的会是一条根本不存在的故障。
+_BLANKET_HOLD = (
+    "保命档（高波动）期间本层不做任何解除——那些决策行记的阶段并没有离开，"
+    "只是被叠了一层高波动"
+)
 _SHADOW_NO_SWITCH = (
     "⚠️ 关掉 gate 对保命档（高波动）毫无影响：那一层没有开关可翻。"
     "「关掉就安全了」在这里是错的——上面那段仍然是关掉之后的实情。"
@@ -408,12 +449,28 @@ def _blocking_note(data: Confirmation) -> str:
     正文与摘要**共用这一句**（摘要那一侧还有一条「不出现 markdown 强调符」的硬要求：
     它的收件人可能是纯文本客户端，`**粗体**` 在那里会原样渲染成星号）。所以这里只用一个
     emoji 做强调，不写 `**`——两处各写一句的话，档位判据就有了两个答案。
+
+    **保命档挡下的那一轮**（`blanket_hold`）档位判据一字不改，换掉的只有后半句：那一轮的
+    「不动手」不是取数出了问题，而是暂时的（高波动一过，自动对账就把表对干净了），所以
+    补救动作从「先让阶段说清楚、再敲一次」变成「等下一轮」。
     """
     if data.mode is MechanismMode.EXECUTING:
+        if data.blanket_hold:
+            # 保命档挡下的那一轮：档位判据一字不改（它们照样在拦人），但补救动作换了——
+            # 「先让阶段说清楚再敲一次」在保命档下是个空动作（阶段已经很清楚），而这一轮的
+            # 不动手本来就是暂时的：高波动一过，下一轮自动对账会把表对干净。
+            return (
+                "⚠️ 但档位还是执行态，所以它们仍然在拦人——活行等保命档过去之后由下一轮"
+                "自动对账（每轮都会跑，不必再敲本命令）"
+            )
         return (
             "⚠️ 但档位还是执行态，所以它们仍然在拦人——要把它们解干净得先让阶段说清楚"
             "（算不出阶段时本轮连对账都不发起：那是「保持现状」而不是「按空集解除」，"
             "与保命档同一取向）；阶段说清楚之后再敲一次本命令才会补上"
+        )
+    if data.blanket_hold:
+        return (
+            "它们已经不拦人了（档位本来就是 Shadow）；活行等保命档过去之后由下一轮自动对账"
         )
     return (
         "它们已经不拦人了（档位本来就是 Shadow）；"
@@ -474,7 +531,9 @@ def _render_body(data: Confirmation, *, closing: bool) -> str:
         _regime_line(data),
     ]
     if data.blanket:
-        lines.append(_BLANKET_NOTE)
+        # 保命档挡下那一轮（`blanket_hold`）要换一句话：原话指着「该停」那一栏说，而那一轮
+        # 判定层的第三条早退分支把整栏抽掉了——照原话说，读的人会去找一个不在页面上的东西。
+        lines.append(_BLANKET_NOTE_HOLD if data.blanket_hold else _BLANKET_NOTE)
     if closing:
         lines.append(_SHADOW_NO_SWITCH)
         if data.mode is MechanismMode.EXECUTING:
@@ -514,10 +573,14 @@ def _render_summary(data: Confirmation) -> str:
     """打开方向的摘要。**它就是要写进 `RegimeMechanismSwitch.reason` 的那句话**，
     所以：纯文本、不换行、不出现 markdown 强调符（收件人可能是即时消息）。"""
     if data.skipped:
+        why = (
+            "打开的一刻是保命档（高波动）：本层不产出策略档声明，也不解除任何东西"
+            if data.blanket_hold
+            else f"打开的一刻算不出「该停哪些」——{data.skipped_display}"
+        )
         return (
-            f"人工打开行情阶段 gate（上线确认）：打开的一刻算不出「该停哪些」——"
-            f"{data.skipped_display}；此刻活着的策略档声明 {data.live_declarations} 条"
-            "一个字都没动"
+            f"人工打开行情阶段 gate（上线确认）：{why}；"
+            f"此刻活着的策略档声明 {data.live_declarations} 条一个字都没动"
             + (f"；{_BLANKET_SUMMARY}" if data.blanket else "")
         )
     parts = [
@@ -546,10 +609,16 @@ def closing_summary(data: Confirmation) -> str:
     """
     blanket = f"；{_BLANKET_SUMMARY}" if data.blanket else ""
     if data.skipped:
-        return (
-            f"人工关闭行情阶段 gate（回到 Shadow）：关闭的一刻算不出「该停哪些」——"
+        why = (
+            "关闭的一刻是保命档（高波动）：本层不做任何解除，"
+            f"此刻活着的策略档声明 {data.live_declarations} 条原样留着"
+            if data.blanket_hold
+            else "关闭的一刻算不出「该停哪些」——"
             f"{data.skipped_display}，此刻活着的策略档声明 {data.live_declarations} 条"
-            f"本轮一条都不会被解除；{_blocking_note(data)}；"
+            "本轮一条都不会被解除"
+        )
+        return (
+            f"人工关闭行情阶段 gate（回到 Shadow）：{why}；{_blocking_note(data)}；"
             "人工豁免不受影响（关闭是撤防，不收回人给的豁免）" + blanket
         )
     tail = (
@@ -601,7 +670,14 @@ def reconcile_warning(data: Confirmation, sync: Mapping[str, Any]) -> str | None
     不说出来没人知道要敲。
 
     **按翻完之后的事实说**：正文里那句 `_blocking_note` 是在翻之前渲染的，它说的
-    「仍然在拦人」在关掉之后就不再成立，抄过来会是一句假话。
+    「仍然在拦人」在关掉之后就不再成立，抄过来会是一句假话。所以「那些活行此刻拦不拦人」
+    取 `sync["gate_open"]`——**翻完之后**那个档位，而不是翻的方向。「翻一次就是把档位翻
+    过去」在关掉方向上恰好让这两者同向，在打开方向上不是（`on` 之后表里的活行照样拦人，
+    而那正是这里要让用户知道的事），所以判据只能取那次同步报回来的事实。
+
+    保命档挡下的那一轮也会露出这句话（`skipped` 非空同样是它），但结论不同：那一轮活行
+    原样留着**正是目的**，所以补救动作不是「再敲一次」，而是等保命档过去之后由自动对账
+    接手——这一支必须说得出这个差别，否则用户会去敲一个敲不出名堂的命令。
 
     写在渲染层而不是各入口各拼一遍：CLI（`manage.py regime_gate`）与 `/regime gate`
     说的是**同一件事**，两处各写一句就是给「此刻表干不干净」造两个说法（第②f 段 Q8
@@ -614,9 +690,20 @@ def reconcile_warning(data: Confirmation, sync: Mapping[str, Any]) -> str | None
     skipped = sync.get("skipped")
     if not skipped or not data.live_declarations:
         return None
+    blocking = (
+        "它们此刻照样拦人（开关是开着的）"
+        if sync.get("gate_open")
+        else "它们此刻已经不拦人了（开关是关的）"
+    )
+    if data.blanket_hold:
+        return (
+            f"⚠️ 档位已经切过去；这一轮是保命档（高波动），本层不做任何解除："
+            f"{data.live_declarations} 条活声明原样留着。{blocking}，"
+            "但表里还有它们——保命档过去之后下一轮会自动把表对干净（不必再敲一次）。"
+        )
     return (
         f"⚠️ 档位已经切过去，但这一轮算不出「该停哪些」（{data.skipped_display}）："
-        f"{data.live_declarations} 条活声明原样留着。它们此刻已经不拦人了（开关是关的），"
+        f"{data.live_declarations} 条活声明原样留着。{blocking}，"
         "但表里还有它们——阶段说清楚之后把同一次动作再敲一遍，表就会对干净。"
     )
 
