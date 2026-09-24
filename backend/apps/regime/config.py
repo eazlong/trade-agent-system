@@ -765,6 +765,18 @@ class EventsConfig:
     - 后者是**覆盖率衰减的提醒阈值**（CONTEXT.md 第 152 条）：超过这么多天没有新事件
       入库，日报第③段与告警都要说。它**只能用来提醒，不能用来判故障**——日历型事件
       靠人录，而平静期可以持续很久，把它当故障判据会得到一份在平静期天天响的告警。
+
+    `confirm_horizon_days`（14，第②段 ②f 加的）是**上线确认页**回显的那个天数，所以它
+    与上面两个 14 又是另一件事，共处一组只是恰好同值：
+
+    - **与 `REPORT.event_horizon_days`（7）刻意不同，也必须不同**（CONTEXT.md 第 183
+      条）。日报第③段回答的是「未来一周有什么事件」，天天要读；上线确认回答的是
+      「接下来两周这个开关会不会空转」，一个人一辈子点几次。同一个数被拿去做两件事，
+      两边就都没法各自调——某个平静的月份里，日报想说的是「一周内没有」、确认页想说的
+      是「两周边界内有没有」，把它们绑在一起等于让其中一个开口说假话。
+    - **与 `coverage_decay_days`（14）也不是一件事**：后者是「多久没新事件入库要提醒」，
+      是**回看**；这个是「往后看多久」，是**前瞻**。同样只有一个字段的理由与上面那条
+      一样——它们现在恰好相等，将来也会各自漂开。
     """
 
     default_halt_before_minutes: int = 120
@@ -773,6 +785,7 @@ class EventsConfig:
     window_cap_minutes: int = 1440
     candidate_expiry_days: int = 14
     coverage_decay_days: int = 14
+    confirm_horizon_days: int = 14
 
     def __post_init__(self) -> None:
         for name in (
@@ -782,6 +795,7 @@ class EventsConfig:
             "window_cap_minutes",
             "candidate_expiry_days",
             "coverage_decay_days",
+            "confirm_horizon_days",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} 必须 >= 1，当前 {getattr(self, name)}")

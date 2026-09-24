@@ -144,6 +144,9 @@ class TestSnapshot(SimpleTestCase):
             # 任何判定**（四个分钟数只在录入端算一次窗口，两个天数是时效），但「同一个
             # `event_time` 配不同的窗口就是两个不同的熔断区间」，所以它同样是历史记录
             # 的一部分——改了就一定看得见。
+            # 第②段 ②f 加进来的 `confirm_horizon_days`（上线确认页回显的那个天数）。
+            # 它进快照的理由与上面几个同类：不参与任何判定，但它决定「打开事件熔断
+            # 开关时，回显的是未来多少天」——同一条通知换个天数就是另一份证据。
             "events": (
                 "default_halt_before_minutes",
                 "default_resume_after_minutes",
@@ -151,6 +154,7 @@ class TestSnapshot(SimpleTestCase):
                 "window_cap_minutes",
                 "candidate_expiry_days",
                 "coverage_decay_days",
+                "confirm_horizon_days",
             ),
             # 第②段 ②a 的一组。它是「减仓动作怎么花钱」的两个边界，**不参与任何
             # 开新仓的判定**（拦不拦由事件窗口决定），但它决定一次减仓的切法与成本
@@ -302,6 +306,18 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.EVENTS.window_cap_minutes, 1440)
         self.assertEqual(config.EVENTS.candidate_expiry_days, 14)
         self.assertEqual(config.EVENTS.coverage_decay_days, 14)
+
+    def test_events_confirm_horizon_is_not_the_report_horizon(self):
+        """上线确认页的天数（第②段 ②f）与日报第③段的天数**是两个数**（第 183 条）。
+
+        两边都钉字面值，且这一条**刻意断言它们不相等**：把 `confirm_horizon_days`
+        改成 7 会让「接下来两周会不会空转」这句问话悄悄变成「一周」，而确认页上写着
+        的还是「未来 14 天」——数值与文案分家的那种错，没有任何别的地方会红。
+        """
+        self.assertEqual(config.EVENTS.confirm_horizon_days, 14)
+        self.assertNotEqual(
+            config.EVENTS.confirm_horizon_days, config.REPORT.event_horizon_days
+        )
 
     def test_derisk_defaults(self):
         """自动减仓的两个成本边界（CONTEXT.md 第 126、127、129 条），字面钉死。
@@ -527,7 +543,11 @@ class TestSelfValidation(SimpleTestCase):
         self.assertIn("default_resume_after_minutes", str(ctx.exception))
 
     def test_events_counts_must_be_positive(self):
-        """0 天的失效期 = 候选事件一落库就已过期；0 分钟的下限 = 窗口退化成一个点。"""
+        """0 天的失效期 = 候选事件一落库就已过期；0 分钟的下限 = 窗口退化成一个点。
+
+        `confirm_horizon_days` 取 0 的坏法是**上线确认页说「未来 0 天内有 0 条事件」**
+        ——一句恒真的话，而它正是那个用来回答「会不会空转」的数。
+        """
         for name in (
             "default_halt_before_minutes",
             "default_resume_after_minutes",
@@ -535,6 +555,7 @@ class TestSelfValidation(SimpleTestCase):
             "window_cap_minutes",
             "candidate_expiry_days",
             "coverage_decay_days",
+            "confirm_horizon_days",
         ):
             with self.subTest(field=name):
                 with self.assertRaises(ValueError):

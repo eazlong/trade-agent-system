@@ -921,7 +921,7 @@ def _section_health(
         if missing:
             lines.append(f"  当前代缺格：{missing} 条（策略 × 阶段在池化表里没有这一格）")
 
-    lines.append(_event_library_line(now=now))
+    lines.append(event_library_line(now=now))
     return "\n".join(lines)
 
 
@@ -967,22 +967,42 @@ def _switch_lines() -> list[str]:
     return lines
 
 
-def _event_library_line(*, now: datetime) -> str:
-    """事件库衰减（CONTEXT.md 第 80 条：超过 14 天无新事件入库要告警）。
+def event_library_staleness(*, now: datetime) -> tuple[datetime | None, int | None]:
+    """事件库最近一次入库的时刻与距今天数。**从未录入过任何事件返回 `(None, None)`**。
 
-    放在第④段而不是第③段：这是**机制自身的健康**信号，不是「未来有什么事件」。两处都写
-    会让同一件事有两个出口，而它们迟早会不一致。
+    与 `event_library_line` 拆开（第②段 ②f）：日报要的是「那一刻 + 多少天」这一整句话，
+    而事件熔断开关的 `reason` 只要那个天数。两个数必须同源——各算一遍就是给「事件库有
+    多陈旧」造第二个答案，而两边不一致时读的人分不出该信哪个（这与那条让确认页复用
+    `event_library_line` 的理由是同一条）。
+
+    两条来源取更晚的那一条：候选事件也是情报，人不处置不代表它没入库。
     """
-    limit = config.EVENTS.coverage_decay_days
     newest = MajorEvent.objects.order_by("-created_at").only("created_at").first()
     candidate = (
         CandidateEvent.objects.order_by("-created_at").only("created_at").first()
     )
     stamps = [row.created_at for row in (newest, candidate) if row is not None]
     if not stamps:
-        return f"事件库：从未录入过任何事件（上限 {limit} 天无新事件即衰减告警）"
+        return None, None
     latest = max(stamps)
-    age = (now - latest).days
+    return latest, (now - latest).days
+
+
+def event_library_line(*, now: datetime) -> str:
+    """事件库衰减（CONTEXT.md 第 80 条：超过 14 天无新事件入库要告警）。
+
+    放在第④段而不是第③段：这是**机制自身的健康**信号，不是「未来有什么事件」。两处都写
+    会让同一件事有两个出口，而它们迟早会不一致。
+
+    **公开**（第②段 ②f）：事件熔断的上线确认页要回显同一句话。空库上线等于熔断永久
+    空转，而空转的样子与正常运行完全一样（CONTEXT.md 第 169 条）——所以「最近入库距今
+    几天」在日报与确认页里必须是同一个算法算出来的，另写一份就是给「事件库有多陈旧」
+    造第二个答案，而两边不一致时读的人分不出该信哪个。
+    """
+    limit = config.EVENTS.coverage_decay_days
+    latest, age = event_library_staleness(now=now)
+    if latest is None:
+        return f"事件库：从未录入过任何事件（上限 {limit} 天无新事件即衰减告警）"
     text = f"事件库：最近入库 {format_business(latest)}（距今 {age} 天，上限 {limit} 天）"
     if age > limit:
         text += "——⚠ 已超过上限，事件情报可能已经衰减"

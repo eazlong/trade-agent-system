@@ -26,6 +26,10 @@
    候选一定没有。
 9. **写入面是一份声明出来的清单**：`_SUBCOMMANDS` 的键集合本身也是契约——多出一个
    键，就等于多了一条没人审过的写入路径。
+10. **收参数的命令也是一份声明出来的清单**（第②段 ②f 加 `/regime` 时补的）：
+    `COMMANDS_WITH_ARGS` 用**精确相等**断言，因为漏登记的表现是「命令看起来没生效」
+    ——`/regime on` 被当成裸 `/regime` 执行，屏幕上回来的确认页与「开关本来就是关的」
+    长得一模一样。
 
 词法那一层不起数据库（纯粹是 pytest 类）；DB 用例走 `test_cancel_task_audit.py` 的
 同一条约定：**普通类 + `django_db(transaction=True)`**。async 入口里的 ORM 是
@@ -234,6 +238,7 @@ class TestTheDispatcher:
             _handle_new_session=AsyncMock(return_value=sentinel),
             _handle_cancel=AsyncMock(return_value=sentinel),
             _handle_event=AsyncMock(return_value=sentinel),
+            _handle_regime=AsyncMock(return_value=sentinel),
             _normal_route=AsyncMock(return_value=sentinel),
             _sentinel=sentinel,
         )
@@ -261,6 +266,7 @@ class TestTheDispatcher:
         assert "/halt" in result.data
         # 提示里必须带上现在真正存在的命令，否则人只知道敲错了、不知道敲什么对。
         assert "/event" in result.data
+        assert "/regime" in result.data
         fake._handle_event.assert_not_awaited()
 
     def test_a_sentence_is_never_taken_for_a_command(self):
@@ -271,11 +277,28 @@ class TestTheDispatcher:
         assert result is fake._sentinel
         fake._handle_cancel.assert_not_awaited()
         fake._handle_event.assert_not_awaited()
+        fake._handle_regime.assert_not_awaited()
 
     def test_the_event_command_is_registered_and_takes_arguments(self):
         assert SLASH_COMMANDS["/event"] == "_handle_event"
-        assert COMMANDS_WITH_ARGS == {"/event"}
+        # 整份清单的**精确相等**（不是「包含」）：`COMMANDS_WITH_ARGS` 决定哪条命令拿得到
+        # 命令词之后的那一段，多列一条就是给一条命令开了参数口。加命令时这条必须手动改，
+        # 那正是它的用处。
+        assert COMMANDS_WITH_ARGS == {"/event", "/regime"}
         assert callable(SupervisorAgent._handle_event)
+
+    def test_the_regime_command_is_registered_and_receives_its_arguments(self):
+        # `/regime` 裸着是确认页、`on`/`off` 才切换，两种情况都由它自己解析，所以它必须
+        # 拿得到参数段。上面那条断的是「清单里有它」，这条断的是「它真的接得到 args」——
+        # 少登记在 `COMMANDS_WITH_ARGS` 里的话，`/regime on` 会被当成不带参数的 `/regime`
+        # 执行：人敲了「打开」，屏幕上回来的却是确认页，而且看起来就像开关没生效。
+        assert SLASH_COMMANDS["/regime"] == "_handle_regime"
+        assert callable(SupervisorAgent._handle_regime)
+
+        fake = self._fake_agent()
+        _run(SupervisorAgent.handle(fake, _msg("/regime on")))
+        fake._handle_regime.assert_awaited_once()
+        assert fake._handle_regime.await_args.args[1] == "on"
 
 
 # --------------------------------------------------------------------------- #

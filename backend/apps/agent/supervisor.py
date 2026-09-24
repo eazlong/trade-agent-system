@@ -49,12 +49,16 @@ SLASH_COMMANDS = {
     "/new": "_handle_new_session",
     "/cancel": "_handle_cancel",
     "/event": "_handle_event",
+    "/regime": "_handle_regime",
 }
 
 # 收参数的命令。`/new` 与 `/cancel` 不收，所以默认是不收：只有列在这里的命令才会
 # 拿到命令词之后的那一段。写成一张显式清单而不是靠 `inspect.signature` 去猜——
 # 「这条命令收不收参数」是一条契约，不是实现细节。
-COMMANDS_WITH_ARGS = {"/event"}
+#
+# `/regime` 收：`/regime` 裸着是确认页，`/regime on|off` 才是切换。它自己只认整词、
+# 多一个词就报错（同 `/event` 的纪律），但「收不收参数」这件事仍然得在这里登记。
+COMMANDS_WITH_ARGS = {"/event", "/regime"}
 
 # 中文别名 → 标准命令。
 #
@@ -71,6 +75,7 @@ COMMAND_HINTS = {
     "/new": "新建会话，清除对话历史",
     "/cancel": "取消当前工作流",
     "/event": "维护重大事件（录入 / 改档 / 改期 / 取消 / 候选转正），不带参数看用法",
+    "/regime": "事件熔断开关：不带参数看上线确认页，on / off 切换（人工确认，不自动切）",
 }
 
 # 可用命令列表（用于错误提示）
@@ -305,6 +310,21 @@ class SupervisorAgent(BaseAgent):
         from .event_commands import handle_event_command
 
         return await handle_event_command(message, args)
+
+    async def _handle_regime(self, message: AgentMessage, args: str) -> AgentResult:
+        """`/regime …`：事件熔断开关的人工入口（第②段 ②f）。
+
+        CONTEXT.md 第160 条：**出 Shadow 切到执行态必须人工确认，不自动切换**。这份
+        「人工」的身份由分发位置保证——命令在意图解析之前被截下来，所以落进
+        `RegimeMechanismSwitch.actor_kind` 的 `chat` 是真的有人在敲，而不是一次 LLM
+        判断的副产品。
+
+        按需引入（与 `_handle_event` 同一条理由）：supervisor 每条消息都会走到，
+        没有理由让它的导入期顺带把 regime 的模型层也拉起来。
+        """
+        from .regime_commands import handle_regime_command
+
+        return await handle_regime_command(message, args)
 
     # ------------------------------------------------------------------ #
     #  会话状态 handlers                                                   #
