@@ -531,10 +531,15 @@ class RegimePoolCell(models.Model):
 class DecisionStatus(str, Enum):
     """停用决策的状态。
 
-    **单元 7 只会写出 `SUGGESTED` 这一个取值**，其余两个是第③段的 gate 层写的——
+    **推导层（第①段单元 7）只写出 `SUGGESTED` 这一个取值**；`applied` / `released` 是
+    第③段的 gate 层翻的（`gate_run._write_statuses`，条件更新、只改 `status` 这一列）。
     这不是「先把枚举铺开」，而是 CONTEXT.md 那条边界的形状：第①段「只记建议，不施加」。
     把 `applied` 摆在这里，是为了让「这条决策到底停没停」永远有一个字段可问，而不是
     靠「有没有对应的 gate 行」去推——后者是一个能算错两次的问题。
+
+    **翻面不留时间戳**：这一列说的是「此刻是什么状态」，不是「什么时候变的」。所以要问
+    「今天比昨天变了什么」得去日报第②段的清单里问（`report._landscape` 的 docstring
+    记着这条），本表答不出来。
     """
 
     SUGGESTED = "suggested"

@@ -17,8 +17,9 @@
    而池化表日后整体换代、还会重算——这一行必须永远答得出「当初依据的是哪一代、
    那一格写了什么」。
 4. **重跑只推进 `last_confirmed_at`**：同一个结论第二次推导出来不新建行、不改证据、
-   不动 `first_decied_at`、不动豁免指针。后三条各自是「当初依据的是哪一代」「当初它
-   是不是被豁免过」的唯一答案，被顺手抹掉就再也问不出来了。
+   不动 `first_decied_at`、不动豁免指针，也**不动 `status`**：那一列被第③段的 gate 层
+   翻过之后由它自己保管（Q9），本层重跑既不重置它、也不删那一行。后三条各自是「当初
+   依据的是哪一代」「当初它是不是被豁免过」的唯一答案，被顺手抹掉就再也问不出来了。
 5. **配对读取**：`evidence["pool_rebuild_id"]` 与它引用的那一格来自**同一代**。分两次
    读当前代（一次拿代、一次拿格子）会落成「依据写的是第 N 代、引用的却是第 N+1 代
    那一格」，而这种错在日报上看起来完全正常。
@@ -400,6 +401,29 @@ class TestTheSuggestionWritten(_Fixture):
         self.assertEqual(summary["confirmed"], 0)
         self.assertEqual(summary["written"], 1)
         self.assertEqual(summary["suggestions"][0]["strategy_id"], str(self.alpha.id))
+
+    def test_a_status_the_gate_layer_flipped_is_never_reset_here(self):
+        """Q9：`applied` / `released` 是第③段 gate 层翻的，本层不认那两档、也不翻回去。
+
+        重跑走的是 `update_or_create` 的 `defaults` 那一支（只有 `last_confirmed_at`），
+        新建那一支才写得出 `suggested`——所以「机制领过它」这件事在重跑里一个字都不动。
+        把 `status` 顺手放回 `defaults`，表现会是「一轮推导悄悄把一条正在拦人的决策标回
+        `suggested`」：日报与 gate 的 `_untouched` 都读这一列，而两边看起来都正常。
+        """
+        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        self.decide()
+        for flipped in (DecisionStatus.APPLIED, DecisionStatus.RELEASED):
+            DeactivationDecision.objects.update(status=flipped.value)
+
+            summary = self.decide(now=days(1))
+
+            self.assertEqual(summary["confirmed"], 1, flipped)
+            self.assertEqual(summary["created"], 0, flipped)
+            # 行不新建、不删除，`status` 原样。
+            self.assertEqual(DeactivationDecision.objects.count(), 1, flipped)
+            row = DeactivationDecision.objects.get()
+            self.assertEqual(row.status, flipped.value, flipped)
+            self.assertEqual(row.last_confirmed_at, days(1))
 
     def test_a_conflicted_cell_produces_no_decision(self):
         """冲突格子照常产出池化结论、照常被引用，但**不产生停用建议**（Q3）。"""

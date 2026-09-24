@@ -951,6 +951,40 @@ class TestTheStatusWrite(_Fixture):
             DecisionStatus.APPLIED.value,
         )
 
+    def test_a_released_row_is_flipped_back_when_it_is_a_target_again(self):
+        """Q9：翻面是**双向**的，且只写 `status`。
+
+        `released` 的行重新成为目标（阶段回来 / 判据又成立）时要回到 `applied`——否则
+        「撤回过的不能再声明」会让那一格永久哑掉。写的是同一列，行本身、`evidence`、
+        `first_decided_at` 一个字都不动，也没有任何一行被删。
+        """
+        decision = self.decision(
+            self.alpha,
+            status=DecisionStatus.RELEASED.value,
+            evidence={"cell": {"trades": 3}, "frozen": True},
+        )
+        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+
+        summary = self.gate_round()
+
+        self.assertEqual(summary["halt"]["created"], 1)
+        self.assertEqual(
+            summary["statuses"],
+            [
+                {
+                    "decision_id": str(decision.pk),
+                    "strategy_id": str(self.alpha.id),
+                    "from": DecisionStatus.RELEASED.value,
+                    "to": DecisionStatus.APPLIED.value,
+                    "written": True,
+                }
+            ],
+        )
+        self.assertEqual(DeactivationDecision.objects.count(), 1)
+        row = DeactivationDecision.objects.get(pk=decision.pk)
+        self.assertEqual(row.status, DecisionStatus.APPLIED.value)
+        self.assertEqual(row.evidence, {"cell": {"trades": 3}, "frozen": True})
+
     def test_the_write_is_matched_on_the_row_not_on_the_pair(self):
         """同一个策略的两行（不同阶段）各写各的目标：按 `strategy_id` 一把写的实现会把
         两行都写成同一个值。"""

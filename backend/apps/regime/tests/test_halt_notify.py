@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, patch
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 
-from apps.regime import events, halt, halt_notify
+from apps.regime import events, gate, gate_switch, halt, halt_notify, halt_sync
 from apps.regime.models import (
     ActorKind,
     HaltDeclaration,
@@ -424,6 +424,42 @@ class TestNotifyBody(SimpleTestCase):
         body = halt_notify.notify_body(row, halt_notify.KIND_OPENED, shadow=False)
 
         self.assertNotIn("⚠️", body)
+
+    def test_a_deactivation_close_reason_is_read_from_the_gate_word_list(self):
+        """解除原因的人话**按触发源路由**（第③段 Q7）：策略停用档那五个码的词表在
+        `gate_switch`，不在 `halt_sync`。
+
+        这条钉的是一个**同名不同义**的坑：两个词表里都有 `regime_left`，而它们说的不是
+        同一件事。一把抓地调 `halt_sync.close_reason_display` 不会报错、也不会返回短码
+        ——它会返回另一档的文案，于是用户读到一句错话却看不出哪里不对。
+        """
+        # 先钉住「这个坑还在」：哪一天两个码不再同值，这条用例就该被删掉或改写，
+        # 而不是变成一条永远绿的摆设。
+        self.assertEqual(gate.CLOSE_REGIME_LEFT, halt_sync.CLOSE_REASON_REGIME_LEFT)
+
+        row = _unpersisted(
+            trigger=HaltTrigger.DEACTIVATION,
+            closed_at=NOW,
+            closed_reason=gate.CLOSE_REGIME_LEFT,
+        )
+        body = halt_notify.notify_body(row, halt_notify.KIND_CLOSED, shadow=False)
+
+        self.assertIn(gate_switch.GATE_CLOSE_REASON_DISPLAY[gate.CLOSE_REGIME_LEFT], body)
+        self.assertNotIn(halt_sync.CLOSE_REASON_DISPLAY[halt_sync.CLOSE_REASON_REGIME_LEFT], body)
+
+    def test_an_event_close_reason_is_read_from_the_window_word_list(self):
+        """反向：事件熔断那几档的码归 `halt_sync` 的词表——路由不能反过来把窗口消息
+        也推到 gate 那一侧。"""
+        row = _unpersisted(
+            closed_at=NOW,
+            closed_reason=halt_sync.CLOSE_REASON_REGIME_LEFT,
+        )
+        body = halt_notify.notify_body(row, halt_notify.KIND_CLOSED, shadow=False)
+
+        self.assertIn(halt_sync.CLOSE_REASON_DISPLAY[halt_sync.CLOSE_REASON_REGIME_LEFT], body)
+        self.assertNotIn(
+            gate_switch.GATE_CLOSE_REASON_DISPLAY[gate.CLOSE_REGIME_LEFT], body
+        )
 
     def test_the_failure_body_says_the_consequence_not_just_the_error(self):
         """要说的不是「有个任务挂了」（那是任务健康检查的事），而是「此刻没人知道该不该

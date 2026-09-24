@@ -49,6 +49,7 @@ Shadow 档是第三种「本轮没有声明」，它与上面两种相反、**�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -71,6 +72,7 @@ from apps.regime.models import (
     DeactivationExemption,
     HaltTrigger,
     RegimeMechanismSwitch,
+    RegimePoolRebuild,
 )
 from apps.regime.slice import STATE_UNFIT
 
@@ -86,7 +88,7 @@ NOTE_NO_GENERATION = (
     "还没有任何一代池化表，本轮不产出停用声明（先跑 recompute_regime_slices）"
 )
 
-__all__ = ["ACTOR_NAME", "sync"]
+__all__ = ["ACTOR_NAME", "Round", "plan_round", "preview", "sync"]
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +259,191 @@ def _write_statuses(
 
 
 # --------------------------------------------------------------------------- #
-# 一轮
+# 取数与判定：一轮的产物（**一个字都没写**）
+# --------------------------------------------------------------------------- #
+
+
+def _is_target(ref: gate.DecisionRef, situation: gate.Situation) -> bool:
+    """这条决策行此刻「该停」——落在当前阶段上，且判据还成立。**不含豁免这一条**。
+
+    「该停」与「会被声明」的差别就是豁免（`gate._declared` 在此之上再排掉在期豁免）。
+    两个数在页面上并排出现（「会拦住 N 个；另有 M 个该停但在人工豁免期」），所以这里
+    给的是那个更大的 N + M。
+    """
+    return ref.regime == situation.regime and ref.warrant == gate.STILL_TARGET
+
+
+def _is_exempt(ref: gate.DecisionRef, situation: gate.Situation) -> bool:
+    """「该停，但人在豁免期按着」——打开开关也拦不住它。"""
+    exemption = situation.exemptions.get(ref.strategy_id)
+    return _is_target(ref, situation) and bool(exemption and exemption.in_force)
+
+
+@dataclass(frozen=True)
+class Round:
+    """一轮的**取数与判定结果**——一个字都没写进库里。
+
+    拆出这一层是为了让 `sync` 与确认页共用同一个求值点：页面上每个数都出自**真正那一轮
+    的同一次判定**，而不是另写一套「会拦住几个」的算法（那是「两处判据分叉、两边看起来
+    都正常」的标准形态）。`sync` 把它落库；`gate_switch.preview` 拿它回答「此刻打开
+    会拦住什么」。
+
+    `plan` 恒非空：没有当前代时用 `GatePlan.blocked = no_generation` 表示，而不是在这里
+    另开一个 `skipped` 字段——`blocked` 的定义就是「本轮一个字都没动」，两条路（没有代 /
+    阶段说不清）在这一层完全同形，下游只认一个字段。
+
+    `hypothetical` 与 `gate_open` 的差别是**档位的来源**：`gate_open` 说的是「流水里现在
+    是什么档」，`hypothetical` 说的是「这个档是假设出来的（此刻还没开）」。页面上
+    「打开之后会拦住 X 个」这句话，只有在 `hypothetical` 为真时才是「打开之后」。
+    """
+
+    now: datetime
+    symbol: str
+    params: JudgementLifecycleConfig
+    managed: deactivation_run.ManagedSet
+    state: deactivation.RegimeState
+    #: 当前代池化表；`None` = 一代都还没有。
+    generation: RegimePoolRebuild | None
+    #: 开关此刻的档位（从流水里读的，不是 `hypothetical` 那个假设）。
+    gate_open: bool
+    #: 开关「开」的那一刻；没开且没有假设时为 `None`。见 `gate.attitude_since`。
+    switch_at: datetime | None
+    #: 档位是**假设**出来的（确认页预览：此刻还没开）。
+    hypothetical: bool
+    plan: gate.GatePlan
+    #: 上一有效判定距今几个自然日；冷启动与没有判定时为 `None`（`Derivation.age_days`）。
+    age_days: int | None = None
+    #: 当前代里有格子、但不在被管集合里的策略 id（幽灵行）。只报数（`Derivation.unmanaged`）。
+    unmanaged: tuple[Any, ...] = ()
+    #: 全部决策行的只读快照——回写 status 时要用它拼「决策行 → 策略」那张表。
+    refs: tuple[gate.DecisionRef, ...] = ()
+    #: 判定用的世界状态。只读。
+    situation: gate.Situation | None = None
+
+    @property
+    def targets(self) -> int:
+        """当前阶段上「该停」的条数（**含**被豁免的）。"""
+        if self.situation is None:
+            return 0
+        return sum(1 for ref in self.refs if _is_target(ref, self.situation))
+
+    @property
+    def exempt(self) -> int:
+        """其中处于在期人工豁免的条数——打开也拦不住的那些。"""
+        if self.situation is None:
+            return 0
+        return sum(1 for ref in self.refs if _is_exempt(ref, self.situation))
+
+
+def plan_round(
+    *,
+    symbol: str = judgement.SYMBOL,
+    now: datetime | None = None,
+    params: JudgementLifecycleConfig | None = None,
+    as_if_open_at: datetime | None = None,
+) -> Round:
+    """取数 + 判定，**一个字都不写**。
+
+    `as_if_open_at` 非空 ⇒ 「假设开关在那一刻是开的」，供确认页预览。它只改 `gate_open`
+    与 `switch_at` 两个入参，判定本身还是 `gate.derive` 那一条——预览因此**不是**第二套
+    预言，而是同一条判定的另一次求值。
+
+    真开着的档位**优先于**假设：那时这一轮说的就是它真会做的事，预览一个「如果打开」的
+    反事实只会把话说拧。
+    """
+    at = now or timezone.now()
+    params = params or config.JUDGEMENT_LIFECYCLE
+
+    managed = deactivation_run.managed_set()
+    state = deactivation_run.current_regime_state(symbol, now=at)
+    generation = pool_rebuild.current_generation()
+    gate_open, switch_at = gate_switch()
+    hypothetical = False
+    if not gate_open and as_if_open_at is not None:
+        gate_open, switch_at, hypothetical = True, as_if_open_at, True
+
+    if generation is None:
+        return Round(
+            now=at,
+            symbol=symbol,
+            params=params,
+            managed=managed,
+            state=state,
+            generation=None,
+            gate_open=gate_open,
+            switch_at=switch_at,
+            hypothetical=hypothetical,
+            plan=gate.GatePlan(
+                blocked=deactivation_run.SKIPPED_NO_GENERATION, note=NOTE_NO_GENERATION
+            ),
+        )
+
+    # 一次读出当前代（**这一代**）的全部格子；代与格子配对传给判定层。
+    cells = pool_rebuild.current_cells(generation)
+    # `deactivation.derive` 在这里只为了三件事：blocked 的判据（冷启动 / 状态过期）、
+    # `unmanaged` 的报数、`age_days`（页面上那句「上一有效判定距今几天」）。逐行的
+    # `warrant` 不由它给——它的 `Outcome` 只覆盖当前阶段那一列，而非当前阶段的决策行
+    # 同样要判（见 `_warrant`）。`blocked` 的判据只有一处，所以宁可多跑一次纯推导，
+    # 也不在这里重写一遍「算不算过期」。
+    derivation = deactivation.derive(
+        cells,
+        state=state,
+        strategy_ids=managed.ids,
+        running_ids=managed.running,
+        exemptions=deactivation_run.in_force_exemptions(now=at),
+        now=at,
+        params=params,
+    )
+    situation = gate.Situation(
+        gate_open=gate_open,
+        switch_at=switch_at,
+        regime=state.regime,
+        # 判定的**生效时刻**（北京 08:00 那个业务日边界），不是它被算出来的时刻：
+        # `attitude_since` 问的是「机制从哪一刻起有理由拦」。
+        regime_effective_at=state.effective_at,
+        generation_at=generation.finished_at,
+        exemptions=(
+            _regime_exemptions(state.regime, now=at) if state.regime is not None else {}
+        ),
+        blocked=derivation.blocked,
+    )
+    refs = _refs(managed=frozenset(managed.ids), cells=cells)
+    return Round(
+        now=at,
+        symbol=symbol,
+        params=params,
+        managed=managed,
+        state=state,
+        generation=generation,
+        gate_open=gate_open,
+        switch_at=switch_at,
+        hypothetical=hypothetical,
+        plan=gate.derive(situation, refs),
+        age_days=derivation.age_days,
+        unmanaged=tuple(derivation.unmanaged),
+        refs=refs,
+        situation=situation,
+    )
+
+
+def preview(
+    *,
+    symbol: str = judgement.SYMBOL,
+    now: datetime | None = None,
+    params: JudgementLifecycleConfig | None = None,
+) -> Round:
+    """「如果此刻把开关打开，这一轮会做什么」——确认页用。**只读**。
+
+    `as_if_open_at` 与 `now` 钉成同一个时刻，是本函数存在的全部理由：两者一旦能各填一个，
+    确认页就会算出一个**从没人见过的世界**（「打开的那一刻是 T1、取数在 T2」），而它看起来
+    和真的一样。这里**没有** `as_if_open_at` 参数，就是为了让那种填法根本写不出来。
+    """
+    at = now or timezone.now()
+    return plan_round(symbol=symbol, now=at, params=params, as_if_open_at=at)
+
+
+# --------------------------------------------------------------------------- #
+# 一轮（落库）
 # --------------------------------------------------------------------------- #
 
 
@@ -268,6 +454,9 @@ def sync(
     params: JudgementLifecycleConfig | None = None,
 ) -> dict[str, Any]:
     """跑一轮 gate：取数 → 判定 → 落声明 → 回写 status。返回**可 JSON 序列化**的摘要。
+
+    取数与判定在 `plan_round`（确认页上那些数就出自它，**同一次求值**），本函数只负责
+    把 `Round` 落库。两件事拆开的理由见 `Round` 的 docstring。
 
     与 `run_deactivation` 同一套摘要约定：`skipped` 键恒存在（没事时是 `None`），
     键集在四条路径上一致（正常 / Shadow / blocked / no_generation），id 一律是字符串。
@@ -281,26 +470,22 @@ def sync(
         now: 注入时钟；不传取当前时刻。同时用于豁免的在期判据与声明行的期望。
         params: 生命周期参数；不传取统一配置面的当前值。
     """
-    at = now or timezone.now()
-    params = params or config.JUDGEMENT_LIFECYCLE
-
-    managed = deactivation_run.managed_set()
-    state = deactivation_run.current_regime_state(symbol, now=at)
-    generation = pool_rebuild.current_generation()
-    open_now, switch_at = gate_switch()
+    round_ = plan_round(symbol=symbol, now=now, params=params)
 
     summary: dict[str, Any] = {
-        "symbol": symbol,
-        "regime": state.regime,
-        "generation_id": generation.pk if generation is not None else None,
+        "symbol": round_.symbol,
+        "regime": round_.state.regime,
+        "generation_id": round_.generation.pk if round_.generation is not None else None,
         "skipped": None,
-        "note": "",
-        "gate_open": open_now,
-        "switch_at": switch_at.isoformat() if switch_at is not None else None,
-        "managed": len(managed.ids),
-        "running": len(managed.running),
-        "unresolved": [str(i) for i in managed.unresolved],
-        "unmanaged": [],
+        "note": round_.plan.note,
+        "gate_open": round_.gate_open,
+        "switch_at": (
+            round_.switch_at.isoformat() if round_.switch_at is not None else None
+        ),
+        "managed": len(round_.managed.ids),
+        "running": len(round_.managed.running),
+        "unresolved": [str(i) for i in round_.managed.unresolved],
+        "unmanaged": [str(i) for i in round_.unmanaged],
         "targets": 0,
         "exempt": 0,
         "declarations": [],
@@ -309,80 +494,33 @@ def sync(
         "halt": None,
     }
 
-    if generation is None:
-        summary["skipped"] = deactivation_run.SKIPPED_NO_GENERATION
-        summary["note"] = NOTE_NO_GENERATION
+    if round_.plan.blocked:
+        # 冷启动 / 状态过期 / 没有当前代：期望集算不出来 ⇒ 连对账都不发起（见模块
+        # docstring）。活行原样留着继续拦：那是这几个收场唯一诚实的动作。
+        # `targets` / `exempt` 也就留在 0——本轮确实一个都没算，报一个「该停 3 个」出来
+        # 只会让人以为机制动过它们。
+        summary["skipped"] = round_.plan.blocked
         logger.info("[regime] 行情阶段 gate：%s", summary["note"])
         return summary
 
-    # 一次读出当前代（**这一代**）的全部格子；代与格子配对传给判定层。
-    cells = pool_rebuild.current_cells(generation)
-    # `deactivation.derive` 在这里只为了两件事：blocked 的判据（冷启动 / 状态过期）与
-    # `unmanaged` 的报数。逐行的 `warrant` 不由它给——它的 `Outcome` 只覆盖当前阶段
-    # 那一列，而非当前阶段的决策行同样要判（见 `_warrant`）。`blocked` 的判据只有一处，
-    # 所以宁可多跑一次纯推导，也不在这里重写一遍「算不算过期」。
-    derivation = deactivation.derive(
-        cells,
-        state=state,
-        strategy_ids=managed.ids,
-        running_ids=managed.running,
-        exemptions=deactivation_run.in_force_exemptions(now=at),
-        now=at,
-        params=params,
-    )
-    summary["unmanaged"] = [str(i) for i in derivation.unmanaged]
-
-    situation = gate.Situation(
-        gate_open=open_now,
-        switch_at=switch_at,
-        regime=state.regime,
-        # 判定的**生效时刻**（北京 08:00 那个业务日边界），不是它被算出来的时刻：
-        # `attitude_since` 问的是「机制从哪一刻起有理由拦」。
-        regime_effective_at=state.effective_at,
-        generation_at=generation.finished_at,
-        exemptions=(
-            _regime_exemptions(state.regime, now=at) if state.regime is not None else {}
-        ),
-        blocked=derivation.blocked,
-    )
-    refs = _refs(managed=frozenset(managed.ids), cells=cells)
-    plan = gate.derive(situation, refs)
-
-    # `plan.note` 在非 blocked 路径上只有 Shadow 那一档非空（正常一轮是空串），而它必须
-    # 进摘要：`gate_open=False` 只说得出「开关关着」，说不出「这一轮拿活行怎么办」——
-    # 那正是 `gate.NOTE_SHADOW` 那句话要交代的事。
-    summary["note"] = plan.note
-
-    if plan.blocked:
-        # 冷启动 / 状态过期：期望集算不出来 ⇒ 连对账都不发起（见模块 docstring）。
-        # 活行原样留着继续拦：那是这两个收场唯一诚实的动作。
-        summary["skipped"] = plan.blocked
-        logger.info("[regime] 行情阶段 gate：%s", summary["note"])
-        return summary
-
-    summary["targets"] = sum(
-        1
-        for ref in refs
-        if ref.regime == state.regime and ref.warrant == gate.STILL_TARGET
-    )
-    summary["exempt"] = sum(
-        1
-        for ref in refs
-        if ref.regime == state.regime
-        and ref.warrant == gate.STILL_TARGET
-        and getattr(situation.exemptions.get(ref.strategy_id), "in_force", False)
-    )
+    # 走到这里 `plan.note` 只可能是 Shadow 那一档（正常一轮是空串），而它必须进摘要：
+    # `gate_open=False` 只说得出「开关关着」，说不出「这一轮拿活行怎么办」——那正是
+    # `gate.NOTE_SHADOW` 那句话要交代的事。
+    summary["targets"] = round_.targets
+    summary["exempt"] = round_.exempt
     summary["close_reasons"] = {
-        str(strategy_id): code for strategy_id, code in plan.close_reasons.items()
+        str(strategy_id): code for strategy_id, code in round_.plan.close_reasons.items()
     }
 
     # **声明先写、记录后写**：声明是机制对市场的动作，status 是对「机制做过什么」的记录。
     # 写声明失败时整轮往上抛（调用方负责让人看见），那时一条 status 都还没动——反过来
     # 先写 status 的话，一次失败会留下一批「机制声明过它」而声明表里什么都没有的假历史。
-    summary["halt"] = halt_sync.sync(gate_plan=plan, actor_name=ACTOR_NAME, now=at)
+    summary["halt"] = halt_sync.sync(
+        gate_plan=round_.plan, actor_name=ACTOR_NAME, now=round_.now
+    )
     summary["statuses"] = _write_statuses(
-        plan.statuses,
-        strategy_of={ref.decision_id: ref.strategy_id for ref in refs},
+        round_.plan.statuses,
+        strategy_of={ref.decision_id: ref.strategy_id for ref in round_.refs},
     )
     summary["declarations"] = [
         {
@@ -396,7 +534,7 @@ def sync(
                 else None
             ),
         }
-        for declaration in plan.declarations
+        for declaration in round_.plan.declarations
     ]
 
     logger.info(

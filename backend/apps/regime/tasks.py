@@ -1,6 +1,6 @@
 """切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
 + 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）
-+ 窗口通知与声明写入失败告警（第②段单元 ②e）。
++ 窗口通知与声明写入失败告警（第②段单元 ②e）+ 行情阶段 gate 同步（第③段单元 ③b）。
 
 ## 为什么是独立任务
 
@@ -44,6 +44,21 @@
 同一件事重做几遍（CONTEXT.md:181 按「读安全 / 写危险」区分新任务，这一条属于「写危险但
 可全量重来」）。异常往上抛，失败可见性走已有的两条路：beat 的任务健康检查（跑了没）与
 日报第④段机制健康（结论新不新）。
+
+## 行情阶段 gate 为什么是**另一条**对账任务（第③段单元 ③b）
+
+`sync_gate` 与 `sync_halt_windows` 写同一张 `HaltDeclaration`，但**档不同**：那条管事件
+熔断与保命档，这条管策略停用档（`HaltTrigger.DEACTIVATION`）。分开的理由是「哪一档没对
+上」这件事不能被另一档的成功盖住——两条任务各自的返回值才是人读的那份「这一档刚刚做了
+什么」。同一套「对账不重试」（下一轮就是重试）与「失败往上抛」的纪律照旧；唯一多出来的
+是**写失败时发告警**：声明表说不出自己在拦什么，与 `sync_halt_windows` 里那条
+`alert_declaration_write_failure` 是同一件事（同一张表、同一个失败面），所以共用同一个出
+口，而不是各写一句。
+
+**它在 Shadow 期也照跑**（`gate_run.sync` 自己认档位）：档位关着时它不拦人，但「阶段换
+了、这批策略不再该停」这个事实仍要落进表里；而阶段说不清的那些轮次里活行一条都不动（连
+对账都不发起），补上的动作是**把同一次开关动作再敲一遍**——那是人在 `gate_switch` 那边
+的事，本任务只负责让每一轮都有一次对账。
 
 ## 窗口同步任务为什么兼着减仓投递（第②段单元 ②d）
 
@@ -337,6 +352,44 @@ def sync_halt_windows() -> dict:
         fired = reduce_run.dispatch()
         summary["reduce_rows"] = fired.get("rows", 0)
         return summary
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+
+@app.task(acks_late=True)
+def sync_gate() -> dict:
+    """按行情阶段对账「本阶段该停哪些策略」（第③段单元 ③b）。
+
+    与 `sync_halt_windows` 同一套写法、同一张表、不同的档（见模块 docstring 的「行情
+    阶段 gate 为什么是另一条对账任务」）：没有 `max_retries`（下一轮 300 秒的对账就是
+    重试），异常往上抛进 beat 的任务健康检查；beat 也是固定 300 秒间隔，不用 crontab
+    （`CELERY_TIMEZONE` 是 UTC，而行情阶段本身是日频判定的产物，这条任务不关心几点）。
+
+    幂等：`gate_run.sync` 的期望值逐字来自库里存好的事实（当前阶段、当前代、声明的
+    `opened_at` 是那个唯一常量），所以连着跑两轮，第二轮必然是声明表整表空转、`statuses`
+    为空。返回的就是它的摘要（18 个键，键集在四条路径上一致——它进 Celery 结果与日报）。
+
+    **只读的那一半也一样跑。** 档位是 Shadow、阶段还没判出来（`blocked`）时这一轮几乎
+    什么都不写，但那是**结论**而不是「可以跳过」：`skipped` 那件事本身要被记下来，否则
+    「机制按阶段停过谁」与「机制根本没在跑」在事后读起来一模一样。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime import gate_run, halt_notify
+
+    try:
+        try:
+            return gate_run.sync()
+        except Exception as exc:  # noqa: BLE001
+            # 与 `sync_halt_windows` 同一条：写声明失败 = 机制说不出自己在拦什么。发完
+            # 再抛——吞掉会让真实故障从任务健康检查里消失。
+            logger.error("[regime] 行情阶段 gate 对账失败，已发告警后继续往上抛", exc_info=True)
+            logger.error(
+                "[regime] 声明写入失败告警结果：%s",
+                halt_notify.alert_declaration_write_failure(exc),
+            )
+            raise
     finally:
         # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()

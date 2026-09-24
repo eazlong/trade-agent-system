@@ -288,7 +288,13 @@ def run_deactivation(
     now: datetime | None = None,
     params: config.JudgementLifecycleConfig | None = None,
 ) -> dict[str, Any]:
-    """当前阶段 × 当前代池化格 → 停用决策（`DeactivationDecision`，状态恒为 `suggested`）。
+    """当前阶段 × 当前代池化格 → 停用决策（`DeactivationDecision`）。
+
+    **本函数只写 `suggested`**：翻面（`applied` / `released`）是第③段 gate 层的事
+    （`gate_run._write_statuses`，只改 `status` 那一列），与本函数不复述同一条判据——
+    「这条策略该不该停」在那边是**按当前阶段重算**的，而这里的结论是**推导那一刻**的。
+    所以「状态恒为 `suggested`」这句话对读这张表的人已经不成立，对本函数的**写入**仍然
+    成立。
 
     幂等：同一个结论反复跑只会把 `last_confirmed_at` 往前推。返回一个**可 JSON 序列化**的
     摘要（Celery 用 JSON 序列化结果，所以 id 一律是字符串），键集在两条路径上一致。

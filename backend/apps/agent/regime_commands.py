@@ -7,15 +7,37 @@ LLM**。这与 `/event` 同一条理由：判据认的是人敲的，而只要�
 
 ## 语法
 
-    /regime            上线确认页（只读，不改变任何东西）
+    /regime            事件熔断的上线确认页（只读，不改变任何东西）
     /regime on         打开事件熔断（先回显确认页，再落一条切换流水）
     /regime off        关掉事件熔断（回到 Shadow）
+    /regime gate       行情阶段 gate 的上线确认页（只读）
+    /regime gate on    打开行情阶段 gate（先回显确认页，再落流水 + 对一次账）
+    /regime gate off   关掉行情阶段 gate（回到 Shadow）
 
-`on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」。
+`on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」。第二级的那个
+词（`gate` / `阶段`）**不进那张别名表**——它是组名，与「打开 / 关掉」不是一类东西。
 
-**打开与关闭都要过确认页**（第169 条），但**只有打开会回显整页**：这一步会让机制在没有
-人的时候自动对市场动手（②d 的减仓执行器），所以「会不会拦住东西」必须当场看见。关闭是
-撤防，回显的是「关掉之后什么变了、什么没变」——把整页再打一遍只会让人跳过它。
+两级共用一套解析纪律（`_word`）：整词匹配、多余一个词就拒绝并点名。裸的 `gate` 是**那一页
+本身**，不是「gate 的开关」；不带动作的 `/regime` 仍然是事件熔断那一页，两个机制各有各的
+只读页（CONTEXT.md 第169 条要求两个机制的动作都要过确认页，而确认页是**各自的**：它们的
+敞口不是同一件事）。
+
+## 两个机制为什么在一条命令下
+
+`/regime` 的宾语是「机制开关」，两个开关（事件熔断 / 行情阶段 gate）的**打开与关闭**是
+同一类动作，所以共用一条命令与一套解析；而它们的**判定与对账各在自己那一层**
+（`breaker_switch` / `gate_switch`），本模块只做「谁敲的、敲的是什么」。
+
+**回显口径有一处刻意的差别。** 两个机制的**打开**都回显整页——这一步会让机制在没有人的
+时候动别人的仓位（gate 那一侧还重一层：它会把本阶段不适配的一批策略**停掉**，写进停止
+声明表）。**关闭**则不同：事件熔断那一档不回显（`_off` 只说「关掉之后什么变了」），行情
+阶段 gate **回显整页**——关闭页里有「关掉就安全了」在保命档（高波动）上是错的那句话
+（那一层没有开关可翻），而它是撤防方向上唯一拦得住这个要命误读的东西；同时 CLI 入口
+`manage.py regime_gate` 两个方向都印整页，聊天里少印一半就是同一个动作两个说法。
+
+gate 的**两个方向**都还会多一句 `gate_switch.reconcile_warning`（档位翻了、但声明表没对
+上），与 CLI 入口共用同一句话：那种轮次里活行一条都没被解除，而「把同一次动作再敲一遍」
+正是能补上的动作。
 
 ## 与 `/event` 的分工
 
@@ -50,7 +72,7 @@ from asgiref.sync import sync_to_async
 from django.db import close_old_connections
 from django.utils import timezone
 
-from apps.regime import breaker_switch, events
+from apps.regime import breaker_switch, events, gate_switch
 from apps.regime.models import ActorKind, MechanismMode
 
 from .base import AgentMessage, AgentResult
@@ -58,10 +80,13 @@ from .base import AgentMessage, AgentResult
 logger = logging.getLogger(__name__)
 
 _USAGE = (
-    "事件熔断开关：\n"
-    "  /regime        上线确认页（只读，不改变任何东西）\n"
-    "  /regime on     打开事件熔断（先回显确认页，再落一条切换流水）\n"
-    "  /regime off    关掉事件熔断（回到 Shadow）"
+    "机制开关：\n"
+    "  /regime            事件熔断的上线确认页（只读，不改变任何东西）\n"
+    "  /regime on         打开事件熔断（先回显确认页，再落一条切换流水）\n"
+    "  /regime off        关掉事件熔断（回到 Shadow）\n"
+    "  /regime gate       行情阶段 gate 的上线确认页（只读）\n"
+    "  /regime gate on    打开行情阶段 gate（先回显确认页，再落流水 + 对一次账）\n"
+    "  /regime gate off   关掉行情阶段 gate（回到 Shadow）"
 )
 
 #: 子命令别名。只认整词，不做前缀匹配——「/regime onx」不是「on」的笔误而是另一个词。
@@ -78,9 +103,30 @@ _ALIASES = {
     "close": "off",
 }
 
+#: 第二级的那个词：`/regime gate …`。它**不进 `_ALIASES`**——那张表是「打开 / 关掉」的
+#: 同义词表，把组名混进去会让 `/regime gate` 在解析上长得像一次开关动作。只认整词。
+_GATE_WORDS = {"gate", "阶段"}
+
 
 def _actor(message: AgentMessage) -> str:
     return (message.user_id or "").strip()
+
+
+def _word(
+    tokens: list[str], table: dict[str, str], *, prefix: str = ""
+) -> tuple[str | None, str | None]:
+    """从一张别名表里认出一个规范名。返回 `(规范名, 给用户看的那句话)`，恰好一个非空。
+
+    「多给了一个词」是手滑（`success=True` 的普通回复），但绝不静默丢掉——开关切换尤其
+    不能容忍：「我明明写了 --备注 X」而它被丢掉，流水里就少了一条人以为写进去了的原因。
+    与 ②f 的写法一字不差，只是把两级解析共用成一个函数。
+    """
+    name = table.get(tokens[0].lower())
+    if name is None:
+        return None, f"未知的子命令：{prefix}{tokens[0]}\n\n{_USAGE}"
+    if len(tokens) > 1:
+        return None, f"这条命令不吃参数，多出来的词：{' '.join(tokens[1:])}\n\n{_USAGE}"
+    return name, None
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +200,101 @@ _SUBCOMMANDS = {"on": _on, "off": _off}
 
 
 # --------------------------------------------------------------------------- #
+# 第二级：行情阶段 gate（第③段单元 ③b）。与事件熔断**同一个形状**：裸命令只读、
+# `on` 回显整页、`off` 只回一句「关掉之后什么变了」。
+#
+# 打开要回显整页的理由在这里更重：它会让机制按行情阶段**停掉一批策略**（写停止声明
+# 表），而不只是「拦住下单」。关闭那一侧多一句警告，那句话与 CLI 入口共用
+# （`gate_switch.reconcile_warning`）——两个入口说的是同一件事。
+# --------------------------------------------------------------------------- #
+
+
+def _gate_status(actor: str, now: datetime) -> str:
+    """裸 `/regime gate`：行情阶段 gate 的上线确认页。**只读**——连一条流水都不写。"""
+    return gate_switch.page(now=now).body
+
+
+def _gate_on(actor: str, now: datetime) -> str:
+    """打开行情阶段 gate。**确认页与流水取自同一次快照**（`gate_switch.page`）。"""
+    briefing = gate_switch.page(now=now)
+    flip = gate_switch.flip_regime_gate(
+        MechanismMode.EXECUTING,
+        actor_kind=ActorKind.CHAT,
+        actor_name=actor,
+        reason=briefing.summary,
+        now=now,
+    )
+    if flip.row is None:
+        # 已经是执行态：不写第二条流水，但仍对了一次账（那正是「再敲一次」的用处）。
+        # 那句警告照样要走：CLI 入口在**两个分支上都**打它（`regime_gate.handle` 的
+        # `_warn_if_not_reconciled` 在 `return` 之前就调了），走 `on` 这条路的人看到的
+        # 话必须与走 CLI 的人一样——「对了一次账」在这一轮可能什么都没对上。
+        return _joined(
+            briefing,
+            flip,
+            "行情阶段 gate**本来就是执行态**，没有写第二条流水（仍然对了一次账）。",
+        )
+
+    tail = (
+        f"✅ 行情阶段 gate 已打开：{MechanismMode(flip.row.from_mode).display} → "
+        f"{MechanismMode(flip.row.to_mode).display}（{events.format_moment(flip.row.at)}）\n"
+        f"本阶段（{briefing.data.regime_display}）被判为不适配的被管策略会被**停用**"
+        "（写进停止声明表）；保命档（高波动）那一层与它无关。"
+    )
+    return _joined(briefing, flip, tail)
+
+
+def _gate_off(actor: str, now: datetime) -> str:
+    """关掉行情阶段 gate。**撤防也要留痕，但不重复整页。**"""
+    briefing = gate_switch.page(closing=True, now=now)
+    flip = gate_switch.flip_regime_gate(
+        MechanismMode.SHADOW,
+        actor_kind=ActorKind.CHAT,
+        actor_name=actor,
+        reason=briefing.summary,
+        now=now,
+    )
+    if flip.row is None:
+        # 撤销方向**不回显整页**，但同样是「再敲一次」的那条路——而「表还没对上」最可能
+        # 就发生在这条路上（阶段说不清时关掉 gate 不解除活行，于是人会再敲一次）。所以
+        # 那句警告必须跟着这句「仍然对了一次账」一起出现，否则这个分支里唯一的好消息
+        # 会把读的人骗成「表已经干净了」。CLI 入口两个分支都打这句，这里对齐。
+        lines = [
+            "行情阶段 gate**本来就是 Shadow**（只记录、不真拦），没有写第二条流水"
+            "（仍然对了一次账）。",
+            "要看当前状态：/regime gate",
+        ]
+        warning = gate_switch.reconcile_warning(briefing.data, flip.sync)
+        if warning is not None:
+            lines.append(warning)
+        return "\n".join(lines)
+
+    return _joined(
+        briefing,
+        flip,
+        f"✅ 行情阶段 gate 已关闭：{MechanismMode(flip.row.from_mode).display} → "
+        f"{MechanismMode(flip.row.to_mode).display}（{events.format_moment(flip.row.at)}）\n"
+        f"本轮的策略档声明按「行情阶段 gate 已回 Shadow」解除"
+        f"（{briefing.data.closing} 条）；人工豁免不受影响（关闭是撤防，不收回人给的豁免）。",
+    )
+
+
+def _joined(briefing, flip, tail: str) -> str:
+    """正文 + 一句「这一步做完了什么」+ 那句「表没对上」的警告（有才加）。
+
+    警告与 CLI 入口共用 `gate_switch.reconcile_warning`：两个入口说的是同一件事。
+    """
+    lines = [briefing.body, "", tail]
+    warning = gate_switch.reconcile_warning(briefing.data, flip.sync)
+    if warning is not None:
+        lines.append(warning)
+    return "\n".join(lines)
+
+
+_GATE_SUBCOMMANDS = {"on": _gate_on, "off": _gate_off}
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -171,23 +312,19 @@ async def handle_regime_command(message: AgentMessage, args: str) -> AgentResult
     tokens = args.split()
     if not tokens:
         handler = _status
+    elif tokens[0].lower() in _GATE_WORDS:
+        # `/regime gate [on|off]`：第二级的词之后才是动作，裸的 `gate` 是那一页本身。
+        if len(tokens) == 1:
+            handler = _gate_status
+        else:
+            name, error = _word(tokens[1:], _ALIASES, prefix=f"{tokens[0]} ")
+            if error is not None:
+                return AgentResult(task_id=message.task_id, success=True, data=error)
+            handler = _GATE_SUBCOMMANDS[name]
     else:
-        word = tokens[0].lower()
-        name = _ALIASES.get(word)
-        if name is None:
-            return AgentResult(
-                task_id=message.task_id,
-                success=True,
-                data=f"未知的子命令：{tokens[0]}\n\n{_USAGE}",
-            )
-        if len(tokens) > 1:
-            # 绝不静默忽略多余的词（与 `/event` 同一条纪律）。开关切换尤其不能容忍：
-            # 「我明明写了 --备注 X」而它被丢掉，流水里就少了一条人以为写进去了的原因。
-            return AgentResult(
-                task_id=message.task_id,
-                success=True,
-                data=f"这条命令不吃参数，多出来的词：{' '.join(tokens[1:])}\n\n{_USAGE}",
-            )
+        name, error = _word(tokens, _ALIASES)
+        if error is not None:
+            return AgentResult(task_id=message.task_id, success=True, data=error)
         handler = _SUBCOMMANDS[name]
 
     now = timezone.now()

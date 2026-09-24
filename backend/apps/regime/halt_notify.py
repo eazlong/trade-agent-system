@@ -67,8 +67,8 @@ from typing import Any, Sequence
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from apps.regime import events, halt, halt_sync
-from apps.regime.models import HaltDeclaration
+from apps.regime import events, gate_switch, halt, halt_sync
+from apps.regime.models import HaltDeclaration, HaltTrigger
 from apps.trading.models import LiveSession
 
 logger = logging.getLogger(__name__)
@@ -187,6 +187,21 @@ def _window_line(row: HaltDeclaration) -> str:
     return f"窗口：{start} → {events.format_moment(row.expires_at)}"
 
 
+def _close_reason_display(row: HaltDeclaration) -> str:
+    """解除原因的人话——**按触发源路由**（第③段 Q7）。
+
+    两个词表里都有一个短码叫 `regime_left`，而它们**不是同一个概念**：`halt_sync` 那个说的是
+    「阶段已离开高波动」（保命档的话），`gate_switch` 那个说的是「这条决策行记的阶段已不是
+    当前阶段」。所以这里必须按 `trigger` 分岔——一把抓地调 `halt_sync.close_reason_display`
+    的表现是：两个词表都认得出这个码，谁都不报错，而一条策略档声明上贴着别档的文案。
+    认不出的码两条路都原样返回（`close_reason_display` 的口径），所以路由写错只会错在
+    同名的那一个码上，正是最难靠肉眼发现的那一个。
+    """
+    if halt.trigger_of(row) is HaltTrigger.DEACTIVATION:
+        return gate_switch.gate_close_reason_display(row.closed_reason)
+    return halt_sync.close_reason_display(row.closed_reason)
+
+
 def notify_body(row: HaltDeclaration, kind: str, *, shadow: bool) -> str:
     """一条窗口消息的正文。``shadow`` 是**发这条消息的此刻**这条线在不在 Shadow。
 
@@ -207,7 +222,7 @@ def notify_body(row: HaltDeclaration, kind: str, *, shadow: bool) -> str:
         lines.append(_window_line(row))
         lines.append(
             f"解除：{events.format_moment(row.closed_at)}"
-            f"（{halt_sync.close_reason_display(row.closed_reason)}）"
+            f"（{_close_reason_display(row)}）"
         )
     return "\n".join(lines)
 
