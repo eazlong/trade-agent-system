@@ -26,8 +26,8 @@
    也不产出建议**，只在 `unresolved`/`unmanaged` 里报数；判据二只标记，且 `mode` 只认
    `live`、`status` 只认 `LiveSession.ACTIVE_STATUSES`（不在这里手抄状态字面量）。
 7. **豁免的「在期」是三条一起**（未关闭 / 已生效 / 未到期），而「阶段离开」的一次性
-   关闭**不可逆**——所以三种「说不清当前阶段」的收场下关闭一律停手。两个方向不对称，
-   就往不会造成不可逆损失的那边倒。
+   关闭**不可逆**——所以三种「说不清当前阶段」的收场下关闭一律停手，**保命档期间也停手**
+   （高波动是叠加层，不是「离开」）。两个方向不对称，就往不会造成不可逆损失的那边倒。
 8. **返回值可 JSON 序列化且键集恒定**：它进 Celery 结果与日报，键集随路径漂移会让
    「今天和昨天有什么不同」多出一堆假差异。
 
@@ -188,16 +188,27 @@ class _Fixture(TestCase):
 
     # --- 造数据的三件套 ---------------------------------------------------- #
 
-    def judged(self, *, regime: str = DOWNTREND, effective_at: datetime | None = None):
+    def judged(
+        self,
+        *,
+        regime: str = DOWNTREND,
+        effective_regime: str | None = None,
+        effective_at: datetime | None = None,
+    ):
         """一条生效中的判定。`attribute_date` 比生效日早两天（今天的映射如此），但模型
-        层不校验这个映射，本文件也不依赖它。"""
+        层不校验这个映射，本文件也不依赖它。
+
+        `effective_regime` 与 `regime` 分开是给保命档用的：高波动是**被资讯抬上来的**，
+        那一行的基础阶段仍是它原本那一档（`base_regime` 是纯量化口径，`effective_regime`
+        是抬升后的值）。默认两者相同——多数用例问的不是这个分岔。
+        """
         moment = effective_at or NOW
         return RegimeJudgement.objects.create(
             symbol=judgement.SYMBOL,
             attribute_date=(moment - timedelta(days=2)).date(),
             effective_at=moment,
             base_regime=regime,
-            effective_regime=regime,
+            effective_regime=effective_regime or regime,
         )
 
     def exempt(
@@ -641,6 +652,41 @@ class TestExemptionClosing(_Fixture):
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
         self.assertEqual(summary["exemptions_closed"], 0)
+
+    def test_no_exemption_is_closed_while_the_blanket_is_live(self):
+        """保命档是**叠加层**（CONTEXT.md 第 115 条），不是「阶段离开」。
+
+        高波动抬升期间生效阶段是 `high_vol`，而豁免登记的永远是**基础阶段**——照 `!=`
+        比下去，用户手上每一条在期豁免都会在高波动第一天被关掉，而 `closed_at` 写下去
+        没有复活路径。用户什么都没做，豁免就没了；等保命档过去、系统回落到适用性层，
+        那条策略直接进停用。这条路径是活的：高波动本身不 blocked，判定照跑。
+        """
+        self.judged(regime=DOWNTREND, effective_regime=BaseRegime.HIGH_VOL)
+        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=DOWNTREND)
+        summary = self.decide()
+        exemption.refresh_from_db()
+        self.assertIsNone(exemption.closed_at)
+        self.assertEqual(summary["exemptions_closed"], 0)
+
+    def test_the_close_resumes_once_the_blanket_has_passed(self):
+        """高波动只是**延后**了「阶段离开」的判定，不是取消它。
+
+        保命档过去后生效阶段回落到基础阶段；它若已经换了（下行趋势 → 上行趋势），旧豁免
+        照常按「阶段离开」关闭。没有这一条，一个「高波动一来就再也不关了」的实现也能让
+        上面那条用例全绿。
+        """
+        self.judged(regime=DOWNTREND, effective_regime=BaseRegime.HIGH_VOL)
+        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=DOWNTREND)
+        self.decide()
+
+        self.judged(regime=UPTREND, effective_at=days(1))
+        summary = self.decide(now=days(1))
+
+        exemption.refresh_from_db()
+        self.assertEqual(exemption.closed_reason, dru.CLOSE_REASON_REGIME_LEFT)
+        self.assertEqual(summary["exemptions_closed"], 1)
 
 
 # --------------------------------------------------------------------------- #

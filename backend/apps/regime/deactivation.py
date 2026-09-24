@@ -134,6 +134,17 @@ BLOCKED_DISPLAY = {
 }
 
 
+def is_blanket(regime: str | None) -> bool:
+    """这个阶段是不是**保命档**（高波动）。
+
+    保命档的判据只能有一处。做成模块级函数而不只留 `RegimeState.blanket` 一个属性，是
+    因为还有调用方**手里只有阶段 slug、没有 `RegimeState`**（`deactivation_run.
+    close_left_regime_exemptions` 收的就是 slug）：那里判错的表现是把每一条在期豁免都
+    关掉，而 `closed_at` 写下去没有复活路径。
+    """
+    return regime == BaseRegime.HIGH_VOL.value
+
+
 @dataclass(frozen=True)
 class RegimeState:
     """当前**生效**的那条阶段。`regime is None` = 冷启动。
@@ -155,7 +166,7 @@ class RegimeState:
 
         放在这里而不是从格子上推：这是**阶段本身**的性质，与这一代池化表算出了什么无关。
         """
-        return self.regime == BaseRegime.HIGH_VOL.value
+        return is_blanket(self.regime)
 
 
 @dataclass(frozen=True)
