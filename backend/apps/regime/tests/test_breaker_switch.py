@@ -522,7 +522,7 @@ class _CliFixture(_Fixture):
     def manage(self, *args) -> str:
         """跑命令，返回 stdout。**不叫 `run`**（框架自己的入口）。"""
         out = StringIO()
-        call_command("manage_event_breaker", *args, stdout=out, stderr=StringIO())
+        call_command("event_breaker", *args, stdout=out, stderr=StringIO())
         return out.getvalue()
 
 

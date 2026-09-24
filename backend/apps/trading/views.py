@@ -450,7 +450,22 @@ def live_session_start(request, pk):
         timeframe,
     )
 
-    return Response({"status": session.status, "message": "Trading framework started"})
+    # CONTEXT.md 第 172 条：被 halt 拦下的动作必须回显是哪个触发源在拦，且回显落在
+    # 「用户发起动作」的那一刻。这个会话的订单要到 K 线到达之后才产生，那时没有任何人
+    # 正在看屏幕——所以在这里就把「你启动了它，但它开不了新仓」说清楚。
+    # **不阻止启动**：存量仓位的止损保护照常上线（所以不 return 400）。
+    # 只报**命中这个会话**的层（按 symbol / strategy），不命中就是空串。
+    from apps.regime import start_notice
+
+    return Response(
+        {
+            "status": session.status,
+            "message": "Trading framework started",
+            # 字段恒在：空串 = 没有层在拦。恒在的话客户端不用去区分「没有层」与
+            # 「服务端没这个字段」——后者会把一次静默的裁剪读成一次未实现的回显。
+            "notice": start_notice.start_notice(session.symbol, str(session.strategy_id)),
+        }
+    )
 
 
 @api_view(["POST"])
@@ -518,7 +533,18 @@ def live_session_resume(request, pk):
         except Exception as e:  # noqa: BLE001
             logger.error("resume: failed to start runner for %s: %s", session.id, e)
 
-    return Response({"status": session.status, "message": "Session resumed"})
+    # 恢复是**同一个时刻**的同一件事（第 172 条：回显落在用户发起动作的那一刻）：
+    # 暂停过的会话从这里重新开始开仓，而它的订单同样在 K 线到达之后才产生。
+    # 漏掉这一处，用户只要「暂停再恢复」就再也看不到那条回显了。
+    from apps.regime import start_notice
+
+    return Response(
+        {
+            "status": session.status,
+            "message": "Session resumed",
+            "notice": start_notice.start_notice(session.symbol, str(session.strategy_id)),
+        }
+    )
 
 
 @api_view(["POST"])

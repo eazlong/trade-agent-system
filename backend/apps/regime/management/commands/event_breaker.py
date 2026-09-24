@@ -9,13 +9,18 @@ admin），但那条路要经过 Telegram。**打开这个开关是「机制开�
 `breaker_switch.flip_event_breaker`）做同一件事。本模块自己不查库、不渲染、不做判断，
 免得「命令行的说法」与「聊天里的说法」分家——那正是第②f 段 Q8 要求同源的道理。
 
-    python manage.py manage_event_breaker                # 只看确认页，什么都不改
-    python manage.py manage_event_breaker --on           # 打开（先回显确认页，再落流水）
-    python manage.py manage_event_breaker --off          # 关掉
-    python manage.py manage_event_breaker --on --actor 张三
+    python manage.py event_breaker                # 只看确认页，什么都不改
+    python manage.py event_breaker --on           # 打开（先回显确认页，再落流水）
+    python manage.py event_breaker --off          # 关掉
+    python manage.py event_breaker --on --actor 张三
 
 不带任何动作参数时是**只读**的（与 `manage_deactivation_exemptions` 一样，跑完动作总是
 把当前状态打出来）。
+
+命名：本命令**不带 `manage_` 前缀**（区别于 `manage_deactivation_exemptions`）。那条命令
+的宾语是「在期豁免」这张表，名字需要说清它管的是哪张表；这条命令的宾语就是机制本身，
+命令词与 `MechanismKind.EVENT_BREAKER` 的那个值同名，敲 `/regime` 的人与敲 CLI 的人看到
+的是同一个词。
 """
 
 from __future__ import annotations
