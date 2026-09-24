@@ -14,15 +14,24 @@ docstring 写了理由），所以合并、推进、作用域这些**语义**能
 
 落库那一半（幂等、唯一键、解除原因、开关）必须真库：`uniq_live_halt_declaration` 是
 数据库约束，而 `sync()` 的全部难处都长在它上面。
+
+## 第三段：策略停用那一档从哪来（第③段）
+
+事件与保命档的期望集本模块自己算得出来；策略停用决策的算不出来（那要一整条池化推导），
+所以 `sync(gate_plan=…)` 接收 `gate.derive` 的产出，本轮**只**对账那一档。这两件事的坏法
+也不同：本模块算错的表现是「拦错了」，而「一轮里管了两档」的表现是两个 300 秒任务在同一
+把唯一键上撞 `UniqueViolation`——后者取决于两个任务相差几毫秒，比读代码难得多的多。
+`TestTheGateRound` 钉的就是这条分界。
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone as dt_timezone
+from uuid import uuid4
 
 from django.test import SimpleTestCase, TestCase
 
-from apps.regime import deactivation, events, halt, halt_sync
+from apps.regime import deactivation, events, gate, halt, halt_sync
 from apps.regime.halt_sync import (
     ACTOR_NAME,
     BLANKET_LABEL,
@@ -30,6 +39,7 @@ from apps.regime.halt_sync import (
     CLOSE_REASON_NO_LONGER_COVERS,
     CLOSE_REASON_REGIME_LEFT,
     CLOSE_REASON_WINDOW_ENDED,
+    GATE_ACTOR_NAME,
     PlannedRow,
 )
 from apps.regime.models import (
@@ -541,3 +551,131 @@ class TestSyncWritesBeforeTheSwitchIsOn(_SyncTestBase):
         self._switch(MechanismKind.EVENT_BREAKER, MechanismMode.EXECUTING)
 
         self.assertIn("FOMC 议息", halt.block_reason("BTC/USDT", now=self.AT))
+
+
+class TestTheGateRound(_SyncTestBase):
+    """`sync(gate_plan=…)`：策略停用那一档。
+
+    **一轮只对账一档**不是优化，是正确性：事件与保命档由 `regime-sync-halt-windows` 驱动，
+    策略停用档由 `regime-gate-sync` 驱动，两个 300 秒任务各自全表重算。若两边都认为「表里
+    不在我期望集里的行就是我该解除的」，它们会在同一把唯一键上同时 `create()`——撞的是
+    `uniq_live_halt_declaration`，而撞不撞取决于两个任务相差几毫秒。这里钉住的那条分界
+    （trigger 不在本轮 `sources` 里就整行跳过）就是唯一挡着它的东西。
+    """
+
+    def _live_deactivation_row(self, strategy_id) -> HaltDeclaration:
+        return HaltDeclaration.objects.create(
+            trigger=HaltTrigger.DEACTIVATION.value,
+            scope=halt.strategy_scope(strategy_id),
+            label=f"策略停用决策：{strategy_id}",
+            opened_at=NOW - timedelta(hours=5),
+            reason="旧一轮写的",
+            actor_kind=ActorKind.TASK.value,
+            actor_name=GATE_ACTOR_NAME,
+        )
+
+    def test_a_gate_round_writes_the_row_with_its_own_signature(self):
+        """这一档的行**只可能**由 `regime-gate-sync` 写，所以署名是另一个名字。
+
+        共用一个署名的话，「这行是谁写的」的答案就变成「两个任务之一」——而排查时真正想
+        知道的恰恰是哪一个（两档坏掉的样子完全不同）。
+        """
+        plan = gate.GatePlan(
+            declarations=(
+                gate.Declaration(
+                    strategy_id="s-1",
+                    label="策略停用决策：均值回归（高波动不适配）",
+                    reason="均值回归 在当前「高波动」阶段判为不适用。",
+                    opened_at=NOW - timedelta(hours=3),
+                ),
+            )
+        )
+
+        summary = halt_sync.sync(now=self.AT, gate_plan=plan, actor_name=GATE_ACTOR_NAME)
+
+        self.assertEqual(summary, {"created": 1, "updated": 0, "unchanged": 0, "closed": 0})
+        row = HaltDeclaration.objects.get()
+        self.assertEqual(row.trigger, HaltTrigger.DEACTIVATION.value)
+        self.assertEqual(row.scope, halt.strategy_scope("s-1"))
+        # **`opened_at` 取自 plan，不取自 `now`**：策略停用没有预先知道的截止时刻，所以
+        # 起点是这一行唯一的时间事实，而它必须幂等（否则 300 秒一轮会把窗口起点一路推后）。
+        self.assertEqual(row.opened_at, NOW - timedelta(hours=3))
+        self.assertIsNone(row.expires_at)
+        self.assertEqual(row.actor_kind, ActorKind.TASK.value)
+        self.assertEqual(row.actor_name, GATE_ACTOR_NAME)
+        self.assertNotEqual(GATE_ACTOR_NAME, ACTOR_NAME)
+
+        again = halt_sync.sync(now=self.AT, gate_plan=plan, actor_name=GATE_ACTOR_NAME)
+        self.assertEqual(again, {"created": 0, "updated": 0, "unchanged": 1, "closed": 0})
+
+    def test_a_gate_round_leaves_the_event_and_blanket_rows_alone(self):
+        """本轮的 `sources` 只有 `DEACTIVATION`：另外两档的行既不是「计划里没有」，也不是
+        「该解除」，而是**下一轮别的任务的事**。把它们当成前者就会静默解除一条事件熔断。
+        """
+        self._create_event()
+        self._judge(BaseRegime.HIGH_VOL, effective_at=NOW - timedelta(days=1))
+        halt_sync.sync(now=self.AT)
+        self.assertEqual(HaltDeclaration.objects.filter(closed_at__isnull=True).count(), 2)
+
+        plan = gate.GatePlan(
+            declarations=(
+                gate.Declaration(
+                    strategy_id="s-1",
+                    label="策略停用决策：某策略",
+                    reason="某策略 在当前阶段判为不适用。",
+                    opened_at=NOW - timedelta(hours=3),
+                ),
+            ),
+            close_reasons={"s-9": gate.CLOSE_BECAME_FIT},
+        )
+        summary = halt_sync.sync(now=self.AT, gate_plan=plan, actor_name=GATE_ACTOR_NAME)
+
+        self.assertEqual(summary, {"created": 1, "updated": 0, "unchanged": 0, "closed": 0})
+        self.assertEqual(HaltDeclaration.objects.filter(closed_at__isnull=True).count(), 3)
+        # 事件与保命档那两行连字段都没被碰过（`_rewrite` 的「没变化就不写」）。
+        self.assertEqual(
+            HaltDeclaration.objects.filter(
+                trigger__in=[HaltTrigger.EVENT.value, HaltTrigger.BLANKET.value],
+                closed_at__isnull=True,
+            ).count(),
+            2,
+        )
+
+    def test_the_plan_keying_is_translated_to_the_scope_before_it_is_used(self):
+        """**plan 的键是策略 id（可能是 UUID），表里的键是 `strategy:<id>`。**
+
+        两个写方各说各的话：判定层只认策略，作用域是这张表的事（`gate.Declaration` 的
+        docstring 明写了）。翻译在 `_gate_planned` 一处发生，所以解除原因也跟着翻成作用域
+        ——否则「`close_reasons` 拿得到码、行却匹配不上」这种失配会表现成「活行解除不掉」，
+        也就是一条停用决策一直拦着，看不出是 bug。
+        """
+        sid = uuid4()
+        row = self._live_deactivation_row(sid)
+        plan = gate.GatePlan(close_reasons={sid: gate.CLOSE_BECAME_FIT})
+
+        summary = halt_sync.sync(now=self.AT, gate_plan=plan, actor_name=GATE_ACTOR_NAME)
+
+        self.assertEqual(summary, {"created": 0, "updated": 0, "unchanged": 0, "closed": 1})
+        row.refresh_from_db()
+        self.assertEqual(row.closed_at, self.AT)
+        self.assertEqual(row.closed_reason, gate.CLOSE_BECAME_FIT)
+
+    def test_a_row_the_plan_says_nothing_about_is_left_blocking(self):
+        """**fail-closed**：本轮在管这一档，却对某一行既没说「声明」也没给解除原因。
+
+        这是写入方的 bug，而两种收场不对称：猜一个码把它解除掉，表里就只剩一条「机制解除
+        过它」的假记录（看起来与「本来就没声明」一样）；原样留着只是多拦一轮——吵闹，但
+        看得见，而且下一轮就修正了。
+        """
+        row = self._live_deactivation_row("s-1")
+
+        with self.assertLogs("apps.regime.halt_sync", level="WARNING") as captured:
+            summary = halt_sync.sync(
+                now=self.AT, gate_plan=gate.GatePlan(), actor_name=GATE_ACTOR_NAME
+            )
+
+        self.assertEqual(summary["closed"], 0)
+        self.assertIsNone(HaltDeclaration.objects.get(pk=row.pk).closed_at)
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("fail-closed", captured.records[0].getMessage())
+        self.assertIn(halt.strategy_scope("s-1"), captured.records[0].getMessage())
