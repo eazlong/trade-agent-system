@@ -70,7 +70,7 @@ from django.utils import timezone
 
 from apps.common.time_utils import business_tz, format_business, to_business
 from apps.regime import config, judgement
-from apps.regime.deactivation import BLOCKED_DISPLAY
+from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
 from apps.regime.models import (
     NO_ESCALATION_DISPLAY,
@@ -585,6 +585,10 @@ def _landscape(
         SECTION_CHANGE: _change(
             by_regime,
             today_blocked=deactivation.get("skipped") or "",
+            # 当轮判定的生效阶段，与上面 `"regime"` 是同一个取值。保命档的进出靠它
+            # 认（`deactivation.is_blanket`）——**传进去而不是让 `_change` 自己查**：
+            # 同一份日报的两段必须来自同一次判定结果。
+            today_regime=judgement_result.get("effective_regime") or "",
             symbol=symbol,
             run_day=run_day,
         ),
@@ -601,7 +605,12 @@ def _strategy_names(strategy_ids: list) -> dict[str, str]:
 
 
 def _change(
-    by_regime: dict, *, today_blocked: str, symbol: str, run_day: date
+    by_regime: dict,
+    *,
+    today_blocked: str,
+    today_regime: str,
+    symbol: str,
+    run_day: date,
 ) -> dict:
     """第②段的结构化内容：与**上一份日报**的 `by_regime` 做差。
 
@@ -613,6 +622,23 @@ def _change(
     `blocked` 的三态是这段的核心：本轮的推导没产出建议时，今天的集合是**空**的，直接做差
     会把「这轮没说话」读成「把这些全解除了」。同理，上一份日报本身是阻塞日时，它那份空
     集合不代表「那天没有建议」，拿它当基准会凭空造出一堆「将停用」。
+
+    ## 保命档那一层要单独补，而且它不在 `diff_regimes` 的坐标系里
+
+    `by_regime` 的键是**建议清单里的阶段**，而保命档是阶段本身的性质（「生效中的判定就是
+    高波动」，`halt_sync`），它在清单里根本没有对应的条目——池化对 `high_vol` 那一格给出
+    的是 `blanket`，`deactivation._verdict` 把它映成 `BLANKET`，而 `BLANKET ∉ targets`。
+    于是「今天进了保命档」这件事，做差做不出来、也不会以别的方式出现。
+
+    这不能靠「少一行」了事：抬升日上一份日报各层的策略**全部消失**（今天的清单只按新阶段
+    产出），只做差会渲染成一片「将解除〈某层〉」——读起来正是「可以交易了」，而事实是
+    **此刻谁都不该开新仓**。所以抬升日把那些 `release` 全部丢掉，只补一条保命档的
+    `halt`；降级日反过来，补一条 `release`。
+
+    `today_regime` 由调用方从当轮判定带进来（`_landscape` 就在它旁边），**本函数不自己
+    去查判定表**：同一份日报里「今日判定」与「相对昨日的变化」必须来自同一次判定结果，
+    各查一次迟早会在日界附近各说各话。上一份的则是现成的——`prev.landscape["regime"]`
+    就是那天写库时的同一个字段（**取不到就当作不是保命档**，即 `is_blanket("")` 为假）。
     """
     prev = (
         DailyReport.objects.filter(symbol=symbol, run_day__lt=run_day)
@@ -654,6 +680,18 @@ def _change(
         }
 
     items = diff_regimes(prev_by_regime, by_regime)
+
+    # 保命档那一层的进出（见 docstring）。**这一段排在判空之前**：只有保命档动了的那些天，
+    # `items` 做完差正好是空的，先判空就会把「今天全场停手」报成「无变化」——而这两句
+    # 对读的人是天差地别的两件事。三条早退路径（本轮阻塞 / 没有上一份 / 上一份阻塞）都
+    # 在前面返回了，它们说的是「今天不比」，这里绝不越过它们去比。
+    prev_blanket = is_blanket(prev_landscape.get("regime") or "")
+    today_blanket = is_blanket(today_regime)
+    if today_blanket and not prev_blanket:
+        items = [i for i in items if i["kind"] != "release"] + [_blanket_item("halt")]
+    elif prev_blanket and not today_blanket:
+        items = items + [_blanket_item("release")]
+
     if not items:
         note = f"与 {prev.run_day} 的日报相比无变化"
         if prev.run_day != run_day - timedelta(days=1):
@@ -717,11 +755,51 @@ def _change_item(kind: str, regime: str, entries: list[dict]) -> dict:
 
 def _change_headline(items: list[dict]) -> str:
     parts = [
-        f"{'将新停用' if item['kind'] == 'halt' else '将解除'}"
-        f"「{item['regime_display']}」{len(item['strategies'])} 个"
+        f"{_verb_of(item)}{_layer_label(item)}"
+        + ("" if item.get("blanket") else f"{len(item['strategies'])} 个")
         for item in items
     ]
     return "；".join(parts)
+
+
+#: 保命档那一层的层名后缀。它与别的层不是同一种东西：别的层回答「哪个阶段里这批策略
+#: 不行」，它回答「此刻谁都不该开新仓」（CONTEXT.md 第 176 条），所以层名后面缀一个
+#: 「档」，与 `HaltTrigger.BLANKET` 的展示名（「保命档（高波动）」）同调。
+_BLANKET_SUFFIX = "档"
+
+#: 保命档条目的补充说明。措辞取自 `halt_sync._blanket_reason`（那边写的是「保命档不做
+#: 适用性判断，与证据无关」），**不在这里另写一句中文**：同一层在日报、`query_halt` 与
+#: 那条声明里必须同措辞——两处各写一遍，读的人迟早要面对「说的是不是同一件事」。
+_BLANKET_NOTE = "（全市场一律，与证据无关）"
+
+
+def _blanket_item(kind: str) -> dict:
+    """保命档那一层的一条变化。``kind`` 与其余条目共用一套取值（``halt`` / ``release``）。
+
+    ``strategies`` **恒为空**，而且不是「暂时填不上」：保命档做的是适用性判断**之外**的
+    判断（「此刻谁都不该开新仓」，与证据无关），它答不出一份策略清单。所以渲染层必须靠
+    ``blanket`` 这个标志换一套说法，不能按「条目里没有策略」去猜——那与「这层的策略正好
+    全被裁掉」在结构上一模一样，混过去的表现是保命档那一行整条消失。
+    """
+    regime = BaseRegime.HIGH_VOL.value
+    return {
+        "kind": kind,
+        "regime": regime,
+        "regime_display": _regime_display(regime),
+        "blanket": True,
+        "strategies": [],
+    }
+
+
+def _verb_of(item: dict) -> str:
+    """预告口径的动词（CONTEXT.md 第 173 条）。"""
+    return "将新停用" if item["kind"] == "halt" else "将解除"
+
+
+def _layer_label(item: dict) -> str:
+    """层名（带书名号）。**层名只有这一处拼**：标题与正文说的必须是同一个层。"""
+    suffix = _BLANKET_SUFFIX if item.get("blanket") else ""
+    return f"「{item['regime_display']}」{suffix}"
 
 
 def render_change(
@@ -732,6 +810,11 @@ def render_change(
     **裁剪发生在渲染之前**：`strategy_ids=None` 表示「不裁」（存档那一份、以及日志）；
     传一个集合表示「只留与这些策略有关的条目」（某个用户那一份）。筛完没有条目时返回
     **空串**，由调用方决定连标题一起省掉——无活跃会话的人不该看到这一节。
+
+    保命档那条**不按策略裁**（它没有策略清单可裁，`_blanket_item`），但它不是段可见性的
+    例外：`strategy_ids` 是空集时连它也一起省掉。空集的意思是「机制压根没在管这个人」，
+    而「全市场一律」正是最该被那句话挡住的——给一个没有活跃会话的人推「全场将停手」，
+    下一次他就会开始忽略日报。
 
     取的是「预告口径」而不是陈述口径（CONTEXT.md 第 173 条）：这些变化**将在明日 08:00
     生效**，所以写「将停用」，不写「已停用」。此刻被停的与这里写的不是同一批，混起来
@@ -745,14 +828,20 @@ def render_change(
 
     lines: list[str] = []
     for item in change.get("items") or []:
+        blanket = bool(item.get("blanket"))
+        if blanket and strategy_ids is not None and not strategy_ids:
+            continue
         entries = item.get("strategies") or []
         if strategy_ids is not None:
             entries = [e for e in entries if e.get("strategy_id") in strategy_ids]
-        if not entries:
+        if not entries and not blanket:
             continue
-        verb = "将新停用" if item["kind"] == "halt" else "将解除"
+        line = f"{_verb_of(item)}{_layer_label(item)}"
+        if blanket:
+            lines.append(line + _BLANKET_NOTE)
+            continue
         names = "、".join(_entry_label(e) for e in entries)
-        lines.append(f"{verb}「{item['regime_display']}」：{names}")
+        lines.append(f"{line}：{names}")
     if not lines:
         return ""
     lines.append("（以上自明日 08:00 起生效）")

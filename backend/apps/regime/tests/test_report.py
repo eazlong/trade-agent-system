@@ -27,7 +27,7 @@
 **分层**：`TestContract` / `TestTheStructuredChange` / `TestCropForOneUser` 三个类是
 `SimpleTestCase`——碰一下库就报错，所以「这几段不落库」是被强制的，不靠 docstring 声明。
 `TestPureRendering` 只读（`_switch_lines` 会读切换流水表，所以它只能是 `TestCase`），
-`TestTheWriteGate` 与后面四个类落真库。
+`TestTheWriteGate` 与后面五个类落真库。
 
 **造数据用真 UUID**：策略主键是 `UUIDField`，而 `_strategy_names` 会拿建议里的
 `strategy_id` 去 `filter(id__in=...)`。塞一个 `"s1"` 进去会当场 `ValidationError`，而不是
@@ -153,6 +153,14 @@ class TestContract(SimpleTestCase):
         # 第①段要认出「量化判出的候选被持续期拦下、于是沿用当前阶段」这一种收场，
         # 而它只存在于判定层的私有名里。两处必须一起改，所以钉住。
         self.assertEqual(report.ACTION_CARRIED, judgement._DECISION_CARRIED)
+
+    def test_the_blanket_predicate_comes_from_the_deactivation_layer(self):
+        # 「哪一档是保命档」只能有一处判据（`deactivation.is_blanket`），日报这边不自己写
+        # `regime == "high_vol"`。判错了不会报错，只会把抬升日渲染成一片「将解除」——
+        # 那是「写下去没有复活路径」的那一类。所以把条目里的 slug 钉在那个判据上。
+        self.assertTrue(
+            deactivation.is_blanket(report._blanket_item("halt")["regime"])
+        )
 
     def test_the_horizon_matches_the_slash_command(self):
         # 日报第③段与 `/event list` 回答的是同一个问题。天数一旦分成两个数，
@@ -413,6 +421,24 @@ class TestTheStructuredChange(SimpleTestCase):
         headline = report._change_headline(items)
         self.assertIn("将新停用「下行趋势」2 个", headline)
 
+    def test_the_headline_does_not_count_the_blanket_layer(self):
+        # 保命档答不出一份策略清单（`_blanket_item`），所以标题里也不出现「N 个」：
+        # 「0 个」会被读成「这条不计」，而它恰恰是那天最重的一条。
+        self.assertEqual(
+            report._change_headline([report._blanket_item("halt")]),
+            "将新停用「高波动」档",
+        )
+
+    def test_the_blanket_line_is_kept_for_a_user_who_has_something_else_to_see(self):
+        # 保命档不按策略裁——它答不出「跟你有关的那几条」。但**段可见性它不是例外**：
+        # 只要这个人还在被机制管着（`strategy_ids` 非空），这条就得出现，否则「全场将
+        # 停手」只会推给恰好有一条策略变动的人。
+        change = {"status": "diff", "items": [report._blanket_item("halt")]}
+        self.assertEqual(
+            report.render_change(change, strategy_ids={"s9"}),
+            "将新停用「高波动」档（全市场一律，与证据无关）\n（以上自明日 08:00 起生效）",
+        )
+
     def test_render_change_speaks_in_the_future_tense(self):
         # 预告口径：这些变化**将在明日 08:00 生效**，所以写「将停用」，不写「已停用」。
         change = {
@@ -512,6 +538,25 @@ class TestCropForOneUser(SimpleTestCase):
     def test_a_user_with_no_active_session_sees_no_section_at_all(self):
         sections = report.crop_for(_report(), set())
         self.assertNotIn(report.SECTION_CHANGE, sections)
+
+    def test_a_blanket_only_change_follows_the_same_visibility_rule(self):
+        # 保命档不按策略裁（它没有清单可裁，`_blanket_item`），但**段可见性它不是例外**：
+        # `strategy_ids` 是空集时整节省掉。给一个机制压根没在管的人推「全场将停手」，
+        # 下一次他就开始忽略日报了——而「必发」正是靠这个被读的。
+        landscape = {
+            report.SECTION_CHANGE: {
+                "status": "diff",
+                "items": [report._blanket_item("halt")],
+            }
+        }
+        self.assertNotIn(
+            report.SECTION_CHANGE,
+            report.crop_for(_report(landscape=landscape), set()),
+        )
+        self.assertIn(
+            "高波动",
+            report.crop_for(_report(landscape=landscape), {"s9"})[report.SECTION_CHANGE],
+        )
 
     def test_the_other_four_sections_are_untouched(self):
         sections = report.crop_for(_report(), {"s1"})
@@ -696,6 +741,156 @@ class TestTheWrittenRow(TestCase):
         change = row.landscape[report.SECTION_CHANGE]
         self.assertEqual(change["baseline_run_day"], (RUN_DAY - timedelta(days=3)).isoformat())
         self.assertEqual(change["status"], "diff")
+
+
+class TestTheBlanketLayerInTheChange(TestCase):
+    """保命档那一层怎么进第②段（Q10）。**这个类落库**，而这是刻意的。
+
+    它钉的是 `_change` 与「上一份日报」一起求值的结果，而「上一份说了什么」只在
+    `DailyReport` 表里。**不塞进 `TestTheStructuredChange`**：那个类是 `SimpleTestCase`，
+    而「这几段不落库」正是靠它强制的（模块 docstring）——放一条要读库的用例进去，那份
+    强制就当场作废，而且是静悄悄地作废。
+
+    保命档**不在 `diff_regimes` 的坐标系里**：`by_regime` 的键是**建议清单里的阶段**，
+    而保命档是阶段本身的性质（池化对 `high_vol` 那一格给 `blanket`，`deactivation._verdict`
+    映成 `BLANKET`，而 `BLANKET ∉ targets`）。所以抬升日做差做出来的是**一片「将解除」**
+    ——读起来正是「可以交易了」，而事实是此刻谁都不该开新仓。压制因此落在 `_change` 里，
+    **不在 `diff_regimes` 里做**：后者「跨层搬动是两件事」的那条语义
+    （`test_moving_across_layers_is_two_facts_not_one`）是它自己的契约，逐字未动。
+    """
+
+    def _yesterday(
+        self, by_regime: dict, *, regime: str | None = None, blocked: str | None = None
+    ) -> None:
+        """昨天那一份日报。``regime=None`` 造的是**没有 ``regime`` 键**的旧格式行。"""
+        landscape: dict = {"by_regime": by_regime}
+        if regime is not None:
+            landscape["regime"] = regime
+        if blocked is not None:
+            landscape["blocked"] = blocked
+        DailyReport.objects.create(
+            symbol=SYMBOL, run_day=RUN_DAY - timedelta(days=1), landscape=landscape
+        )
+
+    def _change_of_today(
+        self, *, today_regime: str, by_regime: dict, today_blocked: str = ""
+    ) -> dict:
+        return report._change(
+            by_regime,
+            today_blocked=today_blocked,
+            today_regime=today_regime,
+            symbol=SYMBOL,
+            run_day=RUN_DAY,
+        )
+
+    def test_an_escalation_day_drops_the_releases_and_adds_one_blanket_halt(self):
+        # 抬升日：今天进了保命档，于是当天的建议清单里**各层的策略全部消失**（清单只按新
+        # 阶段产出），而 `by_regime` 里连 `high_vol` 这个键都不会有。只做差会渲染成一片
+        # 「将解除〈某层〉」，那正是「可以交易了」——与事实相反。
+        self._yesterday({"downtrend": _layer("s_old")}, regime="downtrend")
+        change = self._change_of_today(today_regime="high_vol", by_regime={})
+
+        self.assertEqual(change["status"], "diff")
+        self.assertEqual(len(change["items"]), 1)
+        item = change["items"][0]
+        self.assertEqual(item["kind"], "halt")
+        self.assertTrue(item["blanket"])
+        # 空清单不是「暂时填不上」：保命档答不出一份策略清单（`_blanket_item`）。
+        self.assertEqual(item["strategies"], [])
+        self.assertIn("将新停用「高波动」档", change["note"])
+
+    def test_a_de_escalation_day_keeps_the_halts_and_appends_one_blanket_release(self):
+        # 降级日反过来：原有的变化照报，另补一条「已出保命档」。丢掉 diff 的那一侧就错了
+        # ——那会把「同时出档」说成「只出档」，而两件事的处置完全不同。
+        self._yesterday({}, regime="high_vol")
+        change = self._change_of_today(
+            today_regime="downtrend",
+            by_regime={"downtrend": _layer("s_old", "s_new")},
+        )
+
+        self.assertEqual(
+            [(i["kind"], bool(i.get("blanket"))) for i in change["items"]],
+            [("halt", False), ("release", True)],
+        )
+        self.assertIn("将新停用「下行趋势」2 个", change["note"])
+        self.assertIn("将解除「高波动」档", change["note"])
+
+    def test_a_blanket_only_move_is_a_diff_not_an_unchanged(self):
+        # **压制排在判空之前**（Q4）。只有保命档动了的那些天，做差做完正好是空的：先判空
+        # 就会把「今天全场停手」报成「无变化」——这两句对读的人是天差地别的两件事，
+        # 而后者看起来完全正常。
+        same = {"downtrend": _layer("s1")}
+        self._yesterday(same, regime="downtrend")
+        change = self._change_of_today(today_regime="high_vol", by_regime=same)
+
+        self.assertEqual(report.diff_regimes(same, same), [])  # 做差确实是空的
+        self.assertEqual(change["status"], "diff")
+        self.assertEqual(len(change["items"]), 1)
+
+    def test_the_three_early_returns_are_not_looked_through(self):
+        """三条早退路径说的是「今天不比」，保命档的补写绝不越过它们（Q5）。
+
+        越过「首次」的表现是：机制第一次跑就说「将新停用「高波动」档」，而它连昨天说过
+        什么都还不知道。
+        """
+        first = self._change_of_today(today_regime="high_vol", by_regime={})
+        self.assertEqual((first["status"], first["items"]), ("first", []))
+
+        self._yesterday({}, regime="downtrend")
+        blocked = self._change_of_today(
+            today_regime="high_vol", by_regime={}, today_blocked="cold_start"
+        )
+        self.assertEqual((blocked["status"], blocked["items"]), ("blocked", []))
+
+    def test_a_blocked_baseline_is_not_looked_through_either(self):
+        # 上一份是阻塞日、而它那天恰好判的是高波动：拿它当基准会凭空补一条「将解除
+        # 「高波动」档」。它那份清单是空的，不代表「那天在保命档里没事」。
+        self._yesterday({}, regime="high_vol", blocked="cold_start")
+        change = self._change_of_today(today_regime="downtrend", by_regime={})
+
+        self.assertEqual((change["status"], change["items"]), ("blocked", []))
+
+    def test_a_previous_report_without_a_regime_is_not_read_as_blanket(self):
+        # 旧格式行（`regime` 键是后来才加的）没有那个键 ⇒ 当作**不是**保命档。反方向
+        # （取不到就当作是）会在升级后的第一份日报上凭空写一条「将解除「高波动」档」。
+        self._yesterday({"downtrend": _layer("s_old")})
+        change = self._change_of_today(
+            today_regime="downtrend", by_regime={"downtrend": _layer("s_old")}
+        )
+
+        self.assertEqual((change["status"], change["items"]), ("unchanged", []))
+
+    def test_the_suppression_lives_in_the_change_not_in_the_diff(self):
+        # 分界线的钉子：同一组输入，`diff_regimes` 照旧给出跨层的两件事（release），
+        # `_change` 才把它丢掉。压制写进 `diff_regimes` 的话，`test_moving_across_layers_
+        # is_two_facts_not_one` 那条契约就没了，而它的失效表现是「策略换了个阶段继续被
+        # 停着」被报成「它被解除了」。
+        prev = {"downtrend": _layer("s_old")}
+        self.assertEqual(
+            [i["kind"] for i in report.diff_regimes(prev, {})], ["release"]
+        )
+
+        self._yesterday(prev, regime="downtrend")
+        change = self._change_of_today(today_regime="high_vol", by_regime={})
+
+        self.assertEqual([i["kind"] for i in change["items"]], ["halt"])
+
+    def test_the_archived_section_keeps_the_blanket_line(self):
+        # 存档那一份是**未裁剪**的（`_compose` 调 `render_change` 不传 `strategy_ids`），
+        # 所以保命档那条必须在里面——它是这天最重的一条，而「按人裁」是渲染时的事，
+        # 不该影响机制说了什么的存档。
+        self._yesterday({"downtrend": _layer("s_old")}, regime="downtrend")
+        report.write_daily_report(
+            concluded_payload(effective_regime="high_vol"),
+            derivation(),
+            {},
+            now=NOW,
+        )
+        row = DailyReport.objects.get(symbol=SYMBOL, run_day=RUN_DAY)
+        body = row.sections[report.SECTION_CHANGE]
+
+        self.assertIn("将新停用「高波动」档（全市场一律，与证据无关）", body)
+        self.assertNotIn("将解除", body)
 
 
 class TestTheHealthSection(TestCase):
