@@ -13,9 +13,16 @@ LLM**。这与 `/event` 同一条理由：判据认的是人敲的，而只要�
     /regime gate       行情阶段 gate 的上线确认页（只读）
     /regime gate on    打开行情阶段 gate（先回显确认页，再落流水 + 对一次账）
     /regime gate off   关掉行情阶段 gate（回到 Shadow）
+    /regime exempt              人工恢复豁免的清单（只读，含「此刻算不算数」那一句）
+    /regime exempt grant <策略> [阶段] [备注…]
+                                发出一条豁免（阶段不给则取当前生效阶段）
+    /regime exempt revoke <id> [id…]
+                                按 id 收回（可逆：再发一条即可）
 
-`on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」。第二级的那个
-词（`gate` / `阶段`）**不进那张别名表**——它是组名，与「打开 / 关掉」不是一类东西。
+`on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」；豁免那一支的
+三个动作也各有一套（`list` / 列 / 清单、`grant` / 发 / 发出、`revoke` / 收 / 收回）。第二级
+与第三级的组名（`gate` / `阶段`、`exempt` / `豁免`）**不进那些别名表**——它们是组名，与
+「打开 / 关掉」不是一类东西。
 
 两级共用一套解析纪律（`_word`）：整词匹配、多余一个词就拒绝并点名。裸的 `gate` 是**那一页
 本身**，不是「gate 的开关」；不带动作的 `/regime` 仍然是事件熔断那一页，两个机制各有各的
@@ -45,6 +52,32 @@ gate 的**两个方向**都还会多一句 `gate_switch.reconcile_warning`（档
 任何一行写路径：一条 `/event cancel` 不会顺手关掉开关，一次 `/regime off` 也不会抹掉
 事件表里的任何一行（第②f 段 Q3 —— 窗口同步是 `halt_sync` 的事，它「写与开关无关」）。
 
+## 第三级：人工恢复豁免（第③段 W2）
+
+`/regime exempt …` 是豁免的第二个入口（另一个是管理命令 `manage_deactivation_exemptions`）。
+放在 `/regime` 下面，是因为它与 gate 是同一件事的两面：gate 按阶段停掉一批策略，豁免是
+**人**把其中一条从当轮的停用里放出来（第③段 Q1）。**本模块只做「谁敲的、敲的是什么」**：
+判据、写路径、渲染全在 `deactivation_run` 的「人工豁免」那一节，两个入口逐字共用——同一条
+豁免在终端里与在 Telegram 里长得一样，靠的是同一次渲染，不是靠两处写得小心。
+
+三条只有聊天这一侧才有的决定：
+
+1. **不做二次确认**（Q6）。全库没有对话式二次确认，既有的人工确认是「裸命令先回显一页
+   （只读）+ 人再敲一次带动作词的命令」——而豁免连那一页都不需要：两个动作都可逆
+   （发出→收回，收回→再发一条），而「确认」在聊天里意味着记住上一句话的状态。为一个
+   可逆动作引入这套状态，代价远超收益。
+2. **不额外授权**（Q5）。`granted_by` 就是聊天渠道的 sender id（CLI 那条路写的是
+   `getpass.getuser()`）——同一个字段两种取值，清单里「由 X」要认得出这是谁。机制不因为
+   消息从 Telegram 来就放宽任何判据：冷启动与保命档期间照样拒绝猜阶段。
+3. **阶段认中文名**（`/regime exempt grant 甲策略 下行趋势`）。中文名在**这里**翻成 slug，
+   共享层只认 slug：在共享层再加一张中文表，就是给「阶段叫什么」造第二套答案。
+   代价是**第二个词只能放阶段**——想只给备注就得先写阶段（`grant <策略> <阶段> <备注>`），
+   把备注写在阶段的位置上会得到「认不出的阶段 '回测过得去'」。
+
+**保命档期间显式点名 `high_vol` 仍然照落**（`resolve_regime` 只拒绝「替人猜」），但那次
+发出会附一句 `blanket_grant_warning`：那条豁免在保命档期间完全空转。显式就是知情，
+机制不该替人否决一个明确的选择——但它必须把人不知道的那件事说出来。
+
 ## 报错一律是用户反馈
 
 本模块**没有**自己的输入错误异常类，与 `event_commands.EventInputError` 不同：这里唯一
@@ -65,6 +98,7 @@ gate 的**两个方向**都还会多一句 `gate_switch.reconcile_warning`（档
 
 from __future__ import annotations
 
+import functools
 import logging
 from datetime import datetime
 
@@ -72,12 +106,24 @@ from asgiref.sync import sync_to_async
 from django.db import close_old_connections
 from django.utils import timezone
 
-from apps.regime import breaker_switch, events, gate_switch
+from apps.regime import breaker_switch, deactivation_run, events, gate_switch
 from apps.regime.models import ActorKind, MechanismMode
+from apps.regime.quant import BaseRegime
 
 from .base import AgentMessage, AgentResult
 
 logger = logging.getLogger(__name__)
+
+#: 豁免那一支的用法行。**单独拎出来**：它的报错只印自己这几行（上面那些 `/regime on`
+#: 打在一条「策略名打错了」的回复下面，只会把要改的那一行淹掉），而整页 `_USAGE` 由它
+#: 拼成——两处各写一遍，改了一处就会有一处漏掉。
+_EXEMPT_USAGE = (
+    "  /regime exempt     人工恢复豁免的清单（只读）\n"
+    "  /regime exempt grant <策略> [阶段] [备注…]\n"
+    "                     发出一条豁免（阶段不给则取当前生效阶段）\n"
+    "  /regime exempt revoke <id> [id…]\n"
+    "                     按 id 收回（可逆：再发一条即可）"
+)
 
 _USAGE = (
     "机制开关：\n"
@@ -86,7 +132,7 @@ _USAGE = (
     "  /regime off        关掉事件熔断（回到 Shadow）\n"
     "  /regime gate       行情阶段 gate 的上线确认页（只读）\n"
     "  /regime gate on    打开行情阶段 gate（先回显确认页，再落流水 + 对一次账）\n"
-    "  /regime gate off   关掉行情阶段 gate（回到 Shadow）"
+    "  /regime gate off   关掉行情阶段 gate（回到 Shadow）\n" + _EXEMPT_USAGE
 )
 
 #: 子命令别名。只认整词，不做前缀匹配——「/regime onx」不是「on」的笔误而是另一个词。
@@ -106,6 +152,23 @@ _ALIASES = {
 #: 第二级的那个词：`/regime gate …`。它**不进 `_ALIASES`**——那张表是「打开 / 关掉」的
 #: 同义词表，把组名混进去会让 `/regime gate` 在解析上长得像一次开关动作。只认整词。
 _GATE_WORDS = {"gate", "阶段"}
+
+#: 第三级的那个词：`/regime exempt …`。与 `_GATE_WORDS` 同一条：组名不进动作别名表。
+_EXEMPT_WORDS = {"exempt", "豁免"}
+
+#: 豁免那一支的动作。与 `_ALIASES` 分开：这张表里的词后面**还能跟参数**
+#: （`grant <策略> [阶段] [备注]`），而 `_ALIASES` 那一支是「多一个词就拒绝」。
+_EXEMPT_ALIASES = {
+    "list": "list",
+    "列": "list",
+    "清单": "list",
+    "grant": "grant",
+    "发": "grant",
+    "发出": "grant",
+    "revoke": "revoke",
+    "收": "revoke",
+    "收回": "revoke",
+}
 
 
 def _actor(message: AgentMessage) -> str:
@@ -295,6 +358,112 @@ _GATE_SUBCOMMANDS = {"on": _gate_on, "off": _gate_off}
 
 
 # --------------------------------------------------------------------------- #
+# 第三级：人工恢复豁免（第③段 W2）。本组只做「谁敲的、敲的是什么」——判据、写路径与渲染
+# 全在 `deactivation_run` 的「人工豁免」那一节（模块 docstring「第三级」那一段）。
+#
+# 签名比上面两级多一个入参：`(args, actor, now) -> str`。`args` 是动作词**之后**的那一段
+# （`grant <策略> [阶段] [备注]`），因为这一组的动作带参数——上面两组是「多一个词就拒绝」，
+# 这里多出来的词是参数本身。分发处用 `functools.partial` 把它绑成一个 `(actor, now)`。
+# --------------------------------------------------------------------------- #
+
+
+def _exempt_usage() -> str:
+    """这一组的用法（只有它自己那几行）。
+
+    共享层抛的 `ExemptionError` 只说事实（它同时服务终端），「怎么改」补在这里——两处
+    分别在**两个入口各自的那一层**，谁都没有对方的措辞。
+    """
+    return f"用法：\n{_EXEMPT_USAGE}"
+
+
+def _regime_of(text: str) -> str:
+    """阶段那一项：认 slug，也认中文名（`/regime exempt grant 甲策略 下行趋势`）。
+
+    中文名**只在这一层**翻成 slug（`resolve_regime` 收的是 slug，认不出的会拒绝）：在共享
+    层再加一张中文表，就是给「阶段叫什么」造第二套答案，而终端那边只认 slug。
+    """
+    wanted = (text or "").strip()
+    for member in BaseRegime:
+        if wanted == member.display:
+            return member.value
+    return wanted
+
+
+def _exempt_list(args: list[str], actor: str, now: datetime) -> str:
+    """裸 `/regime exempt`（或 `list` / `列` / `清单`）：清单本身。**只读**。"""
+    if args:
+        return f"列清单不吃参数，多出来的词：{' '.join(args)}\n\n{_exempt_usage()}"
+    return "\n".join(deactivation_run.roster_report(now=now))
+
+
+def _exempt_grant(args: list[str], actor: str, now: datetime) -> str:
+    """`grant <策略> [阶段] [备注…]`：发出一条豁免。
+
+    **策略那一个词必给**：不给就没人知道豁免谁，没有任何合理的默认值。阶段不给则取当前
+    生效阶段（冷启动与保命档期间**拒绝猜**，由共享层判），备注是第三个词之后的全部。
+    """
+    if not args:
+        return (
+            "要指明给哪条策略：/regime exempt grant <策略名或 id> [阶段] [备注]\n\n"
+            + _exempt_usage()
+        )
+
+    try:
+        strategy = deactivation_run.find_strategy_by_token(args[0])
+        choice = deactivation_run.resolve_regime(
+            _regime_of(args[1]) if len(args) > 1 else "", now=now
+        )
+    except deactivation_run.ExemptionError as exc:
+        return f"{exc}\n\n{_exempt_usage()}"
+
+    outcome = deactivation_run.grant(
+        strategy=strategy,
+        regime=choice.regime,
+        # 落款是人：`granted_by` 在聊天这条路上是 sender id（CLI 那条路是系统用户名）。
+        # 这个字段是 10 天之后回头看那条决策时唯一的「谁放行的」，所以不给默认值、不省略。
+        actor=actor,
+        note=" ".join(args[2:]),
+        now=now,
+    )
+
+    lines = []
+    if choice.taken_from_current:
+        # 「取的是当前生效阶段」必须打出来，否则一条取来的阶段会被当成人的决定。
+        lines.append(
+            f"未给阶段，取当前生效阶段：{deactivation_run.regime_display(choice.regime)}"
+            f"（自 {choice.effective_at:%Y-%m-%d %H:%M} 生效）"
+        )
+    lines.append(deactivation_run.grant_summary(outcome))
+    lines.extend(deactivation_run.supersede_warnings(outcome.superseded))
+    warning = deactivation_run.blanket_grant_warning(outcome.exemption)
+    if warning:
+        lines.append(warning)
+    lines.append("要看现在的清单：/regime exempt")
+    return "\n".join(lines)
+
+
+def _exempt_revoke(args: list[str], actor: str, now: datetime) -> str:
+    """`revoke <id> [id…]`：按 id 收回。整批拒绝语义（缺一个就一行不写）在共享层。"""
+    if not args:
+        return (
+            "要指明收回哪几条，例如：/regime exempt revoke 3 4"
+            f"\n\n{_exempt_usage()}"
+        )
+    try:
+        outcome = deactivation_run.revoke(args, now=now)
+    except deactivation_run.ExemptionError as exc:
+        return f"{exc}\n\n{_exempt_usage()}"
+    return "\n".join(deactivation_run.revoke_summary(outcome))
+
+
+_EXEMPT_SUBCOMMANDS = {
+    "list": _exempt_list,
+    "grant": _exempt_grant,
+    "revoke": _exempt_revoke,
+}
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -321,6 +490,18 @@ async def handle_regime_command(message: AgentMessage, args: str) -> AgentResult
             if error is not None:
                 return AgentResult(task_id=message.task_id, success=True, data=error)
             handler = _GATE_SUBCOMMANDS[name]
+    elif tokens[0].lower() in _EXEMPT_WORDS:
+        # `/regime exempt [list|grant|revoke] …`：裸的 `exempt` 是清单本身。这一组与上面两组
+        # 有一处**解析上的差别**：动作词之后的那一段是**参数**，不是「多出来的词」——所以
+        # `_word` 只拿动作词那一个去对表，剩下的原样交给子命令。
+        rest = tokens[1:]
+        if not rest:
+            handler = functools.partial(_exempt_list, [])
+        else:
+            name, error = _word(rest[:1], _EXEMPT_ALIASES, prefix=f"{tokens[0]} ")
+            if error is not None:
+                return AgentResult(task_id=message.task_id, success=True, data=error)
+            handler = functools.partial(_EXEMPT_SUBCOMMANDS[name], rest[1:])
     else:
         name, error = _word(tokens, _ALIASES)
         if error is not None:

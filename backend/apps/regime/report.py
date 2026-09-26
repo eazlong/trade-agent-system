@@ -69,7 +69,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from apps.common.time_utils import business_tz, format_business, to_business
-from apps.regime import config, judgement
+from apps.regime import config, halt, judgement
 from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
 from apps.regime.models import (
@@ -80,6 +80,7 @@ from apps.regime.models import (
     Escalation,
     EventImpact,
     EventStatus,
+    HaltTrigger,
     MajorEvent,
     MechanismKind,
     MechanismMode,
@@ -932,7 +933,8 @@ def _section_health(
     *,
     now: datetime,
 ) -> str:
-    """第④段：上次判定成功时间 + 三个开关 + 是否触发过自熔断 + 未归类策略计数。
+    """第④段：上次判定成功时间 + 三个开关 + 停止声明表此刻的实数 + 是否触发过自熔断
+    + 未归类策略计数。
 
     「上次判定成功时间」的唯一出处是 `judgement.last_judgement()`——**最近写下的那条，
     不论生效了没有**。不能拿 `current_judgement().created_at` 顶替：那读的是「正在生效的
@@ -951,6 +953,7 @@ def _section_health(
         )
 
     lines.extend(_switch_lines())
+    lines.extend(_declaration_lines(now=now, regime=deactivation.get("regime")))
 
     # 「是否触发过自熔断」只能由切换流水回答：自熔断的收场是「退回 Shadow」，那条路径会在
     # 流水里留一条 to_mode=shadow 的行。这里只读，不推断。
@@ -1054,6 +1057,51 @@ def _switch_lines() -> list[str]:
             + (f"（最近一次生效 {format_business(row.at)}）" if row else "（无切换流水）")
         )
     lines.append("  保命档（高波动）：不在这三个开关里——高波动一到就生效，不需要人工确认。")
+    return lines
+
+
+def _declaration_lines(*, now: datetime, regime: object) -> list[str]:
+    """停止声明表**此刻**的实数（第③段 W4）。
+
+    **这一行说的是「此刻」，不是今天那条判定的效果**：声明表吃的是**生效中**的判定
+    （`judgement.current_judgement`），而今天 08:00 刚产出、明日 08:00 才生效的那一条此刻
+    还没咬人。本段上面那行「上次判定成功（结论 …）」报的正是**待生效**的那条——两个阶段名
+    会不一样，所以这一行必须把「按生效中的阶段」写出来，否则读的人只能在两句里挑一句信。
+
+    `blocking_declarations` 而不是只读表：它是**开关感知**的，也就是「此刻真的在拦什么」
+    在本仓的唯一答案（`query_halt` 与下单通路都从它出发）。少了这一层过滤，Shadow 期会把
+    「表里躺着、开开关就咬人」的行报成已经拦住下单。两个数的差额**只在不为零时**说出来
+    ——正常一轮它们相等，而每天印一句「另有 0 条」会让那一句变成背景噪声。
+
+    **只报层名与条数，不报作用域**（行级明细在即时消息与 `/regime gate` 里，那里用的是
+    `HaltLayer.text`）：第④段要回答的是「机制此刻在不在拦、拦在哪儿」，一屏作用域会把
+    这个要点埋掉；至于「停的是不是我的策略」，那是第②段按人裁剪之后的职责。
+
+    层名一律走 `HaltTrigger.display`（与拒绝理由、`query_halt` 同源），顺序按枚举定义的
+    顺序——日报是逐日对照读的，顺序一变，昨天这一行与今天这一行就不是同一件事。
+    """
+    blocking = halt.blocking_declarations(now=now)
+    live = halt.live_declarations(now=now)
+
+    source = (
+        f"按生效中的阶段：{_regime_display(regime)}"
+        if regime
+        else "此刻没有生效中的阶段判定"
+    )
+    if not blocking:
+        lines = [f"停止声明：此刻没有任何一层在拦（{source}）"]
+    else:
+        counts: list[str] = []
+        for trigger in HaltTrigger:
+            count = sum(1 for row in blocking if halt.trigger_of(row) == trigger)
+            if count:
+                counts.append(f"{trigger.display} {count} 条")
+        lines = [
+            f"停止声明：此刻 {len(blocking)} 条在拦（{'、'.join(counts)}；{source}）"
+        ]
+
+    if len(live) > len(blocking):
+        lines.append(f"  另有 {len(live) - len(blocking)} 条活着，开关关着所以不拦")
     return lines
 
 

@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Iterable
 
 from django.db.models import Q
 from django.utils import timezone
@@ -298,6 +299,31 @@ def halt_layers(
         if _matches(row.scope, symbol, strategy_id)
     )
     return HaltVerdict(layers=layers)
+
+
+def layers_touching(
+    pairs: Iterable[tuple[str, str | None]], *, now: datetime | None = None
+) -> tuple[HaltLayer, ...]:
+    """一组「（品种, 策略）」上此刻在拦的层——``halt_layers`` 的**一对多**版本。
+
+    ``halt_layers`` 回答的是「这一张单挡不挡得住」，而有些问题问的是「**这批人**还会被
+    什么拦住」（第③段 Q3：一条窗口消息的受众）。两者的判据必须是同一个 ``_matches``：
+    各自实现一遍的话，通知里说的「还剩几层」与订单通路上真实的拦法会分叉，而两处看起来
+    都正常——正是「同一件事两个说法」的标准形态。
+
+    ``pairs`` 为空（这批人一条活跃会话都没有）⇒ 返回空：没有单子，就没有会拦住它们的层。
+    只查一次 ``blocking_declarations``：层的条数与「每条层命中哪些人」是两件事，前者不该
+    随人数重复算。
+    """
+    wanted = tuple(pairs)
+    if not wanted:
+        return ()
+    at = now or timezone.now()
+    return tuple(
+        layer_of(row)
+        for row in blocking_declarations(now=at)
+        if any(_matches(row.scope, symbol, strategy_id) for symbol, strategy_id in wanted)
+    )
 
 
 def block_reason(

@@ -165,5 +165,14 @@ class TestTheHelpTextMatchesWhatActuallyWorks:
         asyncio.run(channel._cmd_help(update, MagicMock()))
 
         text = update.message.reply_text.await_args.args[0]
-        for command in ("/start", "/status", "/stop", "/help", "/new", "/cancel", "/event"):
+        for command in (
+            "/start",
+            "/status",
+            "/stop",
+            "/help",
+            "/new",
+            "/cancel",
+            "/event",
+            "/regime",
+        ):
             assert command in text, command

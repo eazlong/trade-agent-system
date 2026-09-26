@@ -361,13 +361,43 @@ class TestQueryHalt(TestCase):
         with _frozen():
             text = QueryHaltTool()._render()
 
-        self.assertIn("当前没有任何层在拦：事件熔断层与高波动档都没有生效。", text)
+        self.assertIn(
+            "当前没有任何层在拦：事件熔断层、高波动档与策略停用决策档都没有生效。", text
+        )
         self.assertIn("人工豁免：当前没有在期的人工豁免。", text)
         self.assertIn("机制当前档：Shadow（只记录，不执行）", text)
-        # 第②段把停止判定接到了下单拦截上，所以这句话从「尚未接线」改成了「接线到哪一步」。
-        # 数字取声明表的实数（此处为空表 = 0），与上面两句同源。
+        # 第②段把停止判定接到了下单拦截上，所以这句话从「尚未接线」改成了「接线到哪一步」；
+        # 第③段把第三档（策略停用决策）也接上之后，「差额正是还没接线的那一档」那句不再
+        # 成立，换成了不变量本身。数字取声明表的实数（此处为空表 = 0），与上面两句同源。
         self.assertIn("停止声明表此刻 0 条在生效", text)
         self.assertIn("已接到下单拦截", text)
+        self.assertIn("三档都算在内", text)
+        self.assertNotIn("还没接线", text)
+        self.assertNotIn("要到第③段才接线", text)
+
+    def test_both_numbers_come_from_the_same_evaluation(self):
+        """层数与条数出自同一次求值——``_gate_line`` 必须把 ``now`` 传下去。
+
+        这是一条**接线测试**，理由与「不传 `now` 的版本读起来完全正常」有关：冻结时钟是
+        打在 `django.utils.timezone` 上的全局补丁，所以两条路都看得到同一个时刻，缺了
+        `now=` 的那一版在这一整套用例里**一模一样地通过**。只能问「那次调用拿到了什么」。
+        不钉住的话，缝会在某条声明恰好到期的那一刻张开，而那一刻的表现正好是「有一档
+        没对上」——最费人的一种症状。
+        """
+        from apps.regime import halt as halt_module
+
+        seen: list[object] = []
+        real = halt_module.blocking_declarations
+
+        def _spy(*args, **kwargs):
+            seen.append(kwargs.get("now"))
+            return real(*args, **kwargs)
+
+        with _frozen(), patch.object(halt_module, "blocking_declarations", _spy):
+            QueryHaltTool()._render()
+
+        self.assertTrue(seen, "这一轮没有问过声明表")
+        self.assertEqual(set(seen), {NOW}, "层数与条数不是在同一次求值上算的")
 
     def test_it_echoes_the_current_mode_instead_of_hardcoding_shadow(self):
         """档位那一行取 `RegimeMechanismSwitch.current()`，不写死「Shadow」。

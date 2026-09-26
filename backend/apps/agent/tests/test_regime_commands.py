@@ -39,10 +39,24 @@
 10. **打开的那一刻说不出「该停哪些」也必须说出来。** 页面与尾部都要报 `skipped` 的后果，
     且此时一条声明都不许凭空写出来（那是 `gate_run` 的事，不是开关的事）。
 
+## 第三级：人工恢复豁免（第③段 W2）
+
+`/regime exempt …` 与「开关」不是同一类动作（它是人把某条策略从当轮的停用里放出来），
+所以它自己的三条在这里：
+
+11. **判据与写路径不在这里。** 这一级的三个子命令只做「谁敲的、敲的是什么」：写的还是
+    `deactivation_run.grant`，渲染的还是 `roster_report`。本文件对它的断言因此可以**逐字
+    对上模块**（关掉时钟比一次全文），而不是对着命令里又抄一遍的文案。
+12. **冷启动与保命档期间不猜阶段。** 两者都必须拒绝推断、且在`显式点名`之前一行不写；
+    保命档**显式点名仍然照落**，但要附一句「它在保命档期间不起作用」。
+13. **落款是人。** `granted_by` 写的是聊天渠道的 sender id——同一个字段在 CLI 那条路上是
+    系统用户名，它是 10 天之后回头看那条决策时唯一的「谁放行的」。
+
 异步与数据库：入口 `handle_regime_command` 是 `async`，里面的 ORM 是 `sync_to_async`
 挪到**别的线程**里跑的，那个连接必须看得见本用例造的行——而 `django.test.TestCase` 的
 外层事务恰好挡住这件事。所以这里用**普通类 + `django_db(transaction=True)`**，与
-`test_event_commands.py` 同一条约定（代价是每个用例约 70 秒）。
+`test_event_commands.py` 同一条约定（代价是每个用例约 70 秒）。豁免这一族尤其要真库：
+`grant` 写、`roster_report` 读、`in_force_exemptions` 判「在期」是三条不同的查询。
 """
 
 from __future__ import annotations
@@ -57,9 +71,17 @@ from django.utils import timezone as django_timezone
 from apps.agent.base import AgentMessage, AgentResult
 from apps.agent.regime_commands import handle_regime_command
 from apps.agent.supervisor import _split_command
-from apps.regime import breaker_switch, gate_switch, halt
+from apps.regime import (
+    breaker_switch,
+    config,
+    deactivation_run,
+    gate_switch,
+    halt,
+    judgement,
+)
 from apps.regime.models import (
     ActorKind,
+    DeactivationExemption,
     EventImpact,
     EventScope,
     EventStatus,
@@ -69,8 +91,11 @@ from apps.regime.models import (
     MajorEventChange,
     MechanismKind,
     MechanismMode,
+    RegimeJudgement,
     RegimeMechanismSwitch,
 )
+from apps.regime.quant import BaseRegime
+from apps.trading.models import Strategy
 
 SENDER = "tg:42"
 
@@ -145,6 +170,28 @@ def _live_gate_declaration() -> HaltDeclaration:
 def _only_row() -> RegimeMechanismSwitch:
     """流水的**唯一**一行；多出或少掉都是本文件要抓的错，所以用 `get()` 而不是 `first()`。"""
     return RegimeMechanismSwitch.objects.get()
+
+
+def _strategy(name: str = "AlphaStem") -> Strategy:
+    """豁免的靶子。真行（`Strategy.id` 是 UUID 主键），与 `manage_deactivation_exemptions`
+    的夹具同一条纪律：拿整数当主键写死会在真库上静默错位。"""
+    return Strategy.objects.create(name=name, code_path=f"/t/{name}.py")
+
+
+def _judge(regime: str = BaseRegime.UPTREND.value) -> RegimeJudgement:
+    """一条**生效中**的判定：`effective_at` 在真实时钟之前，`/regime exempt grant` 不带
+    阶段时才认它（`current_judgement` 的语义就是 `effective_at <= now`）。"""
+    effective_at = django_timezone.now() - timedelta(days=1)
+    return RegimeJudgement.objects.create(
+        symbol=judgement.SYMBOL,
+        attribute_date=(effective_at - timedelta(days=2)).date(),
+        effective_at=effective_at,
+        base_regime=regime,
+        escalation="",
+        effective_regime=regime,
+        evidence={},
+        config_snapshot={},
+    )
 
 
 def _latest_row() -> RegimeMechanismSwitch:
@@ -515,3 +562,148 @@ class TestTheCommandAgainstARealDatabase:
         live.refresh_from_db()
         assert live.closed_at is None
         assert HaltDeclaration.objects.filter(pk=live.pk).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTheExemptSubcommands:
+    """第三级：人工恢复豁免（第③段 W2）。
+
+    判据与写路径都在 `deactivation_run`（第③段 Q3），所以这一层能钉的东西只有一件：
+    **命令有没有把人的意思原样传下去**——哪个策略、哪个阶段、谁发的、发了什么备注。
+    传丢其中任何一样，屏幕上回来的仍然是「已发出豁免 #N」，看不出来。而这条记录是 10 天
+    之后回答「当初是谁、为什么放行」的唯一材料。
+    """
+
+    def test_a_bare_exempt_lists_the_roster_and_writes_nothing(self):
+        # 造一条在期豁免（直接写模型：这一条测的是**渲染**，不是写路径）。冻结时钟之后与
+        # 模块逐字对一次全文——命令里但凡又抄了一遍行列格式，这里就是红的。
+        strategy = _strategy()
+        now = django_timezone.now()
+        DeactivationExemption.objects.create(
+            strategy=strategy,
+            regime=BaseRegime.UPTREND.value,
+            granted_at=now,
+            expires_at=now + timedelta(days=10),
+            granted_by="tg:7",
+            note="先观察",
+        )
+        at = django_timezone.now()
+        expected = "\n".join(deactivation_run.roster_report(now=at))
+        with patch("apps.agent.regime_commands.timezone.now", return_value=at):
+            # 组名的中英两个写法、加上动作那三个别名（裸的 `exempt` 就是清单本身）。
+            for text in (
+                "/regime exempt",
+                "/regime 豁免",
+                "/regime exempt list",
+                "/regime 豁免 清单",
+            ):
+                result = _run(_call(text))
+                assert result.success, result.error
+                assert result.data == expected, text
+
+        assert "豁免共 1 条" in expected
+        assert "先观察" in expected
+        assert "汇总：在期 1" in expected
+        # 只读：连一行都不写（命令这一级没有任何写路径，除了 grant / revoke）。
+        assert DeactivationExemption.objects.count() == 1
+
+    def test_granting_writes_one_row_whose_granter_is_the_person_who_typed_it(self):
+        strategy = _strategy()
+        result = _run(_call("/regime exempt grant AlphaStem 下行趋势 回测里这个阶段还行"))
+        assert result.success, result.error
+        assert "已发出豁免 #" in result.data
+        assert "要看现在的清单：/regime exempt" in result.data
+
+        row = DeactivationExemption.objects.get()
+        assert row.strategy_id == strategy.id
+        assert row.regime == BaseRegime.DOWNTREND.value, "中文名要在这里翻成 slug"
+        assert row.note == "回测里这个阶段还行"
+        assert row.granted_by == SENDER, "落款是人（聊天渠道的 sender id）"
+        assert row.expires_at - row.granted_at == timedelta(
+            days=config.DEACTIVATION.exemption_days
+        )
+
+        # 这一族只写豁免表：开关与声明表一个字都不动（那两样是 gate 的事，而且
+        # 「Agent 对 halt/gate 无写权限」这条纪律对人也一样——豁免不是开关）。
+        assert not RegimeMechanismSwitch.objects.exists()
+        assert not HaltDeclaration.objects.exists()
+
+    def test_the_regime_is_taken_from_the_current_judgement_when_omitted(self):
+        _strategy()
+        _judge(BaseRegime.UPTREND.value)
+        result = _run(_call("/regime exempt grant AlphaStem"))
+        assert result.success, result.error
+        # 「取的是当前生效阶段」必须打出来，否则一条取来的阶段会被当成人的决定。
+        assert "未给阶段，取当前生效阶段" in result.data
+        assert BaseRegime.UPTREND.display in result.data
+        assert DeactivationExemption.objects.get().regime == BaseRegime.UPTREND.value
+
+    def test_cold_start_refuses_to_guess_and_writes_nothing(self):
+        _strategy()
+        assert not RegimeJudgement.objects.exists()
+        result = _run(_call("/regime exempt grant AlphaStem"))
+        assert result.success, result.error
+        assert "冷启动" in result.data
+        # 「怎么改」补在这一层（共享层的措辞同时服务终端，它不知道 slash 命令怎么写）。
+        assert "/regime exempt grant" in result.data
+        assert not DeactivationExemption.objects.exists()
+
+    def test_the_blanket_refuses_to_infer_but_honours_an_explicit_choice(self):
+        # 保命档期间每个策略的结论都是 `blanket`、`targets` 恒空 —— 落一条 high_vol 的豁免
+        # 既不计入推导的 `exempt`、也不挡任何东西，10 天里只是一条空转记录，而人看到
+        # 「已发出豁免」会以为办成了一次恢复。**替人猜**是这里唯一要挡的事。
+        _strategy()
+        _judge(BaseRegime.HIGH_VOL.value)
+
+        result = _run(_call("/regime exempt grant AlphaStem"))
+        assert result.success, result.error
+        assert "保命档" in result.data
+        assert not DeactivationExemption.objects.exists(), "拒绝推断时一行都不许写"
+
+        # 显式点名 = 知情：照落，但必须把人不知道的那件事说出来。
+        result = _run(_call("/regime exempt grant AlphaStem 高波动"))
+        assert result.success, result.error
+        assert "已发出豁免 #" in result.data
+        assert "不是可以登记豁免的基础阶段" in result.data
+        assert DeactivationExemption.objects.get().regime == BaseRegime.HIGH_VOL.value
+
+    def test_revoking_closes_the_row_and_a_missing_id_refuses_the_whole_batch(self):
+        strategy = _strategy()
+        _run(_call("/regime exempt grant AlphaStem 下行趋势"))
+        row = DeactivationExemption.objects.get()
+
+        # 缺一个 id ⇒ 整批不写（先把「我刚才写的是哪条」这件事交还给屏幕）。
+        result = _run(_call(f"/regime exempt revoke {row.id} 999999"))
+        assert result.success, result.error
+        assert "不存在" in result.data
+        row.refresh_from_db()
+        assert row.closed_at is None
+
+        result = _run(_call(f"/regime exempt revoke {row.id}"))
+        assert result.success, result.error
+        assert "已收回 1 条豁免" in result.data
+        row.refresh_from_db()
+        assert row.closed_reason == deactivation_run.CLOSE_REASON_MANUAL
+        assert (
+            strategy.id,
+            BaseRegime.DOWNTREND.value,
+        ) not in deactivation_run.in_force_exemptions()
+
+    def test_typos_are_feedback_and_write_nothing(self):
+        _strategy()
+        for text, expected in (
+            ("/regime 豁免 上线", "未知的子命令：豁免 上线"),
+            ("/regime exempt grant", "要指明给哪条策略"),
+            ("/regime exempt grant NoSuchStem 下行趋势", "找不到策略名"),
+            # 备注写在阶段那个位置上：第二个词只能放阶段，这一句是那个约定的代价。
+            ("/regime exempt grant AlphaStem 回测过得去", "认不出的阶段"),
+            ("/regime exempt revoke", "要指明收回哪几条"),
+            ("/regime exempt revoke abc", "必须是整数"),
+        ):
+            result = _run(_call(text))
+            assert result.success, result.error
+            assert expected in result.data, text
+            # 每一句错后面都跟着用法——不然人只知道写错了，不知道该怎么写。
+            assert "/regime exempt grant" in result.data, text
+
+        assert not DeactivationExemption.objects.exists()

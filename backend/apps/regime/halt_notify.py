@@ -17,6 +17,19 @@
 人工豁免**，所以「窗口开了」这件事如果没有主动说出来，用户遇到的是一个不声不响就不让
 下单的系统。这条对「窗口结束」同样成立：不说的话，用户会以为熔断还在。
 
+## 「还剩几层」按受众算，不按全表算（第③段 Q3/Q4）
+
+层可以同时生效（CONTEXT.md:177），所以窗口消息不能只说「本条结束」：单层世界里那句话等于
+「恢复」，两层共存时它什么都不等于——而把「仍有另一层在拦」说成「已恢复」正是这份设计反复
+点名的谎报。两条消息因此都带上「此刻还有哪些层」（`still_blocking`），口径是**受众这些人的
+会话**：先按这一行的作用域求出收件人，再把这群人**全部**活跃实盘会话的（品种, 策略）取出来
+问 `halt.layers_touching`，得到的是**这批人真会被拦住的集合**。
+
+两端都会说出假话，所以要的是中间那条线：按全表报会说出「仍被〈SOL 解锁〉拦住」而收件人只跑
+BTC；按这一行自己的作用域报，`strategy:<id>` 那一档又答不出「他们会话在跑什么」（一条策略
+可以跑好几个品种）；只按本行作用域上那几条会话报，会对一个在别的品种上仍被拦住的人说出
+「恢复可用」——而这两句话的落点都是**账户**（`still_blocking`）。
+
 ## 收件人：受影响策略的活跃实盘会话（不是订阅者）
 
 口径与 `replay_run.alert_recipients` / `deactivation_run.running_strategy_ids` **同一处**
@@ -91,6 +104,30 @@ _SHADOW_NOTE = "当前为 Shadow（只记录、不真拦）：下面这条窗口
 # --------------------------------------------------------------------------- #
 
 
+def _active_live_sessions():
+    """**活跃实盘会话**的唯一谓词（`mode="live"` ∧ `LiveSession.ACTIVE_STATUSES`）。
+
+    与 `replay_run.alert_recipients` / `deactivation_run.running_strategy_ids` 同一处口径。
+    抽出来是因为「收件人」与「这些人还会被什么拦住」两步都从这里取数——各写一遍谓词的话，
+    两句话可以在同一条消息里各说各话（比如一条会话刚被停，收件人少了，而层数还按老名单
+    算），而两个数看起来都正常。
+    """
+    return LiveSession.objects.filter(
+        mode="live", status__in=LiveSession.ACTIVE_STATUSES
+    )
+
+
+def _audience_sessions(scope: str):
+    """这一行作用域上的活跃实盘会话——收件人是从它算的。"""
+    kind, value = halt.parse_scope(scope)
+    sessions = _active_live_sessions()
+    if kind == "symbol":
+        sessions = sessions.filter(symbol=value)
+    elif kind == "strategy":
+        sessions = sessions.filter(strategy_id=value)
+    return sessions
+
+
 def recipients_for_scope(scope: str) -> tuple[str, ...]:
     """一个作用域上「受影响用户」的收件人，**字符串化**、去重后按 id 排序。
 
@@ -102,20 +139,41 @@ def recipients_for_scope(scope: str) -> tuple[str, ...]:
     出站口的推送通道本来就把 id 当字符串用（`alerts.notify_user` 里那句 `str(user_id)`）。
     两个收件人函数返回不同的类型只会让「出去的是什么」这件事多一个说不清的地方。
     """
-    kind, value = halt.parse_scope(scope)
-    sessions = LiveSession.objects.filter(
-        mode="live", status__in=LiveSession.ACTIVE_STATUSES
-    )
-    if kind == "symbol":
-        sessions = sessions.filter(symbol=value)
-    elif kind == "strategy":
-        sessions = sessions.filter(strategy_id=value)
     return tuple(
         str(pk)
-        for pk in sessions.values_list("user_id", flat=True)
+        for pk in _audience_sessions(scope)
+        .values_list("user_id", flat=True)
         .distinct()
         .order_by("user_id")
     )
+
+
+def still_blocking(scope: str, *, now: datetime) -> tuple[halt.HaltLayer, ...]:
+    """这批人此刻还会被哪些层拦住（第③段 Q3）。**含本行自己**——排掉它是调用方的事。
+
+    两步，第一步与收件人同源：
+
+    1. **收件人是哪些人** = 这一行作用域上的活跃实盘会话的用户（`_audience_sessions`）。
+    2. **这些人还会被什么拦住** = 这些用户的**全部**活跃实盘会话的「（品种, 策略）」，
+       问 `halt.layers_touching`。
+
+    第 2 步按**人**展开、而不是只用第 1 步那批会话，是因为这两条断言的落点是**账户**：
+    「开新仓仍不可用」/「开新仓恢复可用」。一个人可以同时跑几个会话，只按本行作用域上那
+    几条算，会对一个在别的品种上仍被停用的策略拦住的人说出「恢复可用」——正是这条设计
+    反复要防的那类假话，而那句话看起来完全正常。
+
+    按**全表**算则反着错：一条 `symbol:SOL/USDT` 的层对一群只跑 BTC 的人**不是**一层，
+    对他们说「仍被那层拦住」同样是假话。求值走 `halt` 那一个判定口（`_matches`），不在
+    这里重写一遍匹配规则：通知里说的「还剩几层」与订单通路上真实的拦法必须同源。
+    """
+    pairs = tuple(
+        _active_live_sessions()
+        .filter(user_id__in=_audience_sessions(scope).values_list("user_id", flat=True))
+        .values_list("symbol", "strategy_id")
+        .distinct()
+        .order_by("symbol")
+    )
+    return halt.layers_touching(pairs, now=now)
 
 
 def all_active_user_ids() -> list[str]:
@@ -184,13 +242,55 @@ def _trigger_display(row: HaltDeclaration) -> str:
     return halt.trigger_of(row).display
 
 
-def _window_line(row: HaltDeclaration) -> str:
-    """一行说清窗口。**两个时刻都走 `events.format_moment`**：同一个时刻在事件库、日报
-    与这里必须是同一句话（各写一遍就是「同一件事三处说法不同」，而读者是同一批人）。"""
+def _period_line(row: HaltDeclaration) -> str:
+    """一行说清这一层的生效期。**两个时刻都走 `events.format_moment`**：同一个时刻在事件库、
+    日报与这里必须是同一句话（各写一遍就是「同一件事三处说法不同」，而读者是同一批人）。
+
+    **按触发源分岔：只有事件熔断是一个「窗口」**（第③段 Q5）。窗口的判据是**两头都在日历
+    上**（`halt_at` / `resume_at`），而另外两档都是机制施加的状态、由状态派生：
+
+    - 保命档的起止是阶段的性质，写「截止时刻不定」读起来像「不知道什么时候解除」——
+      它的截止条件**说得出来**（阶段离开高波动），所以说出来。
+    - 策略停用那一档的解除条件有好几个（阶段离开 / 判据翻面 / 豁免 / 开关回 Shadow），
+      一句说不完，所以它留着「截止时刻不定」。
+
+    这一分岔与 `_headline` 是**同一个**（三档各自「已生效 / 已解除」还是「窗口已开启 /
+    窗口已结束」）：标题说「已生效」而正文说「窗口：… 起」，读的人会去猜这两句说的是不是
+    一件事——那正是这条分岔要消掉的东西，所以两处必须一起改。
+    """
     start = events.format_moment(row.opened_at)
-    if row.expires_at is None:
-        return f"窗口：{start} 起（截止时刻不定）"
-    return f"窗口：{start} → {events.format_moment(row.expires_at)}"
+    trigger = halt.trigger_of(row)
+    if trigger is HaltTrigger.EVENT:
+        # 两头都在日历上才是完整的窗口；事件本身没给恢复时刻时（`resume_at` 空），
+        # 说的是「起点已知、终点不定」，而不是「这不是窗口」。
+        if row.expires_at is None:
+            return f"窗口：{start} 起（截止时刻不定）"
+        return f"窗口：{start} → {events.format_moment(row.expires_at)}"
+    if trigger is HaltTrigger.BLANKET:
+        return f"生效：{start} 起（随阶段离开高波动而结束）"
+    return f"生效：{start} 起（截止时刻不定）"
+
+
+def _headline(row: HaltDeclaration, kind: str) -> str:
+    """消息的第一行。「窗口」这个词与 `_period_line` **同一分岔**（只有事件熔断有窗口）：
+    标题说「窗口已开启」而正文说「生效：… 起」，读的人会去猜这两句说的是不是一件事。"""
+    trigger = _trigger_display(row)
+    scope = halt.scope_display(row.scope)
+    is_window = halt.trigger_of(row) is HaltTrigger.EVENT
+    if kind == KIND_OPENED:
+        state = "窗口已开启" if is_window else "已生效"
+        return f"🔒 【{trigger}】{state}｜作用域 {scope}"
+    state = "窗口已结束" if is_window else "已解除"
+    return f"🔓 【{trigger}】{state}｜作用域 {scope}"
+
+
+def _layers_line(head: str, layers: Sequence[halt.HaltLayer]) -> str:
+    """「此刻还剩几层」那一行（第③段 Q3/Q4）。``head`` 自带条数——两支的句式不同。
+
+    层名走 `halt.HaltLayer.text`（行 → 层的唯一换算口）：用户在通知里读到的层，与他在
+    `query_halt` 里查到、以及下单被拒时看到的那句话必须逐字同源。
+    """
+    return f"{head}：{'；'.join(layer.text for layer in layers)}"
 
 
 def _close_reason_display(row: HaltDeclaration) -> str:
@@ -208,28 +308,55 @@ def _close_reason_display(row: HaltDeclaration) -> str:
     return halt_sync.close_reason_display(row.closed_reason)
 
 
-def notify_body(row: HaltDeclaration, kind: str, *, shadow: bool) -> str:
+def notify_body(
+    row: HaltDeclaration,
+    kind: str,
+    *,
+    shadow: bool,
+    others: Sequence[halt.HaltLayer] = (),
+) -> str:
     """一条窗口消息的正文。``shadow`` 是**发这条消息的此刻**这条线在不在 Shadow。
 
     Shadow 提示**单独占第一行**（第②e 段 Q6）：不写的话，「窗口已记录」会被读成「已经
     拦住了」，而 Shadow 期这两件事恰好相反——用户会以为下单被挡住了，实际没有。
     它说的是「此刻」，不是「窗口开的时候」：开关在这中间被打开过的话，事实以此刻为准。
+
+    ``others`` 是**这批人此刻还会被拦住的其它层**（调用方按受众算好，见
+    `still_blocking`）。层可以同时生效（CONTEXT.md:177），所以：
+
+    - **开启那条**：只有一层时不写层集合（「集合」与「这条」是同一个答案，写了是噪声），
+      两层以上才补一行「此刻共 N 层在拦」。
+    - **结束那条**：**必须说清还剩几层**。单层世界里「本条结束」等于「恢复」，而两层共存
+      时它不等于任何事——把「仍有另一层在拦」说成「已恢复」是谎报，而「用户以为能下单了
+      却下不出去」正是本机制反复要防的那类输出。「已恢复」这个词只在一层都不剩时出现。
     """
-    scope = halt.scope_display(row.scope)
     lines: list[str] = []
     if shadow:
         lines.append(f"⚠️ {_SHADOW_NOTE}")
+    lines.append(_headline(row, kind))
+    lines.append(_period_line(row))
     if kind == KIND_OPENED:
-        lines.append(f"🔒 【{_trigger_display(row)}】窗口已开启｜作用域 {scope}")
-        lines.append(_window_line(row))
         lines.append(f"依据：\n{row.reason}")
+        if others:
+            lines.append(
+                _layers_line(
+                    f"此刻共 {len(others) + 1} 层在拦（本条在内）",
+                    [halt.layer_of(row), *others],
+                )
+            )
     else:
-        lines.append(f"🔓 【{_trigger_display(row)}】窗口已结束｜作用域 {scope}")
-        lines.append(_window_line(row))
         lines.append(
             f"解除：{events.format_moment(row.closed_at)}"
             f"（{_close_reason_display(row)}）"
         )
+        if others:
+            lines.append(
+                _layers_line(
+                    f"⚠️ 本条已解除，但**仍被 {len(others)} 层拦住**，开新仓仍不可用", others
+                )
+            )
+        else:
+            lines.append("✅ 已无任何层在拦，开新仓恢复可用。")
     return "\n".join(lines)
 
 
@@ -303,6 +430,21 @@ def _shadowed(row: HaltDeclaration) -> bool:
     return not halt.switch_open(halt.trigger_of(row))
 
 
+def _others(row: HaltDeclaration, *, now: datetime) -> tuple[halt.HaltLayer, ...]:
+    """这批人此刻还会被拦住的**其它**层（本行自己排掉）。
+
+    结束那一批排不排本行都没关系（它已经解除，`live_declarations` 已经不认它）；**开启
+    那一批必须排**——不排的话用户读到的是「此刻共 2 层在拦：A；A」：两个来源各自都对，
+    合起来是一句错话。
+    """
+    here = (halt.trigger_of(row), row.scope)
+    return tuple(
+        layer
+        for layer in still_blocking(row.scope, now=now)
+        if (layer.trigger, layer.scope) != here
+    )
+
+
 def notify_pending(*, now: datetime | None = None) -> dict:
     """把该发的窗口消息发出去，返回 ``{opened, closed, failed, no_recipients}``。
 
@@ -337,7 +479,9 @@ def notify_pending(*, now: datetime | None = None) -> dict:
                 )
                 continue
 
-            text = notify_body(row, kind, shadow=_shadowed(row))
+            text = notify_body(
+                row, kind, shadow=_shadowed(row), others=_others(row, now=at)
+            )
             sent = asyncio.run(_send_to_each(recipients, text))
             if sent == len(recipients):
                 _mark(row, kind, at)

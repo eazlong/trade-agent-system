@@ -319,3 +319,51 @@ class TestVerdict(_HaltTestBase):
 
         self.assertEqual(layer.opened_at, opened)
         self.assertEqual(layer.expires_at, expires)
+
+
+class TestLayersTouching(_HaltTestBase):
+    """一组「（品种, 策略）」上此刻在拦的层——`halt_layers` 的一对多版本（第③段 Q3）。
+
+    调用方是窗口通知（`halt_notify.still_blocking`：一条消息的受众还会被什么拦住）。
+    钉两件事：**判据与 `halt_layers` 同源**（同一个 `_matches`），以及**每层只出现一次**
+    ——层是声明表的行，不是（行 × 命中的 pair）的组合；按 pair 拼出来的话，一条全市场
+    声明会在「此刻共 N 层在拦」里被数成几个人那么多层。
+    """
+
+    def test_no_pairs_covers_no_layers(self):
+        """一条活跃会话都没有 ⇒ 没有任何单子会被拦住。（也只有这一支不该查库：没有 pair
+        就没有判定，`layers_touching` 直接返回。）"""
+        _declare(scope=halt.global_scope())
+        self.assertEqual(halt.layers_touching((), now=NOW), ())
+
+    def test_the_criteria_are_the_same_as_halt_layers(self):
+        """作用域三档的命中必须与下单口径逐档相同——两边各写一遍的话，通知里说的
+        「还剩几层」与订单通路上真实的拦法会分叉，而两处看起来都正常。"""
+        _declare(scope=halt.global_scope(), label="全市场那层")
+        _declare(scope=halt.symbol_scope(SYMBOL), label="品种那层")
+        _declare(scope=halt.strategy_scope("s-1"), label="策略那层")
+
+        hit = halt.layers_touching(((SYMBOL, "s-1"),), now=NOW)
+        self.assertEqual(
+            {layer.label for layer in hit}, {"全市场那层", "品种那层", "策略那层"}
+        )
+
+        # 一条会话跑的是别的品种、别的策略 ⇒ 只剩全市场那层。
+        self.assertEqual(
+            [layer.label for layer in halt.layers_touching((("BTC/USDT", "s-2"),), now=NOW)],
+            ["全市场那层"],
+        )
+
+    def test_a_layer_that_hits_several_pairs_appears_once(self):
+        _declare(scope=halt.global_scope(), label="全市场那层")
+
+        hit = halt.layers_touching(
+            ((SYMBOL, "s-1"), (SYMBOL, "s-2"), ("BTC/USDT", None)), now=NOW
+        )
+
+        self.assertEqual([layer.label for layer in hit], ["全市场那层"])
+
+    def test_a_layer_that_blocks_nobody_is_not_in_the_set(self):
+        _declare(scope=halt.symbol_scope("BTC/USDT"))
+
+        self.assertEqual(halt.layers_touching(((SYMBOL, "s-1"),), now=NOW), ())

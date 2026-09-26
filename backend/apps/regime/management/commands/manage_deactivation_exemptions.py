@@ -1,24 +1,34 @@
-"""人工恢复豁免的写方（第①段单元 7 收尾，Q7）。
+"""人工恢复豁免的管理命令（第①段单元 7 收尾，Q7）。
 
 CONTEXT.md 第 120 条：恢复产生的是一条**有时效的人工豁免，不是一次性的开关动作**。
-`DeactivationExemption` 是那张表，`deactivation_run.in_force_exemptions` 是它的读者——
-本命令是它**唯一**的写方。
+`DeactivationExemption` 是那张表，`deactivation_run.in_force_exemptions` 是它的读者。
+
+## 本模块是一层薄壳
+
+**状态判据、写路径与展示口径全在 `apps/regime/deactivation_run.py` 的「人工豁免」那一节**
+（第③段 Q3：第③段给豁免开了第二个入口 `/regime exempt`，两个入口要做的判断逐条相同）。
+本模块只剩三件只有命令行才有的东西：argparse 的旗标、`CommandError` 的旗标提示、stdout。
+
+所以这里**从 `deactivation_run` import 并原样再用**：`state_of` / `STATE_*` /
+`regime_display` 在本模块仍然解析得到（`manage.state_of(...)` 是既有调用方与测试的入口），
+但它们只是名字，定义在共享层。共享层抛 `ExemptionError`（**只说事实**，因为它也服务
+Telegram），这里补上「命令行该怎么改」再翻成 `CommandError`。
 
 ## 为什么写方必须是命令，而不是自动路径
 
 豁免的全部意义是「人在知道结论的前提下，决定这一次不停」。任何自动写方（判定失败时
 自动豁免、重算时自动补豁免）都会把这个开关变成机制给自己放行——那正是「Agent 对
 halt/gate 无写权限」那条纪律要挡的东西。所以写豁免的入口只有人工的两条：本命令、
-以及将来的 slash 命令（第②段）。两者最终都落到同一条 `INSERT`。
+以及 `/regime exempt`（第③段）。两者最终都落到同一条 `INSERT`。
 
 ## 三个动作：列出 / 发出 / 收回
 
-- **列出**（默认）——给出每条豁免现在处于哪个状态。四种状态是**互斥**的，判据与
-  `in_force_exemptions` 的「三条一起」逐字相同：`closed_at` 空 **且** `granted_at <= now`
-  **且** `expires_at > now` 才叫「在期」。这里不另写一套判据：两处各判一次，迟早会漂，
-  而漂的表现是「命令说在期、推导说不在期」——最难查的一类不一致。
+- **列出**（默认）——给出每条豁免现在处于哪个状态，并先给一句「此刻算不算数」
+  （`exemption_standing`：保命档在拦时，在期豁免一条都不生效）。四种状态是**互斥**的，
+  判据与 `in_force_exemptions` 的「三条一起」逐字相同（`state_of` 只有一处定义）。
 - **发出**（`--grant`）——`expires_at` 在**写入那一刻**按 `config.DEACTIVATION.exemption_days`
-  换算成绝对时刻存下（模型 docstring 那条：改配置不追溯已经发出的豁免）。
+  换算成绝对时刻存下（模型 docstring 那条：改配置不追溯已经发出的豁免）。不给 `--regime`
+  时取当前生效阶段；**冷启动与保命档期间都拒绝猜**（Q4），只有显式点名才照落。
 - **收回**（`--revoke`）——`closed_at` 写下去，`closed_reason=manual_revoke`。收回是
   **可逆**的（再发一条即可），所以与幽灵清理不同，这里**不需要 `--dry-run`**：
   两个动作都看得见、都能改回去，再设一道确认闸只是形式。
@@ -42,60 +52,38 @@ halt/gate 无写权限」那条纪律要挡的东西。所以写豁免的入口�
 from __future__ import annotations
 
 import getpass
-from datetime import datetime, timedelta
-from uuid import UUID
+from datetime import datetime
 
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from apps.regime import config
-from apps.regime.deactivation_run import (
-    CLOSE_REASON_DISPLAY,
-    CLOSE_REASON_MANUAL,
-    current_regime_state,
+# 定义在 `deactivation_run`（唯一一份）的**状态判据与展示口径**，这里只是把它们转出到
+# 本模块：`manage.state_of(...)` / `manage.STATE_DISPLAY` 这类既有写法必须继续解析得到
+# （它们是第①段以来的入口）。下面那个 import 才是本模块自己要调的东西。
+from apps.regime.deactivation_run import (  # noqa: F401
+    STATE_CLOSED,
+    STATE_DISPLAY,
+    STATE_EXPIRED,
+    STATE_IN_FORCE,
+    STATE_PENDING,
+    state_of,
 )
-from apps.regime.models import DeactivationExemption
+
+from apps.regime.deactivation_run import (
+    ExemptionError,
+    blanket_grant_warning,
+    find_strategy,
+    grant,
+    grant_summary,
+    regime_display,
+    resolve_regime,
+    revoke,
+    revoke_summary,
+    roster_report,
+    supersede_warnings,
+)
 from apps.regime.quant import BaseRegime
 from apps.trading.models import Strategy
-
-#: 豁免在展示层的四种状态（互斥，判据见模块 docstring）。
-STATE_IN_FORCE = "in_force"
-STATE_PENDING = "pending"
-STATE_EXPIRED = "expired"
-STATE_CLOSED = "closed"
-
-STATE_DISPLAY = {
-    STATE_IN_FORCE: "在期",
-    STATE_PENDING: "未生效",
-    STATE_EXPIRED: "已过期",
-    STATE_CLOSED: "已关闭",
-}
-
-
-def state_of(exemption: DeactivationExemption, *, now: datetime) -> str:
-    """一条豁免现在处于哪个状态。**收到豁免行本身**，不收四个字段。
-
-    收行是为了让判据只有一处：谁想知道状态都调这个函数，而不是各自 `filter(...)` 一遍。
-    """
-    if exemption.closed_at is not None:
-        return STATE_CLOSED
-    if exemption.granted_at > now:
-        return STATE_PENDING
-    if exemption.expires_at <= now:
-        return STATE_EXPIRED
-    return STATE_IN_FORCE
-
-
-def regime_display(value: str) -> str:
-    """阶段取值 → 中文。**认不出来就原样返回**，不回落成某一档。
-
-    模型上的 `choices` 只在表单校验里管用，手工写进去的行绕得过它。一条脏行不该让整个
-    清单命令炸掉；但它也绝不能被显示成「下行趋势」——那会让人以为豁免覆盖的是另一档。
-    """
-    try:
-        return BaseRegime(value).display
-    except ValueError:
-        return f"{value}（认不出的阶段）"
 
 
 class Command(BaseCommand):
@@ -166,174 +154,75 @@ class Command(BaseCommand):
 
     def _grant(self, options, now: datetime) -> None:
         strategy = self._resolve_strategy(options)
-        regime = options["regime"] or self._current_regime()
-        days = config.DEACTIVATION.exemption_days
-        actor = options["actor"] or getpass.getuser()
+        choice = self._resolve_regime(options["regime"], now)
+        if choice.taken_from_current:
+            self.stdout.write(
+                f"未给 --regime，取当前生效阶段：{regime_display(choice.regime)}"
+                f"（自 {choice.effective_at:%Y-%m-%d %H:%M} 生效）"
+            )
 
-        # 同一个（策略 × 阶段）上**允许**有多条历史豁免（表上刻意没有唯一约束），
-        # 因为在期的那条被关闭之后还要留痕。但在期时再发一条是「延长/覆盖」的语义，
-        # 而 `in_force_exemptions` 取的是**最近发出的**那条——所以必须说出来，
-        # 否则人会以为两条都在生效、豁免期被叠加了。
-        superseded = [
-            row
-            for row in self._rows_for(strategy, regime)
-            if state_of(row, now=now) == STATE_IN_FORCE
-        ]
-
-        exemption = DeactivationExemption.objects.create(
+        outcome = grant(
             strategy=strategy,
-            regime=regime,
-            granted_at=now,
-            # 生效期在这里、也**只在这里**换算成绝对时刻（`config` 的 docstring：
-            # 改配置不追溯已经发出的豁免）。
-            expires_at=now + timedelta(days=days),
-            granted_by=actor,
+            regime=choice.regime,
+            actor=options["actor"] or getpass.getuser(),
             note=options["note"],
+            now=now,
         )
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"已发出豁免 #{exemption.id}：{strategy.name} × "
-                f"{regime_display(regime)}，至 {exemption.expires_at:%Y-%m-%d %H:%M} "
-                f"（{days} 个自然日），发出人 {actor}"
-            )
-        )
-        for row in superseded:
-            self.stdout.write(
-                f"  注意：同一格原有在期豁免 #{row.id}（至 {row.expires_at:%Y-%m-%d}），"
-                "推导只认最近发出的那条，它仍在表里留痕但已不再生效"
-            )
+        self.stdout.write(self.style.SUCCESS(grant_summary(outcome)))
+        # 同一格原有在期豁免被盖住 / 显式点名了保命档：两句话都不是「顺带的提示」，
+        # 而是这次写入的实际后果，必须在同一屏里说清。
+        for line in supersede_warnings(outcome.superseded):
+            self.stdout.write(line)
+        warning = blanket_grant_warning(outcome.exemption)
+        if warning:
+            self.stdout.write(warning)
 
-    def _revoke(self, ids, now: datetime) -> None:
-        """按 id 收回。条件更新 + 先到者为准，与 `close_left_regime_exemptions` 同形。"""
-        wanted = [self._parse_exemption_id(raw) for raw in ids]
-        found = set(
-            DeactivationExemption.objects.filter(id__in=wanted).values_list(
-                "id", flat=True
-            )
-        )
-        missing = [str(i) for i in wanted if i not in found]
-        if missing:
-            raise CommandError(
-                f"这些豁免 id 不存在：{'、'.join(missing)}。"
-                "不带参数跑一次可以看到现有清单里的 id。"
-            )
-
-        # 还没关的才关：已经关掉的（阶段离开 / 早先撤过）保持原样，连原因为都不覆盖。
-        closed = DeactivationExemption.objects.filter(
-            id__in=wanted, closed_at__isnull=True
-        ).update(closed_at=now, closed_reason=CLOSE_REASON_MANUAL)
-
-        already = len(wanted) - closed
-        self.stdout.write(
-            self.style.SUCCESS(f"已收回 {closed} 条豁免（manual_revoke）")
-        )
-        if already:
-            self.stdout.write(
-                f"  另外 {already} 条本来就已关闭，保持原样"
-                "（先到者为准，不覆盖先手的 closed_reason）"
-            )
+    def _revoke(self, raw_ids, now: datetime) -> None:
+        # 收回与发出的方向相反，两者都说「怎么改」反而是噪音：id 不存在 / 不是整数这两句
+        # 共享层的措辞已经能照着改。
+        outcome = self._shared(revoke, raw_ids, now=now)
+        lines = revoke_summary(outcome)
+        self.stdout.write(self.style.SUCCESS(lines[0]))
+        for line in lines[1:]:
+            self.stdout.write(line)
 
     # -- 列出 -------------------------------------------------------------- #
 
     def _list(self, now: datetime) -> None:
-        rows = list(
-            DeactivationExemption.objects.select_related("strategy").order_by(
-                "-granted_at", "id"
-            )
-        )
-        if not rows:
-            self.stdout.write("没有任何豁免记录")
-            return
-
-        counts: dict[str, int] = {state: 0 for state in STATE_DISPLAY}
-        self.stdout.write(f"豁免共 {len(rows)} 条：")
-        for row in rows:
-            state = state_of(row, now=now)
-            counts[state] += 1
-            self.stdout.write(
-                f"  #{row.id} {row.strategy.name} × {regime_display(row.regime)}"
-                f"  [{STATE_DISPLAY[state]}]"
-                f"  {row.granted_at:%Y-%m-%d} → {row.expires_at:%Y-%m-%d}"
-                f"  由 {row.granted_by}"
-                + (f"  关闭原因：{CLOSE_REASON_DISPLAY.get(row.closed_reason, row.closed_reason)}"
-                   if state == STATE_CLOSED else "")
-                + (f"  备注：{row.note}" if row.note else "")
-            )
-        self.stdout.write(
-            "汇总："
-            + "，".join(f"{STATE_DISPLAY[s]} {counts[s]}" for s in STATE_DISPLAY)
-        )
+        for line in roster_report(now=now):
+            self.stdout.write(line)
 
     # -- 取数 -------------------------------------------------------------- #
 
-    def _rows_for(self, strategy, regime: str):
-        """同一格已有的豁免。`ordering` 在模型的 `Meta` 上，这里不重排。"""
-        return DeactivationExemption.objects.filter(
-            strategy=strategy, regime=regime
-        ).order_by("-granted_at", "id")
-
     def _resolve_strategy(self, options) -> Strategy:
-        raw_id = options["strategy_id"].strip()
-        name = options["strategy"].strip()
-        if not raw_id and not name:
-            raise CommandError("--grant 需要 --strategy 或 --strategy-id 指明给谁发豁免")
-        if raw_id and name:
-            raise CommandError("--strategy 与 --strategy-id 只能给一个")
-
-        if raw_id:
-            strategy = Strategy.objects.filter(id=self._parse_uuid(raw_id)).first()
-            if strategy is None:
-                raise CommandError(f"找不到策略 id {raw_id}")
-            return strategy
-
-        matches = list(Strategy.objects.filter(name=name))
-        if not matches:
-            raise CommandError(f"找不到策略名 {name!r}（精确匹配 `Strategy.name`）")
-        if len(matches) > 1:
-            raise CommandError(
-                f"策略名 {name!r} 对应 {len(matches)} 行，请用 --strategy-id 指明其中一个："
-                + "、".join(str(row.id) for row in matches)
-            )
-        return matches[0]
-
-    def _current_regime(self) -> str:
-        """当前生效阶段。取不到就要求人显式给 `--regime`。
-
-        **不兜底成某个默认阶段**：豁免有一个 10 天的实际效力，拿一个猜出来的阶段落库
-        是「替人做决定」里最难发现的那种。冷启动时人本来就该自己说是哪个阶段。
-        """
-        state = current_regime_state()
-        if state.regime is None:
-            raise CommandError(
-                "当前没有生效中的阶段判定（冷启动），无法推断 --regime，请显式给出 "
-                f"（可选：{'、'.join(m.value for m in BaseRegime)}）"
-            )
-        self.stdout.write(
-            f"未给 --regime，取当前生效阶段：{regime_display(state.regime)}"
-            f"（自 {state.effective_at:%Y-%m-%d %H:%M} 生效）"
+        return self._shared(
+            find_strategy,
+            name=options["strategy"],
+            strategy_id=options["strategy_id"],
+            hint="（--strategy 与 --strategy-id 恰好给一个）",
         )
-        return state.regime
 
-    @staticmethod
-    def _parse_exemption_id(raw: str) -> int:
-        """豁免 id 是自增整数（策略主键才是 UUID），但让错误在参数解析这一层就响，
-        而不是等一个 `ValueError` 从 ORM 里冒出来。"""
-        text = str(raw).strip()
-        try:
-            return int(text)
-        except ValueError:
-            raise CommandError(f"豁免 id 必须是整数，收到 {text!r}")
+    def _resolve_regime(self, raw: str, now: datetime):
+        """冷启动 / 保命档的拒绝来自共享层，**旗标提示由这里补**：共享层同时服务 Telegram，
+        它不该知道「--regime」这个名字。
 
-    @staticmethod
-    def _parse_uuid(raw: str) -> UUID:
-        """策略主键的解析。**不能复用上面那个**：拿一个 UUID 去 `int()` 会把
-        「格式不对」报成「豁免 id 必须是整数」，而这是给人看的命令行。
-
-        也不把解析交给 ORM：`Strategy.objects.filter(id="x")` 抛的是 `ValidationError`，
-        在管理命令里它会显示成一段堆栈，而不是一句能照做的提示。
+        `hint` 里**不重复枚举可选阶段**：共享层那三句话的末尾已经带着 `regime_options_text()`
+        （两个入口共用那一份），这里再抄一遍就是给「阶段有哪几档」造第二处答案。
         """
-        text = str(raw).strip()
+        return self._shared(
+            resolve_regime,
+            raw,
+            now=now,
+            hint="（--grant 用 --regime 显式点名阶段）",
+        )
+
+    def _shared(self, fn, *args, hint: str = "", **kwargs):
+        """跑一次共享层，把 `ExemptionError`（只说事实）翻成 `CommandError`。
+
+        `hint` 是旗标措辞，**只在这里补**：共享层的措辞对两个入口都成立，这一句只对命令行
+        成立。`from exc` 保留原始异常链——调试时要能看出它是从判据还是从 ORM 出来的。
+        """
         try:
-            return UUID(text)
-        except ValueError:
-            raise CommandError(f"策略 id 必须是 UUID，收到 {text!r}")
+            return fn(*args, **kwargs)
+        except ExemptionError as exc:
+            raise CommandError(f"{exc}{hint}") from exc

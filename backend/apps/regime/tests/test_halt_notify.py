@@ -139,21 +139,44 @@ def _unpersisted(
     *,
     trigger: HaltTrigger = HaltTrigger.EVENT,
     scope: str | None = None,
+    label: str = "FOMC 议息",
+    reason: str = "高影响事件熔断窗口",
     opened_at: datetime = NOW - timedelta(hours=1),
     expires_at: datetime | None = None,
     closed_at: datetime | None = None,
     closed_reason: str = "",
 ) -> HaltDeclaration:
-    """一条**不落库**的声明行——`notify_body` 只读那几列，不必先造一遍库。"""
+    """一条**不落库**的声明行——`notify_body` 只读那几列，不必先造一遍库。
+
+    `label` / `reason` 可以改，是因为有些用例要断言的正是**某句话不出现**（「窗口」在
+    保命档那一档不许出现），而默认文案里带「窗口」二字。
+    """
     return HaltDeclaration(
         trigger=trigger.value,
         scope=halt.global_scope() if scope is None else scope,
-        label="FOMC 议息",
-        reason="高影响事件熔断窗口",
+        label=label,
+        reason=reason,
         opened_at=opened_at,
         expires_at=expires_at,
         closed_at=closed_at,
         closed_reason=closed_reason,
+    )
+
+
+def _layer(
+    *,
+    trigger: HaltTrigger = HaltTrigger.BLANKET,
+    scope: str | None = None,
+    label: str = "高波动",
+) -> halt.HaltLayer:
+    """一层（**求值结果**，纯值对象）——`notify_body` 收的就是它，不必落库。"""
+    return halt.HaltLayer(
+        trigger=trigger,
+        scope=halt.global_scope() if scope is None else scope,
+        label=label,
+        reason="阶段处于高波动",
+        opened_at=NOW - timedelta(hours=3),
+        expires_at=None,
     )
 
 
@@ -393,13 +416,96 @@ class TestNotifyBody(SimpleTestCase):
         )
         self.assertIn(row.reason, body)
 
-    def test_an_open_ended_window_says_the_end_is_unknown(self):
-        """保命档的行 `expires_at` 恒为 `None`：它随阶段起落，没有预先知道的截止时刻。
-        不留空或写「None」，用户会以为那一刻之后自动恢复。"""
-        row = _unpersisted(trigger=HaltTrigger.BLANKET)
+    def test_the_blanket_line_says_how_it_ends_instead_of_calling_it_a_window(self):
+        """保命档的行 `expires_at` 恒为 `None`（它随阶段起落），但它**不是日历窗口**
+        （第③段 Q5）：说「截止时刻不定」读起来像「不知道什么时候解除」，而它的截止条件
+        说得出来——阶段离开高波动。标题与正文是**同一个分岔**，所以两处都不许出现「窗口」。
+        """
+        row = _unpersisted(
+            trigger=HaltTrigger.BLANKET, label="高波动", reason="阶段进入高波动"
+        )
         body = halt_notify.notify_body(row, halt_notify.KIND_OPENED, shadow=False)
 
+        self.assertIn("已生效", body)  # 标题：不是「窗口已开启」
+        self.assertIn("生效：", body)
+        self.assertIn("随阶段离开高波动而结束", body)
+        self.assertNotIn("窗口", body)
+        self.assertNotIn("截止时刻不定", body)
+
+    def test_the_deactivation_line_says_the_end_is_not_a_fixed_moment(self):
+        """策略停用那一档的解除条件有好几个（阶段离开 / 判据翻面 / 豁免 / 开关回 Shadow），
+        一句说不完——所以只有它留着「截止时刻不定」。同样地，标题说「已生效」而正文说
+        「生效：… 起」，两处不许一处分岔另一处不分岔。
+        """
+        row = _unpersisted(
+            trigger=HaltTrigger.DEACTIVATION, label="本阶段不适配", reason="趋势里逆势策略"
+        )
+        body = halt_notify.notify_body(row, halt_notify.KIND_OPENED, shadow=False)
+
+        self.assertIn("已生效", body)
         self.assertIn("截止时刻不定", body)
+        self.assertNotIn("窗口", body)
+
+    def test_an_event_window_without_a_resume_time_still_says_its_start(self):
+        """事件本身没给恢复时刻（`resume_at` 空）时，说的是「起点已知、终点不定」，
+        **不是**「这不是窗口」——那一档仍然是事件熔断，标题照旧说「窗口已开启」。"""
+        row = _unpersisted(expires_at=None, reason="事件未给恢复时刻")
+        body = halt_notify.notify_body(row, halt_notify.KIND_OPENED, shadow=False)
+
+        self.assertIn("窗口已开启", body)
+        self.assertIn("窗口：", body)
+        self.assertIn("截止时刻不定", body)
+
+    def test_a_lone_layer_gets_no_layer_roster(self):
+        """只有一层时不写层集合：「集合」与「这一条」是同一个答案，写了是噪声。"""
+        row = _unpersisted(expires_at=NOW + timedelta(hours=2))
+        body = halt_notify.notify_body(row, halt_notify.KIND_OPENED, shadow=False)
+
+        self.assertNotIn("层在拦", body)
+
+    def test_the_opening_counts_the_layers_when_there_is_more_than_one(self):
+        """两层以上时开启那条要报总数**且把本行算进去**（`others` 已经排掉本行）：
+        CONTEXT.md:177 里用户看到的始终是一个集合，说「还有另一层」会让人以为总共两层。
+        """
+        row = _unpersisted(expires_at=NOW + timedelta(hours=2))
+        other = _layer(label="高波动")
+
+        body = halt_notify.notify_body(
+            row, halt_notify.KIND_OPENED, shadow=False, others=(other,)
+        )
+
+        self.assertIn("此刻共 2 层在拦（本条在内）", body)
+        # 层名走 `halt.HaltLayer.text`：通知里读到的层，与 `query_halt` 里查到、下单被拒时
+        # 看到的那句话必须逐字同源。
+        self.assertIn(other.text, body)
+        self.assertIn(halt.layer_of(row).text, body)
+
+    def test_the_closing_says_how_many_layers_are_left(self):
+        """结束那条**必须说清还剩几层**（第③段 Q4）。单层世界里「本条结束」等于「恢复」，
+        两层共存时它什么都不等于——把「仍有另一层在拦」说成「已恢复」是谎报，而
+        「用户以为能下单了却下不出去」正是本机制反复要防的那类输出。
+        """
+        row = _unpersisted(closed_at=NOW, closed_reason="window_ended", expires_at=NOW)
+        other = _layer(label="高波动")
+
+        body = halt_notify.notify_body(
+            row, halt_notify.KIND_CLOSED, shadow=False, others=(other,)
+        )
+
+        self.assertIn("仍被 1 层拦住", body)
+        self.assertIn("开新仓仍不可用", body)
+        self.assertIn(other.text, body)
+        self.assertNotIn("已恢复", body)
+
+    def test_the_closing_claims_recovery_only_when_nothing_is_left(self):
+        """「恢复可用」这个断言**只在一层都不剩时**出现（Q132）：它是这条消息里唯一一处
+        说「能下单了」，而那个断言错了的代价是用户去下一个必然被拒的单。"""
+        row = _unpersisted(closed_at=NOW, closed_reason="window_ended", expires_at=NOW)
+
+        body = halt_notify.notify_body(row, halt_notify.KIND_CLOSED, shadow=False)
+
+        self.assertIn("已无任何层在拦", body)
+        self.assertIn("开新仓恢复可用", body)
 
     def test_the_closing_says_when_and_why(self):
         row = _unpersisted(
@@ -635,6 +741,125 @@ class TestNotifyPending(TestCase):
             halt_notify.notify_pending(now=NOW)
 
         self.assertFalse(_texts(mock)[0].startswith("⚠️"))
+
+
+    def test_a_closing_notice_names_the_layer_that_still_blocks(self):
+        """两层共存时关掉一层（第③段 Q4）→ 用户在消息里读到「仍被 1 层拦住」并看到是
+        哪一层。**这条走真库**：`still_blocking` 从受众算起，口径与收件人同源。
+
+        保命档那一行不需要开关（`HALT_TRIGGER_SWITCH[BLANKET] = None`），所以这条用例
+        里的事件熔断声明**不开开关**也照样成立——上面那层是关掉的那条，它已经解除。
+        """
+        _declaration(
+            opened_at=NOW - timedelta(hours=2),
+            closed_at=NOW - timedelta(minutes=5),
+            closed_reason="window_ended",
+            opened_notified_at=NOW - timedelta(hours=2),
+        )
+        _declaration(
+            trigger=HaltTrigger.BLANKET,
+            label="高波动",
+            reason="阶段进入高波动",
+            opened_at=NOW - timedelta(hours=3),
+            opened_notified_at=NOW - timedelta(hours=3),
+        )
+
+        with _notify(True) as mock:
+            summary = halt_notify.notify_pending(now=NOW)
+
+        self.assertEqual(summary["closed"], 1)
+        self.assertEqual(mock.await_count, 1)
+        body = _texts(mock)[0]
+        self.assertIn("仍被 1 层拦住", body)
+        self.assertIn("高波动（保命档（高波动），作用域 全市场（global））", body)
+        self.assertNotIn("已恢复", body)
+
+    def test_a_layer_outside_the_audience_is_not_counted_against_them(self):
+        """Q3 的 (c)：层集合按**这批人**求闭包，不按全表。
+
+        收件人只跑 BTC，而表里此刻有一条 `symbol:SOL/USDT` 的层。按全表报会说出
+        「仍被〈SOL 解锁〉拦住」——那是一句对收件人为假的话，而这条消息的全部意义就是
+        不撒谎（假话与真话在这里长得一模一样，所以只有用例能分开它们）。
+        """
+        _switch(MechanismKind.EVENT_BREAKER, MechanismMode.EXECUTING)
+        _declaration(
+            scope=halt.symbol_scope("BTC/USDT"),
+            label="BTC 解锁",
+            opened_at=NOW - timedelta(hours=2),
+            closed_at=NOW - timedelta(minutes=5),
+            closed_reason="window_ended",
+            opened_notified_at=NOW - timedelta(hours=2),
+        )
+        _declaration(
+            scope=halt.symbol_scope("SOL/USDT"),
+            label="SOL 解锁",
+            opened_at=NOW - timedelta(hours=1),
+            opened_notified_at=NOW - timedelta(minutes=30),
+        )
+
+        with _notify(True) as mock:
+            summary = halt_notify.notify_pending(now=NOW)
+
+        self.assertEqual(summary["closed"], 1)
+        body = _texts(mock)[0]
+        self.assertNotIn("SOL", body)
+        self.assertIn("已无任何层在拦", body)
+
+    def test_a_layer_the_recipient_really_hits_is_counted(self):
+        """同一张表、同一条 `symbol:SOL/USDT` 的层，落在**真的跑 SOL 的人**身上就是一层
+        ——哪怕这条消息说的是 BTC 那个作用域。
+
+        两句断言的落点是**账户**（「开新仓仍不可用」/「开新仓恢复可用」），而一个人可以
+        同时跑几个会话：只按本行作用域上那几条会话算，会对一个在 SOL 上仍被拦住的人说出
+        「恢复可用」。所以闭包按**这些人的全部会话**算，收件人按本行作用域算。
+        """
+        _switch(MechanismKind.EVENT_BREAKER, MechanismMode.EXECUTING)
+        _session(self.user, symbol="SOL/USDT")
+        _declaration(
+            scope=halt.symbol_scope("BTC/USDT"),
+            label="BTC 解锁",
+            opened_at=NOW - timedelta(hours=2),
+            closed_at=NOW - timedelta(minutes=5),
+            closed_reason="window_ended",
+            opened_notified_at=NOW - timedelta(hours=2),
+        )
+        _declaration(
+            scope=halt.symbol_scope("SOL/USDT"),
+            label="SOL 解锁",
+            opened_at=NOW - timedelta(hours=1),
+            opened_notified_at=NOW - timedelta(minutes=30),
+        )
+
+        with _notify(True) as mock:
+            halt_notify.notify_pending(now=NOW)
+
+        self.assertEqual(mock.await_count, 1, "两个会话属于同一个人，只该收到一条")
+        body = _texts(mock)[0]
+        self.assertIn("仍被 1 层拦住", body)
+        self.assertIn("SOL 解锁", body)
+        self.assertNotIn("已恢复", body)
+
+    def test_the_opening_does_not_list_itself_twice(self):
+        """`_others` 必须排掉本行：**开启那一批里本行正在拦**（它就是刚生效的那一层），
+        不排的话用户读到的是「此刻共 2 层在拦：A；A」——两个来源各自都对，合起来是一句错话。
+        """
+        _switch(MechanismKind.EVENT_BREAKER, MechanismMode.EXECUTING)
+        _declaration(
+            trigger=HaltTrigger.BLANKET,
+            label="高波动",
+            reason="阶段进入高波动",
+            opened_at=NOW - timedelta(hours=3),
+            opened_notified_at=NOW - timedelta(hours=3),
+        )
+        _declaration(opened_at=NOW - timedelta(minutes=5))
+
+        with _notify(True) as mock:
+            summary = halt_notify.notify_pending(now=NOW)
+
+        self.assertEqual(summary["opened"], 1)
+        body = _texts(mock)[0]
+        self.assertIn("此刻共 2 层在拦（本条在内）", body)
+        self.assertEqual(body.count("FOMC 议息（"), 1)
 
 
 # --------------------------------------------------------------------------- #

@@ -13,9 +13,10 @@
 2. **生效期在写入那一刻换算**。`expires_at = granted_at + exemption_days`，存下来的是
    绝对时刻。所以**改配置不追溯**：已经发出的那条豁免不会因为 `exemption_days` 变了而
    延长或缩短。这条与 `RegimeJudgement` 存 `attribute_date` 是同一条纪律。
-3. **不猜阶段**。`--grant` 不给 `--regime` 时取当前生效阶段；**冷启动时拒绝执行**，
-   而不是回落成某个默认档——豁免有 10 天实际效力，拿一个猜出来的阶段落库是最难被发现
-   的那种「替人做决定」。
+3. **不猜阶段**。`--grant` 不给 `--regime` 时取当前生效阶段；**冷启动与保命档期间都
+   拒绝执行**，而不是回落成某个默认档——豁免有 10 天实际效力，拿一个猜出来的阶段落库是
+   最难被发现的那种「替人做决定」。保命档那一档尤其隐蔽：`high_vol` 期间推导的 `targets`
+   恒空，落下来的是一条 10 天里什么都没挡住的记录，而屏幕上写的是「已发出豁免」。
 4. **收回先到者为准**。`--revoke` 只关还没关的：已经关掉的（阶段离开 / 早先撤过）保持
    原样，连 `closed_reason` 都不覆盖。两个方向不对称——多写一笔会抹掉「它是怎么失效的」
    这条信息，少写一笔只是等下一轮。
@@ -322,6 +323,37 @@ class TestGrantRegime(_Fixture):
         message = self.manage_error("--grant", "--strategy", "AlphaStem")
         self.assertIn("冷启动", message)
         self.assertFalse(DeactivationExemption.objects.exists())
+
+    def test_a_blanket_phase_refuses_to_be_inferred(self):
+        """**保命档期间不猜**（第③段 Q4），与上一条同一条取向。
+
+        高波动是叠加层、不是可以登记豁免的基础阶段：保命档期间每个策略的结论都是
+        `blanket`、`targets` 恒空，所以一条 `high_vol` 的豁免既不计入推导的 `exempt`、
+        也不挡任何东西——它是一张 10 天的空转记录。而人看到「已发出豁免」会以为自己
+        办成了一次恢复（这正是这条命令过去的形态：`_current_regime` 直接取
+        `effective_regime`，保命档期间它就等于 `high_vol`）。
+        """
+        self.judge(BaseRegime.HIGH_VOL.value)
+        message = self.manage_error("--grant", "--strategy", "AlphaStem")
+        self.assertIn("保命档", message)
+        self.assertFalse(DeactivationExemption.objects.exists())
+
+    def test_an_explicitly_named_blanket_is_allowed_with_a_warning(self):
+        """**显式点名** `--regime high_vol` 仍然照落——显式就是知情。
+
+        机制不该替人否决一个明确的选择；但它必须把「这条豁免在保命档期间不起作用」说出来。
+        """
+        out, _ = self.manage(
+            "--grant",
+            "--strategy",
+            "AlphaStem",
+            "--regime",
+            BaseRegime.HIGH_VOL.value,
+        )
+        self.assertEqual(
+            DeactivationExemption.objects.get().regime, BaseRegime.HIGH_VOL.value
+        )
+        self.assertIn("不是可以登记豁免的基础阶段", out)
 
 
 # --------------------------------------------------------------------------- #
@@ -632,3 +664,22 @@ class TestListing(_Fixture):
         )
         self.assertIn("已发出豁免", out)
         self.assertIn("豁免共 1 条", out)
+
+    def test_the_listing_says_the_exemptions_are_ineffective_during_a_blanket(self):
+        """清单里那句「此刻算不算数」：保命档在拦时，**在期豁免一条都不生效**。
+
+        「在期」两个字本身不告诉人这件事——而人看到的形态是「我明明放行过它，它还被停着」，
+        与「机制没听见我」完全分不开（CONTEXT.md 第 176 条）。这句话与 `query_halt` 的
+        输出共用一处（`deactivation_run.exemption_standing`），所以它是同一句。
+        """
+        self.exemption()
+        self.judge(BaseRegime.HIGH_VOL.value)
+        out, _ = self.manage()
+        self.assertIn("当前一条都不生效", out)
+
+    def test_the_listing_says_they_are_in_force_when_nothing_blocks_them(self):
+        """反方向。少了这一条，「永远说『不生效』」这种写坏了的实现也能通过上面那条。"""
+        self.exemption()
+        self.judge(BaseRegime.RANGE.value)
+        out, _ = self.manage()
+        self.assertIn("豁免照常生效", out)

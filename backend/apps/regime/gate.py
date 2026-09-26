@@ -189,7 +189,9 @@ class Declaration:
     reason: str
     #: 见 `attitude_since`。
     opened_at: datetime
-    #: 策略停用没有预先知道的截止时刻（Q10 的「窗口：… 起（截止时刻不定）」）。
+    #: 策略停用没有预先知道的截止时刻（Q10 的「… 起（截止时刻不定）」；第③段 Q5 之后
+    #: 这句话只对**事件熔断**那一档说「窗口：」，这一档说的是「生效：」——
+    #: `halt_notify._period_line` 按触发源分岔。
     expires_at: datetime | None = None
 
 

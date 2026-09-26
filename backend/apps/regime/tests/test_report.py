@@ -27,6 +27,7 @@
 **分层**：`TestContract` / `TestTheStructuredChange` / `TestCropForOneUser` 三个类是
 `SimpleTestCase`——碰一下库就报错，所以「这几段不落库」是被强制的，不靠 docstring 声明。
 `TestPureRendering` 只读（`_switch_lines` 会读切换流水表，所以它只能是 `TestCase`），
+`TestTheDeclarationLine` 落几行声明（第③段 W4 加的那一行读的是声明表），
 `TestTheWriteGate` 与后面五个类落真库。
 
 **造数据用真 UUID**：策略主键是 `UUIDField`，而 `_strategy_names` 会拿建议里的
@@ -47,16 +48,19 @@ from django.test import SimpleTestCase, TestCase
 
 from apps.agent import event_commands
 from apps.common.time_utils import business_tz, format_business
-from apps.regime import config, deactivation, deactivation_run, judgement, report
+from apps.regime import config, deactivation, deactivation_run, halt, judgement, report
 from apps.regime.models import (
     NO_ESCALATION_DISPLAY,
     ActorKind,
     DailyReport,
+    HaltDeclaration,
+    HaltTrigger,
     MechanismKind,
     MechanismMode,
     RegimeMechanismSwitch,
     business_midnight,
 )
+from apps.regime.quant import BaseRegime
 from apps.regime.tests.test_shadow import (
     RUN_DAY,
     SYMBOL,
@@ -383,6 +387,123 @@ class TestPureRendering(TestCase):
         sections = {name: "内容" for name in report.SECTIONS}
         body = report.render_body(sections, symbol=SYMBOL, run_day=RUN_DAY)
         self.assertIn(f"【三、未来 {config.REPORT.event_horizon_days} 天的高影响事件】", body)
+
+
+# --------------------------------------------------------------------------- #
+# 第④段里「停止声明：此刻 …」那一行（第③段 W4）
+# --------------------------------------------------------------------------- #
+
+
+def _declare(
+    *,
+    trigger: HaltTrigger = HaltTrigger.EVENT,
+    scope: str | None = None,
+    label: str = "FOMC 议息",
+) -> HaltDeclaration:
+    """一条此刻活着的声明。（触发源 × 作用域）是唯一键，所以同一档要多行就给不同作用域。"""
+    return HaltDeclaration.objects.create(
+        trigger=trigger.value,
+        scope=scope or halt.global_scope(),
+        label=label,
+        opened_at=NOW - timedelta(hours=2),
+        expires_at=None,
+        closed_at=None,
+        reason="测试",
+        actor_kind=ActorKind.TASK.value,
+        actor_name="regime.sync_halt_windows",
+    )
+
+
+def _open_switch(kind: MechanismKind) -> RegimeMechanismSwitch:
+    """把这个开关拨到执行态。`at` 早于 `NOW`，所以 `current()` 读得到它。"""
+    return RegimeMechanismSwitch.objects.create(
+        kind=kind.value,
+        from_mode=MechanismMode.SHADOW.value,
+        to_mode=MechanismMode.EXECUTING.value,
+        at=NOW - timedelta(days=1),
+        actor_kind=ActorKind.CLI.value,
+        actor_name="ops",
+        reason="测试",
+    )
+
+
+class TestTheDeclarationLine(TestCase):
+    """第③段 W4：日报第④段加了「停止声明表此刻的实数」这一行。
+
+    这一行的要点是**它说的时刻**：声明表吃的是**生效中**的判定，而第④段上面那行
+    「上次判定成功（结论 …）」报的是**待生效**的那条。所以断言按**整行**比对——句子里的
+    「此刻」「按生效中的阶段」与层名、条数是一个整体，少了任何一半，这一行就成了
+    「今天那条判定已经在拦」的假话（而它读起来完全正常）。
+    """
+
+    def test_each_layer_is_counted_and_the_effective_phase_is_named(self):
+        _declare(trigger=HaltTrigger.BLANKET, label="保命档（高波动）")
+        _declare(trigger=HaltTrigger.EVENT)
+        _declare(trigger=HaltTrigger.DEACTIVATION, scope=f"strategy:{_new_id()}")
+        _declare(trigger=HaltTrigger.DEACTIVATION, scope=f"strategy:{_new_id()}")
+        _open_switch(MechanismKind.EVENT_BREAKER)
+        _open_switch(MechanismKind.REGIME_GATE)
+
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=BaseRegime.RANGE.value),
+            [
+                "停止声明：此刻 4 条在拦（保命档（高波动） 1 条、事件熔断 1 条、"
+                "策略停用决策 2 条；按生效中的阶段：箱体震荡）"
+            ],
+        )
+
+    def test_the_blanket_counts_with_no_switch_to_open(self):
+        # `HALT_TRIGGER_SWITCH[BLANKET] = None`：一个开关都不拨，保命档照样算在拦——
+        # 「高波动算生效」这句话在日报上就是这个形状。
+        _declare(trigger=HaltTrigger.BLANKET, label="保命档（高波动）")
+
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=BaseRegime.HIGH_VOL.value),
+            ["停止声明：此刻 1 条在拦（保命档（高波动） 1 条；按生效中的阶段：高波动）"],
+        )
+
+    def test_nothing_at_all_is_a_statement_not_a_blank(self):
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=BaseRegime.RANGE.value),
+            ["停止声明：此刻没有任何一层在拦（按生效中的阶段：箱体震荡）"],
+        )
+
+    def test_cold_start_says_there_is_no_effective_phase(self):
+        # `regime` 为空（冷启动）时不能说「按生效中的阶段：（无）」——那读起来像有个阶段
+        # 叫「（无）」。这一行要答的是「它依据的是哪条判定」，所以如实说没有。
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=None),
+            ["停止声明：此刻没有任何一层在拦（此刻没有生效中的阶段判定）"],
+        )
+
+    def test_alive_rows_behind_a_closed_switch_are_reported_as_a_difference(self):
+        # 同一批行只拨开关：Shadow 期它们不拦人（与 `query_halt`、下单通路同一个口径），
+        # 但「表里躺着、开开关就咬人」必须在日报里看得见——出 Shadow 之前，这是唯一一份
+        # 能让人提前看见「它准备拦哪些」的日频文档。
+        _declare(trigger=HaltTrigger.DEACTIVATION, scope=f"strategy:{_new_id()}")
+        _declare(trigger=HaltTrigger.DEACTIVATION, scope=f"strategy:{_new_id()}")
+
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=BaseRegime.UPTREND.value),
+            [
+                "停止声明：此刻没有任何一层在拦（按生效中的阶段：上行趋势）",
+                "  另有 2 条活着，开关关着所以不拦",
+            ],
+        )
+
+        _open_switch(MechanismKind.REGIME_GATE)
+        self.assertEqual(
+            report._declaration_lines(now=NOW, regime=BaseRegime.UPTREND.value),
+            ["停止声明：此刻 2 条在拦（策略停用决策 2 条；按生效中的阶段：上行趋势）"],
+        )
+
+    def test_the_section_carries_the_line(self):
+        # 接线：这一行真的在 `_section_health` 里。少了这条断言，把那一行 `extend` 删掉
+        # 也能让上面所有用例通过——它们调的是 `_declaration_lines` 本身。
+        body = report._section_health(
+            SYMBOL, {}, {"regime": BaseRegime.RANGE.value}, now=NOW
+        )
+        self.assertIn("停止声明：此刻没有任何一层在拦（按生效中的阶段：箱体震荡）", body)
 
 
 # --------------------------------------------------------------------------- #

@@ -213,19 +213,15 @@ def _exemption_lines(now, *, blanket_live: bool) -> list[str]:
 
     **人工恢复豁免不穿透保命档**——这条必须能在这条输出里被读出来。否则用户会看到一个自己
     放行过、却又被停的策略，而那与「机制没听见我」在观感上无法区分。
+
+    那句话本身在 `deactivation_run.exemption_standing`：同一句还要出现在豁免清单（终端与
+    `/regime exempt`）里，两处各写一份的话，「当前一条都不生效」这个警告迟早只在其中一处
+    跟着改。这里只加前缀——工具的输出每一行都带话题名。
     """
     from apps.regime import deactivation_run
-    from apps.regime.slice import REASON_DISPLAY, REASON_HIGH_VOL_BLANKET
 
-    count = len(deactivation_run.in_force_exemptions(now=now))
-    if not count:
-        return ["人工豁免：当前没有在期的人工豁免。"]
-    if blanket_live:
-        return [
-            f"人工豁免：{count} 条在期，但**当前一条都不生效**——"
-            f"{REASON_DISPLAY[REASON_HIGH_VOL_BLANKET]}在拦，人工恢复豁免不穿透保命档。"
-        ]
-    return [f"人工豁免：{count} 条在期（当前没有保命档在拦，豁免照常生效）。"]
+    standing = deactivation_run.exemption_standing(now=now, blanket_live=blanket_live)
+    return [f"人工豁免：{standing}"]
 
 
 def _gate_line(now) -> str:
@@ -238,9 +234,14 @@ def _gate_line(now) -> str:
 
     没有这一行，「现在在拦什么」会被读成「这些层已经在拦下单了」。第②c 段之后上面列的层
     **就是**声明表的行（``query_halt`` 与 ``pre_trade_check`` 从同一个 ``blocking_declarations``
-    出发），但两者仍不是同一批：声明表里还有 ``DEACTIVATION``（第③段的停用决策）那一档，
-    它的写入方是停用决策任务、尚未接线。所以报的是**声明表的实数**——上面列了几层、这张表
-    有几条，两者的差额正是「还没接线的那一档」，直接写出来比让人自己去比对强。
+    出发），**三档全在内**：事件熔断、保命档、以及第③段接上的策略停用决策。所以报的是
+    **声明表的实数**，而它与上面列出的层数是**同一个函数、同一次求值上的同一个数**——
+    两个数相等是一条结构上的不变量，报出来是为了让它**看得见**。
+
+    **``now`` 一路传下去是这条不变量的前提**（这里原先漏传，只对上面几层生效）：少了它，
+    上面几层按冻结的时刻算、这一行按墙上时钟算，差额会在某条声明恰好到期的那个瞬间冒出来
+    ——而它长得就像「有一档没对上」。这句话原先写的是「差额正是还没接线的那一档」：③b/③c
+    把那一档接上之后那句话已经不成立，而它当时掩盖的正是这条双时钟的缝。
 
     ``blocking_declarations`` 而不是 ``live_declarations``：要报的是真的在拦的条数；少一层
     开关过滤，就会把「开关关着但行还留着」读成一个正在拦的层。
@@ -255,21 +256,24 @@ def _gate_line(now) -> str:
     from apps.regime import halt
     from apps.regime.models import MechanismKind, RegimeMechanismSwitch
 
-    declared = len(halt.blocking_declarations())
+    declared = len(halt.blocking_declarations(now=now))
     return (
         f"机制当前档：{RegimeMechanismSwitch.current().display}"
         f"；事件熔断开关："
         f"{RegimeMechanismSwitch.current(MechanismKind.EVENT_BREAKER).display}"
         f"；停止声明表此刻 {declared} 条在生效（拦住的是开新仓，减仓放行）"
         "——停止判定已接到下单拦截（第②段 halt 状态机）：上面列的层就是这张表里的行，"
-        "订单通路认的也是它。（策略停用决策那一档的写入方要到第③段才接线。）"
+        "**三档都算在内**（事件熔断 / 保命档 / 策略停用决策），订单通路认的也是它。"
+        "上面列了几层、这里就是几条——同一个 ``blocking_declarations``、同一个时刻，"
+        "两个数本该恒等；不等只可能是取数坏了。"
     )
 
 
 class QueryHaltTool(BaseTool):
     name = "query_halt"
     description = (
-        "查询行情阶段机制当前**全部在拦的层**（事件熔断层、高波动档又称保命档），"
+        "查询行情阶段机制当前**全部在拦的层**（事件熔断层、高波动档又称保命档、"
+        "策略停用决策档），"
         "每层带作用域、触发源、生效期与依据。多层可以同时生效，所以返回的是一个集合而不是"
         "一条。**读的是停止声明表**——订单通路真正认的那一份，所以这里列出的层就是此刻会"
         "拦住开新仓的层。**不按人裁剪**：用户问的是「现在系统在拦什么」，裁剪会让他怀疑"
@@ -292,7 +296,9 @@ class QueryHaltTool(BaseTool):
 
         lines: list[str] = []
         if not rows:
-            lines.append("当前没有任何层在拦：事件熔断层与高波动档都没有生效。")
+            lines.append(
+                "当前没有任何层在拦：事件熔断层、高波动档与策略停用决策档都没有生效。"
+            )
         else:
             lines.append(f"当前在拦的层：{len(rows)} 层（系统级状态，不按人裁剪）")
             for index, row in enumerate(rows, start=1):
