@@ -127,6 +127,7 @@ class TelegramChannel(BaseChannel):
             "/event  — 重大事件维护（录入 / 改档 / 改期 / 取消 / 候选转正或否决 / 列表）\n"
             "          直接发 /event 看用法\n"
             "/regime — 机制开关：事件熔断 / 行情阶段 gate / 人工恢复豁免\n"
+            "          出 Shadow 体检与切换：/regime mech\n"
             "          直接发 /regime 看用法\n"
             "\n直接发送消息即可与Agent交互。"
         )

@@ -707,3 +707,123 @@ class TestTheExemptSubcommands:
             assert "/regime exempt grant" in result.data, text
 
         assert not DeactivationExemption.objects.exists()
+
+
+#: 机制整体那一页的第一行（`mechanism_switch` 的渲染）。与上面两个锚同一条纪律：取模块
+#: 自己的常量，换词时用例跟着换锚，而不是变成一条「文案改了」的红灯。
+MECH_PAGE_TITLE = "机制整体 · 出 Shadow 体检"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTheMechSubcommands:
+    """第四级：机制整体那一档（出 Shadow 那个单元）。
+
+    上面十三条规定里，第 1/2/4/5/7 条对它逐条成立（不许丢词、落款是人、打错不写库、重复
+    按不动手、只碰自己那一档）。另有两条是它自己的：
+
+    14. **它必须说出「这一档不是执行开关」。** `HALT_TRIGGER_SWITCH` 只把另外两档映射到
+        两个下游开关，而 `MECHANISM` 全仓只有读者——出 Shadow 的实际效果是**留一条记录**。
+        这句话只在命令的回复里说得出口（日报一天一次、页面也只有敲命令才看得见），少了它
+        人敲完就以为机制上线了。
+    15. **门槛不达标照样切，但要说出来。** 页面不是守卫（未到期、频率超标都不拒绝），
+        职责是把没达标的项摆在人脸前——而且要在**点头之后**再说一遍，因为点头之前的
+        那一遍会被「我已经点过头了」盖掉。
+    """
+
+    def test_a_bare_mech_shows_the_page_and_writes_nothing(self):
+        result = _run(_call("/regime mech"))
+        assert result.success, result.error
+        assert MECH_PAGE_TITLE in result.data
+        assert not RegimeMechanismSwitch.objects.exists()
+
+    def test_exit_shows_the_page_then_writes_one_row(self):
+        result = _run(_call("/regime mech exit"))
+        assert result.success, result.error
+        assert MECH_PAGE_TITLE in result.data, "先回显体检页，再落流水（与另外两级同形）"
+        row = _only_row()
+        assert row.kind == MechanismKind.MECHANISM.value
+        assert row.from_mode == MechanismMode.SHADOW.value
+        assert row.to_mode == MechanismMode.EXECUTING.value
+        # 落款是人：这条流水是事后回答「谁把机制放出去的」的唯一材料。
+        assert (row.actor_kind, row.actor_name) == (ActorKind.CHAT.value, SENDER)
+
+    def test_the_reason_comes_from_the_page_snapshot(self):
+        """`reason` 是体检页摘要，不是命令里另写的一句话。
+
+        本仓今天一条判定都没有，所以摘要就是「Shadow 尚未开始」——**这个形状本身就是
+        断言**：门槛一个都没达（甚至还没起算）也照切，但流水里留下的是事实。
+        """
+        _run(_call("/regime mech exit"))
+        assert "人工出 Shadow" in _only_row().reason
+        assert "尚未开始" in _only_row().reason
+
+    def test_the_reply_says_this_is_not_an_execution_switch(self):
+        result = _run(_call("/regime mech exit"))
+        assert "不是执行开关" in result.data, "少了这句，人敲完就以为机制上线了"
+        assert "留一条记录" in result.data
+        # 而且要指出真正拦人的那两条命令，否则这句话只带来困惑。
+        assert "/regime on" in result.data
+        assert "/regime gate on" in result.data
+
+    def test_the_unmet_items_are_repeated_after_the_flip(self):
+        """第 15 条：页面里说过一次，切完之后再说一次——同一份快照渲染的两处。
+
+        本仓今天一条判定都没有，所以复述的是**最强的那一句**（「什么都还没被校验过」），
+        而不是平时那句「还没达标的项：…」。两者都是 `unmet_note`，选哪一句由快照决定。
+        """
+        result = _run(_call("/regime mech exit"))
+        assert "⚠️ Shadow 尚未开始：这一档什么都还没被校验过" in result.data
+
+    def test_back_says_it_undoes_nothing(self):
+        _run(_call("/regime mech exit"))
+        result = _run(_call("/regime mech back"))
+        assert result.success, result.error
+        assert "不解除任何东西" in result.data
+        assert HaltDeclaration.objects.count() == 0, "退回 Shadow 不碰声明表"
+        assert RegimeMechanismSwitch.objects.count() == 2
+        assert _latest_row().to_mode == MechanismMode.SHADOW.value
+
+    def test_back_does_not_repeat_the_whole_page(self):
+        """撤防方向不回显整页（与 gate 的关闭一致）——但要说清它做了什么。"""
+        _run(_call("/regime mech exit"))
+        result = _run(_call("/regime mech back"))
+        assert MECH_PAGE_TITLE not in result.data
+        assert "已退回 Shadow" in result.data
+
+    def test_every_alias_resolves(self):
+        for text in ("/regime 机制", "/regime 机制 exit", "/regime mech 出"):
+            result = _run(_call(text))
+            assert result.success, (text, result.error)
+            assert MECH_PAGE_TITLE in result.data, text
+            RegimeMechanismSwitch.objects.all().delete()
+
+        _run(_call("/regime mech 出"))
+        result = _run(_call("/regime 机制 回"))
+        assert result.success, result.error
+        assert "已退回 Shadow" in result.data
+
+    def test_pressing_exit_twice_writes_one_row(self):
+        _run(_call("/regime mech exit"))
+        result = _run(_call("/regime mech exit"))
+        assert result.success, result.error
+        assert "本来就是执行态" in result.data
+        assert RegimeMechanismSwitch.objects.count() == 1
+
+    def test_the_other_two_switches_are_untouched(self):
+        """`kind` 只有一个值：这一档翻了，另外两个开关的档位一动不动。"""
+        _run(_call("/regime mech exit"))
+        for kind in (MechanismKind.EVENT_BREAKER, MechanismKind.REGIME_GATE):
+            assert RegimeMechanismSwitch.current(kind) is MechanismMode.SHADOW
+            assert RegimeMechanismSwitch.latest(kind) is None
+
+    def test_typos_are_feedback_and_write_nothing(self):
+        for text, expected in (
+            ("/regime mech 上线", "未知的子命令：mech 上线"),
+            ("/regime 机制 exit now", "这条命令不吃参数，多出来的词：now"),
+        ):
+            result = _run(_call(text))
+            assert result.success, result.error
+            assert expected in result.data, text
+            # 每一句错后面都跟着整页用法——人只知道写错了，还得知道该怎么写。
+            assert "/regime mech exit" in result.data, text
+        assert not RegimeMechanismSwitch.objects.exists()

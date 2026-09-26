@@ -69,11 +69,12 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from apps.common.time_utils import business_tz, format_business, to_business
-from apps.regime import config, halt, judgement
+from apps.regime import config, halt, judgement, mechanism_switch
 from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
 from apps.regime.models import (
     NO_ESCALATION_DISPLAY,
+    ActorKind,
     CandidateEvent,
     CandidateStatus,
     DailyReport,
@@ -952,7 +953,7 @@ def _section_health(
             f"（运行日 {last.run_day}，结论 {_regime_display(last.effective_regime)}）"
         )
 
-    lines.extend(_switch_lines())
+    lines.extend(_switch_lines(now=now))
     lines.extend(_declaration_lines(now=now, regime=deactivation.get("regime")))
 
     # 「是否触发过自熔断」只能由切换流水回答：自熔断的收场是「退回 Shadow」，那条路径会在
@@ -962,6 +963,12 @@ def _section_health(
     # 「有一条退回 Shadow 的行」与「机制自熔断过」是同一句话。加列之后就不同了——人工把
     # 事件熔断那个开关关掉同样是一条 to_mode=shadow 的行，而那不是自熔断（自熔断说的是
     # 机制整体不可信）。少这一条限定，日报会把一次例行的人工关开关报成自熔断。
+    #
+    # **还要限定 `actor_kind`**：`/regime mech back` 让人能自己把机制退回 Shadow，而那一条
+    # 也是 to_mode=shadow。不加这一层，一次人工退回会被日报报成「自熔断触发过」——比上面
+    # 那条更坏，因为自熔断是「机制不可信」的结论，而它接下来会被当成重新上线的依据。
+    # 人工退回不是没发生：它由 `_switch_lines` 的「机制当前档（最近一次切换 …）」那一行
+    # 报出来，这里只回答「**自**熔断有没有触发过」。
     back = [
         row
         for row in RegimeMechanismSwitch.objects.filter(
@@ -969,10 +976,17 @@ def _section_health(
             to_mode=MechanismMode.SHADOW.value,
         ).order_by("-at", "-id")[:1]
     ]
-    if back:
+    if back and back[0].actor_kind == ActorKind.TASK.value:
         lines.append(
             f"自熔断：触发过（最近一次 {format_business(back[0].at)}，"
             f"{back[0].actor_name}：{back[0].reason}）"
+        )
+    elif back:
+        # 有人退回过、但不是自熔断。说「未触发过」而不说「没有退回记录」：后一句在这里
+        # 是假话（流水里确实有一条退回 Shadow 的行），而日报上的假话正是这一轮要清掉的东西。
+        lines.append(
+            f"自熔断：未触发过（最近一次退回 Shadow 是**人工**：{back[0].actor_name}，"
+            f"{format_business(back[0].at)}）"
         )
     else:
         lines.append("自熔断：未触发过（切换流水里没有一条退回 Shadow 的记录）")
@@ -1027,7 +1041,7 @@ _SWITCH_KINDS = (
 )
 
 
-def _switch_lines() -> list[str]:
+def _switch_lines(*, now: datetime) -> list[str]:
     """三个开关各自的当前档 + 各自最近一次生效时间（CONTEXT.md 第 179 条）。
 
     「各自最近一次生效时间」在第②段之前答不出来——那张表没有「是哪一个开关」这一列，
@@ -1040,6 +1054,11 @@ def _switch_lines() -> list[str]:
     末一行说的是**保命档不在三个开关里**：它是阶段本身的性质（高波动一到就生效），
     没有哪个人点头才让它生效（CONTEXT.md 第 179 条的三个开关对应的是三条**自动行为**，
     而保命档不需要被「启用」）。不写这一行，读日报的人会以为高波动档也要等某个开关。
+
+    「出 Shadow 到期」那一行只**在到期之后**出现（`mechanism_switch.expiry_notice`，
+    第 159 条）：到期前天天报一句「还没到期」是二十天的噪声，会训练人跳过第④段，而这条
+    兜底要防的恰恰是「没人管的库让 Shadow 无限期挂着、挂着的样子与正常跑着一样」。
+    位置紧跟在「机制当前档」下面：它说的是**那一档**的事，离了半个屏幕就会被读成别的东西。
     """
     lines: list[str] = []
 
@@ -1048,6 +1067,9 @@ def _switch_lines() -> list[str]:
         f"机制当前档：{RegimeMechanismSwitch.current(MechanismKind.MECHANISM).display}"
         + (f"（最近一次切换 {format_business(master.at)}）" if master else "（无切换流水）")
     )
+    notice = mechanism_switch.expiry_notice(now=now)
+    if notice is not None:
+        lines.append(notice)
 
     lines.append("三个开关（各自独立、各自人工确认）：")
     for kind in _SWITCH_KINDS:

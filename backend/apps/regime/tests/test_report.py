@@ -57,6 +57,7 @@ from apps.regime.models import (
     HaltTrigger,
     MechanismKind,
     MechanismMode,
+    RegimeJudgement,
     RegimeMechanismSwitch,
     business_midnight,
 )
@@ -337,7 +338,7 @@ class TestPureRendering(TestCase):
         # **一个开关查一次**——但这里一行流水都没有，所以三行都只能如实说「无切换流水」。
         # 断言按条数而不是按整段文本：三行各查各的这件事，只有数一数才看得出来；只断言
         # 「无切换流水」在不在的话，三个开关塌成一行也照样通过。
-        body = "\n".join(report._switch_lines())
+        body = "\n".join(report._switch_lines(now=NOW))
         self.assertIn("三个开关（各自独立、各自人工确认）：", body)
         self.assertEqual(body.count("无切换流水"), 4)  # 机制整体 1 + 三个开关各 1
         for kind in report._SWITCH_KINDS:
@@ -361,7 +362,7 @@ class TestPureRendering(TestCase):
             actor_name="ops",
             reason="事件熔断上线",
         )
-        body = "\n".join(report._switch_lines())
+        body = "\n".join(report._switch_lines(now=NOW))
 
         self.assertEqual(body.count("无切换流水"), 3)  # 机制整体 + 另两个开关
         self.assertIn(f"  事件熔断：执行态（最近一次生效 {format_business(NOW)}）", body)
@@ -1012,6 +1013,131 @@ class TestTheBlanketLayerInTheChange(TestCase):
 
         self.assertIn("将新停用「高波动」档（全市场一律，与证据无关）", body)
         self.assertNotIn("将解除", body)
+
+
+# --------------------------------------------------------------------------- #
+# 第④段里「出 Shadow 到期」那一行 / 自熔断那一行（出 Shadow 那个单元）
+# --------------------------------------------------------------------------- #
+
+
+def _started_shadow(days_ago: int) -> RegimeJudgement:
+    """把 Shadow 的起算日放到「RUN_DAY 往前 `days_ago` 天」——即已跑 `days_ago + 1` 天。
+
+    **必须是含资讯结论的判定**（`news_ref.status` 为 `ok`）：起算日取的是第一条成功的
+    资讯判定，不是第一条判定。`concluded_payload()` 造的那条没有 `news_ref`，所以它起不了
+    算——那正好是本仓今天的形状（判定跑过、资讯没接上）。
+    """
+    run_day = RUN_DAY - timedelta(days=days_ago)
+    return RegimeJudgement.objects.create(
+        symbol=SYMBOL,
+        attribute_date=run_day - timedelta(days=1),
+        effective_at=business_midnight(run_day + timedelta(days=1)),
+        base_regime=BaseRegime.RANGE.value,
+        escalation="",
+        effective_regime=BaseRegime.RANGE.value,
+        news_ref={"status": "ok"},
+    )
+
+
+def _back(kind: ActorKind) -> RegimeMechanismSwitch:
+    """一条「退回 Shadow」。`actor_kind` 是人工与自熔断的唯一分界。"""
+    return RegimeMechanismSwitch.objects.create(
+        kind=MechanismKind.MECHANISM.value,
+        from_mode=MechanismMode.EXECUTING.value,
+        to_mode=MechanismMode.SHADOW.value,
+        at=NOW - timedelta(hours=3),
+        actor_kind=kind.value,
+        actor_name="alice" if kind is ActorKind.CHAT else "regime.self_fuse",
+        reason="测试",
+    )
+
+
+class TestTheExpiryLine(TestCase):
+    """第④段在**到期之后**每天加一行「出 Shadow」（第 159 条的兜底需要一个人能看见它）。
+
+    这一行的位置与缺席都是要点：到期前天天报一句「还没到期」是二十天的噪声（会训练人跳过
+    第④段），而到期之后它必须紧跟在「机制当前档」下面——离了半个屏幕就会被读成别的东西。
+    """
+
+    def health(self) -> str:
+        return report._section_health(
+            SYMBOL, {}, {"regime": BaseRegime.RANGE.value}, now=NOW
+        )
+
+    def test_nothing_at_all_is_printed_before_the_deadline(self):
+        """本仓今天就是这个形状：一条判定都没有。到期那一行不该出现。
+
+        锚用「/regime mech」而不是「出 Shadow」——**后者是那个档位自己的名字**
+        （`MechanismKind.MECHANISM` 的 display 就叫「出 Shadow（判定 + 切片 + 自动停用）」），
+        三个开关那一段里天天都有它。
+        """
+        self.assertNotIn("/regime mech", self.health())
+
+    def test_a_running_shadow_period_is_not_nagged_about(self):
+        _started_shadow(days_ago=2)
+        self.assertNotIn("/regime mech", self.health(), "还没到期就不该天天报一句")
+
+    def test_the_cap_line_appears_after_the_deadline(self):
+        """兜底到期：日子满了、窗口一个都没有。这一句必须带着「事件窗口数不足」。"""
+        _started_shadow(days_ago=config.SHADOW.expiry_cap_days - 1)
+        body = self.health()
+        self.assertIn("出 Shadow", body)
+        self.assertIn("兜底", body)
+        self.assertIn("事件窗口数不足", body)
+        self.assertIn("/regime mech", body, "要指出下一步该敲哪条命令")
+
+    def test_it_sits_right_below_the_current_mode_line(self):
+        _started_shadow(days_ago=config.SHADOW.expiry_cap_days - 1)
+        lines = self.health().splitlines()
+        at = next(i for i, line in enumerate(lines) if line.startswith("机制当前档："))
+        self.assertTrue(lines[at + 1].startswith("出 Shadow"), lines[at : at + 2])
+        # 而且要在三个开关之前：它说的是「机制整体」那一档的事，不是某一个开关的事。
+        switches = next(i for i, line in enumerate(lines) if line.startswith("三个开关"))
+        self.assertLess(at, switches)
+
+
+class TestTheSelfFuseLine(TestCase):
+    """「自熔断：…」那一行必须把**人工退回**与**自熔断**分开（出 Shadow 那个单元）。
+
+    加 `/regime mech back` 之前，`to_mode=shadow` 的行只可能来自自熔断，所以「有一条退回
+    Shadow 的行」与「机制自熔断过」是同一句话。有了人工退回之后它们不是了——而报错的
+    方向很坏：一次人工退回会被日报报成「机制自熔断过」，而自熔断是「机制不可信」的结论，
+    接下来会被当成重新上线的依据。
+    """
+
+    def health(self) -> str:
+        return report._section_health(
+            SYMBOL, {}, {"regime": BaseRegime.RANGE.value}, now=NOW
+        )
+
+    def test_a_human_back_is_not_a_self_fuse(self):
+        _back(ActorKind.CHAT)
+        body = self.health()
+        self.assertIn("自熔断：未触发过", body)
+        self.assertIn("人工", body)
+        self.assertIn("alice", body, "谁退回去的必须写在日报里")
+
+    def test_a_task_back_is_the_self_fuse(self):
+        _back(ActorKind.TASK)
+        body = self.health()
+        self.assertIn("自熔断：触发过", body)
+        self.assertIn("regime.self_fuse", body)
+
+    def test_no_back_record_at_all_says_so(self):
+        self.assertIn("自熔断：未触发过（切换流水里没有一条退回 Shadow 的记录）", self.health())
+
+    def test_a_row_from_another_switch_is_not_a_back_at_all(self):
+        """事件熔断被关掉写的也是 `to_mode=shadow` 的行——那不是机制退回过 Shadow。"""
+        RegimeMechanismSwitch.objects.create(
+            kind=MechanismKind.EVENT_BREAKER.value,
+            from_mode=MechanismMode.EXECUTING.value,
+            to_mode=MechanismMode.SHADOW.value,
+            at=NOW - timedelta(hours=3),
+            actor_kind=ActorKind.CHAT.value,
+            actor_name="alice",
+            reason="关掉事件熔断",
+        )
+        self.assertIn("自熔断：未触发过（切换流水里没有一条退回 Shadow 的记录）", self.health())
 
 
 class TestTheHealthSection(TestCase):

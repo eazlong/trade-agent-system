@@ -1,4 +1,4 @@
-"""事件熔断开关的斜杠命令（第②段单元 ②f）。
+"""行情阶段机制三个开关的斜杠命令（第②段单元 ②f → 第③段 W2 → 出 Shadow 那一档）。
 
 CONTEXT.md 第 160 条：**出 Shadow 切到执行态必须人工确认，不自动切换**。本模块是那个
 「人工」的入口，`SupervisorAgent.handle()` 在最前面把命令截下来交给这里——**不经过
@@ -18,11 +18,15 @@ LLM**。这与 `/event` 同一条理由：判据认的是人敲的，而只要�
                                 发出一条豁免（阶段不给则取当前生效阶段）
     /regime exempt revoke <id> [id…]
                                 按 id 收回（可逆：再发一条即可）
+    /regime mech             机制整体的准入体检页（只读）
+    /regime mech exit        出 Shadow：切到执行态（先回显体检页，再落一条切换流水）
+    /regime mech back        退回 Shadow（只记录，不执行）
 
 `on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」；豁免那一支的
-三个动作也各有一套（`list` / 列 / 清单、`grant` / 发 / 发出、`revoke` / 收 / 收回）。第二级
-与第三级的组名（`gate` / `阶段`、`exempt` / `豁免`）**不进那些别名表**——它们是组名，与
-「打开 / 关掉」不是一类东西。
+三个动作也各有一套（`list` / 列 / 清单、`grant` / 发 / 发出、`revoke` / 收 / 收回）；机制
+整体那一支认 `mech` / `机制` 与 `exit` / 出、`back` / 回。第二级往后的组名（`gate` / `阶段`、
+`exempt` / `豁免`、`mech` / `机制`）**不进那些别名表**——它们是组名，与「打开 / 关掉」不是
+一类东西。
 
 两级共用一套解析纪律（`_word`）：整词匹配、多余一个词就拒绝并点名。裸的 `gate` 是**那一页
 本身**，不是「gate 的开关」；不带动作的 `/regime` 仍然是事件熔断那一页，两个机制各有各的
@@ -78,6 +82,27 @@ gate 的**两个方向**都还会多一句 `gate_switch.reconcile_warning`（档
 发出会附一句 `blanket_grant_warning`：那条豁免在保命档期间完全空转。显式就是知情，
 机制不该替人否决一个明确的选择——但它必须把人不知道的那件事说出来。
 
+## 第四级：机制整体那一档（第①③段的出口）
+
+`/regime mech …` 是三个开关里**最后一个**、也是唯一一直没有入口的那个：事件熔断与 gate
+各管一样东西，机制整体这一档管「这套机制本身可不可信」。判据、写路径与体检页全在
+`mechanism_switch`，本模块照旧只做「谁敲的、敲的是什么」。
+
+三处与前三级**刻意不同**，都落在回复里让人看见：
+
+1. **`exit` 的回显里有一句「这一档不是执行开关」。** `HALT_TRIGGER_SWITCH` 只把事件熔断
+   映射到 `EVENT_BREAKER`、把停用映射到 `REGIME_GATE`，而 `MECHANISM` 在**全仓只有读者**
+   （日报第④段、`query_halt`）。所以出 Shadow 的实际效果是**留一条记录**——它记的是
+   「第①段的判定与切片被验证过了」。不说这句话，人敲完就以为机制上线了，而它什么都没
+   打开；真要动作得各自开 `/regime on` 与 `/regime gate on`。
+2. **`exit` 之后紧接着再报一遍没达标的项**（`mechanism_switch.unmet_note`，与体检页同一次
+   快照）。页面里已经说过一次，但那一次在点头**之前**；把一个不达标的上线只说在动作之前，
+   等于让「我已经点过头了」把这条信息盖掉。这不是禁止（页面不拒绝任何方向），是让人知道
+   这次切换带着什么。
+3. **`back` 不回显整页**（撤防方向，与 gate 的关闭一致），但要说清它**不解除任何东西**：
+   声明表、停用决策、人工豁免各有各的开关与到期。撤防最危险的误读是「退回去就都停了」，
+   而退回 Shadow 一个停用也不解除。
+
 ## 报错一律是用户反馈
 
 本模块**没有**自己的输入错误异常类，与 `event_commands.EventInputError` 不同：这里唯一
@@ -106,7 +131,13 @@ from asgiref.sync import sync_to_async
 from django.db import close_old_connections
 from django.utils import timezone
 
-from apps.regime import breaker_switch, deactivation_run, events, gate_switch
+from apps.regime import (
+    breaker_switch,
+    deactivation_run,
+    events,
+    gate_switch,
+    mechanism_switch,
+)
 from apps.regime.models import ActorKind, MechanismMode
 from apps.regime.quant import BaseRegime
 
@@ -132,7 +163,10 @@ _USAGE = (
     "  /regime off        关掉事件熔断（回到 Shadow）\n"
     "  /regime gate       行情阶段 gate 的上线确认页（只读）\n"
     "  /regime gate on    打开行情阶段 gate（先回显确认页，再落流水 + 对一次账）\n"
-    "  /regime gate off   关掉行情阶段 gate（回到 Shadow）\n" + _EXEMPT_USAGE
+    "  /regime gate off   关掉行情阶段 gate（回到 Shadow）\n"
+    "  /regime mech       机制整体的准入体检页（只读）\n"
+    "  /regime mech exit  出 Shadow（先回显体检页，再落一条切换流水）\n"
+    "  /regime mech back  退回 Shadow（只记录，不执行）\n" + _EXEMPT_USAGE
 )
 
 #: 子命令别名。只认整词，不做前缀匹配——「/regime onx」不是「on」的笔误而是另一个词。
@@ -155,6 +189,19 @@ _GATE_WORDS = {"gate", "阶段"}
 
 #: 第三级的那个词：`/regime exempt …`。与 `_GATE_WORDS` 同一条：组名不进动作别名表。
 _EXEMPT_WORDS = {"exempt", "豁免"}
+
+#: 第四级的那个词：`/regime mech …`。同上。
+_MECH_WORDS = {"mech", "机制"}
+
+#: 机制整体的两个动作。只有两个：**出**（切执行态）与**回**（退回 Shadow）。两个方向都
+#: 留痕，但都不带参数——切换原因由 `mechanism_switch` 从体检页快照生成（理由见那边
+#: 模块 docstring：原因要与人看过的那些数同源，不能由人手写）。
+_MECH_ALIASES = {
+    "exit": "exit",
+    "出": "exit",
+    "back": "back",
+    "回": "back",
+}
 
 #: 豁免那一支的动作。与 `_ALIASES` 分开：这张表里的词后面**还能跟参数**
 #: （`grant <策略> [阶段] [备注]`），而 `_ALIASES` 那一支是「多一个词就拒绝」。
@@ -464,6 +511,77 @@ _EXEMPT_SUBCOMMANDS = {
 
 
 # --------------------------------------------------------------------------- #
+# 第四级：机制整体那一档。判据、写路径与体检页全在 `mechanism_switch`（见模块 docstring
+# 「第四级」）。这一档**不是执行开关**：出 Shadow 只留一条记录，真正拦人的是上面两个。
+# --------------------------------------------------------------------------- #
+
+
+def _mech_status(actor: str, now: datetime) -> str:
+    """裸 `/regime mech`：准入体检页本身。**只读**——连一条流水都不写。"""
+    return mechanism_switch.page(now=now).body
+
+
+def _mech_exit(actor: str, now: datetime) -> str:
+    """出 Shadow。**体检页与流水取自同一次快照**（`mechanism_switch.page`）。"""
+    briefing = mechanism_switch.page(now=now)
+    row = mechanism_switch.flip_mechanism(
+        MechanismMode.EXECUTING,
+        actor_kind=ActorKind.CHAT,
+        actor_name=actor,
+        reason=briefing.summary,
+        now=now,
+    )
+    if row is None:
+        # 这一支**不补** `unmet_note`：那句话说的是「这次切换带着什么」，而这次什么都没切。
+        # （整页里已经有全部缺口，所以信息没丢。）
+        return briefing.body + "\n\n机制整体**本来就是执行态**，没有写第二条流水。"
+
+    lines = [
+        briefing.body,
+        "",
+        f"✅ 机制整体已出 Shadow：{MechanismMode(row.from_mode).display} → "
+        f"{MechanismMode(row.to_mode).display}（{events.format_moment(row.at)}）",
+        "⚠️ **这一档不是执行开关**：出 Shadow 的效果是**留一条记录**（第①段的判定与切片"
+        "被验证过了），它没有打开任何东西。要真拦人，两个执行开关各自开各自的："
+        "/regime on（事件熔断）、/regime gate on（行情阶段停用）。",
+    ]
+    note = mechanism_switch.unmet_note(briefing.data)
+    if note is not None:
+        lines.append(note)
+    return "\n".join(lines)
+
+
+def _mech_back(actor: str, now: datetime) -> str:
+    """退回 Shadow。**撤防也要留痕，但不重复整页**（与 gate 的关闭一致）。"""
+    data = mechanism_switch.confirmation(now=now)
+    row = mechanism_switch.flip_mechanism(
+        MechanismMode.SHADOW,
+        actor_kind=ActorKind.CHAT,
+        actor_name=actor,
+        reason=mechanism_switch.closing_summary(data),
+        now=now,
+    )
+    if row is None:
+        return (
+            "机制整体**本来就是 Shadow**（只记录、不执行），没有写第二条流水。\n"
+            "要看现在的体检页：/regime mech"
+        )
+
+    lines = [
+        f"✅ 机制整体已退回 Shadow：{MechanismMode(row.from_mode).display} → "
+        f"{MechanismMode(row.to_mode).display}（{events.format_moment(row.at)}）",
+        "⚠️ 退回 Shadow **不解除任何东西**：停止声明表原样留着，策略停用决策与人工豁免"
+        "各有各的开关与到期——它只管「机制整体这一档」自己。",
+        "下一次出 Shadow 仍然要人工确认（第 161 条），并且那一页会把这一次退回的原因"
+        "摆出来。要看：/regime mech",
+    ]
+    return "\n".join(lines)
+
+
+_MECH_SUBCOMMANDS = {"exit": _mech_exit, "back": _mech_back}
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -490,6 +608,15 @@ async def handle_regime_command(message: AgentMessage, args: str) -> AgentResult
             if error is not None:
                 return AgentResult(task_id=message.task_id, success=True, data=error)
             handler = _GATE_SUBCOMMANDS[name]
+    elif tokens[0].lower() in _MECH_WORDS:
+        # `/regime mech [exit|back]`：裸的 `mech` 是那一页本身。
+        if len(tokens) == 1:
+            handler = _mech_status
+        else:
+            name, error = _word(tokens[1:], _MECH_ALIASES, prefix=f"{tokens[0]} ")
+            if error is not None:
+                return AgentResult(task_id=message.task_id, success=True, data=error)
+            handler = _MECH_SUBCOMMANDS[name]
     elif tokens[0].lower() in _EXEMPT_WORDS:
         # `/regime exempt [list|grant|revoke] …`：裸的 `exempt` 是清单本身。这一组与上面两组
         # 有一处**解析上的差别**：动作词之后的那一段是**参数**，不是「多出来的词」——所以

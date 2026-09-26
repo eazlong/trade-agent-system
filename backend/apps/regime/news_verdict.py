@@ -72,7 +72,7 @@ import asyncio
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from django.db.models import Q
 from django.utils import timezone
@@ -308,6 +308,31 @@ def _run_coro_blocking(coro):
 # --------------------------------------------------------------------------- #
 
 
+#: 「一次**成功**的资讯判定」的判据，**唯一一份**。两个调用方共用它：采集窗口的起点
+#: （`last_success_at`）与 Shadow 的起算日（`first_success_run_day`）。分成两处写，两边
+#: 迟早会分家——而分家的形状是「窗口从某天开始、Shadow 从另一天起算」，两个数都对不上，
+#: 却都各自自洽。
+#:
+#: `ok` 与 `quiet` 都算成功：`quiet`（源全成功、0 条）是一次可信的结论，窗口从它往后推
+#: 是对的。`failed` 不算——那一轮什么也没判出来，窗口必须盖住它。
+#:
+#: 用 `Q(...) | Q(...)` 而不是 `news_ref__status__in=(...)`：JSON 键上的 `in` 在两种
+#: 写法里只有前者是文档里明确的形态，而这两行代码要活很多年。
+_SUCCESS_Q = Q(news_ref__status=STATUS_OK) | Q(news_ref__status=STATUS_QUIET)
+
+
+def _successful(symbol: str):
+    """全部**成功**的资讯判定，按运行日升序。"""
+    return (
+        RegimeJudgement.objects.filter(symbol=symbol, news_ref__isnull=False)
+        .filter(_SUCCESS_Q)
+        # 按 `attribute_date` 排而不是 `effective_at`：`run_day` 是前者的函数，所以这就是
+        # 「按运行日排」。模型层不校验两者的映射（见 `RegimeJudgement` docstring），一条
+        # 映射不一致的历史行不该改变「第一条是哪天」的答案。
+        .order_by("attribute_date", "effective_at")
+    )
+
+
 def last_success_at(symbol: str) -> datetime | None:
     """上一次**成功**的资讯判定落在哪个业务时刻，也就是本轮的采集窗口起点。
 
@@ -316,19 +341,30 @@ def last_success_at(symbol: str) -> datetime | None:
     有两套时间口径。代价是锚点比上一轮实际跑完的时刻早 24 小时，于是窗口与上一轮重叠
     一小段——重叠由 url 去重（`_drop_seen`）天然吃掉，不会重复投喂。
 
-    `ok` 与 `quiet` 都算成功：`quiet`（源全成功、0 条）是一次可信的结论，窗口从它往后
-    推是对的。`failed` 不算——那一轮什么也没判出来，窗口必须盖住它。
-
-    这里用 `Q(...) | Q(...)` 而不是 `news_ref__status__in=(...)`：JSON 键上的 `in`
-    在两种写法里只有前者是文档里明确的形态，而这两行代码要活很多年。
+    「成功」的判据见 `_SUCCESS_Q`（`ok` / `quiet` 算，`failed` 不算），与 Shadow 起算日
+    共用同一份。
     """
     return (
-        RegimeJudgement.objects.filter(symbol=symbol, news_ref__isnull=False)
-        .filter(Q(news_ref__status=STATUS_OK) | Q(news_ref__status=STATUS_QUIET))
+        _successful(symbol)
         .order_by("-effective_at")
         .values_list("effective_at", flat=True)
         .first()
     )
+
+
+def first_success_run_day(symbol: str) -> date | None:
+    """**第一条**成功的资讯判定落在哪个运行日；一条都没有时返回 `None`。
+
+    这一个日期是 Shadow 期的起算日（CONTEXT.md 第 159 条：Shadow 从资讯通道可用之后才
+    开始）。取它而不是「第一条 Shadow 记录」的理由也在这里：判定链路先跑起来、资讯通道
+    后接上是很可能的部署顺序，而先跑的那几天交出的是一份**纯量化**的成绩单——用它们起算，
+    等于让准入体检去评估另一个函数。
+
+    `None` 与「今天」是两件事：`None` 是「Shadow 尚未开始」，任何消费方都必须能说出这句
+    话，而不是把它渲染成一个看起来正常的 0（见 `mechanism_switch._start_line`）。
+    """
+    row = _successful(symbol).first()
+    return row.run_day if row is not None else None
 
 
 def _failure(base: dict, stage: str, exc: BaseException) -> dict:
