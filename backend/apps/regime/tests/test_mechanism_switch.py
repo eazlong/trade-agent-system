@@ -29,16 +29,26 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 
 from django.test import TestCase
 from django.utils import timezone as django_timezone
 
 from apps.common.time_utils import business_tz, to_business
-from apps.regime import config, mechanism_switch, news_verdict
+from apps.regime import (
+    beat_health_run,
+    config,
+    judgement,
+    mechanism_switch,
+    news_verdict,
+    truth,
+)
 from apps.regime.models import (
     ActorKind,
     BaseRegime,
+    DailyCandle,
+    Escalation,
     EventImpact,
     EventScope,
     EventStatus,
@@ -47,6 +57,7 @@ from apps.regime.models import (
     MechanismMode,
     RegimeJudgement,
     RegimeMechanismSwitch,
+    RegimeTruthInterval,
     ShadowDailyRecord,
     business_midnight,
 )
@@ -59,6 +70,7 @@ MIN_DAYS = config.SHADOW.min_natural_days
 MIN_WINDOWS = config.SHADOW.min_event_windows
 CAP_DAYS = config.SHADOW.expiry_cap_days
 MAX_RATE = config.SHADOW.max_trigger_rate
+MIN_RATE = config.SHADOW.min_agreement_rate
 
 #: 起算日：**刚好满 `MIN_DAYS` 个自然日**（含两端）。各用例用一个只改起算日的 helper 挪它。
 START = TODAY - timedelta(days=MIN_DAYS - 1)
@@ -66,7 +78,8 @@ START = TODAY - timedelta(days=MIN_DAYS - 1)
 #: 体检页正文里那几行必须一直在的句子。它们不是装饰：第 1 句防「按一下就以为上线了」，
 #: 第 2 句防「算不出来被读成通过」，第 3 句防「拿一个三个月才评估得出的条款当准入门槛」。
 NOT_A_SWITCH = "不是执行开关"
-TRUTH_ABSENT = "真值未录入"
+#: ①没录真值时的首行措辞，取自 `truth.describe`（那一段的唯一渲染器）。
+TRUTH_ABSENT = "尚未录入任何人工标注区间"
 SELF_FUSE_NOT_A_GATE = "不构成出 Shadow 的准入门槛"
 
 
@@ -80,10 +93,16 @@ def _judgement(
     *,
     status: str = news_verdict.STATUS_OK,
     symbol: str = SYMBOL,
+    base: BaseRegime = BaseRegime.RANGE,
+    escalation: str = "",
 ) -> RegimeJudgement:
     """落一条判定，`news_ref.status` 由 `status` 决定。
 
-    三值的具体取值与本文件无关（这一档不读阶段），但字段必填，所以给一个固定值。
+    三值默认都是箱体震荡、不带抬升：这一档多数用例不读阶段（只读起算日与状态），而字段
+    必填。要验资讯抬升那一条时给 `base` / `escalation`，**生效阶段由 `apply_escalation`
+    现算**——在夹具里手写「抬升的生效阶段是哪个档」，就是把判定链路的合成规则抄了第二遍，
+    哪天规则改了，抄的那份会继续按旧规则把用例喂成绿的。
+
     `attribute_date = run_day - 1`、`effective_at = 业务日界(run_day + 1)`：这就是
     `test_shadow` 里那套映射（模型层不校验它，映射由判定链路统一实现）。
     """
@@ -91,9 +110,9 @@ def _judgement(
         symbol=symbol,
         attribute_date=run_day - timedelta(days=1),
         effective_at=business_midnight(run_day + timedelta(days=1)),
-        base_regime=BaseRegime.RANGE.value,
-        escalation="",
-        effective_regime=BaseRegime.RANGE.value,
+        base_regime=base.value,
+        escalation=escalation,
+        effective_regime=judgement.apply_escalation(base, escalation).value,
         news_ref={"status": status},
     )
 
@@ -142,6 +161,53 @@ def _event(
 def _at(day: date, hour: int = 10) -> datetime:
     """业务时区某个自然日的某个钟点。事件窗口用得到（`halt_at` 是绝对时刻）。"""
     return datetime.combine(day, time(hour, 0), tzinfo=business_tz())
+
+
+def _truth(start: date, end: date, *, regime: BaseRegime = BaseRegime.DOWNTREND):
+    """落一段人工真值（①的比对基准）。落款固定是人，与「录入方」无关的那些用例用不到它。"""
+    return RegimeTruthInterval.objects.create(
+        start_date=start,
+        end_date=end,
+        regime=regime.value,
+        note="",
+        actor_kind=ActorKind.CHAT.value,
+        actor_name="tester",
+    )
+
+
+def _candles(closes, *, band: float = 1.0) -> None:
+    """按收盘价序列落日线，**日期结束于今天**（这一页的数都相对今天算）。
+
+    日线是①那一侧唯一的真取数口：`truth_run.agreement` 拿它重算量化标签，所以这一档
+    要端到端验一次，就得真的喂进一条序列——**喂进去的序列决定标签**，下面两条曲线是
+    先算过再写下来的，不是猜的（`band=1.0` 的振幅，见 `test_quant` 的那套造数手法）。
+    """
+    last = TODAY
+    first = last - timedelta(days=len(closes) - 1)
+    DailyCandle.objects.bulk_create(
+        [
+            DailyCandle(
+                symbol=SYMBOL,
+                date=first + timedelta(days=i),
+                open_time=datetime.combine(
+                    first + timedelta(days=i), time(0, 0), tzinfo=timezone.utc
+                ),
+                open=Decimal(str(close)),
+                high=Decimal(str(close + band)),
+                low=Decimal(str(close - band)),
+                close=Decimal(str(close)),
+                volume=Decimal("1"),
+            )
+            for i, close in enumerate(closes)
+        ]
+    )
+
+
+#: 300 天每天 +1 → 尾部判「上行趋势」（预热 263 天后才判得出，最后 37 天都有标签）。
+RAMP = [100 + i for i in range(300)]
+#: 260 天在 100 上下 ±3 来回，之后 40 天纹丝不动 → 尾部判「箱体震荡」：振幅分位落到
+#: 低处（波动已经收敛），而两条均线在平段里贴到一起（间距过不了 0.5 个 ATR 的门槛）。
+CHOP_THEN_FLAT = [100 + (3 if i % 2 else -3) for i in range(260)] + [100.0] * 40
 
 
 class _Fixture(TestCase):
@@ -499,19 +565,230 @@ class TestTheHonestLines(_Fixture):
         self.assertIn("/regime gate on", body)
 
     def test_the_agreement_rate_is_reported_as_undecidable(self):
-        """成功标准①今天算不出来（真值没有存放它的地方）。**留白会被读成「这条大概没
-        问题」**，所以必须写成一句明确的「无法判定」并按未达标计。"""
+        """**一段真值都没录**时①算不出来。留白会被读成「这条大概没问题」，所以必须写成
+        一句明确的「无法判定」+「按未达标计」，并把录入入口一起给出来。
+
+        真值表建起来之前，这一页写的是「真值未录入（那一档还不存在）」；现在它存在了，
+        所以措辞从「没有存放它的地方」变成「还没有人录」——后者是可行动的那一种。
+        """
         self.start(days_ago=MIN_DAYS - 1)
+        data = self.sweep()
         body = self.body()
         self.assertIn(TRUTH_ABSENT, body)
         self.assertIn("无法判定", body)
-        self.assertIn("一致率无法判定", mechanism_switch.unmet_note(self.sweep()) or "")
+        self.assertIn("按未达标计", body, "算不出来按未达标计，不能只写「无法判定」")
+        self.assertIn("/regime label add", body, "要指出录入入口")
+        self.assertFalse(data.agreement.met)
+        self.assertIn(TRUTH_ABSENT, mechanism_switch.unmet_note(data) or "")
 
     def test_the_self_fuse_clause_is_not_a_gate(self):
         """自熔断的频率条款要连续 3 个月才评估得出，而 Shadow 期的量级是几十个自然日——
         切换那一刻它必然无结论。这一页明写它不构成准入门槛，而不是算成一个空栏。"""
         self.start(days_ago=MIN_DAYS - 1)
         self.assertIn(SELF_FUSE_NOT_A_GATE, self.body())
+
+
+# --------------------------------------------------------------------------- #
+# ①这一条从真值表里取数（本单元新接的那一段）
+# --------------------------------------------------------------------------- #
+
+
+class TestTheAgreementIsWired(_Fixture):
+    """①是四条门槛里唯一要读**另一张表**的（人工真值）。它坏掉的样子与「真的一段都没
+    录」长得一模一样：这一页永远说「未达标」。所以要两头都钉——一头是 `confirmation()`
+    真的去比对了，一头是比对出来的那一段真的进了正文与缺口单。
+
+    比对的那一侧（逐日口径、冲突日、错向）由 `test_truth.py` 钉住；这里钉的是**接线**：
+    真值、日线、门槛三个来源都换成假的也不会红的那种坏法。
+    """
+
+    def test_without_candles_every_truth_day_is_a_gap(self):
+        """录了真值、一根日线都没有：算法每天都答不上来。缺口**进分母**（第 163 条的口径
+        是「有真值的天」，算法答不上来就是没答对），但要单列成「当天没有输出」，不能混进
+        「判成了别的档」。"""
+        self.start(days_ago=MIN_DAYS - 1)
+        _truth(TODAY - timedelta(days=1), TODAY)
+        body = self.body()
+        self.assertNotIn(TRUTH_ABSENT, body, "录了真值就不再是「尚未录入」")
+        self.assertIn(
+            f"① 判定与人工标注的一致率 ≥ {MIN_RATE:.0%}：未达标——0/2 天一致（0%）", body
+        )
+        self.assertIn("2 天算法当天没有输出，按不匹配计", body)
+
+    def test_matching_days_reach_the_page_and_drop_the_gap(self):
+        """**端到端**：一条稳步上行的序列 + 一段标为〈上行趋势〉的真值 → ①达标。
+
+        达标之后它在缺口单上**整条消失**（与另外几条不同：①只在没达标时占位），而正文
+        里照旧印出来——「达标」也是一个结论，不是可以省掉的一行。
+        """
+        self.start(days_ago=MIN_DAYS - 1)
+        _candles(RAMP)
+        _truth(TODAY - timedelta(days=4), TODAY, regime=BaseRegime.UPTREND)
+
+        data = self.sweep()
+        self.assertTrue(data.agreement.met, data.agreement)
+        self.assertEqual((data.agreement.counted, data.agreement.matched), (5, 5))
+        self.assertIn(
+            f"① 判定与人工标注的一致率 ≥ {MIN_RATE:.0%}：达标——5/5 天一致（100%）",
+            self.body(),
+        )
+        self.assertNotIn(
+            "① 判定与人工标注的一致率", mechanism_switch.unmet_note(data) or ""
+        )
+
+    def test_a_single_misdirection_keeps_the_first_gap(self):
+        """**端到端**，第 164 条最要紧的那一半：人工标〈下行趋势〉、算法判〈箱体震荡〉。
+
+        这正是箱体震荡这个兜底档的退化之路，也是单向门槛要堵的那一侧（反过来错只算普通
+        不一致）。错向一次①就不达标，页面必须把这句单独印出来——只印「0% 一致」的话，
+        读的人会以为再多标几天就能补救。
+        """
+        self.start(days_ago=MIN_DAYS - 1)
+        _candles(CHOP_THEN_FLAT)
+        _truth(TODAY - timedelta(days=2), TODAY, regime=BaseRegime.DOWNTREND)
+
+        data = self.sweep()
+        self.assertEqual(data.agreement.misdirected, 3)
+        self.assertFalse(data.agreement.met)
+        body = self.body()
+        self.assertIn("系统性错向 3 天", body)
+        self.assertIn("哪怕一次也算不达标", body)
+        self.assertIn("① 判定与人工标注的一致率", mechanism_switch.unmet_note(data) or "")
+
+    def test_an_escalated_day_is_not_a_misdirection(self):
+        """**端到端**，资讯抬升那一档：同一批日线、同一段〈下行趋势〉真值，只是那三天
+        **在生效的判定被资讯抬到高波动**。
+
+        这正是抬升口径要救的那一天：上一条用例（没有抬升）里它是一次系统性错向，
+        而机制那天给出的答案本来就不是量化给的——拿纯量化标签去比，等于机制靠资讯
+        判对了反而被记一笔。有抬升，那三天摘出分母、单列出来，错向归零。
+        """
+        self.start(days_ago=MIN_DAYS - 1)
+        _candles(CHOP_THEN_FLAT)
+        _truth(TODAY - timedelta(days=2), TODAY, regime=BaseRegime.DOWNTREND)
+        _judgement(
+            TODAY - timedelta(days=3),
+            base=BaseRegime.RANGE,
+            escalation=Escalation.NEWS.value,
+        )
+
+        data = self.sweep()
+        self.assertEqual(data.agreement.escalated, 3)
+        self.assertEqual(data.agreement.escalated_matched, 0)
+        self.assertEqual((data.agreement.counted, data.agreement.misdirected), (0, 0))
+        self.assertIsNone(data.agreement.rate)
+        body = self.body()
+        self.assertIn("另有 3 天当天在生效的判定带资讯抬升", body)
+        self.assertIn("全部落在资讯抬升日上，没有一天可用于比对", body)
+        self.assertNotIn("系统性错向", body)
+
+    def test_the_news_being_right_does_not_make_gate_one_pass(self):
+        """K（人工标注与当天的生效阶段一致的天数）只让排除**可审计**，不参与达标判断。
+
+        同一批抬升日，把真值改标〈高波动〉：K=3，机制那三天的生效阶段确实是高波动。
+        一致率照样是「无法判定」、照样按未达标计——①是**量化判定**的准入门槛，资讯层
+        判得准不准不该替它开门。谁哪天把 K 接进 `met`，这条会红。
+        """
+        self.start(days_ago=MIN_DAYS - 1)
+        _candles(CHOP_THEN_FLAT)
+        _truth(TODAY - timedelta(days=2), TODAY, regime=BaseRegime.HIGH_VOL)
+        _judgement(
+            TODAY - timedelta(days=3),
+            base=BaseRegime.RANGE,
+            escalation=Escalation.NEWS.value,
+        )
+
+        data = self.sweep()
+        self.assertEqual(data.agreement.escalated_matched, 3)
+        self.assertEqual(data.agreement.counted, 0)
+        self.assertFalse(data.agreement.met)
+        body = self.body()
+        self.assertIn("其中 3 天人工标注与当天的生效阶段一致", body)
+        self.assertIn("无法判定——按未达标计", body)
+
+    def test_a_no_op_escalation_day_stays_in_the_denominator(self):
+        """判据是**生效阶段与基础阶段不相等**，不是「抬升标志非空」。
+
+        基础阶段已经是高波动时资讯照抬升、标志照记，而生效阶段与基础阶段相同——那天
+        机制给出的**就是**纯量化答案。按标志非空去摘，等于把最极端的日子从分母里挑走，
+        一致率只会被抬上去（这里确实判反了：三天全落在错向上，就该记三天）。
+        """
+        self.start(days_ago=MIN_DAYS - 1)
+        _candles(CHOP_THEN_FLAT)
+        _truth(TODAY - timedelta(days=2), TODAY, regime=BaseRegime.HIGH_VOL)
+        _judgement(
+            TODAY - timedelta(days=3),
+            base=BaseRegime.HIGH_VOL,
+            escalation=Escalation.NEWS.value,
+        )
+
+        data = self.sweep()
+        self.assertEqual(data.agreement.escalated, 0)
+        self.assertEqual((data.agreement.counted, data.agreement.misdirected), (3, 3))
+        self.assertNotIn("资讯抬升", self.body())
+
+
+# --------------------------------------------------------------------------- #
+# 调度表那一段：这一页是「跑了没」唯一的按需读面（它不经过 beat）
+# --------------------------------------------------------------------------- #
+
+
+class TestTheSchedulerIsOnThePage(_Fixture):
+    """端到端：真的去读 `PeriodicTask` 表与 `celery_app.beat_schedule` 的差集。
+
+    纯层的判据在 `test_beat_health.py` 里钉着；这里钉的是**这一页真的印出来了**——
+    第 180 条要求的「跑了没」此前没有任何出口，而这一页是唯一一个不经 beat 的读面：
+    按需渲染，所以 beat 死了它也照印（印出来的正是「一条都没被派发过」）。
+    """
+
+    def _a_declared_name(self) -> str:
+        """一个**真的在文件里声明了**的任务名。
+
+        不写死字面量：`beat_schedule` 里改名是常事，写死会让这条用例在改名时红，而它红
+        的原因与「这一页读不读得出超期」无关。代价是 `declared()` 空掉时它会静默通过——
+        所以先断言它非空。
+        """
+        names = beat_health_run.declared()
+        self.assertTrue(names, "`beat_schedule` 里一条都没声明：本用例的前提不成立")
+        return names[0]
+
+    def test_a_task_that_never_got_into_the_schedule_is_named_on_the_page(self):
+        """空表 = beat 一次都没起来过（或条目是后来加的、beat 没重启）。
+
+        这是**今天这个环境真实的样子**：文件里声明了、`PeriodicTask` 里没有行，于是
+        「从未被调度」与「正常跑着」在旧接口上长得一模一样（两边的 `last_run_at` 都是
+        null）。这一页必须把它说成一句能被追责的话。
+        """
+        from django_celery_beat.models import PeriodicTask
+
+        PeriodicTask.objects.all().delete()
+        body = self.body()
+
+        self.assertIn("调度表（beat）", body)
+        self.assertIn("从未进入调度表", body)
+        self.assertIn("重启 beat", body)
+
+    def test_a_task_that_stopped_running_is_named_as_overdue(self):
+        """有行、发过、但已经错过不止一轮：这一页要说出「多少一轮、上次多久前」。"""
+        from django_celery_beat.models import IntervalSchedule, PeriodicTask
+
+        name = self._a_declared_name()
+        PeriodicTask.objects.create(
+            name=name,
+            task="apps.regime.tasks.sync_gate",
+            interval=IntervalSchedule.objects.create(every=300, period="seconds"),
+            last_run_at=NOW - timedelta(hours=6),
+        )
+
+        body = self.body()
+        self.assertIn(f"{name}：已超期（每 5 分一轮，上次距今 6 小时）", body)
+
+    def test_the_page_says_it_only_answers_whether_beat_dispatched(self):
+        """全篇最要紧的一句：`last_run_at` 是 beat 派发时盖的，不是 worker 成功时盖的。
+
+        少了这句，这一行会把「发了」读成「好了」——那比没有这一行更坏。
+        """
+        self.assertIn("只答「beat 把它**发出去了没有**」", self.body())
 
 
 # --------------------------------------------------------------------------- #
@@ -556,7 +833,7 @@ class TestTheSnapshot(_Fixture):
         self.assertIn("触发频率", note)
         self.assertNotIn("自然日", note, "天数够了，不该再报它")
         self.assertNotIn("事件窗口", note, "窗口够了，不该再报它")
-        self.assertIn("一致率无法判定", note)
+        self.assertIn(TRUTH_ABSENT, note, "①没录真值，照样要出现在缺口单上")
 
 
 # --------------------------------------------------------------------------- #
@@ -682,3 +959,16 @@ class TestTheExpiryNotice(_Fixture):
         notice = mechanism_switch.expiry_notice(now=NOW) or ""
         self.assertIn("已到期", notice)
         self.assertNotIn("事件窗口数不足", notice)
+
+    def test_the_notice_does_not_depend_on_the_agreement(self):
+        """到期那一句只问两个布尔（到期了没 / 窗口够不够），与①今天算不算得出来无关。
+
+        从前这里为了让 `Confirmation(...)` 的签名过关，把频率那三个数填 0 造了个假对象。
+        真值表建起来之后，这条路上多了一个「还没录真值」的状态：它要是被卷进这句判据，
+        录一段真值就会让这句提醒改口——而它说的是日期，不该被别的东西影响。
+        """
+        self.start(days_ago=CAP_DAYS - 1)
+        before = mechanism_switch.expiry_notice(now=NOW)
+        self.assertIsNotNone(before)
+        _truth(TODAY - timedelta(days=1), TODAY)
+        self.assertEqual(mechanism_switch.expiry_notice(now=NOW), before)

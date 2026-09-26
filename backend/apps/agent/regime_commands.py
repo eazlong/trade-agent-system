@@ -21,12 +21,18 @@ LLM**。这与 `/event` 同一条理由：判据认的是人敲的，而只要�
     /regime mech             机制整体的准入体检页（只读）
     /regime mech exit        出 Shadow：切到执行态（先回显体检页，再落一条切换流水）
     /regime mech back        退回 Shadow（只记录，不执行）
+    /regime label            人工标注区间（真值）的清单与一致率（只读）
+    /regime label add <起> <终> <档位> [备注…]
+                             录入一段人工标注（成功标准①的比对基准）
+    /regime label rm <id> [id…]
+                             按 id 撤回（软删：行还在库里，原文不动）
 
 `on` / `off` 也认「开 / 开启 / 打开 / open」与「关 / 关闭 / 关掉 / close」；豁免那一支的
 三个动作也各有一套（`list` / 列 / 清单、`grant` / 发 / 发出、`revoke` / 收 / 收回）；机制
-整体那一支认 `mech` / `机制` 与 `exit` / 出、`back` / 回。第二级往后的组名（`gate` / `阶段`、
-`exempt` / `豁免`、`mech` / `机制`）**不进那些别名表**——它们是组名，与「打开 / 关掉」不是
-一类东西。
+整体那一支认 `mech` / `机制` 与 `exit` / 出、`back` / 回；真值那一支认 `label` / `标注` 与
+`list` / 列 / 清单、`add` / 录 / 录入、`rm` / 删 / 删除。第二级往后的组名（`gate` / `阶段`、
+`exempt` / `豁免`、`mech` / `机制`、`label` / `标注`）**不进那些别名表**——它们是组名，
+与「打开 / 关掉」不是一类东西。
 
 两级共用一套解析纪律（`_word`）：整词匹配、多余一个词就拒绝并点名。裸的 `gate` 是**那一页
 本身**，不是「gate 的开关」；不带动作的 `/regime` 仍然是事件熔断那一页，两个机制各有各的
@@ -103,6 +109,24 @@ gate 的**两个方向**都还会多一句 `gate_switch.reconcile_warning`（档
    声明表、停用决策、人工豁免各有各的开关与到期。撤防最危险的误读是「退回去就都停了」，
    而退回 Shadow 一个停用也不解除。
 
+## 第五级：人工真值（第 164 条）
+
+`/regime label …` 是成功标准①的**输入口**：人在这里把「我确定的那些历史区间是哪一档」写
+下来，`truth_run.agreement()` 拿它与历史量化标签比。与第四级同一条理由——判据、写路径与
+渲染全在 `truth.py` / `truth_run.py`，本模块只做「谁敲的、敲的是什么」。
+
+三处只有这一层才有的决定：
+
+1. **录入路径一个算法数字都不回显。** 第 164 条要求「先标完再看算法输出」，而那句话拦不
+   住任何东西——人愿意就能去开体检页。机制唯一能做的是**不在录入的那一次交互里**把结论
+   递到眼前：并排放着，人就会照着它改自己刚写下的判断，一致率随后测的是「人同不同意自己
+   刚才看见的东西」。所以回复只报人自己输入的东西（段数、天数、跟已有区间打不打架）。
+2. **档位认中文名**（ `/regime label add 2024-01-05 2024-03-20 下行趋势`），与 `exempt
+   grant` 共用同一个翻译（`_regime_of`），共享层只认 slug。
+3. **`rm` 是撤回，不是删除。** 回复里必须说清「行还在库里、原文一个字没动」：这是它与
+   `/event cancel` 在观感上最容易混的地方（后者也不删行），而两者的收场不同——撤回会把
+   这一段从分母里拿掉，取消只是把事件挪出日历。
+
 ## 报错一律是用户反馈
 
 本模块**没有**自己的输入错误异常类，与 `event_commands.EventInputError` 不同：这里唯一
@@ -137,6 +161,8 @@ from apps.regime import (
     events,
     gate_switch,
     mechanism_switch,
+    truth,
+    truth_run,
 )
 from apps.regime.models import ActorKind, MechanismMode
 from apps.regime.quant import BaseRegime
@@ -156,6 +182,16 @@ _EXEMPT_USAGE = (
     "                     按 id 收回（可逆：再发一条即可）"
 )
 
+#: 真值那一支的用法行。与 `_EXEMPT_USAGE` 同一条理由：报错只印自己这几行。
+_LABEL_USAGE = (
+    "  /regime label      人工标注区间（真值）的清单与一致率（只读）\n"
+    "  /regime label add <起> <终> <档位> [备注…]\n"
+    "                     录入一段人工标注，例如：\n"
+    "                     /regime label add 2024-01-05 2024-03-20 下行趋势 某轮熊市\n"
+    "  /regime label rm <id> [id…]\n"
+    "                     按 id 撤回（软删：行还在库里，原文不动）"
+)
+
 _USAGE = (
     "机制开关：\n"
     "  /regime            事件熔断的上线确认页（只读，不改变任何东西）\n"
@@ -166,7 +202,7 @@ _USAGE = (
     "  /regime gate off   关掉行情阶段 gate（回到 Shadow）\n"
     "  /regime mech       机制整体的准入体检页（只读）\n"
     "  /regime mech exit  出 Shadow（先回显体检页，再落一条切换流水）\n"
-    "  /regime mech back  退回 Shadow（只记录，不执行）\n" + _EXEMPT_USAGE
+    "  /regime mech back  退回 Shadow（只记录，不执行）\n" + _EXEMPT_USAGE + "\n" + _LABEL_USAGE
 )
 
 #: 子命令别名。只认整词，不做前缀匹配——「/regime onx」不是「on」的笔误而是另一个词。
@@ -215,6 +251,23 @@ _EXEMPT_ALIASES = {
     "revoke": "revoke",
     "收": "revoke",
     "收回": "revoke",
+}
+
+#: 第五级的那个词：`/regime label …`。同上：组名不进动作别名表。
+_LABEL_WORDS = {"label", "标注"}
+
+#: 真值那一支的动作。`rm` 收的是 id，`add` 收的是三个位置参数加一段自由文本——与
+#: `_EXEMPT_ALIASES` 同类（词后面还能跟参数），所以不共用 `_ALIASES`。
+_LABEL_ALIASES = {
+    "list": "list",
+    "列": "list",
+    "清单": "list",
+    "add": "add",
+    "录": "add",
+    "录入": "add",
+    "rm": "rm",
+    "删": "rm",
+    "删除": "rm",
 }
 
 
@@ -582,6 +635,78 @@ _MECH_SUBCOMMANDS = {"exit": _mech_exit, "back": _mech_back}
 
 
 # --------------------------------------------------------------------------- #
+# 第五级：人工真值（第 164 条）。本组只做「谁敲的、敲的是什么」——比对、写路径与渲染全在
+# `truth.py` / `truth_run.py`（模块 docstring「第五级」那一段）。
+#
+# 签名与第三级同形：`(args, actor, now) -> str`，`args` 是动作词**之后**的那一段。
+# --------------------------------------------------------------------------- #
+
+
+def _label_usage() -> str:
+    """这一组的用法（只有它自己那几行）。
+
+    共享层抛的 `TruthInputError` 只说事实（它同时服务将来可能的终端入口），「怎么改」补在
+    这里——两处分别在两个入口各自的那一层。
+    """
+    return f"用法：\n{_LABEL_USAGE}"
+
+
+def _label_list(args: list[str], actor: str, now: datetime) -> str:
+    """裸 `/regime label`（或 `list` / `列` / `清单`）：清单与一致率。**只读**。"""
+    if args:
+        return f"列清单不吃参数，多出来的词：{' '.join(args)}\n\n{_label_usage()}"
+    return "\n".join(truth_run.roster_lines())
+
+
+def _label_add(args: list[str], actor: str, now: datetime) -> str:
+    """`add <起> <终> <档位> [备注…]`：录入一段人工标注。
+
+    三个位置参数**都要给**：区间少了任一端就没法比，档位不给则没有任何合理的默认值
+    ——「大概是箱体震荡吧」正是第 164 条要挡的那种猜测。备注是第四个词之后的全部。
+    """
+    if len(args) < 3:
+        return (
+            "要指明区间与档位：/regime label add <起> <终> <档位> [备注…]\n"
+            "例如：/regime label add 2024-01-05 2024-03-20 下行趋势 某轮熊市\n\n"
+            + _label_usage()
+        )
+    try:
+        start = truth_run.parse_day(args[0])
+        end = truth_run.parse_day(args[1])
+        regime = truth_run.parse_regime(_regime_of(args[2]))
+        outcome = truth_run.add(
+            start=start,
+            end=end,
+            regime=regime,
+            actor_kind=ActorKind.CHAT,
+            # 落款是人：聊天这条路上是 sender id（与豁免的 `granted_by` 同一口径）。
+            # 「谁在什么时候标了什么」是事后判断标注有没有被锚定的唯一线索。
+            actor_name=actor,
+            note=" ".join(args[3:]),
+            now=now,
+        )
+    except truth.TruthInputError as exc:
+        return f"{exc}\n\n{_label_usage()}"
+    return "\n".join(truth_run.add_summary(outcome))
+
+
+def _label_rm(args: list[str], actor: str, now: datetime) -> str:
+    """`rm <id> [id…]`：按 id 撤回。整批拒绝语义（缺一个就一行不写）在共享层。"""
+    if not args:
+        return f"要指明撤回哪几段，例如：/regime label rm 3\n\n{_label_usage()}"
+    try:
+        outcome = truth_run.retract(
+            args, actor_kind=ActorKind.CHAT, actor_name=actor, now=now
+        )
+    except truth.TruthInputError as exc:
+        return f"{exc}\n\n{_label_usage()}"
+    return "\n".join(truth_run.retract_summary(outcome, now=now))
+
+
+_LABEL_SUBCOMMANDS = {"list": _label_list, "add": _label_add, "rm": _label_rm}
+
+
+# --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
 
@@ -629,6 +754,17 @@ async def handle_regime_command(message: AgentMessage, args: str) -> AgentResult
             if error is not None:
                 return AgentResult(task_id=message.task_id, success=True, data=error)
             handler = functools.partial(_EXEMPT_SUBCOMMANDS[name], rest[1:])
+    elif tokens[0].lower() in _LABEL_WORDS:
+        # `/regime label [list|add|rm] …`：与豁免那一支同形——裸的 `label` 是清单本身，
+        # 动作词之后的那一段是**参数**，所以 `_word` 只拿动作词那一个去对表。
+        rest = tokens[1:]
+        if not rest:
+            handler = functools.partial(_label_list, [])
+        else:
+            name, error = _word(rest[:1], _LABEL_ALIASES, prefix=f"{tokens[0]} ")
+            if error is not None:
+                return AgentResult(task_id=message.task_id, success=True, data=error)
+            handler = functools.partial(_LABEL_SUBCOMMANDS[name], rest[1:])
     else:
         name, error = _word(tokens, _ALIASES)
         if error is not None:

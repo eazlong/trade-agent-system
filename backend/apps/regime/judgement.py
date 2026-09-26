@@ -149,6 +149,46 @@ def current_judgement(
     return _records(symbol).filter(effective_at__lte=now).order_by("-effective_at").first()
 
 
+def in_force_days(
+    start: date, end: date, symbol: str = SYMBOL
+) -> dict[date, tuple[BaseRegime, BaseRegime]]:
+    """`[start, end]` 里**每一天在生效的那条判定**，值 = `(基础阶段, 生效阶段)`。
+
+    「在生效」用的是与 `current_judgement` **同一句话**：`effective_at <= 业务日界(那天)`
+    的最新一条。判据写了两遍（那边按时刻查一条、这边一次走完整段），所以 `test_judgement`
+    里有一条用例逐日拿两边对账——两处分家的话，同一天会有两个「在生效」的答案，而那种
+    错位处处自洽。
+
+    一次查询走完整段，而不是每天调一次 `current_judgement`：一段人工真值可以横跨几个月，
+    逐日查就是几百次查询，而这条读法每次都发生在体检页打开的那一刻。
+
+    **没有生效判定的日子不进映射**（冷启动之前、判定链还没开始跑）：那不是「那天判成了
+    箱体震荡」，是「那天没有判定」，调用方必须能分开。所以缺席 ≠ 某个默认档位。
+
+    调用方是成功标准①（`truth.tally` 的 `in_force` 入参）：它靠这里的第二个值把**资讯
+    抬升日**挑出去——那几天机制用的不是纯量化结论，拿纯量化标签去比是不公平的。
+    """
+    rows = list(
+        _records(symbol)
+        .filter(effective_at__lte=business_midnight(end))
+        .order_by("effective_at")
+        .values_list("effective_at", "base_regime", "effective_regime")
+    )
+    days: dict[date, tuple[BaseRegime, BaseRegime]] = {}
+    index = 0
+    in_force: tuple[datetime, str, str] | None = None
+    day = start
+    while day <= end:
+        boundary = business_midnight(day)
+        while index < len(rows) and rows[index][0] <= boundary:
+            in_force = rows[index]
+            index += 1
+        if in_force is not None:
+            days[day] = (BaseRegime(in_force[1]), BaseRegime(in_force[2]))
+        day += timedelta(days=1)
+    return days
+
+
 def pending_judgement(
     symbol: str = SYMBOL, now: datetime | None = None
 ) -> RegimeJudgement | None:

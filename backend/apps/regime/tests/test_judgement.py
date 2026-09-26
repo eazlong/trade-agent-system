@@ -39,6 +39,7 @@ from apps.regime.judgement import (
     apply_min_dwell,
     build_evidence,
     current_judgement,
+    in_force_days,
     in_force_since,
     last_judgement,
     load_candles,
@@ -186,17 +187,30 @@ def make_judgement(
     *,
     attribute_day: date | None = None,
     escalation: str = "",
+    effective: BaseRegime | str | None = None,
     symbol: str = SYMBOL,
 ) -> RegimeJudgement:
-    """直接造一条历史判定记录（`effective_day` 的北京 08:00 生效）。"""
-    value = regime.value if isinstance(regime, BaseRegime) else regime
+    """直接造一条历史判定记录（`effective_day` 的北京 08:00 生效）。
+
+    `regime` 是**基础**阶段。`effective` 不给时生效阶段与它相同；给了就是「真的被改过」
+    的那一条（v1 的形状：基础〈箱体震荡〉+ 资讯抬升 → 生效〈高波动〉）。两者分开是必要的：
+    基础阶段已经是〈高波动〉时资讯照抬升、标志照记，但生效阶段与基础阶段相同——那是
+    「空操作」，与「真的改过」在①的口径里必须区分开。
+    """
+    base = regime.value if isinstance(regime, BaseRegime) else regime
+    if effective is None:
+        effective_value = base
+    else:
+        effective_value = (
+            effective.value if isinstance(effective, BaseRegime) else effective
+        )
     return RegimeJudgement.objects.create(
         symbol=symbol,
         attribute_date=attribute_day or (effective_day - timedelta(days=2)),
         effective_at=business_midnight(effective_day),
-        base_regime=value,
+        base_regime=base,
         escalation=escalation,
-        effective_regime=value,
+        effective_regime=effective_value,
     )
 
 
@@ -403,6 +417,104 @@ class TestInForceSinceWalksBackToTheLastChange(TestCase):
             escalation=Escalation.NEWS.value,
         )
         self.assertEqual(in_force_since(escalated), escalated.effective_at)
+
+
+class TestInForceDaysIsTheSameSentenceForAWholeSpan(TestCase):
+    """`in_force_days` 逐日回答「那天在生效的是哪条」，一次查询走完整个跨度。
+
+    它与 `current_judgement` 是**同一句话**（`effective_at <= 业务日界(那天)` 的最新一条），
+    只是按天问而不是按时刻问。两处分家的话，同一天会有两个「在生效」的答案——而那种错位
+    处处自洽，所以这里有一条用例逐日拿两边对账。
+
+    成功标准①靠它把**资讯抬升日**摘出分母，所以它答错的代价不是这一页难看：一个被抬升的
+    日子被算成「量化判错了」，而这个机制存在的意义恰恰是在那种日子里更保守。
+    """
+
+    def setUp(self):
+        self.r22 = make_judgement(RUN_DAY, BaseRegime.RANGE)
+        self.r23 = make_judgement(RUN_DAY + timedelta(days=1), BaseRegime.UPTREND)
+        # 09-24 那条是真的被资讯改过的：基础〈箱体震荡〉→ 生效〈高波动〉。
+        self.r24 = make_judgement(
+            RUN_DAY + timedelta(days=2),
+            BaseRegime.RANGE,
+            escalation=Escalation.NEWS.value,
+            effective=BaseRegime.HIGH_VOL,
+        )
+
+    def test_each_day_gets_the_record_in_force_that_day(self):
+        days = in_force_days(RUN_DAY - timedelta(days=2), RUN_DAY + timedelta(days=3))
+        # 头一天（09-20）还没有任何结论生效：**不进映射**，而不是给一个默认档位。
+        self.assertNotIn(RUN_DAY - timedelta(days=2), days)
+        self.assertEqual(days[RUN_DAY], (BaseRegime.RANGE, BaseRegime.RANGE))
+        self.assertEqual(days[RUN_DAY + timedelta(days=1)], (BaseRegime.UPTREND, BaseRegime.UPTREND))
+        # 09-24 起生效的那条一直用到下一次判定为止——09-25 还在它手里。
+        for offset in (2, 3):
+            self.assertEqual(
+                days[RUN_DAY + timedelta(days=offset)],
+                (BaseRegime.RANGE, BaseRegime.HIGH_VOL),
+            )
+
+    def test_the_boundary_is_the_business_day_start(self):
+        """边界是闭的：`effective_at <= 业务日界(那天)`，到点当天就算它。"""
+        days = in_force_days(RUN_DAY, RUN_DAY + timedelta(days=1))
+        self.assertEqual(days[RUN_DAY], (BaseRegime.RANGE, BaseRegime.RANGE))
+        self.assertEqual(days[RUN_DAY + timedelta(days=1)][0], BaseRegime.UPTREND)
+
+    def test_it_agrees_with_current_judgement_day_by_day(self):
+        """两处判据必须逐日一致（这个函数的 docstring 就是这么承诺的）。"""
+        start, end = RUN_DAY - timedelta(days=3), RUN_DAY + timedelta(days=4)
+        days = in_force_days(start, end)
+        day = start
+        while day <= end:
+            with self.subTest(day=day):
+                record = current_judgement(now=business_midnight(day))
+                if record is None:
+                    self.assertNotIn(day, days)
+                else:
+                    self.assertEqual(
+                        days[day],
+                        (BaseRegime(record.base_regime), BaseRegime(record.effective_regime)),
+                    )
+            day += timedelta(days=1)
+
+    def test_a_no_op_escalation_looks_like_what_it_is(self):
+        """基础阶段已经是〈高波动〉时资讯又抬了一次：标志非空，但两值相同。
+
+        ①因此**不摘**这一天——机制当天给出的就是纯量化答案，摘掉它等于把最极端的日子从
+        分母里挑走。判据是「生效阶段与基础阶段不同」，不是「抬升标志非空」。
+
+        落在 09-26（`setUp` 那三条之外的日子）：`(symbol, effective_at)` 是唯一的，
+        同一天写第二条是撞唯一约束，不是「覆盖」。
+        """
+        day = RUN_DAY + timedelta(days=4)
+        make_judgement(
+            day,
+            BaseRegime.HIGH_VOL,
+            escalation=Escalation.NEWS.value,
+        )
+        self.assertEqual(
+            in_force_days(day, day)[day],
+            (BaseRegime.HIGH_VOL, BaseRegime.HIGH_VOL),
+        )
+
+    def test_it_does_not_read_another_symbols_judgements(self):
+        """另一个 symbol 的结论不替本 symbol 答，也不因为「它有一条」就多出一天。
+
+        09-20 只有 ETH/USDT 有结论（`setUp` 那三条都在 09-22 之后）：对本 symbol 来说
+        那天是**没有判定**——不进映射，不是「跟 ETH 一样」，也不是某个默认档位。
+        """
+        day = RUN_DAY - timedelta(days=2)
+        make_judgement(day, BaseRegime.UPTREND, symbol="ETH/USDT")
+        self.assertEqual(in_force_days(day, day), {})
+        # 而 `setUp` 那条本 symbol 的结论照旧答在它自己的日子上（说明上面不是「查不到」）。
+        self.assertEqual(
+            in_force_days(RUN_DAY, RUN_DAY)[RUN_DAY],
+            (BaseRegime.RANGE, BaseRegime.RANGE),
+        )
+
+    def test_a_reversed_span_is_empty_not_an_error(self):
+        """录反的区间在 `truth.Interval` 那一层就被拒了，但读口自己也不该炸。"""
+        self.assertEqual(in_force_days(RUN_DAY, RUN_DAY - timedelta(days=1)), {})
 
 
 # --------------------------------------------------------------------------- #

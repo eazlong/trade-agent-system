@@ -1216,6 +1216,95 @@ class ShadowDailyRecord(models.Model):
 
 
 # --------------------------------------------------------------------------- #
+# 人工真值（第 164 条）：成功标准①的比对基准
+#
+# 这一段存的是**人的判断**，与本目录下所有别的表性质相反——别的表记「机制看到了什么 /
+# 做了什么」，这一段记「人认定当时是什么」。所以它单独成段，写入方只有一个人工入口。
+# --------------------------------------------------------------------------- #
+
+
+class RegimeTruthInterval(models.Model):
+    """人工标注的一段「已知历史区间」+ 它当时的档位（CONTEXT.md 第 164 条）。
+
+    第 164 条把形状定死了：**一条一段**（区间 + 档位），不是逐日打标——「已知」这个词是
+    硬要求，有争议或事后才看清的日子不入真值，宁少勿滥（一个错的真值会把判对的日子记成
+    判错）。所以表里没有「置信度 / 依据 / 来源」这类字段：能进这张表的只有「我确定那段
+    时间是熊市」这一种东西。
+
+    **标注必须发生在算法的输出可见之前**（同条），否则标注会被算法锚定，「一致率」变成
+    自己验自己。这道防线拦不住一个去查库的人，所以它落在**命令的渲染面**上——
+    `apps/agent/regime_commands` 的录入路径一个算法数字都不回显。
+
+    **撤回而不是修改**：录错了走软删（`retracted_at` 那一组字段），不做就地编辑。本表是
+    比对的**基准**，改一个基准字段会让已经算过的一致率变脸，而「原来标的是什么」恰恰是
+    事后判断「标注有没有被算法锚定」的唯一线索。软删而不是删行，理由与声明表同一条：
+    行本身是历史，「删掉『为什么当初这么标』就答不出」。
+
+    不存 `symbol`：真值是**全市场级**的（CONTEXT.md 第 70 / 71 条，判定源全仓唯一），
+    存一列 symbol 会造出「某个品种的行情阶段真值」这个不存在的对象；比对用哪个标的的
+    标签，由判定侧（`config.CANDLES.symbol`）唯一决定。
+    """
+
+    start_date = models.DateField("区间起点（含）", db_index=True)
+    end_date = models.DateField("区间终点（含）")
+
+    regime = models.CharField(
+        "人工认定的档位",
+        max_length=16,
+        choices=[(m.value, m.display) for m in BaseRegime],
+    )
+
+    note = models.CharField(
+        "备注（例如「某轮牛市」）", max_length=200, blank=True, default=""
+    )
+
+    #: 录入人与撤回人各记一组（`kind` + `name`），与 `RegimeMechanismSwitch` 同形。理由见
+    #: `ActorKind`：`chat` 行的人是平台 sender id、`cli` 行的人是系统用户名，混成一个
+    #: 自由文本字段之后，「谁干的」这一栏就不可比了。
+    actor_kind = models.CharField("录入方类别", max_length=16, choices=ActorKind.choices())
+    actor_name = models.CharField("录入方", max_length=128)
+    created_at = models.DateTimeField("录入时间", auto_now_add=True)
+
+    #: 撤回。用三个字段而不是「删行 + 一张流水表」：后者是两份可以互相矛盾的真相，而这里
+    #: 要记的恰好是同一件事的两面（这一段被撤回了 + 谁在什么时候撤的）。
+    retracted_at = models.DateTimeField("撤回时间（UTC）", null=True, blank=True)
+    retracted_by_kind = models.CharField(
+        "撤回方类别", max_length=16, choices=ActorKind.choices(), blank=True, default=""
+    )
+    retracted_by_name = models.CharField("撤回方", max_length=128, blank=True, default="")
+
+    class Meta:
+        db_table = "regime_truth_intervals"
+        verbose_name = "人工真值区间"
+        verbose_name_plural = "人工真值区间"
+        # 按时间排：清单是给人读的，读的人按时间找那一段。
+        ordering = ["start_date", "id"]
+        constraints = [
+            # 起点不晚于终点。挡的是「录反了」——反向区间在比对里一天的并集都不贡献，
+            # 于是它会以「录进去了、一致率没变」的形状静默存在。
+            models.CheckConstraint(
+                check=models.Q(end_date__gte=models.F("start_date")),
+                name="ck_truth_interval_order",
+            )
+        ]
+
+    @property
+    def days(self) -> int:
+        """区间覆盖的自然日数，**闭区间含两端**（区间是 `[start, end]`）。"""
+        return (self.end_date - self.start_date).days + 1
+
+    @property
+    def live(self) -> bool:
+        return self.retracted_at is None
+
+    def __str__(self) -> str:
+        return (
+            f"#{self.pk} {self.start_date}~{self.end_date} {self.regime}"
+            f"{'' if self.live else '（已撤回）'}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 重大事件与候选事件（第①段单元 8ii）
 #
 # 本段的边界（CONTEXT.md 的「第②段才做窗口与减仓」）：这里**只有维护入口的形状**——

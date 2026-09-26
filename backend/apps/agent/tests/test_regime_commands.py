@@ -62,7 +62,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -78,6 +78,7 @@ from apps.regime import (
     gate_switch,
     halt,
     judgement,
+    truth_run,
 )
 from apps.regime.models import (
     ActorKind,
@@ -93,6 +94,7 @@ from apps.regime.models import (
     MechanismMode,
     RegimeJudgement,
     RegimeMechanismSwitch,
+    RegimeTruthInterval,
 )
 from apps.regime.quant import BaseRegime
 from apps.trading.models import Strategy
@@ -827,3 +829,188 @@ class TestTheMechSubcommands:
             # 每一句错后面都跟着整页用法——人只知道写错了，还得知道该怎么写。
             assert "/regime mech exit" in result.data, text
         assert not RegimeMechanismSwitch.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTheLabelSubcommands:
+    """第五级：人工真值（第 164 条）。
+
+    上面十五条规定里，第 1/2/4/7 条对它逐条成立（不许丢词、落款是人、打错不写库、只碰
+    自己那一张表）。另有四条是它自己的：
+
+    16. **录入的那一次一个算法数字都不回显。** 第 164 条要求「先标完再看算法输出」，而那句
+        话拦不住任何东西——人愿意就能去开体检页。机制唯一能做的是不在录入的那一次交互里
+        把结论递到眼前：并排放着，人就会照着它改自己刚写下的判断。所以这条用例盯的是
+        **回复里没有①②那句话、也没有任何「几成一致」**，而不是别的。
+    17. **撤回是软删。** 行还在、原文（区间、档位、备注、录入人）一个字没动，另记撤回人
+        与撤回时刻——它是事后判断「标注有没有被算法锚定」的唯一线索。
+    18. **整批拒绝。** 缺一个 id 就一行都不写（与 `deactivation_run.revoke` 同形）：报错时
+        人本来就已在「我刚写的是哪条」上不确定了，把其中几条悄悄撤掉，收场是半张表被改过。
+    19. **重叠当场说清是哪一种。** 同档位重叠 = 互相佐证（覆盖天数不叠加），异档位重叠 =
+        冲突日（不进分母）——两种都在回复里报，因为不说的话「覆盖天数没变」看起来与
+        「这次没写进去」一模一样。
+    """
+
+    def _only_id(self) -> int:
+        """表里那一行的真实主键。
+
+        **不许写死 `1`**：测试库的序列不跟着用例回滚，第二次跑同一张表时新行就不是 1 了，
+        于是 `rm 1` 会以「id 不存在」红掉，而那是测试自己的假设错，不是实现错。
+        """
+        return RegimeTruthInterval.objects.get().pk
+
+    def test_a_bare_label_lists_the_roster_and_writes_nothing(self):
+        result = _run(_call("/regime label"))
+        assert result.success, result.error
+        assert "还没有任何人工标注区间" in result.data
+        assert "/regime label add" in result.data
+        assert not RegimeTruthInterval.objects.exists()
+
+    def test_the_roster_is_the_modules_own_rendering(self):
+        """与第三级同一条纪律：断言逐字对上模块（`truth_run.roster_lines`），而不是对着
+        命令里又抄一遍的文案。"""
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势 某轮熊市"))
+        expected = "\n".join(truth_run.roster_lines())
+        # 组名的中英两个写法、加上动作的三个别名（裸的 `label` 就是清单本身）。
+        for text in ("/regime label", "/regime 标注", "/regime label list", "/regime 标注 清单"):
+            result = _run(_call(text))
+            assert result.success, result.error
+            assert result.data == expected, text
+
+        assert "2024-01-05 ~ 2024-01-20（16 天）" in expected
+        assert "某轮熊市" in expected
+        assert "一致率" in expected, "清单底下要摆出①那一句（第 164 条的那条标准）"
+
+    def test_add_records_who_what_and_when(self):
+        result = _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势 某轮熊市"))
+        assert result.success, result.error
+        assert "已录入 #" in result.data
+
+        row = RegimeTruthInterval.objects.get()
+        assert (row.start_date, row.end_date) == (date(2024, 1, 5), date(2024, 1, 20))
+        assert row.regime == BaseRegime.DOWNTREND.value, "中文名要在这里翻成 slug"
+        assert row.note == "某轮熊市"
+        assert (row.actor_kind, row.actor_name) == (ActorKind.CHAT.value, SENDER)
+        assert row.created_at is not None, "录入时刻由 DB 侧盖（auto_now_add）"
+        assert row.retracted_at is None
+
+    def test_the_add_reply_echoes_no_algorithm_conclusion(self):
+        """第 16 条，也就是第 164 条「先标完再看算法输出」的可执行形式。
+
+        造一段**已知会被判错**的区间也没关系：回复里不许出现①那句话、不许出现任何
+        「几天一致」——那正是会把人锚定的东西。
+        """
+        result = _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        assert result.success, result.error
+        assert "已录入" in result.data
+        assert "16 天" in result.data
+        assert "① 判定与人工标注的一致率" not in result.data
+        assert "无法判定" not in result.data
+        assert "天一致" not in result.data
+        # 但要把「为什么没回显」说出来：不说的话，下一次人会以为这是一条不回显的普通录入。
+        assert "没有回显任何算法结论" in result.data
+
+    def test_overlapping_the_same_regime_is_corroboration_not_a_conflict(self):
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        result = _run(_call("/regime label add 2024-01-10 2024-01-25 下行趋势"))
+        assert result.success, result.error
+        assert "档位一致" in result.data
+        assert "覆盖天数没有按两段相加" in result.data
+        assert "冲突日" not in result.data
+
+        # 覆盖天数在那一次录入的回复里：并集 01-05 ~ 01-25 是 21 天，不是 16+16。
+        assert "共 21 天" in result.data, "01-05 ~ 01-25 是 21 天，不是 16+16"
+        roster = _run(_call("/regime label")).data
+        assert "活 2 段" in roster, "两段都算活区间（重叠不是撤回）"
+
+    def test_overlapping_a_different_regime_reports_the_conflict(self):
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        result = _run(_call("/regime label add 2024-01-18 2024-01-25 箱体震荡"))
+        assert result.success, result.error
+        assert "冲突日" in result.data
+        assert "3 个冲突日" in result.data, "01-18 ~ 01-20 三天"
+        assert "不计入一致率的分母" in result.data
+
+        # 冲突日不进分母：并被集是 01-05 ~ 01-25（21 天），冲突 3 天，剩下 18 天。
+        roster = _run(_call("/regime label")).data
+        assert "另有 3 天被两段不同档位的人工区间同时覆盖" in roster
+        assert "分母 18 天" in roster
+
+    def test_rm_soft_deletes_and_keeps_the_original_text(self):
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势 某轮熊市"))
+        result = _run(_call(f"/regime label rm #{self._only_id()}"))
+        assert result.success, result.error
+        assert "已撤回 1 段" in result.data
+        assert "行还在库里" in result.data
+
+        row = RegimeTruthInterval.objects.get()
+        assert row.retracted_at is not None
+        assert (row.retracted_by_kind, row.retracted_by_name) == (
+            ActorKind.CHAT.value,
+            SENDER,
+        )
+        # 原文一个字没动：改一个基准字段会让已经算过的一致率变脸。
+        assert (row.start_date, row.end_date) == (date(2024, 1, 5), date(2024, 1, 20))
+        assert row.regime == BaseRegime.DOWNTREND.value
+        assert row.note == "某轮熊市"
+        assert row.actor_name == SENDER
+
+        # 撤回之后它不再参与比对，但撤回数要摆出来——一段区间悄悄从分母里消失，看起来
+        # 与「从来没有过」一样。
+        roster = _run(_call("/regime label")).data
+        assert "一段活的都没有" in roster
+        assert "已撤回 1 段" in roster
+
+    def test_rm_rejects_the_whole_batch_when_one_id_is_missing(self):
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        result = _run(_call(f"/regime label rm {self._only_id()} 999999"))
+        assert result.success, result.error
+        assert "这些区间 id 不存在：999999" in result.data
+        assert "/regime label rm" in result.data, "怎么改补在这一层"
+        assert RegimeTruthInterval.objects.get().retracted_at is None, "一行都不许写"
+
+    def test_rm_of_an_already_retracted_row_changes_nothing(self):
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        row_id = self._only_id()
+        _run(_call(f"/regime label rm {row_id}"))
+        first = RegimeTruthInterval.objects.get().retracted_at
+        result = _run(_call(f"/regime label rm {row_id}"))
+        assert result.success, result.error
+        assert "本来就都已撤回" in result.data
+        assert RegimeTruthInterval.objects.get().retracted_at == first, (
+            "先到者为准：不覆盖先手的撤回人与撤回时刻"
+        )
+
+    def test_typos_and_bad_input_are_feedback_and_write_nothing(self):
+        for text, expected in (
+            ("/regime label 上线", "未知的子命令：label 上线"),
+            ("/regime label list now", "列清单不吃参数，多出来的词：now"),
+            ("/regime label add 2024-01-05", "要指明区间与档位"),
+            ("/regime label add 2024/01/05 2024-01-20 下行趋势", "认不出的日期"),
+            ("/regime label add 2024-01-05 2024-01-20 横盘", "认不出的档位"),
+            ("/regime label add 2024-03-20 2024-01-05 下行趋势", "早于起点"),
+            ("/regime label rm", "要指明撤回哪几段"),
+            ("/regime label rm abc", "认不出的区间 id"),
+        ):
+            result = _run(_call(text))
+            assert result.success, (text, result.error)
+            assert expected in result.data, text
+            # 每一句错后面都跟着这一组自己的用法——人只知道写错了，还得知道该怎么写。
+            assert "/regime label add" in result.data, text
+        assert not RegimeTruthInterval.objects.exists()
+
+    def test_every_alias_resolves(self):
+        result = _run(_call("/regime 标注 录入 2024-01-05 2024-01-20 下行趋势"))
+        assert result.success, result.error
+        assert "已录入 #" in result.data
+        result = _run(_call(f"/regime label 删 {self._only_id()}"))
+        assert result.success, result.error
+        assert "已撤回 1 段" in result.data
+
+    def test_the_other_tables_are_untouched(self):
+        """这一族只写真值表：开关、声明表、豁免一个字都不动（真值只是比对的基准，
+        它不拦任何人）。"""
+        _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势"))
+        assert not RegimeMechanismSwitch.objects.exists()
+        assert not HaltDeclaration.objects.exists()
+        assert not DeactivationExemption.objects.exists()

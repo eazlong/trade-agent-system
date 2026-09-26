@@ -23,12 +23,30 @@ Shadow 之后再回执行态同样要人工确认，且必须显式记录「这�
 
 ## 三条成功标准各自的今天（第 163 条）
 
-- **① 阶段判定与人工标注的一致率**：**今天算不出来**。真值（人在算法输出可见之前独立标注
-  的已知历史区间）全仓没有存放它的地方。这一页如实写「真值未录入 → 无法判定」，并**按未
-  达标显示**：留白会被人读成「这条大概没问题」。
+- **① 阶段判定与人工标注的一致率**：可以算，但**要有人先把真值录进去**。真值是人在算法
+  输出可见之前独立标注的已知历史区间（`RegimeTruthInterval`，入口 `/regime label`）；
+  一段都没录时这一页如实写「无法判定」并**按未达标显示**：留白会被人读成「这条大概没
+  问题」。比对与那句话本身都在 `truth.py` / `truth_run.py`（见下「不自己算一致率」）。
 - **② 触发频率 < 10% 自然日**：可以算。分母是起算日到今天的自然日数，分子是三个触发源的
   并集（`_days_with_trigger`）。
 - **③ 每次判定出的熔断有完整可读解释**：不可机械判定，这一页只把它列成人工核对的条目。
+
+## 为什么这一页要印「调度表」那一段
+
+这一页是**唯一**按需渲染、不经过 beat 的机制读面：判定、日报、对账全都由 beat 驱动，
+beat 一哑，那些出口一起哑。而第 180 条要求的「任务跑了没」在今天**没有出口**——
+`check_task_health` 扫的是建过 `TaskTracker` 的任务，beat 任务结构上不在其中（详见
+`beat_health.py` 的模块 docstring）。所以那一行印在这里：它读 `PeriodicTask` 表与
+`beat_schedule`，答「调度器此刻会发什么、上次发出去是什么时候」。
+
+**它答不出「beat 自己死了」**：那一行也印不出来——beat 死了就没有页面之外的出口了，
+而这正是这一页存在的理由（人问的时候它还在）。它同样答不出「任务失败了」：`last_run_at`
+由 beat 在派发时盖，不由 worker 在成功时盖，所以这一行把「发出去了」与「成了」分开说。
+
+**它的读数还是 3 分钟粒度的**：`last_run_at` 由调度器定期落库（`sync_every`，默认 180
+秒），不是每次派发都写。所以那一行自己印着「粒度下限」那句话——少了它，「距今 3 分」
+会被读成「3 分钟没跑」，而 30 秒一轮的任务正常情况下就是这个数（实测踩过：判据里不含
+这一项时，三条 30 秒一轮的任务长期误报「已超期」，而 beat 日志显示它们一切正常）。
 
 ## 到期怎么算（第 159 条）
 
@@ -62,9 +80,9 @@ Shadow 之后再回执行态同样要人工确认，且必须显式记录「这�
 
 ## 两个方向都不拒绝
 
-未到期、频率超标、一致率无法判定——**这一页都不阻止人切**。设计里没有任何一条说「不达标
-就不许上线」，而「不确定时往保守倒」在这里的具体形状是把没达标的项**摆在人脸前**（页面
-正文写一遍、切完之后再写一遍），不是替人按着。硬拒绝还会教人去找绕过它的路。
+未到期、频率超标、一致率不达标（或算不出来）——**这一页都不阻止人切**。设计里没有任何
+一条说「不达标就不许上线」，而「不确定时往保守倒」在这里的具体形状是把没达标的项**摆在
+人脸前**（页面正文写一遍、切完之后再写一遍），不是替人按着。硬拒绝还会教人去找绕过它的路。
 
 ## 这一版不做的事
 
@@ -73,7 +91,9 @@ Shadow 之后再回执行态同样要人工确认，且必须显式记录「这�
   自然日——切换那一刻它必然无结论，所以页面**明写它不构成准入门槛**，而不是算成一个空栏。
 * **不碰另外两个开关**：`kind` 在这里写死（与 `breaker_switch` / `gate_switch` 同一条）。
 * **不发即时消息。** 到期是「可以谈了」而不是资金动作；日报第④段在到期之后每天说一句。
-* **不建真值表**：一致率那一栏的来源是下一个单元（人工标注的已知历史区间）。
+* **不自己算一致率。** 第①条标准的比对全在 `truth.py` / `truth_run.py`（人工标注的已知
+  区间 × 历史量化标签），本模块只把 `truth.describe` 那段话摆进页面——「同一件事两个
+  说法」在这里代价格外高：一致率是出 Shadow 的依据。
 """
 
 from __future__ import annotations
@@ -85,7 +105,15 @@ from datetime import date, datetime, timedelta
 from django.utils import timezone
 
 from apps.common.time_utils import to_business
-from apps.regime import config, events, halt_sync, news_verdict
+from apps.regime import (
+    beat_health_run,
+    config,
+    events,
+    halt_sync,
+    news_verdict,
+    truth,
+    truth_run,
+)
 from apps.regime.models import (
     ActorKind,
     BaseRegime,
@@ -132,6 +160,34 @@ class Achieved:
     #: 它可能与 `ran_days` 不等，而那个差额会**把触发频率算低**（判定没跑的那天既不
     #: 触发、也不出错），所以它必须能被看见。
     recorded_days: int
+
+
+# --- 到期与两个门槛：**判据只依赖 `Achieved`**，所以提到模块级 ---------------------- #
+#
+# 提出来是因为 `expiry_notice`（日报第④段）只需要「到期了没 / 窗口够不够」两个布尔，过去
+# 它为此造了一个**带假零值的 `Confirmation`**（频率那三个数填 0）——为了让类型对上而写下
+# 的一句假话。判据搬到这里之后那个构造就没了，将来给 `Confirmation` 加字段也不必再往那个
+# 假对象里塞一个假值。`Confirmation` 的同名 property 委托给这几个函数，两处仍是同一个答案。
+
+
+def _days_met(achieved: Achieved) -> bool:
+    return achieved.ran_days >= config.SHADOW.min_natural_days
+
+
+def _windows_met(achieved: Achieved) -> bool:
+    return achieved.windows >= config.SHADOW.min_event_windows
+
+
+def _expired(achieved: Achieved) -> bool:
+    """到期 = 两条都满足，**或**兜底的日子到了。到期只说「可以谈了」，不说「达标了」。"""
+    return (_days_met(achieved) and _windows_met(achieved)) or (
+        achieved.ran_days >= config.SHADOW.expiry_cap_days
+    )
+
+
+def _windows_short(achieved: Achieved) -> bool:
+    """兜底到期：日子够了、窗口没够。**切换流水里必须带上这一句**（第 159 条）。"""
+    return _expired(achieved) and not _windows_met(achieved)
 
 
 def _progress(*, now: datetime) -> Achieved:
@@ -228,6 +284,10 @@ class Confirmation:
     event_days: int
     #: 最近一次**退回 Shadow** 的那条流水（人工或自熔断），从没退回过是 `None`。
     last_back: RegimeMechanismSwitch | None
+    #: 第①条标准（一致率）的比对结果。**没有默认值**：给它一个 `Agreement()` 的默认值，
+    #: 就是让「忘了算」在页面上长得与「一段真值都没录」一模一样，而这两件事一个要查代码
+    #: 一个要录真值。构造这个对象的地方必须显式回答「一致率从哪来」。
+    agreement: truth.Agreement
 
     # -- 门槛，全部来自统一配置面（`config.SHADOW`，第 164 条要求它们在那里） -------- #
 
@@ -243,35 +303,31 @@ class Confirmation:
     def expiry_cap_days(self) -> int:
         return config.SHADOW.expiry_cap_days
 
-    @property
-    def min_agreement_rate(self) -> float:
-        return config.SHADOW.min_agreement_rate
+    # ①一致率的那个阈值**不在这里**：它只被 `truth.describe` 用到，而那段话是页面与
+    # `/regime label` 共用的（`truth.Agreement.min_rate` 读同一处配置）。在这儿再放一个
+    # 同名的 property，会让人以为页面自己算那个百分比。
 
     @property
     def max_trigger_rate(self) -> float:
         return config.SHADOW.max_trigger_rate
 
-    # -- 到期（第 159 条） ------------------------------------------------------- #
+    # -- 到期（第 159 条）。判据在模块级（见那一段注释），这里只是它的名字 ------------- #
 
     @property
     def days_met(self) -> bool:
-        return self.achieved.ran_days >= self.min_natural_days
+        return _days_met(self.achieved)
 
     @property
     def windows_met(self) -> bool:
-        return self.achieved.windows >= self.min_event_windows
+        return _windows_met(self.achieved)
 
     @property
     def expired(self) -> bool:
-        """到期 = 两条都满足，**或**兜底的日子到了。到期只说「可以谈了」，不说「达标了」。"""
-        return (self.days_met and self.windows_met) or (
-            self.achieved.ran_days >= self.expiry_cap_days
-        )
+        return _expired(self.achieved)
 
     @property
     def windows_short(self) -> bool:
-        """兜底到期：日子够了、窗口没够。**切换流水里必须带上这一句**（第 159 条）。"""
-        return self.expired and not self.windows_met
+        return _windows_short(self.achieved)
 
     # -- 成功标准②：触发频率（第 163 条） ---------------------------------------- #
 
@@ -290,7 +346,12 @@ class Confirmation:
 
 
 def confirmation(*, now: datetime | None = None) -> Confirmation:
-    """把体检页要的数算出来。**只读**。"""
+    """把体检页要的数算出来。**只读**。
+
+    一致率那一路（`truth_run.agreement()`）每次都会**全量重算一遍历史标签**
+    （`slicing.load_tags` 的约定：标签不落库），十毫秒级。所以本函数的调用方要**一次算、
+    多处用**——`page()` 正是这么做的（正文与摘要同源，`unmet_note` 也收同一份快照）。
+    """
     at = now or timezone.now()
     achieved = _progress(now=at)
 
@@ -309,6 +370,7 @@ def confirmation(*, now: datetime | None = None) -> Confirmation:
         high_vol_days=high_vol_days,
         event_days=event_days,
         last_back=_last_back(),
+        agreement=truth_run.agreement(),
     )
 
 
@@ -388,12 +450,18 @@ def _expiry_lines(data: Confirmation) -> list[str]:
 
 
 def _criteria_lines(data: Confirmation) -> list[str]:
-    """成功标准三条各自的今天（第 163 条）。①与③今天都算不出来，**如实说**。"""
-    lines = [
-        "成功标准（第 163 条）：",
-        f"  · ① 判定与人工标注的一致率 ≥ {data.min_agreement_rate:.0%}：**无法判定**——"
-        "真值未录入（人工标注的已知历史区间还没有存放它的地方），按未达标计。",
-    ]
+    """成功标准三条各自的今天（第 163 条）。③今天算不出来，**如实说**。
+
+    ①那一段**整段委托给 `truth.describe`**，本模块一个字都不自己拼：同一段话还要出现在
+    `/regime label` 的清单底下，而「一致率」是出 Shadow 的依据——两个入口给出两个说法，
+    读到哪一个都会让人怀疑另一个。`describe` 返回的行不带缩进（两处的排版不一样），所以
+    这里补缩进：首行跟着这一级的 `·` 走，续行再往右三列，措辞一个字不动。
+    """
+    lines = ["成功标准（第 163 条）："]
+    criteria = truth.describe(data.agreement)
+    lines.append("  · " + criteria[0])
+    lines.extend("  " + extra for extra in criteria[1:])
+
     rate = data.rate
     if rate is None:
         lines.append(
@@ -439,6 +507,23 @@ def _back_lines(data: Confirmation) -> list[str]:
     return lines
 
 
+def _beat_lines(data: Confirmation) -> list[str]:
+    """调度表体检那一段。**紧跟在「Shadow 尚未开始」后面**，因为它是那句话的原因。
+
+    这一页今天最容易被读错的地方就在这里：起算日为空时页面只说「一条含资讯结论的判定都
+    还没有」，而读的人会往「资讯通道还没接上」「才跑了两天」上猜——真正的原因可能是
+    **判定任务从来没有被调度过**（`beat_schedule` 只在 beat 启动时合并一次，往文件里加的
+    条目不会自动生效）。两句话挨着印，第一句才不会被读成「再等等就好了」。
+
+    `now` 取自快照（`data.now`）：一页上只有一个时钟，否则这一段的「距今」与正文里别的
+    时刻会出自两次 `timezone.now()`。
+
+    读数是 `beat_health_run` 的事（那两个来源都不属于本模块），措辞在 `beat_health`。
+    """
+    lines = beat_health_run.lines(now=data.now)
+    return ["  · " + lines[0], *["  " + extra for extra in lines[1:]]]
+
+
 def _render_body(data: Confirmation) -> str:
     """体检页正文。**只读，跑多少遍都不改变任何东西。**
 
@@ -451,6 +536,8 @@ def _render_body(data: Confirmation) -> str:
         f"当前档位：{mode.display}",
         "",
         *_start_line(data),
+        "",
+        *_beat_lines(data),
         "",
     ]
     if data.achieved.started_on:
@@ -470,6 +557,9 @@ def _render_body(data: Confirmation) -> str:
             "不是打开了什么。",
             "真要动作：/regime on（事件熔断）、/regime gate on（行情阶段停用）——"
             "这两个才拦人。",
+            "真值录入：/regime label add <起> <终> <档位> [备注…]"
+            "（第 164 条要求**先标完再看算法输出**，所以录入的那一次不回显任何算法结论）",
+            "          /regime label 看清单与一致率",
             "操作：/regime mech exit 出 Shadow（切到执行态）",
             "      /regime mech back 退回 Shadow（只记录，不执行）",
         ]
@@ -494,7 +584,9 @@ def _render_summary(data: Confirmation) -> str:
         f"期内高影响事件窗口 {data.achieved.windows}/{data.min_event_windows}",
         f"触发频率 {_percent(rate)}（{data.trigger_days}/{data.achieved.ran_days} 天，"
         f"门槛 < {data.max_trigger_rate:.0%}）",
-        "一致率无法判定（真值未录入）",
+        # ①那一句取自 `truth.describe` 的首行（与体检页、`/regime label` 同一处措辞）。
+        # 摘要是**一行能读完**的，所以只取首行：那几个支撑它的计数留在页面上。
+        truth.describe(data.agreement)[0],
     ]
     if data.windows_short:
         parts.append(f"**兜底到期：事件窗口数不足 {data.achieved.windows}/{data.min_event_windows}**")
@@ -581,7 +673,11 @@ def unmet_note(data: Confirmation) -> str | None:
         gaps.append(
             f"触发频率 {_percent(data.rate)}（门槛 < {data.max_trigger_rate:.0%}）"
         )
-    gaps.append("一致率无法判定（真值未录入）")
+    if not data.agreement.met:
+        # ①与另外几条不同：它**没达标**才出现，达标了就整条不出现（其余几条同理）。
+        # 从前这里无条件写「一致率无法判定（真值未录入）」——真值表建起来之后那句话就是
+        # 假的：录了真值照样可能算不出来（区间互相冲突），而算得出来时它更不该出现。
+        gaps.append(truth.describe(data.agreement)[0])
     gaps.append("解释完整没核对（这一页算不出来）")
     return "⚠️ 还没达标的项：" + "；".join(gaps) + "。这不是禁止，是让你知道这次切换带着什么。"
 
@@ -592,26 +688,22 @@ def expiry_notice(*, now: datetime | None = None) -> str | None:
     **到期前不天天报「还没到期」**：那是二十天的噪声，会训练人忽略第④段；而到期之后
     一直报到出 Shadow 为止，因为「一个没人管的库能让 Shadow 无限期挂着、挂着的样子与
     正常跑着完全一样」正是这条兜底要防的形状，而它只有一个出口：人看见。
+
+    **不建 `Confirmation`**：这条路上只需要「到期了没 / 窗口够不够」两个布尔，判据在模块
+    级（`_expired` / `_windows_short`）。从前这里为了让类型对上，造了一个把频率那三个数
+    填 0 的假对象——「为了让签名过关而写下的一句假话」，加一个字段就要往里塞一个假值。
     """
     at = now or timezone.now()
     achieved = _progress(now=at)
     if achieved.started_on is None:
         return None
-    data = Confirmation(
-        now=at,
-        achieved=achieved,
-        trigger_days=0,
-        deactivation_days=0,
-        high_vol_days=0,
-        event_days=0,
-        last_back=None,
-    )
-    if not data.expired:
+    if not _expired(achieved):
         return None
-    if data.windows_short:
+    if _windows_short(achieved):
         return (
             f"出 Shadow：**已到期（兜底）**——已跑 {achieved.ran_days} 个自然日，"
-            f"但期内高影响事件窗口只有 {achieved.windows}/{data.min_event_windows} 个"
+            f"但期内高影响事件窗口只有 {achieved.windows}/"
+            f"{config.SHADOW.min_event_windows} 个"
             f"（事件窗口数不足）。用 /regime mech 看体检页。"
         )
     return (
