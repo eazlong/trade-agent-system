@@ -200,7 +200,7 @@ class TestJudgementRidesTheSnapshotHeartbeat(TestCase):
     def test_the_existing_snapshot_duty_runs_first(self):
         """既有职责先跑，新职责后跑；新职责之间按上下游排。
 
-        判定失败会往上抛（真故障必须被任务健康检查看见），若它排在快照之前就会连带
+        判定失败会往上抛（真故障必须让任务标 FAILURE，而不是被吞成一行日志），若它排在快照之前就会连带
         吞掉这一次快照。快照本来就是 5 分钟一轮的幂等写入，晚一轮无所谓，但顺序反过来
         等于让新机制有能力打断一条已在生产上运行的链路——没有理由付这个代价。
 

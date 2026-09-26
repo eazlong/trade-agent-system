@@ -204,6 +204,18 @@ def list_scheduled_tasks(request: Request) -> Response:
 
     results = []
 
+    # 静态条目在库里**也有**行：`DatabaseScheduler.setup_schedule` 启动时把 `beat_schedule`
+    # 合并进来（`update_or_create(name=…)`），`last_run_at` / `total_run_count` 由调度器每次
+    # 派发时写在那一行上。所以这三格要**读真的**，不能写死。
+    #
+    # 原先写死成 `True/None/0` 的代价不是「少了个数」：`beat_schedule` 只在 beat 启动时合并
+    # 一次，**往文件里后来加的条目在库里没有行**——于是「从未被调度过」与「正常跑着」在
+    # 这个接口上完全一样（两行的 `last_run_at` 都是 null）。`scheduled` 这一格就是那个区别。
+    tasks = list(
+        PeriodicTask.objects.all().select_related("crontab", "interval").order_by("-id")
+    )
+    rows_by_name = {row.name: row for row in tasks}
+
     # 1. 静态定义（celery_app.py beat_schedule）
     beat_schedule = celery_app.conf.beat_schedule or {}
     for name, entry in beat_schedule.items():
@@ -214,6 +226,7 @@ def list_scheduled_tasks(request: Request) -> Response:
         # 验证 task 是否真实存在（避免显示无效条目）
         if not _task_exists(task):
             continue
+        row = rows_by_name.get(name)
         results.append(
             {
                 "id": None,
@@ -221,19 +234,21 @@ def list_scheduled_tasks(request: Request) -> Response:
                 "agent_name": kwargs.get("agent_name", "system"),
                 "message": kwargs.get("message", ""),
                 "schedule": schedule_str,
-                "enabled": True,
-                "last_run_at": None,
-                "total_run_count": 0,
+                "enabled": row.enabled if row else True,
+                "last_run_at": row.last_run_at.isoformat()
+                if row and row.last_run_at
+                else None,
+                "total_run_count": row.total_run_count if row else 0,
                 "expires": None,
                 "start_time": None,
                 "source": "static",
+                # False = 这一条**没有被调度器收下**（beat 自上次启动以来没重启过），
+                # 与「收下了但一次都没跑」是两件事，见上面那段注释。
+                "scheduled": row is not None,
             }
         )
 
     # 2. 数据库动态任务（django-celery-beat）
-    tasks = (
-        PeriodicTask.objects.all().select_related("crontab", "interval").order_by("-id")
-    )
     for task in tasks:
         schedule_desc = ""
         if task.crontab:

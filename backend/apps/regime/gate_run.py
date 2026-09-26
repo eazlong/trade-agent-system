@@ -460,8 +460,7 @@ def sync(
 
     与 `run_deactivation` 同一套摘要约定：`skipped` 键恒存在（没事时是 `None`），
     键集在四条路径上一致（正常 / Shadow / blocked / no_generation），id 一律是字符串。
-    它进 Celery 结果与任务健康检查，键集随路径漂移会让「今天和昨天有什么不同」多出一堆
-    假差异。
+    它进 Celery 结果，键集随路径漂移会让「今天和昨天有什么不同」多出一堆假差异。
 
     幂等：期望值逐字来自库里存好的事实，所以连着跑两轮，第二轮一定是声明表
     `unchanged == 活行数`、且 `statuses` 为空。

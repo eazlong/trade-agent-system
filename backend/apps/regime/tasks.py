@@ -1,6 +1,7 @@
 """切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
 + 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）
-+ 窗口通知与声明写入失败告警（第②段单元 ②e）+ 行情阶段 gate 同步（第③段单元 ③b）。
++ 窗口通知与声明写入失败告警（第②段单元 ②e）+ 行情阶段 gate 同步（第③段单元 ③b）
++ 调度表体检（第③段单元 U3）。
 
 ## 为什么是独立任务
 
@@ -24,13 +25,40 @@
 （3 次、间隔递增），重试仍失败则任务标 FAILURE。批内单条失败也走同一条路——整批重投，
 代价是几轮白干，换来的是「不必为坏数据单开一条错误分支」。
 
+## 「跑了没」这条路今天通到哪里
+
+CONTEXT.md:180 给新任务钉的失败可见性是**两条互相独立的路**：「任务跑了没」（接入已有的
+任务健康检查）与「结论新不新」（日报第④段）。第二条是活的；**第一条此前从未落地，而本
+模块里多处注释把它当成已经有了**——所以事实在这里写清楚一次，下面各处只引用这一节。
+
+- `check_task_health`（`apps/agent/tasks.py`）扫的是 Redis 里 `task:progress:*` 且
+  `status=running` 的那种 hash，只有建过 `TaskTracker` 的任务才有（agent 任务、回测
+  任务）；它的僵尸分支还要 `user_id` 才能把消息发出去、要一份 `agent:tasks` 载荷才能
+  自动重试——**beat 任务两样都没有，结构上接不进去**。
+- 于是本模块这些任务的返回值、以及「重试仍失败」的 FAILURE，都落在 Redis DB2 的 Celery
+  结果后端里，**今天没有读者**：一条不再被调度的任务与一条正常跑的任务，从外面看起来
+  完全一样（正是「沉默必须能被识别为异常」要堵的形状）。
+- **补上的第一半是 `beat_health.py`**（体检页「调度表（beat）」那一段）：它读
+  `PeriodicTask.last_run_at` 与 `beat_schedule` 的差集，只答**「beat 把它发出去了没
+  有」**。发出去了但每次都失败，在它那里与成功长得一样；而它自己也是一条经 beat 渲染的
+  路径，beat 死了这一段就跟着不刷新。
+- **第二半是 `tasks.check_beat_health`**（第③段单元 U3）：同一份 `findings`，收窄到
+  「值得喊人」的那几档，给全体 `is_active` 用户发一条即时消息。体检页要人主动去看，而
+  CONTEXT.md:66 的「告警」是给一个具体的人的即时消息。**它自己也在被检查的那份名单里，
+  可它对自己恒为「看不见」**：它没被调度就不会跑——那一档的答案只有体检页给得出，而
+  体检页同样经 beat 渲染。
+- **两条路都只答「beat 把它派出去了没有」。** 发出去了、worker 里每次都失败，两处都看
+  不见（那是 CONTEXT.md:180 承认的那条缝：日报第④段只说得出「结论不新」，第⑤段兜底）。
+  所以，「异常往上抛」仍然是唯一正确的做法——吞掉只会更糟，连 FAILURE 那条记录都没有
+  了。下面各处说到它时得说全：**「进任务健康检查」是当时的设想，不是今天的现状。**
+
 ## 日报投递与投递看门狗为什么也在这里、也各自是一条任务
 
 它们是**两条互相独立的路径**（CONTEXT.md:175）：投递任务负责「把日报送到」，
 看门狗负责「送到没有」。合成一条就等于让看门狗去报自己的失败——而它恰好是失败的那一
 个时，它不会响。**投递任务失败不触发告警**（同上那条纪律：任务自己的故障往上抛，
-交给 beat 的任务健康检查）；看门狗要说的不是「我失败了」，而是「今天这份日报没到你
-手上」——那是一件关于世界的事实，且它是唯一说得出这句话的东西。
+而这条路今天通到哪里见上面「跑了没」那一节）；看门狗要说的不是「我失败了」，而是「今天
+这份日报没到你手上」——那是一件关于世界的事实，且它是唯一说得出这句话的东西。
 
 两者都不挂在 `snapshot_daily_equity` 那条心跳上：那条心跳的顺序与职责被
 `test_timing.py` 逐段钉着（「回退方式 = 删掉一个调用」），而投递与看门狗本来就是独立
@@ -42,8 +70,9 @@
 `HaltDeclaration` 的那一轮与上一轮之间没有「做过 / 没做过」的区别（见 `halt_sync.py`）。
 所以它不需要 `max_retries`——**下一轮 300 秒的对账就是重试**，再排三次退避重试只是把
 同一件事重做几遍（CONTEXT.md:181 按「读安全 / 写危险」区分新任务，这一条属于「写危险但
-可全量重来」）。异常往上抛，失败可见性走已有的两条路：beat 的任务健康检查（跑了没）与
-日报第④段机制健康（结论新不新）。
+可全量重来」）。异常往上抛：第 180 条那两条路里，今天活着的是**日报第④段机制健康**
+（结论新不新）；「跑了没」那一条只有体检页的调度表那一段（且它只答 beat 发出去了没有），
+事实见上面「跑了没」那一节。
 
 ## 行情阶段 gate 为什么是**另一条**对账任务（第③段单元 ③b）
 
@@ -100,9 +129,10 @@
 - **声明写入失败走 catch → 发 → 再抛**（②e Q7），与 `reduce_run._alert`（发了就继续）
   不同：失败的是机制本身，对账没完成就该让任务标 FAILURE——下一轮 300 秒的对账就是重试。
   告警发不出去也只记日志（②e Q8：不递归告警），但**绝不吞掉原异常**——吞掉会让真实故障
-  从 beat 的任务健康检查里消失。
+  连「任务标了 FAILURE」这条最后的记录都没有（而那条记录今天没有读者，见上面那一节）。
 - **通知失败不改变任务成败**：任务跑成功了、只是有人的消息没送到，那是 `window_notify`
-  里的计数（`failed` / `no_recipients`），随返回值进任务健康检查。窗口通知本身**没有**
+  里的计数（`failed` / `no_recipients`），随返回值进 Celery 结果后端（同样是今天没有读者
+  的地方）。窗口通知本身**没有**
   重试逻辑——「送达了才记账」加上 300 秒一轮的调度就是重试（`halt_notify` 的 docstring）。
 """
 
@@ -239,7 +269,8 @@ def deliver_report(self, run_day=None) -> dict:
     幂等：已成功送达的人不再重投（`report.deliver_daily_report`）。所以这个任务天然可以
     被重复投递、被 beat 每 5 分钟撞一次、被重试三次——代价都只是几次没有收件人的空转。
 
-    **不吞异常**：DB 故障往上抛，走 Celery 的有限重试与任务健康检查。这一层不写告警
+    **不吞异常**：DB 故障往上抛，走 Celery 的有限重试、最终标 FAILURE（这条路今天通到哪里
+    见模块 docstring 的「跑了没」那一节）。这一层不写告警
     （CONTEXT.md：新任务不自己发告警）；「用户没收到日报」那句话由看门狗说。
     """
     from django.db import close_old_connections
@@ -276,9 +307,10 @@ def check_report_delivery(self, run_day=None) -> dict:
 
     一天绝大多数轮次走到的是「未到截止时刻」或「已投递」，都是干净的空转。
 
-    **不吞异常**：这里读不到库就没法判「投出去了没有」，往上抛让 beat 的任务健康检查
-    看得见——**这条路径自己哑掉，是它自己发现不了的**（CONTEXT.md:180 承认的那条缝，
-    由「日报本身是否到达」在第⑤段兜底）。
+    **不吞异常**：这里读不到库就没法判「投出去了没有」，往上抛（从而留下 FAILURE 记录）
+    是**唯一**说得出「看门狗自己挂了」的做法——而这条路径自己哑掉，恰恰是它自己发现不了
+    的（CONTEXT.md:180 承认的那条缝，由「日报本身是否到达」在第⑤段兜底）：体检页那一段
+    只知道 beat 有没有把它发出去，看不见它在 worker 里死了没有。
     """
     from django.db import close_old_connections
 
@@ -318,7 +350,7 @@ def sync_halt_windows() -> dict:
 
     返回值是 `halt_sync.sync` 的摘要，外加 ``reduce_rows``（本轮写下的减仓记录条数，空闲
     轮为 0）与 ``window_notify``（窗口通知的计数：``opened`` / ``closed`` / ``failed`` /
-    ``no_recipients``）。后两者进 beat 的任务健康检查——**通知发不出去不改变任务成败**
+    ``no_recipients``）。后两者进返回值——**通知发不出去不改变任务成败**
     （那是「有人没收到消息」，不是「对账没完成」）。
 
     没有 `max_retries`、也不吞异常——理由见模块 docstring（对账的下一次执行就是重试）。
@@ -367,13 +399,13 @@ def sync_gate() -> dict:
 
     与 `sync_halt_windows` 同一套写法、同一张表、不同的档（见模块 docstring 的「行情
     阶段 gate 为什么是另一条对账任务」）：没有 `max_retries`（下一轮 300 秒的对账就是
-    重试），异常往上抛进 beat 的任务健康检查；beat 也是固定 300 秒间隔，不用 crontab
+    重试），异常往上抛（这条路今天通到哪里见模块 docstring 的「跑了没」那一节）；
+    beat 也是固定 300 秒间隔，不用 crontab
     （`CELERY_TIMEZONE` 是 UTC，而行情阶段本身是日频判定的产物，这条任务不关心几点）。
 
     幂等：`gate_run.sync` 的期望值逐字来自库里存好的事实（当前阶段、当前代、声明的
     `opened_at` 是那个唯一常量），所以连着跑两轮，第二轮必然是声明表整表空转、`statuses`
-    为空。返回的就是它的摘要（18 个键，键集在四条路径上一致——它进 Celery 结果与任务
-    健康检查）。
+    为空。返回的就是它的摘要（18 个键，键集在四条路径上一致——它进 Celery 结果）。
 
     **只读的那一半也一样跑。** 档位是 Shadow、阶段还没判出来（`blocked`）时这一轮几乎
     什么都不写，但那是**结论**而不是「可以跳过」：`skipped` 那件事本身要被记下来，否则
@@ -388,7 +420,7 @@ def sync_gate() -> dict:
             return gate_run.sync()
         except Exception as exc:  # noqa: BLE001
             # 与 `sync_halt_windows` 同一条：写声明失败 = 机制说不出自己在拦什么。发完
-            # 再抛——吞掉会让真实故障从任务健康检查里消失。
+            # 再抛——吞掉会让真实故障连 FAILURE 那条记录都没有。
             #
             # 但正文那一档不同（第③段 Q1）：这一档的豁免是**人可以给的**
             # （`manage_deactivation_exemptions`），而事件熔断那一档不可人工豁免。照抄
@@ -399,6 +431,48 @@ def sync_gate() -> dict:
                 halt_notify.alert_gate_write_failure(exc),
             )
             raise
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+#: `check_beat_health` 的**空转**档位：这几档不记日志。这条任务一天 288 轮，每轮印一行
+#: 「没有异常」等于把日志变成噪声（`halt_notify.notify_pending` 同一条：没事就不说话）。
+_QUIET_BEAT_REASONS = frozenset({"no_problems", "nothing_to_say", "already_alerted_today"})
+
+
+@app.task(acks_late=True)
+def check_beat_health() -> dict:
+    """调度表体检：把「哪几条 beat 条目没在正常跑」变成一条即时消息（第③段单元 U3）。
+
+    这是模块 docstring「跑了没」那一节的**第二半**——第一半是体检页
+    （`beat_health.py` + `mechanism_switch._beat_lines`），它要人主动去看；这一条主动说
+    给全体 `is_active` 用户听。两者读的是**同一份** `beat_health.findings`，消息层只是
+    把它收窄到值得喊人的三档（哪三档、为什么是那三档，全在 `beat_health` 的模块
+    docstring）。
+
+    **只读**：一行库都不写，唯一的副作用是往外发消息（`halt_notify.alert_everyone`
+    那一个出口），且同一批问题同一业务日只成功喊一次（`beat_health_run._alerted_on`，
+    进程内——为什么不放 Redis、为什么不用「连续两轮」，那份账上面写着）。
+
+    **没有 `max_retries`**：纯读、幂等，下一轮 300 秒就是重试（与 `sync_halt_windows` /
+    `sync_gate` / `expire_candidates` 同一条纪律）。异常照旧往上抛——读不到库就说不出
+    「beat 把它派出去了没有」，而吞掉会让这次故障连 FAILURE 那条记录都没有（那条记录
+    今天也没有读者，见模块 docstring 那一节）。
+
+    返回值是 `beat_health_run.check` 的摘要（`reason` 是一个小词表，见那个函数）。
+    空转的几档不记日志。
+
+    **它自己也在被检查的名单里，而它对自己恒为「看不见」**：它没被调度就不会跑。这一档
+    与「beat 整个死了」是同一个形状，答案只有体检页与人的日常看得见。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime import beat_health_run
+
+    try:
+        summary = beat_health_run.check()
+        if summary["reason"] not in _QUIET_BEAT_REASONS:
+            logger.warning("[regime] 调度表体检：%s", summary)
+        return summary
     finally:
         # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()

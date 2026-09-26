@@ -10,6 +10,13 @@
 （`alert_declaration_write_failure` / `alert_gate_write_failure`）而不是一个带 `body`
 参数的：调用方各认领自己那一档，读代码的人不必跳进来才知道用户会读到哪一段话。
 
+第③段单元 U3 再加第五条：**调度表体检**（`tasks.check_beat_health` →
+`beat_health_run.check`）。它不是「停止声明」那一族的事，进这个模块只为一件事——**受众
+与出口**：它要说的同样是「机制自身健康出了问题」（有几条 beat 条目不会被派发出去），
+落点与上面两条一样是全体 `is_active` 用户，正文在它自己的纯层（`beat_health.alert_body`）。
+所以出站口 `alert_everyone` 现在是**公开的**：它服务的正文有三处，本模块只管「发给谁、
+从哪儿出去」。
+
 ## 为什么必须有这一层（而不是日志）
 
 一个「表里没有窗口」的系统与「现在没有事件」的系统，从外面看起来一模一样——用户不看
@@ -66,7 +73,8 @@ BTC；按这一行自己的作用域报，`strategy:<id>` 那一档又答不出�
   时刻，记不出「哪几个人收到了」，而按人记账是另一张表（`DailyReport.delivery` 那样的
   JSON）。为一条 300 秒重试的窗口通知开那张表不值，重复一条消息的代价比漏掉一条小。
 - **失败不再往上告警**（第②e 段 Q8）：递归告警没有底，通知发不出去这件事只记日志、并把
-  计数放进任务返回值，由 beat 的任务健康检查看见。
+  计数放进任务返回值。**那不代表有谁看得见**：这个返回值落进今天没有读者的 Celery 结果
+  后端（`tasks.py` 模块 docstring 的「跑了没」那一节）。
 
 ## 这一层是同步的，出站那一步是 async
 
@@ -365,7 +373,8 @@ def write_failure_body(error: str) -> str:
 
     必须把**后果**写出来，而不只是报一个异常：一个「表里没有窗口」的系统看起来与「现在
     没有事件」一模一样，而事件熔断不可人工豁免——所以这段文字要说的不是「有个任务挂了」
-    （那是任务健康检查的事），而是「此刻没人知道该不该拦，请人工看一眼」。
+    （那件事今天只有体检页的调度表那一段看得见，且只看得出「beat 发出去了没有」），
+    而是「此刻没人知道该不该拦，请人工看一眼」。
     """
     return (
         "🚨 停止声明窗口同步失败：机制此刻说不出自己在拦什么\n"
@@ -502,23 +511,25 @@ def notify_pending(*, now: datetime | None = None) -> dict:
     return summary
 
 
-def _alert_everyone(text: str) -> dict:
-    """把一条「机制自身故障」投给全体 `is_active` 用户，返回 ``{"recipients", "delivered"}``。
+def alert_everyone(text: str) -> dict:
+    """把一条「机制自身故障」的消息投给全体 `is_active` 用户，返回
+    ``{"recipients", "delivered"}``。
 
     受众是**全体**而不是受影响的那些人（CONTEXT.md:66 的两类落点之一）：这条消息不是
-    「你的单出事了」，而是「机制此刻说不出自己在拦什么」——那对每个人都有后果。
+    「你的单出事了」，而是「机制本身出了你看不见的事」——那对每个人都有后果。
 
-    发不出去只记日志（第②e 段 Q8：不递归告警，但也不静默成功）：原本那个异常才是要往上抛
-    的东西，替换掉它会让真实故障从 beat 的任务健康检查里消失。
+    三条消息共用它，**正文都在各自的纯层**（`write_failure_body` /
+    `gate_write_failure_body` / `beat_health.alert_body`）：这里只管受众与出口。
+    所以它是公开的，而两个 `alert_*` 是包装——那两条把「哪一档的正文」写进函数名里，
+    为的是读 `tasks.py` 的人不必跳进来才知道用户会读到哪一段话。
+
+    发不出去只记日志（第②e 段 Q8：不递归告警，但也不静默成功）：原本那个要往上抛的东西
+    才是主角，替换掉它会让真实故障连 FAILURE 那条记录都没有。
     """
     recipients = all_active_user_ids()
     sent = asyncio.run(_send_to_each(recipients, text))
     if sent != len(recipients):
-        logger.error(
-            "[regime] 声明写入失败的告警自身未送达：%s/%s（原异常仍往上抛）",
-            sent,
-            len(recipients),
-        )
+        logger.error("[regime] 告警自身未送达：%s/%s", sent, len(recipients))
     return {"recipients": len(recipients), "delivered": sent}
 
 
@@ -532,7 +543,7 @@ def alert_declaration_write_failure(error: Exception) -> dict:
     Returns:
         ``{"recipients": n, "delivered": n}``。
     """
-    return _alert_everyone(write_failure_body(str(error)))
+    return alert_everyone(write_failure_body(str(error)))
 
 
 def alert_gate_write_failure(error: Exception) -> dict:
@@ -543,4 +554,4 @@ def alert_gate_write_failure(error: Exception) -> dict:
     （`tasks.sync_halt_windows` / `tasks.sync_gate`）各自认领自己那一档，读 `tasks.py` 的
     人就看得出来「这条任务失败时用户读到的是哪一段话」。
     """
-    return _alert_everyone(gate_write_failure_body(str(error)))
+    return alert_everyone(gate_write_failure_body(str(error)))

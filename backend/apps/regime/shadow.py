@@ -52,7 +52,7 @@
 四种（返回值里的 `outcome`），每一种都带一句给人看的话（`note`）：**日志不算被看见**，
 `note` 的正经出口是日报。判定层失败或没有结论**不抛异常**——它是「今天没有结论」，不是
 本层的失败，照落一行（这正是「判定跑了但机制没表态」能被数出来的原因）。数据库故障才抛，
-往上给任务健康检查。
+往上让任务标 FAILURE。
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def write_shadow_record(
 
     `judgement` / `deactivation` 是 `run_daily_judgement()` 与 `run_deactivation()` 的
     返回值（任务层把它们放在 `payload["regime"]` / `payload["deactivation"]`）。返回值进
-    日志与任务健康检查，不静默。
+    日志与调用方的返回值，不静默。
     """
     now = now or timezone.now()
     symbol = (

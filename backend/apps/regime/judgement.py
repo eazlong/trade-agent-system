@@ -63,8 +63,10 @@ CONTEXT.md 写的是「调度用 beat 的 crontab，且业务时区在 crontab �
 
 **这处偏离已确认为有意为之**，不是可以随手推翻的文档措辞，也不是「实现时忘了」。
 它换来的是：判定没有自己的调度面要维护，也就没有「beat 没起来 ⇒ 结论永不产生」的
-单点；代价是判定跟着别人的心跳走，心跳停了判定也停——而那同时会被任务健康检查看见
-（两条职责共用一个返回值），不会成为静默故障。
+单点；代价是判定跟着别人的心跳走，心跳停了判定也停。**这个代价今天只被看见一半**：
+体检页的调度表那一段（`beat_health.py`）能说出「beat 没把那条心跳发出去」，说不出「发出去
+了但每次都失败」——两条职责共用一个返回值，而那个返回值今天没有读者。完整的来龙去脉见
+`tasks.py` 模块 docstring 的「跑了没」那一节。
 
 要改回独立 crontab 条目时，改动面只有两处：本模块的 `run_daily_judgement()` 调用方，
 以及 `celery_app.py` 的 `beat_schedule`（用**新名字**，不要改名或复用既有条目——复用
@@ -337,7 +339,7 @@ def run_daily_judgement(
     escalation: str | None = None,
     news_ref: dict | None = None,
 ) -> dict:
-    """跑一次当日判定并按需落库。返回值进日志与任务健康检查，不静默。
+    """跑一次当日判定并按需落库。返回值进日志与调用方（任务）的返回值，不静默。
 
     `escalation=None` 是**生产路径**：自己去跑一轮资讯通道（`run_news_judgement`），用
     它给出的抬升标志与引用快照。给了值（`""` 或 `Escalation.NEWS.value`）就是**覆盖**，
@@ -501,6 +503,7 @@ def _record_once(**fields) -> tuple[RegimeJudgement, bool]:
             )
         except Exception:
             # 与并发 tick 撞上唯一约束时 `get_or_create` 自己会回查一次；走到这里是
-            # 真的写不进去（约束之外的 DB 故障），必须往上抛给任务健康检查。
+            # 真的写不进去（约束之外的 DB 故障），必须往上抛——让任务标 FAILURE，
+            # 而不是把故障吞成一行日志。
             logger.error("[regime] 判定记录写入失败", exc_info=True)
             raise

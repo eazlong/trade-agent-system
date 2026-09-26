@@ -437,6 +437,84 @@ class TestListScheduledTasksAPI(TestCase):
         self.assertEqual(one_time_tasks[0]["agent_name"], "analyst")
         self.assertEqual(one_time_tasks[0]["status"], "pending")
 
+    @patch("rest_framework.permissions.IsAuthenticated.has_permission", return_value=True)
+    def test_a_static_entry_reads_its_own_row_instead_of_a_hardcoded_null(self, mock_auth):
+        """静态条目的 `last_run_at` / `total_run_count` / `enabled` 取自库里**那一行**。
+
+        原先写死成 `None / 0 / True`，代价不是「少了个数」：`beat_schedule` 只在 beat
+        启动时合并进 `PeriodicTask` 表一次，所以「文件里声明了、调度器从没收到过它」与
+        「收下了、只是还没跑」在这个接口上完全一样（两边的 `last_run_at` 都是 null）。
+        这两件事的下一步动作不同——前者要重启 beat，后者只要等。`scheduled` 就是那个区别。
+        """
+        from celery_app import app as celery_app
+        from django_celery_beat.models import IntervalSchedule, PeriodicTask
+        from rest_framework.test import APIRequestFactory
+
+        from apps.agent.views import list_scheduled_tasks
+
+        request = APIRequestFactory().get("/api/agent/tasks/scheduled/")
+        static = [
+            t
+            for t in list_scheduled_tasks(request).data["tasks"]
+            if t["source"] == "static"
+        ]
+        self.assertTrue(static, "静态条目一条都没有：本用例的前提不成立")
+
+        # 表是空的（beat 从没起来过）⇒ 每一条静态条目都必须被标成「没被调度器收下」。
+        self.assertTrue(all(t["scheduled"] is False for t in static))
+
+        name = static[0]["name"]
+        PeriodicTask.objects.create(
+            name=name,
+            task=celery_app.conf.beat_schedule[name]["task"],
+            interval=IntervalSchedule.objects.create(every=30, period="seconds"),
+            last_run_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            total_run_count=7,
+        )
+
+        row = next(
+            t for t in list_scheduled_tasks(request).data["tasks"] if t["name"] == name
+        )
+        self.assertTrue(row["scheduled"])
+        self.assertEqual(row["total_run_count"], 7)
+        self.assertIsNotNone(row["last_run_at"], "库里那一行有值，接口不该回 null")
+
+    @patch("rest_framework.permissions.IsAuthenticated.has_permission", return_value=True)
+    def test_a_disabled_static_entry_does_not_claim_to_be_enabled(self, mock_auth):
+        """`enabled` 那一格原先也写死成 `True`：一条**被人停用的**静态任务照旧显示为正常。
+
+        顺带记一条库的行为：`PeriodicTask.save()` 对停用行会把 `last_run_at` 强制清成
+        null（`if not self.enabled: self.last_run_at = None`），所以「停用」与「从未跑过」
+        在库里本来就分不开——分开它们的是 `enabled` 这一格本身。
+        """
+        from celery_app import app as celery_app
+        from django_celery_beat.models import IntervalSchedule, PeriodicTask
+        from rest_framework.test import APIRequestFactory
+
+        from apps.agent.views import list_scheduled_tasks
+
+        request = APIRequestFactory().get("/api/agent/tasks/scheduled/")
+        static = [
+            t
+            for t in list_scheduled_tasks(request).data["tasks"]
+            if t["source"] == "static"
+        ]
+        self.assertTrue(static, "静态条目一条都没有：本用例的前提不成立")
+
+        name = static[0]["name"]
+        PeriodicTask.objects.create(
+            name=name,
+            task=celery_app.conf.beat_schedule[name]["task"],
+            interval=IntervalSchedule.objects.create(every=30, period="seconds"),
+            enabled=False,
+        )
+
+        row = next(
+            t for t in list_scheduled_tasks(request).data["tasks"] if t["name"] == name
+        )
+        self.assertFalse(row["enabled"])
+        self.assertTrue(row["scheduled"], "行在表里：停用不等于没被调度器收下")
+
 
 class TestScheduledTaskIntegration(TestCase):
     """Integration tests for the full scheduled task lifecycle."""

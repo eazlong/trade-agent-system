@@ -572,8 +572,8 @@ class TestNotifyBody(SimpleTestCase):
         )
 
     def test_the_failure_body_says_the_consequence_not_just_the_error(self):
-        """要说的不是「有个任务挂了」（那是任务健康检查的事），而是「此刻没人知道该不该
-        拦」——一个「表里没有窗口」的系统看起来与「现在没有事件」一模一样。"""
+        """要说的不是「有个任务挂了」（那件事塞不进这条消息的正文），而是「此刻没人知道
+        该不该拦」——一个「表里没有窗口」的系统看起来与「现在没有事件」一模一样。"""
         body = halt_notify.write_failure_body("could not connect to server")
 
         self.assertIn("停止声明窗口同步失败", body)
@@ -1015,8 +1015,8 @@ class TestTheTaskWiring(TestCase):
     def test_a_write_failure_alerts_and_then_still_raises(self):
         """②e Q7：catch → 发 → 再抛。
 
-        吞掉异常会让真实故障从 beat 的任务健康检查里消失——「任务在跑、但表没更新」会
-        变成一件看起来正常的事。而失败的是机制本身，对账没完成就该让任务标 FAILURE。
+        吞掉异常会让真实故障连 FAILURE 那条记录都没有——「任务在跑、但表没更新」会变成
+        一件看起来正常的事。而失败的是机制本身，对账没完成就该让任务标 FAILURE。
         """
         from apps.regime import tasks
 
