@@ -73,6 +73,7 @@ from apps.regime import config, halt, judgement, mechanism_switch
 from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
 from apps.regime.models import (
+    CANDIDATE_DISCARD_EXPIRED,
     NO_ESCALATION_DISPLAY,
     ActorKind,
     CandidateEvent,
@@ -907,18 +908,71 @@ def _candidate_lines(*, now: datetime) -> list[str]:
     `describe_candidate` 与 `describe_event` 结构上可分辨（候选没有「熔断窗口」那一行），
     所以这里不必再写一遍「这不是熔断」——但一行总括要说，因为日报是许多人第一次听说
     「候选」这个词的地方。
+
+    两半**必须成对存在**：待处置的（要人动手）与到期被丢掉的（机制提过、没人处置的证据，
+    CONTEXT.md 第 152 条）。少了后一半，清理一跑起来过期候选就从这一节上整个消失——
+    连「它曾经存在过」都不会有人知道。
     """
     pending = list(
         CandidateEvent.objects.filter(
             status=CandidateStatus.PENDING.value
         ).order_by("-raised_at", "-id")
     )
-    if not pending:
-        return ["待人工处置的候选事件：没有"]
+    if pending:
+        lines = [
+            f"待人工处置的候选事件：{len(pending)} 条（**不产生任何熔断**，"
+            "转正需人工重新给出时间/档位/作用域）",
+            *(describe_candidate(candidate, now=now) for candidate in pending),
+        ]
+    else:
+        lines = ["待人工处置的候选事件：没有"]
+    lines.extend(_dropped_candidate_lines(now=now))
+    return lines
+
+
+#: 「到期被丢弃」那一段回看多少天。**这是日报的一个展示窗口，不是机制参数**，所以它是本
+#: 文件的常量而不进 `config.GROUPS`：那一组会被一起调整、一起审计，还会被
+#: `config.full_snapshot()` 内嵌进每一条判定记录（`config_snapshot`）——把一个展示窗口
+#: 塞进去，会让日后读判定记录的人以为它与判定有关。
+#:
+#: 也**刻意不绑** `EVENTS.candidate_expiry_days` 与 `EVENTS.coverage_decay_days`：那两个 14
+#: 数的是「一条候选能活多久」与「多久无新事件入库要提醒」，`config.EVENTS` 的 docstring
+#: 自己写着它们「将来也会各自漂开」。再让第三个用途绑上去，就是让三处一起漂。
+_DROPPED_WINDOW_DAYS = 14
+
+
+def _dropped_candidate_lines(*, now: datetime) -> list[str]:
+    """到期未确认、已被自动丢弃的候选（第 152 条那条「覆盖率衰减」的证据）。
+
+    **只在这一期真有人被丢时才印**，一行都不印不算沉默：「清理动作还活着吗」这个问题在
+    体检页的「调度表（beat）」那一段有唯一的家（`beat_health.py`），在日报里再补一句
+    「近 14 天没有丢弃」就是给同一个问题造第二个答案。
+
+    逐条一行而不是 `describe_candidate` 那种多行块：这是要一眼扫过的证据清单，不是要人
+    动手的待办。**「提出于」必须带上**——窗口按丢弃时刻算，于是「三个月前提出、今天才被
+    丢」（清理坏了一阵子，第一次跑就是这种形状）会被印得像最近的衰减。
+
+    行里**不印失效时刻**：它是 `提出日 + 14 天` 的算术结果，而这段文字要说的是「多久没人
+    理」，不是「在哪一秒被丢」。失效期本身在总括与 `describe_candidate` 里各说了一次，
+    再往每行塞一遍只会让这份清单变长。
+    """
+    since = now - timedelta(days=_DROPPED_WINDOW_DAYS)
+    dropped = list(
+        CandidateEvent.objects.filter(
+            status=CandidateStatus.DISCARDED.value,
+            discard_reason=CANDIDATE_DISCARD_EXPIRED,
+            decided_at__gte=since,
+        ).order_by("-decided_at", "-id")
+    )
+    if not dropped:
+        return []
     return [
-        f"待人工处置的候选事件：{len(pending)} 条（**不产生任何熔断**，"
-        "转正需人工重新给出时间/档位/作用域）",
-        *(describe_candidate(candidate, now=now) for candidate in pending),
+        f"到期未确认而自动丢弃（近 {_DROPPED_WINDOW_DAYS} 天）：{len(dropped)} 条"
+        "——机制提过、没人处置",
+        *(
+            f"候选 #{candidate.id}「{candidate.name}」（{candidate.raised_at} 提出）"
+            for candidate in dropped
+        ),
     ]
 
 

@@ -131,6 +131,21 @@ app.conf.beat_schedule = {
         'task': 'apps.regime.tasks.sync_gate',
         'schedule': 300.0,
     },
+    # 候选事件到期清理（CONTEXT.md 第 37 / 94 条）：把过了 14 天失效期、还没人确认的候选
+    # 标成「已丢弃」。**这一条此前没有任何调度入口**，所以「到期即丢弃」只存在于实现与
+    # 测试里，而模型与命令的注释都当它在跑。
+    # **与上面两条分开一条 beat 条目**：它写的是候选表，那两条碰的是声明表，失败面不同。
+    # 固定间隔，不用 crontab：它只关心「多久跑一次」，不关心「每天几点」；而失效期是
+    # 14 天，5 分钟一轮换来的唯一好处是「到期」到「被丢弃」之间的窗口短到可以忽略
+    # （那个窗口里候选的回显会以「已过失效期」开头）。一轮的代价是一次带索引的查询加
+    # 可能的零行更新。
+    # **要重启 beat 才会被调度**：`beat_schedule` 只在 beat 启动那一刻合并进
+    # `PeriodicTask` 一次（见 `apps/regime/beat_health.py` 的模块 docstring），在那之前
+    # 体检页的「调度表（beat）」会把它印成「从未进入调度表」。
+    'regime-candidate-expiry': {
+        'task': 'apps.regime.tasks.expire_candidates',
+        'schedule': 300.0,
+    },
     # 调度表体检（第③段单元 U3）：把「哪几条 beat 条目没在正常跑」变成一条给全体用户
     # 的即时消息（体检页那一段是它的第一半，见 `apps/regime/beat_health.py`）。
     # **自己必须是一条独立的条目**：它盯的正是「条目有没有进调度表 / 有没有发出去」，

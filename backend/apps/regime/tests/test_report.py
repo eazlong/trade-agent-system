@@ -3,7 +3,7 @@
 `test_timing.py` 钉的是接线（这条职责挂在哪、排在谁后面）；这个文件钉的是它的另一半——
 **一天一条写成什么样**。判定与推导的逻辑在这里一行都不断言，那会是第二处真相。
 
-本文件钉的五条性质，每一条坏了都不报警、只出错的东西：
+本文件钉的六条性质，每一条坏了都不报警、只出错的东西：
 
 1. **报的是「明日才生效」的那条**（CONTEXT.md 第 173 条）。第①段读 `effective_at`，正文里
    必须明写生效时刻，否则「今日判定」这个词就在撒谎——此刻咬人的是另一条。拿
@@ -23,11 +23,15 @@
    `_DECISION_CARRIED`、`REPORT.event_horizon_days` 与 `/event list` 的
    `DEFAULT_HORIZON_DAYS`、第③段的查询形状与 `event_commands._list`。三处漂开都会表现成
    「日报说有 2 条、追问时工具说有 5 条」，而这种不一致没人会当成 bug 报上来。
+6. **候选那一节有两半，缺一半不报警**：待人工处置的，与到期未确认被丢掉的（第 152 条
+   要的那份衰减证据）。清理任务一挂上 beat，过期候选就从「待人工处置」里整个消失——
+   没有后一半，这一节只剩「没有」两个字，而「机制提过、没人处置」再没有读者。
 
 **分层**：`TestContract` / `TestTheStructuredChange` / `TestCropForOneUser` 三个类是
 `SimpleTestCase`——碰一下库就报错，所以「这几段不落库」是被强制的，不靠 docstring 声明。
 `TestPureRendering` 只读（`_switch_lines` 会读切换流水表，所以它只能是 `TestCase`），
 `TestTheDeclarationLine` 落几行声明（第③段 W4 加的那一行读的是声明表），
+`TestTheCandidateSection` 落几行候选（第③段末尾那一节读候选表），
 `TestTheWriteGate` 与后面五个类落真库。
 
 **造数据用真 UUID**：策略主键是 `UUIDField`，而 `_strategy_names` 会拿建议里的
@@ -50,8 +54,13 @@ from apps.agent import event_commands
 from apps.common.time_utils import business_tz, format_business
 from apps.regime import config, deactivation, deactivation_run, halt, judgement, report
 from apps.regime.models import (
+    CANDIDATE_DISCARD_EXPIRED,
+    CANDIDATE_DISCARD_REJECTED,
     NO_ESCALATION_DISPLAY,
     ActorKind,
+    CandidateEvent,
+    CandidateOrigin,
+    CandidateStatus,
     DailyReport,
     HaltDeclaration,
     HaltTrigger,
@@ -505,6 +514,122 @@ class TestTheDeclarationLine(TestCase):
             SYMBOL, {}, {"regime": BaseRegime.RANGE.value}, now=NOW
         )
         self.assertIn("停止声明：此刻没有任何一层在拦（按生效中的阶段：箱体震荡）", body)
+
+
+# --------------------------------------------------------------------------- #
+# 第③段末尾：候选事件那一节（含「到期被丢弃」那半）
+# --------------------------------------------------------------------------- #
+
+
+def _candidate(
+    *,
+    name: str = "某事件",
+    status: str = CandidateStatus.PENDING.value,
+    raised_at: date | None = None,
+    discard_reason: str = "",
+    decided_at: datetime | None = None,
+) -> CandidateEvent:
+    """一条候选。默认是**待确认**的；`discarded` 由调用方点名（状态与原因一起给）。
+
+    `expires_at` 不参与本文件的任何断言（窗口判据读的是 `decided_at` 与丢弃原因），
+    所以给一个还在有效期内的值，免得待确认那条走 `describe_candidate` 的 ⚠ 分支。
+    """
+    return CandidateEvent.objects.create(
+        name=name,
+        origin=CandidateOrigin.AGENT.value,
+        raised_at=raised_at or RUN_DAY - timedelta(days=1),
+        raised_by="u-1",
+        expires_at=NOW + timedelta(days=13),
+        status=status,
+        discard_reason=discard_reason,
+        decided_at=decided_at,
+    )
+
+
+def _dropped(
+    *, name: str = "某事件", raised_days_ago: int = 20, decided_days_ago: int = 1
+) -> CandidateEvent:
+    """一条**到期未确认、已被清理丢弃**的候选。"""
+    return _candidate(
+        name=name,
+        status=CandidateStatus.DISCARDED.value,
+        raised_at=RUN_DAY - timedelta(days=raised_days_ago),
+        discard_reason=CANDIDATE_DISCARD_EXPIRED,
+        decided_at=NOW - timedelta(days=decided_days_ago),
+    )
+
+
+class TestTheCandidateSection(TestCase):
+    """第③段末尾那一节：待确认的那些（要人动手）+ 到期被丢的那些（第 152 条的证据）。
+
+    两半**必须成对**：清理任务（`apps.regime.tasks.expire_candidates`）一跑起来，过期
+    候选就从「待人工处置」里消失，只剩这一节说得清「机制提过、没人处置」。少了后半，
+    它会连「曾经存在过」都不留。
+    """
+
+    def test_a_clean_section_is_the_empty_line_and_nothing_else(self):
+        """没有人被丢时**不印**「近 14 天没有丢弃」。
+
+        「清理任务还活着吗」在体检页的「调度表（beat）」那一段有唯一的家；在日报里补一
+        句 0，就是给同一个问题造第二个答案。
+        """
+        self.assertEqual(
+            report._candidate_lines(now=NOW), ["待人工处置的候选事件：没有"]
+        )
+
+    def test_a_dropped_candidate_is_named_with_when_it_was_raised(self):
+        """整行比对：「提出于」是判「最近才衰减」还是「清理坏了一阵子」的分界。
+
+        按丢弃时刻算的窗口会把「很久以前提出、今天才被丢」印得像最近的衰减——而清理
+        第一次真正跑起来时，那正是它的形状。
+        """
+        raised_at = RUN_DAY - timedelta(days=20)
+        candidate = _dropped(name="某宏观事件", raised_days_ago=20)
+
+        self.assertEqual(
+            report._candidate_lines(now=NOW),
+            [
+                "待人工处置的候选事件：没有",
+                "到期未确认而自动丢弃（近 14 天）：1 条——机制提过、没人处置",
+                f"候选 #{candidate.id}「某宏观事件」（{raised_at} 提出）",
+            ],
+        )
+
+    def test_a_human_rejection_is_not_decay_evidence(self):
+        """`rejected` 是有人处置过——把它算进「没人处置」里，这一行就在诬告自己人。"""
+        _candidate(
+            name="被人否决的",
+            status=CandidateStatus.DISCARDED.value,
+            discard_reason=CANDIDATE_DISCARD_REJECTED,
+            decided_at=NOW - timedelta(days=1),
+        )
+        self.assertEqual(
+            report._candidate_lines(now=NOW), ["待人工处置的候选事件：没有"]
+        )
+
+    def test_a_drop_outside_the_window_is_not_counted(self):
+        _dropped(decided_days_ago=20)
+        self.assertEqual(
+            report._candidate_lines(now=NOW), ["待人工处置的候选事件：没有"]
+        )
+
+    def test_the_two_halves_share_one_section_with_the_pending_first(self):
+        """待办在前、证据在后：先给人要动手的，再给「上一批没人动」的账。"""
+        pending = _candidate(name="还没人理的")
+        _dropped(name="已经没人理的")
+
+        lines = report._candidate_lines(now=NOW)
+        self.assertEqual(lines[0], "待人工处置的候选事件：1 条（**不产生任何熔断**，转正需人工重新给出时间/档位/作用域）")
+        self.assertIn(f"候选 #{pending.id} 还没人理的", lines[1])
+        self.assertEqual(
+            lines[2], "到期未确认而自动丢弃（近 14 天）：1 条——机制提过、没人处置"
+        )
+
+    def test_the_events_section_carries_it(self):
+        # 接线：这一节真的在 `_section_events` 里（第③段与 `query_events` 同源，所以
+        # 两处一起得到它）。删掉那个 `extend` 能骗过上面所有用例。
+        _dropped()
+        self.assertIn("到期未确认而自动丢弃", report._section_events(now=NOW))
 
 
 # --------------------------------------------------------------------------- #

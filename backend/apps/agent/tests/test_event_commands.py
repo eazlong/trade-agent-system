@@ -213,8 +213,8 @@ class TestTheLexer:
 
 class TestTheWriteSurfaceIsADeclaredList:
     def test_the_seven_subcommands_are_exactly_these(self):
-        # 多出一个键 = 多一条没人审过的写入路径。提出方（`raise_candidate`）与每日清理
-        # （`expire_candidates`）刻意不在这里：前者的出口是候选表，后者是定时任务。
+        # 多出一个键 = 多一条没人审过的写入路径。提出方（`raise_candidate`）与定时清理
+        # （`expire_candidates`）刻意不在这里：前者的出口是候选表，后者挂在 beat 上。
         assert set(event_commands._SUBCOMMANDS) == {
             "add",
             "impact",

@@ -61,6 +61,7 @@ from apps.regime.models import (
     MajorEventChange,
     NewsItem,
 )
+from apps.regime.tests.test_slicing import _StubbedConnectionReset
 
 #: 事件本身的名义时刻：北京时间 2026-09-25 20:30 == UTC 2026-09-25 12:30。
 EVENT_TEXT = "2026-09-25 20:30"
@@ -990,7 +991,7 @@ class TestDiscardingACandidate(_WithSymbols):
             events.discard_candidate(
                 candidate, reason=CANDIDATE_DISCARD_EXPIRED, actor_name="xl"
             )
-        self.assertIn("由每日清理自动落", str(ctx.exception))
+        self.assertIn("由定时清理自动落", str(ctx.exception))
         candidate.refresh_from_db()
         self.assertEqual(candidate.status, CandidateStatus.PENDING.value)
 
@@ -1083,13 +1084,77 @@ class TestCandidatesExpireWithoutAnyoneLooking(_WithSymbols):
         self.assertEqual(sum("已丢弃" in line for line in logs.output), 2)
 
     def test_an_expired_candidate_says_it_is_waiting_for_the_cleanup(self):
-        """到期与「已丢弃」之间的那段时间（当天还没跑清理）也要读得出来。"""
+        """到期与「已丢弃」之间的那个窗口也要读得出来。
+
+        清理每 5 分钟一轮，所以正常时这个窗口几乎见不到；见得到它，就等于看到**清理任务
+        自己没在跑**——这句话必须印出来，否则这一行会被读成「明天就好了」。
+        """
         candidate = self._candidate(days_ago=20)
         text = events.describe_candidate(
             candidate, now=datetime(2026, 9, 25, 1, 0, tzinfo=timezone.utc)
         )
         self.assertIn("已过失效期", text)
-        self.assertIn("等下一次每日清理", text)
+        self.assertIn("等下一次定时清理", text)
+        self.assertIn("说明清理任务自己没在跑", text)
+
+
+class TestTheCleanupIsAScheduledTask(_StubbedConnectionReset, _WithSymbols):
+    """清理此前**一个调用方都没有**：实现、测试、注释全在，就是没人调它。
+
+    `events.expire_candidates` 的行为在上面那个类里钉着，这里只钉另外三件不重复的事：
+    任务**真的挂上了 beat**（且是可判定固定间隔的条目）、任务体真的把行翻过去了、
+    以及**任务不吞异常**（CONTEXT.md 第 180 条：吞掉会让一次真故障连 FAILURE 那条记录
+    都没有）。
+
+    要 `_StubbedConnectionReset` 是因为任务体的 `finally` 里有 `close_old_connections()`
+    ——它在 `TestCase` 的事务里必然把连接关掉，理由见那个类的 docstring。
+    """
+
+    def _stale(self, *, days_ago: int = 20) -> CandidateEvent:
+        """`now` 用真实时钟：任务自己取当前时刻，注入不了。"""
+        return events.raise_candidate(
+            name=f"候选 {days_ago} 天前提的",
+            origin=CandidateOrigin.AGENT.value,
+            raised_by="u-1",
+            now=datetime.now(timezone.utc) - timedelta(days=days_ago),
+        )
+
+    def test_the_beat_entry_points_at_this_task_and_has_a_fixed_interval(self):
+        """固定间隔而不是 crontab：体检页读不出 crontab 的「下一次该在什么时候」，
+        于是它会落进「不定罪」那一档——「清理没在跑」这件事就没人说得出了。"""
+        from celery_app import app
+
+        entry = app.conf.beat_schedule["regime-candidate-expiry"]
+        self.assertEqual(entry["task"], "apps.regime.tasks.expire_candidates")
+        self.assertIsInstance(entry["schedule"], (int, float))
+
+    def test_the_task_reports_how_many_rows_it_moved(self):
+        from apps.regime import tasks
+
+        self._stale()
+        self._stale(days_ago=21)
+        self.assertEqual(tasks.expire_candidates.run(), {"expired": 2})
+        self.assertEqual(
+            CandidateEvent.objects.filter(
+                status=CandidateStatus.DISCARDED.value
+            ).count(),
+            2,
+        )
+
+    def test_a_clean_round_says_zero(self):
+        from apps.regime import tasks
+
+        self._stale(days_ago=1)  # 还在失效期内
+        self.assertEqual(tasks.expire_candidates.run(), {"expired": 0})
+
+    def test_a_failure_is_not_swallowed(self):
+        from unittest.mock import patch
+
+        from apps.regime import tasks
+
+        with patch.object(events, "expire_candidates", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                tasks.expire_candidates.run()
 
 
 # --------------------------------------------------------------------------- #

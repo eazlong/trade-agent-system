@@ -624,7 +624,7 @@ def discard_candidate(
         )
     if reason == CANDIDATE_DISCARD_EXPIRED:
         raise EventInputError(
-            "「到期未确认」由每日清理自动落，不走人工入口——"
+            "「到期未确认」由定时清理自动落，不走人工入口——"
             "人工丢弃请用「否决」，好让日报分得清「没人看」与「看过了」"
         )
     if not candidate.is_pending:
@@ -731,7 +731,8 @@ def describe_candidate(candidate: CandidateEvent, *, now: datetime | None = None
     if candidate.is_pending and candidate.is_expired(now):
         lines.append(
             f"  ⚠ 已过失效期（{format_moment(candidate.expires_at)}），"
-            "等下一次每日清理落成「已丢弃」"
+            "等下一次定时清理落成「已丢弃」——一直没有落成，说明清理任务自己没在跑"
+            "（见 /regime mech 的「调度表（beat）」）"
         )
     elif candidate.is_pending:
         lines.append(f"  失效于：{format_moment(candidate.expires_at)}")

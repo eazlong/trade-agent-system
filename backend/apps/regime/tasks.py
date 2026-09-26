@@ -1,6 +1,7 @@
 """切片任务（第①段单元 6ii）+ 日报投递与投递看门狗（第①段单元 8iv）
 + 停止声明窗口同步（第②段单元 ②c）+ 减仓投递（第②段单元 ②d）
 + 窗口通知与声明写入失败告警（第②段单元 ②e）+ 行情阶段 gate 同步（第③段单元 ③b）
++ 候选事件到期清理（CONTEXT.md 第 37 / 94 条那条 14 天失效期的执行者）
 + 调度表体检（第③段单元 U3）。
 
 ## 为什么是独立任务
@@ -434,6 +435,43 @@ def sync_gate() -> dict:
     finally:
         # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
         close_old_connections()
+
+
+@app.task(acks_late=True)
+def expire_candidates() -> dict:
+    """把到期未确认的候选事件标成「已丢弃」（CONTEXT.md 第 37 / 94 条）。
+
+    这一条此前**一条调用方都没有**：`events.expire_candidates` 的实现与测试都在，模型与
+    命令注释里「由清理动作做」的说法也都在，唯独没有调度入口——于是候选永远不会从
+    `pending` 变成 `discarded`。体检页那次的形状是「文件里写了、调度表里没有」，这一条
+    更彻底：文件里也没有。
+
+    幂等：`events.expire_candidates` 自己按 `status=pending` 判两次（读一次、写一次，
+    先到者为准——转正是终态，不能被清理改回去），且**不删任何行**：只改状态、写
+    `decided_at` 与丢弃原因，`decided_by` 留空（「没有人处置」本身就是第 152 条要的那份
+    证据）。所以没有 `max_retries`——下一轮 300 秒的对账就是重试（与 `sync_halt_windows`
+    / `sync_gate` 同一条纪律）。异常照旧往上抛：这是个写入，可它幂等，而吞掉只会让一次
+    真故障连 FAILURE 那条记录都没有（这条路今天通到哪里，见模块 docstring 的「跑了没」
+    那一节）。
+
+    返回值只有 ``expired``（本轮改了几行）。逐行的「哪一条到期被丢」由
+    `events.expire_candidates` 自己记 INFO 日志，本任务不重打一遍；0 行不是异常——
+    候选是人工维护的日频产物。
+
+    丢弃的证据不会随这一条任务一起消失：日报第③段末尾（与 `query_events`，两处同源）
+    有一段专印「近 14 天到期未确认而被丢弃的」，见 `report._dropped_candidate_lines`。
+    """
+    from django.db import close_old_connections
+
+    from apps.regime import events
+
+    try:
+        return {"expired": events.expire_candidates()}
+    finally:
+        # 反复调度的任务必须自己收掉 DB 连接，否则连接会攒在 worker 上
+        close_old_connections()
+
+
 #: `check_beat_health` 的**空转**档位：这几档不记日志。这条任务一天 288 轮，每轮印一行
 #: 「没有异常」等于把日志变成噪声（`halt_notify.notify_pending` 同一条：没事就不说话）。
 _QUIET_BEAT_REASONS = frozenset({"no_problems", "nothing_to_say", "already_alerted_today"})

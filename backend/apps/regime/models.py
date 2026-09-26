@@ -1752,8 +1752,8 @@ class CandidateEvent(models.Model):
 
     def is_expired(self, now=None) -> bool:
         """是否已过失效期。**只回答事实，不改状态**——到期改成 `discarded` 是一次
-        写入，由每日的清理动作做（`events.expire_candidates`）。查询端用得到这个判断，
-        因为「今天过期的」与「今天被丢弃的」之间隔着一次任务运行。"""
+        写入，由定时清理动作做（`events.expire_candidates`，挂在 beat 上）。查询端用
+        得到这个判断，因为「已经过期的」与「已经被丢弃的」之间隔着一次任务运行。"""
         from django.utils import timezone as _tz
 
         return (now or _tz.now()) >= self.expires_at
