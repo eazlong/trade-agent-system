@@ -103,7 +103,9 @@ DB 的情况下被穷举测试。
   显式拒绝——**不**复用 `evaluate.is_usable_metric_number`：那份判据只认 `int` / `float`
   （它自己 docstring 写明 `isinstance(value, (int, float))`），而 `Decimal` 会被它整个判成
   「不是数」，于是每一个合法本金都会被当成证据不足。这里不是「写第二份判据」——是那条
-  判据的适用域本就不含金额，「强行复用」会让它变成一份错的共用。
+  判据的适用域本就不含金额，强行复用会让它变成一份错的共用。金额侧的同一组检查在
+  `orchestrator.RunContext.__post_init__` 的 `initial_capital` 上已经有了（`isinstance` +
+  `is_finite()` + `> 0`），本模块与它同构。
 * **笔数与时长是两个分母**。`sample_sufficient` 与 `no_trades` 判的是**笔数**
   （`len(clipped)`），`time_in_market_pct` 与加权平均用的是**秒**。一个零时长的点观测
   计 1 笔、贡献 0 秒。混用会把「2 笔、每笔都开满全程」与「2 笔、各开一分钟」读成同一个
