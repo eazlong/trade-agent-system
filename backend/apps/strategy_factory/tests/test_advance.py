@@ -1986,3 +1986,505 @@ class TestTheHoldReleasesWhenTheRegimeFlips:
         assert out.detail["mechanism_mode"] == MechanismMode.SHADOW.value
         candidate.refresh_from_db()
         assert candidate.status == "oos_running"
+
+
+class TestTheHoldHandsTheLayersVerdictBackInsteadOfCrashing:
+    """候选停 `regime_hold`、来处那一层**这一轮判了「不行」**时，结论要退回来处（#52）。
+
+    修之前这一支是 `return inner`：`inner.next_status` 是 `oos_failed` / `paper_failed`，
+    而 `regime_hold` 的合法出边只有 `oos_running` / `paper_running` / `cancelled` /
+    `rejected` ⇒ `_persist_step` 写状态时抛 `InvalidTransitionError`，**整步事务回滚**
+    （失败码、行情依据、转移记录一样都不落），批任务把它收成一条 warning，候选永远停在
+    `regime_hold`——而它在页面上与「行情还没翻」一模一样，且每 5 分钟复现一次。
+
+    修法是「原路退回、失败码带回」：这不是把不合格洗成停住（下一轮那一层会自己把它判去
+    `*_failed`，见 `test_the_failure_lands_on_the_second_round`），而是 `status.py` 那条
+    既有纪律的直接后果——「`regime_hold` 没有去 `*_failed` 的边：暂停不是判定」。
+
+    **这一类必须与 `TestTheHoldReleasesWhenTheRegimeFlips` 分开两组**：那一组盯的是
+    「行情翻面/档位放行 ⇒ 退回来处」，这一组盯的是「那一层自己判了不行 ⇒ 也退回来处」。
+    两条路的落点相同，但**判据来源相反**（一个是闸门的结论、一个是那一层的结论），
+    合成一组就会掩盖「行情没翻时被误当成失败退回」那种坏法——那正是本票实施时实测
+    踩到的坑（见下面 `test_a_still_unfit_regime_does_not_bounce_the_candidate`）。
+    """
+
+    #: 「那一层判了不行」的八种签名：来处 × 该层结论 × 期望的失败码。
+    #:
+    #: 四个 oos 签名覆盖判定层 `_evaluate_oos` 的**全部**失败出口（读不出结论 /
+    #: 分折数据不足 / 折数不可用 / 衰减超上限），四个 paper 签名覆盖
+    #: `_evaluate_paper_running` 的全部失败出口（风控命中 / 盈亏下限 / 观察期未满且
+    #: 会话结束 / 观察期满但样本量不足且会话结束）。**逐个列全**而不是挑两条：本票的
+    #: 复发形态正是「漏了一支」。
+    FAILURE_SIGNATURES = [
+        pytest.param(
+            StrategyCandidateStatus.OOS_RUNNING,
+            "oos",
+            OosEvidence(error="样本内主行不存在（#52 探针）"),
+            ReasonCode.OOS_BACKTEST_FAILED,
+            id="oos:error",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.OOS_RUNNING,
+            "oos",
+            OosEvidence(decay_pct=None, fold_count=5, data_sufficient=False),
+            ReasonCode.INSUFFICIENT_EVIDENCE,
+            id="oos:data_insufficient",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.OOS_RUNNING,
+            "oos",
+            OosEvidence(decay_pct=5.0, fold_count=0),
+            ReasonCode.INSUFFICIENT_EVIDENCE,
+            id="oos:fold_count_bad",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.OOS_RUNNING,
+            "oos",
+            OosEvidence(decay_pct=95.0, fold_count=5),
+            ReasonCode.OOS_DECAY_ABOVE_MAX,
+            id="oos:decay_above_max",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.PAPER_RUNNING,
+            "paper",
+            PaperEvidence(
+                wall_clock_days=20.0,
+                running_days=20.0,
+                closed_trades=40,
+                return_pct=5.0,
+                risk_hits=CONFIG.paper_max_risk_hits + 3,
+            ),
+            ReasonCode.PAPER_RISK_HITS_ABOVE_MAX,
+            id="paper:risk_hits_above_max",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.PAPER_RUNNING,
+            "paper",
+            PaperEvidence(
+                wall_clock_days=20.0,
+                running_days=20.0,
+                closed_trades=40,
+                return_pct=CONFIG.paper_min_return_pct - 5.0,
+                risk_hits=0,
+            ),
+            ReasonCode.PAPER_RETURN_BELOW_MIN,
+            id="paper:return_below_min",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.PAPER_RUNNING,
+            "paper",
+            PaperEvidence(
+                wall_clock_days=3.0,
+                running_days=3.0,
+                closed_trades=40,
+                return_pct=5.0,
+                risk_hits=0,
+                session_ended=True,
+            ),
+            ReasonCode.PAPER_OBSERVATION_INCOMPLETE,
+            id="paper:observation_incomplete_ended",
+        ),
+        pytest.param(
+            StrategyCandidateStatus.PAPER_RUNNING,
+            "paper",
+            PaperEvidence(
+                wall_clock_days=20.0,
+                running_days=20.0,
+                closed_trades=2,
+                return_pct=5.0,
+                risk_hits=0,
+                session_ended=True,
+            ),
+            ReasonCode.INSUFFICIENT_EVIDENCE,
+            id="paper:insufficient_ended",
+        ),
+    ]
+
+    def _deps(self, *, regime, oos=None, paper=None) -> AdvanceDeps:
+        return AdvanceDeps(
+            resolve_run_context=lambda candidate: _ctx(),
+            start_in_sample=lambda candidate, ctx, plan: {},
+            read_in_sample=lambda candidate: None,
+            start_oos=lambda candidate, ctx, plan, rid: {},
+            read_oos=lambda candidate: oos,
+            create_paper_session=lambda candidate: None,
+            read_paper=lambda candidate: paper,
+            read_regime=regime,
+            notify=lambda candidate, message: True,
+            now=lambda: FIXED_NOW,
+        )
+
+    def _held(self, *, tag: str, from_status, layer, layers=None):
+        """停 `regime_hold` 的候选 + 一条真实的「从 X 进来」转移记录。
+
+        `layers` 用来给需要往回推 `in_sample` 主行 id 的用例（样本外层要求它当衰减分母）
+        预置层记录；不传就是空 `evidence`。
+        """
+        strategy = _strategy(f"verdict_back_{tag}")
+        candidate = _candidate(
+            strategy,
+            StrategyCandidateStatus.REGIME_HOLD,
+            name=f"vb_{tag}",
+            evidence={"layers": layers} if layers else {},
+        )
+        StrategyCandidateTransition.objects.create(
+            candidate=candidate,
+            layer=layer,
+            from_status=from_status.value,
+            to_status=StrategyCandidateStatus.REGIME_HOLD.value,
+            reason_code=ReasonCode.REGIME_UNFIT.value,
+            detail={},
+            at=FIXED_NOW,
+        )
+        return candidate
+
+    @pytest.mark.parametrize(
+        "from_status, layer, evidence, expected_code", FAILURE_SIGNATURES
+    )
+    def test_the_failure_is_handed_back_to_the_layer_it_came_from(
+        self, from_status, layer, evidence, expected_code
+    ):
+        """八种失败签名各一条：不抛、落 `came_from`、**失败码原样保留**。
+
+        「落 `came_from`」与「失败码保留」必须一起断言：只断言不抛，改法可以退化成
+        「留在 `regime_hold`」（那会把这一轮的证据丢掉）；只断言失败码，改法可以退化成
+        「落 `*_failed`」（那是本条修之前的非法边，而且它把「暂停」变成了「判定」）。
+        """
+        _open_regime_gate()
+        candidate = self._held(
+            tag=f"{from_status.value}_{expected_code.value}",
+            from_status=from_status,
+            layer=layer,
+            # 样本外层要往回推 `in_sample` 主行 id（它是衰减的分母），缺了它判定会
+            # 在「起跑前」就抛 `AdvanceWiringError`——那不是本票要验的东西。
+            layers=(
+                {"in_sample": {"result_id": "00000000-0000-0000-0000-000000000001"}}
+                if layer == "oos"
+                else None
+            ),
+        )
+        # 行情格给 `fit`：「那一层判了不行」这件事不该被行情判定影响，而 `unfit`
+        # 会让「是闸门拦的」与「是那一层判的」混在一起读不出来。
+        deps = self._deps(
+            regime=lambda c: RegimeEvidence(
+                regime="range", cell=RegimePoolCellEvidence(state="fit")
+            ),
+            **{layer: evidence},
+        )
+
+        out = advance(candidate, deps=deps)
+
+        assert out.to_status is from_status, (out.to_status, out.reason_code)
+        assert out.reason_code is expected_code, out.reason_code
+        candidate.refresh_from_db()
+        assert candidate.status == from_status.value
+
+    def test_the_failure_lands_on_the_second_round(self):
+        """连续推进两轮：轮 1 退回来处，轮 2 **由那一层自己**判去 `*_failed`。
+
+        没有这一条，「退回来处」就与「换个地方停住」在测试上分不开——而两者的区别正是
+        本票允许的代价（晚一轮）与不可接受的代价（永远不动）之间的分界。
+        """
+        _open_regime_gate()
+        candidate = self._held(
+            tag="two_round",
+            from_status=StrategyCandidateStatus.OOS_RUNNING,
+            layer="oos",
+            layers={"in_sample": {"result_id": "00000000-0000-0000-0000-000000000001"}},
+        )
+        deps = self._deps(
+            regime=lambda c: RegimeEvidence(
+                regime="range", cell=RegimePoolCellEvidence(state="fit")
+            ),
+            oos=OosEvidence(error="样本内主行不存在（#52 探针）"),
+        )
+
+        first = advance(candidate, deps=deps)
+
+        assert first.to_status is StrategyCandidateStatus.OOS_RUNNING
+        assert first.reason_code is ReasonCode.OOS_BACKTEST_FAILED
+
+        second = advance(candidate, deps=deps)
+
+        assert second.to_status is StrategyCandidateStatus.OOS_FAILED, (
+            second.reason_code
+        )
+        assert second.reason_code is ReasonCode.OOS_BACKTEST_FAILED
+        candidate.refresh_from_db()
+        assert candidate.status == "oos_failed"
+
+    def test_a_still_unfit_regime_does_not_bounce_the_candidate(self):
+        """**行情还没翻时，候选必须留在原地**——这一条钉的是本票实施时实测踩到的坑。
+
+        `_oos_verdict` / `_paper_running_step` 内部自己也接了一遍行情闸门，所以「行情
+        还没翻」时它们返回的结论同样是 `REGIME_HOLD`。「那一层判了不行」与「闸门这一轮
+        还是不行」于是落在同一个出口上，而正确动作相反。
+
+        若把两者一起「退回来处」，持有轮每 5 分钟就会把候选从 `regime_hold` 弹到
+        `oos_running`、下一轮再被闸门拦回来——整个持有期都在震荡，每轮还多一条审计记录。
+        这条用例与 `TestTheHoldReleasesWhenTheRegimeFlips::test_still_unfit_keeps_it_parked_with_no_side_effects`
+        是**同一件事的两个证人**：那一条在持有组里守着沉默，这一条在失败组里守着边界——
+        只在其中一组写，改法从另一侧破坏时不会有任何用例变红。
+        """
+        _open_regime_gate()
+        candidate = self._held(
+            tag="still_unfit",
+            from_status=StrategyCandidateStatus.OOS_RUNNING,
+            layer="oos",
+            layers={"in_sample": {"result_id": "00000000-0000-0000-0000-000000000001"}},
+        )
+        deps = self._deps(
+            regime=lambda c: RegimeEvidence(
+                regime="downtrend", cell=RegimePoolCellEvidence(state="unfit")
+            ),
+            oos=OosEvidence(decay_pct=5.0, fold_count=5),
+        )
+
+        out = advance(candidate, deps=deps)
+
+        assert out.to_status is StrategyCandidateStatus.REGIME_HOLD, out.reason_code
+        assert out.changed is False
+        candidate.refresh_from_db()
+        assert candidate.status == "regime_hold"
+
+
+class TestEveryDepartureFromRegimeHoldIsALegalEdge:
+    """**从 `regime_hold` 出发的每一次 `advance()`，落点必须落在转移表里**（#52 验收）。
+
+    这不是「再来一遍上面那些用例」：上面按**原因码签名**列了八条，而这一组按**落点**
+    穷举——来处 × 该层全部结论 × 行情格 × 档位。两种列法挡的东西不同：
+
+    * 签名清单会随判定层长出新出口而漏（本票修之前，八条签名一条用例都没有）；
+    * 落点穷举问的是「不管哪条路，出的边合法吗」，新增出口自动被覆盖。
+
+    落点判据用 `ALLOWED_TRANSITIONS` 而不是硬编码四个状态名：转移表是全仓关于候选生命
+    周期的唯一真相（`status.py` 的 docstring 原话），这里抄一份就成了第二个真相。
+    `to_status == from_status`（自环）不算转移，要单独放行——`can_transition(x, x)` 是假，
+    但「不动」本来就是一个合法结局。
+    """
+
+    #: 该层的**全部**结论，按落点分组列（不是按原因码挑）：`passed` 走升档、`pending` /
+    #: `observing` 走停住、其余走失败。三组都要在，否则「只有失败那支被验过」。
+    OOS_OUTCOMES = {
+        "passed": OosEvidence(decay_pct=5.0, fold_count=5),
+        "pending": None,
+        "error": OosEvidence(error="读不出结论（#52 穷举）"),
+        "data_insufficient": OosEvidence(
+            decay_pct=None, fold_count=5, data_sufficient=False
+        ),
+        "fold_count_bad": OosEvidence(decay_pct=5.0, fold_count=0),
+        "decay_above_max": OosEvidence(decay_pct=95.0, fold_count=5),
+    }
+    PAPER_OUTCOMES = {
+        "passed": PaperEvidence(
+            wall_clock_days=20.0,
+            running_days=20.0,
+            closed_trades=40,
+            return_pct=5.0,
+            risk_hits=0,
+        ),
+        "observing": PaperEvidence(
+            wall_clock_days=3.0,
+            running_days=3.0,
+            closed_trades=5,
+            return_pct=0.5,
+            risk_hits=0,
+        ),
+        "pending": None,
+        "risk_hits_above_max": PaperEvidence(
+            wall_clock_days=20.0,
+            running_days=20.0,
+            closed_trades=40,
+            return_pct=5.0,
+            risk_hits=CONFIG.paper_max_risk_hits + 3,
+        ),
+        "return_below_min": PaperEvidence(
+            wall_clock_days=20.0,
+            running_days=20.0,
+            closed_trades=40,
+            return_pct=CONFIG.paper_min_return_pct - 5.0,
+            risk_hits=0,
+        ),
+        "observation_incomplete_ended": PaperEvidence(
+            wall_clock_days=3.0,
+            running_days=3.0,
+            closed_trades=40,
+            return_pct=5.0,
+            risk_hits=0,
+            session_ended=True,
+        ),
+        "insufficient_ended": PaperEvidence(
+            wall_clock_days=20.0,
+            running_days=20.0,
+            closed_trades=2,
+            return_pct=5.0,
+            risk_hits=0,
+            session_ended=True,
+        ),
+    }
+    #: 行情格：`fit` 放行、`unfit` 拦、其余按 fail-closed 处理，冷启动 `None` 单独一档
+    #: （它与「没有格子」不是同一件事，但在闸门那一侧落到同一支）。
+    REGIMES = {
+        "fit": RegimeEvidence(regime="range", cell=RegimePoolCellEvidence(state="fit")),
+        "unfit": RegimeEvidence(
+            regime="downtrend", cell=RegimePoolCellEvidence(state="unfit")
+        ),
+        "neutral": RegimeEvidence(
+            regime="range", cell=RegimePoolCellEvidence(state="neutral")
+        ),
+        "unknown": RegimeEvidence(
+            regime="range", cell=RegimePoolCellEvidence(state="unknown")
+        ),
+        "no_cell": RegimeEvidence(regime="range", cell=None),
+        "cold_start": None,
+    }
+
+    def _held(self, *, tag, from_status, layer):
+        strategy = _strategy(f"depart_{tag}")
+        candidate = _candidate(
+            strategy,
+            StrategyCandidateStatus.REGIME_HOLD,
+            name=f"dep_{tag}",
+            evidence={
+                "layers": {
+                    "in_sample": {"result_id": "00000000-0000-0000-0000-000000000001"}
+                }
+            },
+        )
+        StrategyCandidateTransition.objects.create(
+            candidate=candidate,
+            layer=layer,
+            from_status=from_status.value,
+            to_status=StrategyCandidateStatus.REGIME_HOLD.value,
+            reason_code=ReasonCode.REGIME_UNFIT.value,
+            detail={},
+            at=FIXED_NOW,
+        )
+        return candidate
+
+    def test_no_departure_produces_an_illegal_edge(self):
+        """2 来处 × 13 种层结论 × 6 行情格 × 2 档位 = 156 次真实 `advance()`。
+
+        **不吞异常**：本票修之前这条会以 `InvalidTransitionError` 直接炸在 `advance()`
+        里，而不是「断言失败」——那正是缺陷形态（异常被批任务收成 warning，人看不见）。
+        所以这里刻意不 `try/except`：让它炸，炸出来就是红色的。
+        """
+        from apps.regime.models import (
+            ActorKind,
+            MechanismKind,
+            MechanismMode,
+            RegimeMechanismSwitch,
+        )
+        from apps.strategy_factory.status import ALLOWED_TRANSITIONS
+
+        illegal: list[str] = []
+        combinations = 0
+
+        for tier in (MechanismMode.SHADOW, MechanismMode.EXECUTING):
+            # 档位写**流水行**：与 `_open_regime_gate()` 同一条纪律（打桩读取等于把被测
+            # 的那处换算一起换掉）。每个组合一条流水，读的是最后一行。
+            RegimeMechanismSwitch.objects.create(
+                kind=MechanismKind.REGIME_GATE.value,
+                from_mode=MechanismMode.SHADOW.value,
+                to_mode=tier.value,
+                at=FIXED_NOW - timedelta(days=1),
+                actor_kind=ActorKind.CLI.value,
+                actor_name="ops",
+                reason="测试：#52 落点穷举",
+            )
+            for from_status, layer, outcomes in (
+                (StrategyCandidateStatus.OOS_RUNNING, "oos", self.OOS_OUTCOMES),
+                (StrategyCandidateStatus.PAPER_RUNNING, "paper", self.PAPER_OUTCOMES),
+            ):
+                for outcome_name, evidence in outcomes.items():
+                    for regime_name, regime in self.REGIMES.items():
+                        combinations += 1
+                        tag = f"{tier.value}_{from_status.value}_{outcome_name}_{regime_name}"
+                        candidate = self._held(
+                            tag=tag, from_status=from_status, layer=layer
+                        )
+                        deps = AdvanceDeps(
+                            resolve_run_context=lambda c: _ctx(),
+                            start_in_sample=lambda c, ctx, plan: {},
+                            read_in_sample=lambda c: None,
+                            start_oos=lambda c, ctx, plan, rid: {},
+                            read_oos=lambda c, _e=evidence: (
+                                _e if layer == "oos" else None
+                            ),
+                            create_paper_session=lambda c: None,
+                            read_paper=lambda c, _e=evidence: (
+                                _e if layer == "paper" else None
+                            ),
+                            read_regime=lambda c, _r=regime: _r,
+                            notify=lambda c, m: True,
+                            now=lambda: FIXED_NOW,
+                        )
+
+                        out = advance(candidate, deps=deps)
+
+                        if out.to_status is out.from_status:
+                            continue
+                        if out.to_status not in ALLOWED_TRANSITIONS[out.from_status]:
+                            illegal.append(
+                                f"{tag}: {out.from_status.value} → {out.to_status.value}"
+                                f"（{out.reason_code.value}）"
+                            )
+
+        assert combinations == 2 * (
+            len(self.OOS_OUTCOMES) + len(self.PAPER_OUTCOMES)
+        ) * len(self.REGIMES)
+        assert illegal == [], "从 regime_hold 出发出现了非法边：" + "\n".join(illegal)
+
+
+def test_the_non_promotion_set_only_holds_stopping_codes():
+    """`_REGIME_NON_PROMOTION_REASONS` **只收「结论本来就是停住」的码**（#52 附带清理）。
+
+    这一条不是重复上面的用例：上面验的是**行为**（落点与原因码），这一条验的是**集合
+    的语义**——一个名字里写着「不是升档」的集合，如果住进一个失败码
+    （`paper_observation_incomplete` 对应的结论是 `PAPER_FAILED`），行为可能仍然正确
+    （它落 `came_from`，与失败那支的落点相同），但读代码的人只能靠翻判定层才发现
+    「这里收了一个失败码」。
+
+    判据取**判定层的实际结论**（`evaluate_candidate` 产出的 `next_status`），不是再抄
+    一份状态名清单：抄一份就成了第二个真相，而这张表本来就该跟着判定层走。
+    """
+    from apps.strategy_factory.evaluate import (
+        CandidateEvidence,
+        PaperEvidence,
+        evaluate_candidate,
+    )
+    from apps.strategy_factory.orchestrator import _REGIME_NON_PROMOTION_REASONS
+
+    #: 每个码对应的**一份真实证据**：光给原因码无法让判定层产出它，必须给能触发它的
+    #: 那一份输入。这样这条用例同时也钉住「这个码是从哪条判定路径出来的」。
+    evidence_by_code = {
+        ReasonCode.OOS_PENDING: CandidateEvidence(
+            status=StrategyCandidateStatus.OOS_RUNNING, oos=None
+        ),
+        ReasonCode.PAPER_OBSERVING: CandidateEvidence(
+            status=StrategyCandidateStatus.PAPER_RUNNING, paper=None
+        ),
+        ReasonCode.PAPER_OBSERVATION_INCOMPLETE: CandidateEvidence(
+            status=StrategyCandidateStatus.PAPER_RUNNING,
+            paper=PaperEvidence(
+                wall_clock_days=3.0,
+                running_days=3.0,
+                closed_trades=40,
+                return_pct=5.0,
+                risk_hits=0,
+                session_ended=True,
+            ),
+        ),
+    }
+
+    for code in _REGIME_NON_PROMOTION_REASONS:
+        assert code in evidence_by_code, f"新码 {code} 没有对应的证据夹具，补一条再进来"
+        verdict = evaluate_candidate(evidence_by_code[code])
+        assert verdict.reason_code is code, (
+            f"{code} 的夹具产出的其实是 {verdict.reason_code}，这条用例验错了码"
+        )
+        assert verdict.next_status is not StrategyCandidateStatus.OOS_FAILED
+        assert verdict.next_status is not StrategyCandidateStatus.PAPER_FAILED, (
+            f"{code} 的结论是 {verdict.next_status.value}——失败码不该住在"
+            "「尚未升档」这个集合里（#52）"
+        )

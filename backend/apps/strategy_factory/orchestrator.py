@@ -881,21 +881,55 @@ def _regime_hold_verdict(fresh: StrategyCandidate, deps: AdvanceDeps) -> Verdict
     if inner.reason_code in _REGIME_NON_PROMOTION_REASONS:
         return replace(inner, next_status=came_from)
 
-    # 那一层判了「不行」（回测失败 / 衰减超标 / 风控命中……）：**原样返回**，不退回。
-    # 一个被行情拦下过的候选，回来时仍然要照同一把尺量；闸门不该替它把一次
-    # 不合格洗成一次停住。
-    return inner
+    # ── 剩下两种情形共用这一个出口，必须先分开（票 #52）─────────────────────── #
+    #
+    # **这一条不能省，也不能挪到后面**：`_oos_verdict` / `_paper_running_step` 内部
+    # 自己就接了一遍行情闸门（`_apply_regime_gate`），所以「行情还没翻」时它们返回的
+    # 结论同样是 `REGIME_HOLD`。于是「那一层判了不行」与「闸门这一轮还是不行」在此
+    # **落到同一行 return 上**，而两者的正确动作相反：
+    #
+    #   * 还是持有 → 不动（自环不是边；动了会让候选每 5 分钟被弹回来处再弹回去，
+    #     行情没翻的整个持有期都在震荡，每轮还多一条审计记录）；
+    #   * 判了不行 → 退回 `came_from`，把失败码带回去让它下一轮自己落 `*_failed`。
+    #
+    # 判据取 `inner.next_status`（结论要落到哪一格）而不是枚举原因码：`ReasonCode`
+    # 是开放集合（每加一个失败签名都要回来改表，而漏改的表现正是本票要修的那种非法
+    # 边），而「结论是 `REGIME_HOLD`」在判定层已经是一个封闭事实。
+    if inner.next_status is StrategyCandidateStatus.REGIME_HOLD:
+        return inner
+
+    # 那一层判了「不行」（回测失败 / 衰减超标 / 风控命中……）：**原路退回它进来的
+    # 那一层**，结论（失败原因码 + 依据数字）原封不动带回去。下一轮由那一层照同一把
+    # 尺再量一次，把它判去 `oos_failed` / `paper_failed`。
+    #
+    # 为什么不是「原样返回」（本票修的就是这个）：`REGIME_HOLD` 的合法出边只有
+    # `oos_running` / `paper_running` / `cancelled` / `rejected`（`status.py` 那张
+    # 穷举表），原样返回一个 `oos_failed` / `paper_failed` 会在 `_persist_step` 写状态
+    # 那一步抛 `InvalidTransitionError`——**整步事务回滚**，失败码、行情依据、转移记录
+    # 一样都不落；批任务把它收成一条 warning，候选永远停在 `regime_hold`，而它在
+    # 页面上与「行情还没翻」一模一样。
+    #
+    # 代价说清楚：这次「判了不合格」晚一轮落库、多一条审计记录。这是既有纪律的直接
+    # 后果——`status.py` 明写「`regime_hold` 没有去 `*_failed` 的边：暂停不是判定」。
+    # 换来的是状态机形状不变（转移表 / 自校验 / 196 对穷举用例零改动）。
+    return replace(inner, next_status=came_from)
 
 
 #: `regime_hold` 的来处那一层「还没过、但也不是失败」的结论：停住类。这些结论下
 #: 候选回到来处，并且**带着自己的原因码**（`oos_pending` / `paper_observing` 等）——
 #: 所以不能走「强行升档」那条路（那会伪造一次通过），也不能留在 `regime_hold`
 #: （那会把它这一轮的证据丢掉）。
+#:
+#: **只收「结论本来就是停住」的码**（票 #52 之前这里多收了一个
+#: `PAPER_OBSERVATION_INCOMPLETE`，它对应的结论是 `PAPER_FAILED`——一个失败码住进
+#: 「不是失败」的集合，读代码的人只能靠翻判定层才发现）。失败码一律走上面那条
+#: 「判了不行」的出口：落点同样是 `came_from`，但它是**退回去让那一层自己重判**，
+#: 不是「这一层还在等」。这条边界由一条用例守着（断言集合里每个码的判定结论都不是
+#: `*_failed`），所以将来再有失败码被顺手塞进来会直接转红。
 _REGIME_NON_PROMOTION_REASONS = frozenset(
     {
         ReasonCode.OOS_PENDING,
         ReasonCode.PAPER_OBSERVING,
-        ReasonCode.PAPER_OBSERVATION_INCOMPLETE,
     }
 )
 
