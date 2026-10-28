@@ -74,7 +74,14 @@ def _strategy_path() -> str | None:
         repo_mirror,
     ]
     for p in candidates:
-        if p.is_file():
+        # `os.path.isfile` 而不是 `p.is_file()`（#58）：两者对「读不了的目录」行为
+        # 不同——`Path.is_file()` 会**抛 `PermissionError`**，而 `os.path.isfile`
+        # 内部吞掉 `OSError` 返回 False。CI 上 `/root` 存在但当前用户读不了，
+        # 于是前者会炸、后者安静。本文件因为是懒调用 + `pytest.skip` 兜底，
+        # 炸了也只红本文件；但「在 CI 上永远红」和「探不到就跳过」是两种命运，
+        # 该选后者。`test_volume_support_reclaim_strategy.py` 那边同样的探测曾经
+        # 在模块级调用，代价是整个 `pytest apps/` 中断。
+        if os.path.isfile(p):
             return str(p)
     return None
 
