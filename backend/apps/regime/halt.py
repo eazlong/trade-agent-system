@@ -204,6 +204,40 @@ class HaltVerdict:
         return "停止判定命中：" + "；".join(layer.text for layer in self.layers)
 
 
+def switch_mode(kind: MechanismKind) -> MechanismMode:
+    """这一档现在是哪一档。
+
+    **本函数是「此刻这条线开没开」这一类判断的唯一读口**：`switch_open`（halt 侧）与候选
+    漏斗侧（`strategy_factory.orchestrator`）都从这里读，所以两侧不可能读到两个答案——
+    而「同一档位下 halt 侧读、漏斗侧不读」正是票 #50 修掉的那个分叉。
+
+    **别把它读成字面上的「全仓唯一调用点」**：仓里另有多处 `RegimeMechanismSwitch.current(...)`
+    的调用（`gate_switch` / `mechanism_switch` / `breaker_switch` 的确认页与写路径幂等、
+    `briefing` / `report` / `regime_queries` 的回显），它们各自答的是「页面上显示什么」
+    或「这条命令要不要写一行流水」，**不答「此刻哪条线在拦」**。本函数的管辖范围是后者
+    这一类判断，不是 `current()` 的所有调用方。
+
+    **收 `kind` 而不是收触发源**：`switch_open` 手里是 `HaltTrigger`（要先按
+    `HALT_TRIGGER_SWITCH` 换一次），而候选漏斗那一侧手里直接就是 `MechanismKind`。两个
+    入口共用下面同一处读，而不是让漏斗侧自己去 `RegimeMechanismSwitch.current(...)`。
+    """
+    return RegimeMechanismSwitch.current(kind)
+
+
+def is_open_mode(mode: MechanismMode) -> bool:
+    """这个档位算「打开」吗。
+
+    **本仓「哪一档算开」这条判据的唯一定义处**：`switch_open` 与候选漏斗侧都比对这一个
+    函数的结果，谁都不自己写 `is MechanismMode.EXECUTING`——写第二遍的人，会在将来多一档
+    （如「只拦订单不拦候选」）时安静地把它读成「关」，而它们各自看都是对的。
+
+    同样**不是字面上的「全仓唯一比较点」**：`gate_switch` / `briefing` / `mechanism_switch`
+    / `event_breaker` 另有几处 `is MechanismMode.EXECUTING`（确认页与写路径幂等、回显），
+    那些比较答的是「这个页面/这条命令处在什么档」，不参与「哪条线在拦」的判定。
+    """
+    return mode is MechanismMode.EXECUTING
+
+
 def switch_open(
     trigger: HaltTrigger, cache: dict[MechanismKind, bool] | None = None
 ) -> bool:
@@ -216,6 +250,11 @@ def switch_open(
     注释），第二个答案
     分叉的表现就是保命档被某个「默认关」的开关关掉——那正是注释里说要避免的事。
 
+    **「档位怎么读」与「哪一档算开」都不在本函数里**：它们分别是 `switch_mode` 与
+    `is_open_mode`（各自唯一一处）。本函数只做「触发源 → `kind`」这一跳，再交给那两个。
+    自己在这里写一遍 `is MechanismMode.EXECUTING` 就是给「哪一档算开」造第二个答案——
+    而那正是候选漏斗接档位时（票 #50）被发现的分叉形态：同一档位下，halt 侧读、漏斗侧不读。
+
     ``cache`` 是可选的一次求值内共享缓存（按 ``kind`` 缓存）。**不要**在这里做模块级缓存：
     那一层会变成进程内的开关快照，见模块 docstring 第 3 条（声明与开关都必须现读）。
     """
@@ -224,7 +263,7 @@ def switch_open(
         return True
     cache = {} if cache is None else cache
     if kind not in cache:
-        cache[kind] = RegimeMechanismSwitch.current(kind) is MechanismMode.EXECUTING
+        cache[kind] = is_open_mode(switch_mode(kind))
     return cache[kind]
 
 

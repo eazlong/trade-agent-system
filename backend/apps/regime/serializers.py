@@ -270,30 +270,51 @@ def switch_payload(
     `never_switched` 是给前端的一个**布尔**，不是一句文案：「从未切换过」怎么排版属于
     前端，而「有没有切换过」是数据。
 
-    `note` 是**这一档的常驻说明**，只有机制整体那一档有（`mechanism_switch` 的
-    `NOT_EXECUTION_SWITCH`）：那句话说的是「出 Shadow 只是留一条记录」，它必须与确认页
-    正文、slash 回执同一处字面量，否则改词时会漏掉一份。前端原样显示，一个字不改。
+    `note` 是**这一档的常驻说明**，由 `_kind_notes()` 一处给出：机制整体那一档说的是
+    「出 Shadow 只是留一条记录」（`mechanism_switch.NOT_EXECUTION_SWITCH`），行情阶段 gate
+    那一档说的是「本档是执行开关、辖制哪三条动作线」（`gate_switch.GATE_SCOPE_NOTE`）。
+    **两句方向相反、两句都必须在**（#50）：一句防「以为机制上线了」，一句防「以为只留个
+    记录」。两句的字面量各自只有一个出处（那两个模块），前端在卡片常驻 / 确认弹窗 / 切换
+    结果三处渲染的都是**这一个** `note` 字段，一个字不改写；机制整体那一句另外还被确认页
+    正文与 chat 回执引用（`regime_commands._mech_exit`），所以它更不能在前端或本文件里再抄
+    一遍。`EVENT_BREAKER` 那一档仍然没有 `note`——它只辖一条线，在它卡片上补一句「本档
+    辖制什么」是一句废话。前端原样显示，一个字不改。
 
     **它是卡片说明，不是这次动作的回执**：回执（翻没翻、从哪到哪）在 `switch/` 的响应里。
-    把它放在这里而不是每次切换回一次，是因为「这一档不是执行开关」在切换**之前**就要被
-    读到——人得先知道按下去会发生什么，再决定按不按。
+    把它放在这里而不是每次切换回一次，是因为「这一档按下去会发生什么」在切换**之前**就要
+    被读到——人得先知道按下去会发生什么，再决定按不按。
     """
-    # 延迟 import：`mechanism_switch` 会拖进 config / 事件日历 / 日报那一串模块，而本文件
-    # 被几乎所有 regime 用例 import（包括只测池化表的那些）。与 `_stale_limit()` 里延迟
-    # import `pool_rebuild` 同一条理由。
-    from apps.regime import mechanism_switch
-
+    # 延迟 import：`mechanism_switch` / `gate_switch` 各自会拖进 config / 事件日历 / 日报
+    # 那一串模块，而本文件被几乎所有 regime 用例 import（包括只测池化表的那些）。与
+    # `_stale_limit()` 里延迟 import `pool_rebuild` 同一条理由。`gate_switch` 在 `views`
+    # 的 `FLIP_SOURCES` 里已经是模块级 import，所以这里不多出一次冷启动代价。
     mode = _mode_of(latest)
     return {
         "kind": kind_payload(kind),
         "mode": mode_payload(mode),
         "latest": None if latest is None else _switch_row(latest),
         "never_switched": latest is None,
-        "note": (
-            mechanism_switch.NOT_EXECUTION_SWITCH
-            if kind is MechanismKind.MECHANISM
-            else None
-        ),
+        "note": _kind_notes().get(kind),
+    }
+
+
+def _kind_notes() -> Mapping[MechanismKind, str]:
+    """各档的常驻说明。**只有真有话说的档才在这张表里**。
+
+    两个键，两句话方向相反，缺任何一个都会让人按错：#50 之前 REGIME_GATE 那一档没有
+    `note`，于是卡片上只剩「Shadow（只记录，不执行）」——而那一档辖下的候选漏斗当时
+    正在拦人，这就是一句没有对手方的假话。（`EVENT_BREAKER` 至今不在表里：它只辖一条线，
+    在它卡片上写「本档辖制什么」是废话。）
+
+    字面量**不在本函数里写**：它属于那两个模块各自（`mechanism_switch` / `gate_switch`）。
+    在那两处，同一句话还要被别的读面引（机制整体那句已经被确认页正文与 chat 回执引着），
+    而抄一份到本文件就是给「同一件事两个说法」开店。
+    """
+    from apps.regime import gate_switch, mechanism_switch
+
+    return {
+        MechanismKind.MECHANISM: mechanism_switch.NOT_EXECUTION_SWITCH,
+        MechanismKind.REGIME_GATE: gate_switch.GATE_SCOPE_NOTE,
     }
 
 
