@@ -35,6 +35,20 @@ jobs:
           ruff check apps/
 
       - name: Type Check
+        # **已知允许漂**：`continue-on-error` 是刻意的，不是忘了删。
+        #
+        # 现状是 `apps/` 下有大量 pyright 报错，绝大多数属于同一类误报——Django 的模型
+        # 管理器与字段在无 stub 时被读成 `type[X]` / `JSONField`
+        # （`Cannot access attribute "objects"`、`Cannot access attribute "get" for class
+        # "JSONField"` 一类）。把它们一次性清干净需要引入 django-stubs 并重跑全仓，那是
+        # 一张独立的票，不该混进「把全量测试门打开」这件事里（#55）。
+        #
+        # 所以这条目前的定位是**信号而不是门**：它照样跑、照样把真实报错打进日志，但不
+        # 拦合并。判断「某次改动有没有引入新错误」的方式是与基线对比（错误**种类**去
+        # 行号、去字面量后对比），而不是看这个 step 红不红。
+        #
+        # 要把它变成硬门的票必须同时做三件事：装 django-stubs、把既有误报清到零或写进
+        # `pyrightconfig.json` 的忽略项、去掉这个标记。缺一件都会让门变成噪音。
         continue-on-error: true
         run: |
           cd backend
@@ -59,9 +73,14 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Run DST Tests
+        # `FERNET_KEY` 与 `full-tests` 同一理由、同一个固定测试值：pytest 一进来就会
+        # 经 conftest → `core.settings.test` → `base.py` 读到它，缺了在 import 期就抛。
+        # 这一次它还没咬人只是因为下面的目录当前不存在（见 `|| echo` 那条），一旦有人
+        # 把 DST 用例加进来，这个作业会复刻 #55 的失败形态。
         env:
           SIMULATION_MODE: "True"
-          DJANGO_SETTINGS_MODULE: core.settings.dev
+          DJANGO_SETTINGS_MODULE: core.settings.test
+          FERNET_KEY: qUnBCWUSE-vtGZuw6RhCNFAEft8glcswaGnIcvsWohE=
         run: |
           cd backend
           pytest apps/trading/tests/dst/ -v || echo "DST tests need implementation"
@@ -109,8 +128,24 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Run Tests with Coverage
+        # `FERNET_KEY` 是 `core/settings/base.py` 的**硬要求**（缺了就在 settings import
+        # 期抛 `ImproperlyConfigured`，pytest 连收集都开始不了）。它之前一直缺，于是
+        # 这个作业从建仓起 59 次全红、一次 pytest 都没跑起来过（#55）。
+        #
+        # 取值是**固定的测试用密钥**，不是仓库 secret：
+        # - 它只用于加密字段的往返（`ExchangeAccount.api_key_enc` 一类），测试库是临时
+        #   sqlite、每次会话重建，密钥本身没有任何秘密价值；
+        # - 用 `secrets.*` 会让 **fork 提交的 PR 永远红**（外部仓库拿不到 secret），
+        #   而那正是最需要这道门的人群；
+        # - 固定值可复现、可 diff，不会变成「本地能过 CI 不过」的又一个来源。
+        #
+        # `DJANGO_SETTINGS_MODULE` 用 `core.settings.test` 而不是 `dev`：仓库的
+        # `backend/conftest.py` 本来就会把它**强制**改写成 `test`（见该文件头部注释），
+        # 所以这里传 `dev` 只是让「CI 说的是什么」与「实际跑的是什么」不一致。现在两处
+        # 说的是同一个值，读日志的人不必再去 conftest 里找答案。
         env:
-          DJANGO_SETTINGS_MODULE: core.settings.dev
+          DJANGO_SETTINGS_MODULE: core.settings.test
+          FERNET_KEY: qUnBCWUSE-vtGZuw6RhCNFAEft8glcswaGnIcvsWohE=
         run: |
           cd backend
           pytest apps/ --cov=apps --cov-report=xml --cov-report=term-missing
