@@ -26,6 +26,7 @@ DB 用例用真事务回滚的 `TestCase`（与 `test_slicing.py` 同形），�
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -1157,17 +1158,46 @@ class TestRecomputeCommand(_StubbedConnectionReset, _BacktestFixture):
 
 
 class TestBacktestSavePathWiring(TestCase):
-    """`apps/backtest/tasks.py` 两次 dispatch 的接线（spec #30 D11 的那两行）。"""
+    """`apps/backtest/tasks.py` 三处 dispatch 的接线（spec #30 D11；#54 按函数重新校准）。
 
-    def test_run_backtest_dispatches_capital_efficiency(self):
-        """源码级断言：接线被删掉时它会红，而运行整条 `run_backtest_task` 要起交易所。
+    ## 为什么不数个数
 
-        读的是**真实源文件**而不是 import 进来的对象——那两个调用点就是本票在回测 app
-        里的全部改动，少任何一个都会静默地「回测跑完了、效率永远算不出来」。
-        """
+    本类原来断言「`dispatch_capital_efficiency([` 出现 2 次」与「import 出现 2 次」。
+    第二种在 b088ffb 加了第 3 处（网格搜索**部分结果**收尾）之后转红；第一种则一直是
+    **假绿**——它数的是带方括号的调用，而 `_finalize_partial_grid` 那一处传的是
+    `result_ids` 变量（没有方括号），于是「少一处真接线」也能让计数刚好回到 2。
+
+    实测过（干净 worktree，删掉那处 import + dispatch、保留 `try/except` 结构）：
+    `TestBacktestSavePathWiring` **四条全绿**，而真实后果是「网格搜索超时/异常时的
+    部分结果永远不算资金效率」。
+
+    所以判据改成**按函数名逐个断言**：三个收尾点各一次，一个都不许少、也不许多。
+    函数用 AST 定位（`ast.FunctionDef.lineno/end_lineno`），不靠字符串切分、不靠行号常量
+    ——重命名会立刻转红，注释里出现同名也不会误判。
+    """
+
+    #: 三个收尾点，各自的位置不同、理由不同，所以要逐个点名：
+    #:
+    #: * `run_backtest_task`：单条回测跑完，投这一个结果；
+    #: * `run_grid_search_task`：网格搜索**成功**收尾，循环外一次性投整批（不逐组合投：
+    #:   那个循环带 7200 秒硬超时，逐组合多背 200 次 broker 往返）；
+    #: * `_finalize_partial_grid`：网格搜索**超时/异常**收尾，把已经产出的那批也投出去
+    #:   ——漏了它，部分结果就永远不算资金效率，而那恰恰是最需要看效率的场景。
+    TAILS = ("run_backtest_task", "run_grid_search_task", "_finalize_partial_grid")
+
+    def test_every_tail_dispatches_exactly_once(self):
+        """三个收尾点**各**投一次。删掉任何一处都必须转红。"""
         source = _backtest_tasks_source()
+        tree = ast.parse(source)
 
-        assert source.count("dispatch_capital_efficiency([") == 2
+        missing: list[str] = []
+        for name in self.TAILS:
+            body = _function_source(source, tree, name)
+            calls = body.count("dispatch_capital_efficiency(")
+            if calls != 1:
+                missing.append(f"{name}: {calls} 处调用")
+
+        assert missing == [], "收尾点的资金效率投递不是各一次：" + "；".join(missing)
 
     def test_the_dispatch_import_stays_inside_the_function(self):
         """**这一条防的是一类真故障**：`celery_app.py:22` 先 import `apps.backtest.tasks`，
@@ -1177,26 +1207,42 @@ class TestBacktestSavePathWiring(TestCase):
         （`ImportError: partially initialized module`），**整个 Django 起不来**。
         `dispatch_slice` 那条边能放在顶部只是导入顺序的巧合（`celery_app.py:27` 排在
         22 之后），不是一条可以照抄的许可。
+
+        判据用**模块级 import 的模块名集合**（AST），而不是「顶部文本里有没有这句话」：
+        后者会被注释、docstring、以及「在函数 A 里出现过就先命中」这三件事模糊掉。
         """
         source = _backtest_tasks_source()
-        header = source.split("def run_backtest_task")[0]
+        tree = ast.parse(source)
 
-        assert "from apps.strategy_factory.tasks import" not in header
-        assert source.count("from apps.strategy_factory.tasks import") == 2
+        module_level = _module_level_import_modules(tree)
 
-    def test_the_two_call_sites_are_the_backtest_and_grid_search_tails(self):
+        assert "apps.strategy_factory.tasks" not in module_level, (
+            "`apps.strategy_factory.tasks` 不许在模块顶部 import（循环导入会让 Django 起不来）"
+        )
+        # 每个收尾点自己那条 import 仍然要留着（不然 `dispatch_capital_efficiency`
+        # 这个名字在函数里没有来处，运行期才炸 NameError）。
+        for name in self.TAILS:
+            body = _function_source(source, tree, name)
+            assert "from apps.strategy_factory.tasks import" in body, (
+                f"{name} 里缺少 `dispatch_capital_efficiency` 的函数内 import"
+            )
+
+    def test_the_three_tails_carry_the_right_payloads(self):
+        """三处投的载荷各不相同，各按自己的形状断言（合并成一个「有调用」会掩盖投错）。"""
         source = _backtest_tasks_source()
-        lines = source.splitlines()
+        tree = ast.parse(source)
 
-        call_lines = [
-            index
-            for index, line in enumerate(lines)
-            if "dispatch_capital_efficiency([" in line
-        ]
-        assert len(call_lines) == 2
-        # 一处收单个结果、一处在循环结束后收整批。
-        assert 'stats.get("result_id")' in lines[call_lines[0]]
-        assert 'r.get("result_id") for r in results' in lines[call_lines[1]]
+        backtest = _function_source(source, tree, "run_backtest_task")
+        assert 'dispatch_capital_efficiency([stats.get("result_id")])' in backtest
+
+        grid_success = _function_source(source, tree, "run_grid_search_task")
+        assert (
+            'dispatch_capital_efficiency([r.get("result_id") for r in results])'
+            in grid_success
+        )
+
+        partial = _function_source(source, tree, "_finalize_partial_grid")
+        assert "dispatch_capital_efficiency(result_ids)" in partial
 
     def test_the_dispatches_are_next_to_each_other(self):
         """两条附加产物并排投：一个失败不影响另一个，读的人也不必去别处找。"""
@@ -1214,6 +1260,109 @@ def _backtest_tasks_source() -> str:
     return Path(module.__file__).read_text(encoding="utf-8")
 
 
+def _function_source(source: str, tree: ast.Module, name: str) -> str:
+    """按 AST 取出一个模块级函数/方法的**源码片段**（含装饰器之后的 `def` 到函数结束）。
+
+    不用 `source.split("def <name>")`：那样在「注释里提到同名函数」或「先出现的
+    `def` 是另一个名字的前缀」时会切错，而切错的片段仍然能跑断言——于是守卫会在错误的
+    范围上绿。AST 给的是语法结构上的那个函数，没有歧义。
+
+    找不到就 `KeyError`（Fail Loud）：要点名的函数被改名/删掉，本来就应该让用例炸出来，
+    而不是安静地断言一个空字符串。
+    """
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            lines = source.splitlines()
+            return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    raise KeyError(f"`apps/backtest/tasks.py` 里找不到模块级函数 {name}")
+
+
+def _module_level_import_modules(tree: ast.Module) -> set[str]:
+    """模块**顶层** import 到的模块名集合（`from a.b import c` → `a.b`，`import a.b` → `a.b`）。
+
+    只看 `tree.body`：函数体内的 import 不进这个集合——那正是本类要区分的东西。
+    """
+    modules: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+    return modules
+
+
+def _identifiers(node: ast.AST) -> set[str]:
+    """一个 AST 子树里出现过的**标识符**：名字、属性名、关键字参数名、形参名、import 名。
+
+    「标识符」而不是「源码子串」——`capital_efficiency` 出现在注释或 docstring 里不算
+    「引用了它」，出现在 `x.capital_efficiency` / `from ... import capital_efficiency`
+    里才算。这个区别正是 #54 那两条误报的来源。
+    """
+    found: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            found.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            found.add(child.attr)
+        elif isinstance(child, ast.keyword) and child.arg:
+            found.add(child.arg)
+        elif isinstance(child, ast.arg):
+            found.add(child.arg)
+        elif isinstance(child, ast.ImportFrom):
+            if child.module:
+                found.add(child.module)
+            found.update(alias.name for alias in child.names)
+        elif isinstance(child, ast.Import):
+            found.update(alias.name for alias in child.names)
+    return found
+
+
+def _function_node(tree: ast.Module, name: str) -> ast.AST:
+    """按名字取模块级函数/方法的 AST 节点（找不到就 `KeyError`，与 `_function_source` 同纪律）。"""
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            return node
+    raise KeyError(f"找不到模块级函数 {name}")
+
+
+def _assigns_attribute(function: ast.AST, attribute: str) -> bool:
+    """`function` 里有没有 `obj.<attribute> = ...` 这样的**赋值目标**。
+
+    刻意**不**用 `"<attribute>" in <源码>`：注释、docstring、日志文案里的同一个词会让
+    「删掉这行写入」这件事看不出来。本文件对这个区别做过变异实测：子串版在写入被删掉
+    之后仍然绿（注释里还剩 8 个 `metrics`）。
+    """
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr == attribute:
+                    return True
+    return False
+
+
+def _passes_keyword(function: ast.AST, keyword_name: str) -> bool:
+    """`function` 里有没有调用把 `keyword_name=` 作为关键字实参传出去（`create(...)` 那条路）。"""
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call) and any(
+            keyword.arg == keyword_name for keyword in node.keywords
+        ):
+            return True
+    return False
+
+
+def _class_node(tree: ast.Module, name: str) -> ast.ClassDef:
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise KeyError(f"`apps/strategy_engine/backtest_mode.py` 里找不到类 {name}")
+
+
 class TestEngineUntouched(TestCase):
     """验收条目：**`BacktestEngine` 一行未动**。
 
@@ -1221,24 +1370,78 @@ class TestEngineUntouched(TestCase):
     东西：文件的（内容）哈希稳定性要靠 diff 证明，测试能证明的是**引擎不 import 本票
     的任何东西**——它一旦反过来依赖资金效率，本票就不再是「消费已落库的结果」，
     而成了「回测引擎的第二个职责」。
+
+    ## #54：判据从「整个文件」收窄到「类体」
+
+    原来这两条读的是 `backtest_mode.py` **全文**，而那个文件里既有被守的 `BacktestEngine`，
+    也有 `trade_quality_metrics()` 与 `save_backtest_result()`——**后者就是「保存路径」，
+    本来就该写 `metrics`**（ea66db6 加的，是对的）。于是「文件级 `not in`」把正当代码
+    当成了违规，两条从此常年红。
+
+    现在判据是 **`BacktestEngine` 类体里的标识符**：意图一个字没变（引擎不许反向依赖
+    资金效率层、不许自己写 `metrics`），范围对准实现。往类体里加一句 `self.x = "metrics"`
+    或一个 `capital_efficiency` 引用会立刻转红；写在类体**之外**保持绿——那是保存路径的
+    正当位置，也正是当前误报的形态。
     """
 
-    def test_the_engine_does_not_import_the_capital_efficiency_layer(self):
+    def _engine_source(self) -> str:
         from pathlib import Path
 
         from apps.strategy_engine import backtest_mode
 
-        source = Path(backtest_mode.__file__).read_text(encoding="utf-8")
+        return Path(backtest_mode.__file__).read_text(encoding="utf-8")
 
-        assert "capital_efficiency" not in source
-        assert "strategy_factory" not in source
+    def test_the_engine_does_not_import_the_capital_efficiency_layer(self):
+        """引擎不引用资金效率层，也不反向依赖整个候选漏斗。"""
+        tree = ast.parse(self._engine_source())
+        identifiers = _identifiers(_class_node(tree, "BacktestEngine"))
+
+        assert not [i for i in identifiers if "capital_efficiency" in i], (
+            "`BacktestEngine` 类体里出现了资金效率层的引用（它只该消费已落库的结果）"
+        )
+        assert not [i for i in identifiers if "strategy_factory" in i], (
+            "`BacktestEngine` 类体里出现了候选漏斗的引用"
+        )
 
     def test_the_engine_does_not_write_metrics(self):
         """引擎返回 `stats` 字典就结束；写 `metrics` 是保存路径的事（本票也只在投递侧）。"""
-        from pathlib import Path
+        tree = ast.parse(self._engine_source())
+        identifiers = _identifiers(_class_node(tree, "BacktestEngine"))
 
-        from apps.strategy_engine import backtest_mode
+        assert not [i for i in identifiers if "metrics" in i], (
+            "`BacktestEngine` 类体里出现了 `metrics`（写库是 `save_backtest_result` 的事）"
+        )
 
-        source = Path(backtest_mode.__file__).read_text(encoding="utf-8")
+    def test_the_metrics_write_still_lives_in_the_save_path(self):
+        """反向的一条：收窄范围不许顺手把「保存路径确实写 metrics」这件事也丢掉。
 
-        assert "metrics" not in source
+        没有这一条，「引擎不写 metrics」可以用「谁都不写 metrics」来满足——那时前端
+        `metrics.profit_factor` 会静默变成空，而上面两条全绿。
+
+        **判据必须是结构而不是子串**：本文件刚为这件事踩过一次——第一版这里写的是
+        `"metrics" in save_fn`，把写入真的删掉之后它**照样绿**，因为注释里还有 8 个
+        `metrics`。所以这里找的是两种**语法形态**：`X.metrics = ...` 的赋值目标，
+        或调用里的 `metrics=` 关键字实参。两者都是「真的在写这一列」的形状。
+        """
+        tree = ast.parse(self._engine_source())
+        assert "metrics" not in _identifiers(_class_node(tree, "BacktestEngine"))
+
+        save_fn = _function_node(tree, "save_backtest_result")
+        # **两条写入路径分别断言**，不是「至少有一处」。它们各管一种情形，坏一条
+        # 就是一类静默故障：
+        #
+        #  * `obj.metrics = ...`（更新已有行）——少了它，重跑一条回测不会刷新指标；
+        #  * `create(metrics=...)`（新建行）——少了它，**第一次**落库的记录就没有
+        #    `metrics`，前端 `metrics.profit_factor` 一直是空。
+        #
+        # 实测过：只按「有任意一处」断言时，删掉新建那一路仍然全绿——那正是本类
+        # 一开始要修的那种假绿。代价是将来若把两条路径合并成 `update_or_create`，
+        # 这条会转红；那是**有意的**提醒（合并时得确认新路径两条情形都覆盖）。
+        assert _assigns_attribute(save_fn, "metrics"), (
+            "`save_backtest_result` 的**更新路径**没有写 `metrics`（`obj.metrics = ...`）"
+            "——重跑回测不会刷新指标"
+        )
+        assert _passes_keyword(save_fn, "metrics"), (
+            "`save_backtest_result` 的**新建路径**没有把 `metrics=` 交给 ORM"
+            "——首次落库的记录前端 `metrics.profit_factor` 一直是空"
+        )

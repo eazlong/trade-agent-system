@@ -228,13 +228,18 @@ class TestColdStart(_Fixture):
                 self.assertIsNone(row["latest"])
                 self.assertTrue(row["never_switched"])
 
-    def test_only_the_mechanism_card_carries_the_not_an_execution_switch_note(self):
-        """P5 #49：档位卡片上那句「出 Shadow 只是留一条记录」必须来自后端，且只有机制
-        整体那一档有它。
+    def test_card_notes_say_which_tier_blocks_what(self):
+        """P5 #49 + #50：档位卡片上的常驻说明必须来自后端，且**两句话各自在它该在的档上**。
 
-        断言的是**同一个常量**（`mechanism_switch.NOT_EXECUTION_SWITCH`）而不是抄一遍
-        句子：抄一遍之后，改词时用例照样绿、页面却还是旧话。另两个开关没有这句——它们
-        才是真正拦人的那两个，在它们的卡片上写「不是执行开关」是一句反话。
+        两句方向相反、缺一不可：「出 Shadow 只是留一条记录」（机制整体那一档）与
+        「本档是执行开关，辖制这些动作」（行情阶段 gate 那一档，`#50` 补）。#50 之前
+        gate 那一档没有 `note`，卡片上只剩「Shadow（只记录，不执行）」，而那一档辖下的
+        候选漏斗当时正在拦人——一句没有对手方的假话。
+
+        断言的是**同一个常量**（`mechanism_switch.NOT_EXECUTION_SWITCH` /
+        `gate_switch.GATE_SCOPE_NOTE`）而不是抄一遍句子：抄一遍之后，改词时用例照样绿、
+        页面却还是旧话。`EVENT_BREAKER` 仍然没有这句——它只辖一条线，写「本档辖制什么」
+        是废话。
         """
         notes = {
             row["kind"]["value"]: row["note"]
@@ -244,8 +249,18 @@ class TestColdStart(_Fixture):
         self.assertEqual(
             notes[MechanismKind.MECHANISM.value], mechanism_switch.NOT_EXECUTION_SWITCH
         )
+        self.assertEqual(
+            notes[MechanismKind.REGIME_GATE.value], gate_switch.GATE_SCOPE_NOTE
+        )
         self.assertIsNone(notes[MechanismKind.EVENT_BREAKER.value])
-        self.assertIsNone(notes[MechanismKind.REGIME_GATE.value])
+        # 两句话不许互相串：gate 那一档写「不是执行开关」是反话（它恰恰是总闸），
+        # 机制整体那一档写「本档辖制三条线」则是把别人的动作算到它头上。
+        self.assertNotIn("不是执行开关", gate_switch.GATE_SCOPE_NOTE)
+        self.assertNotIn(
+            "候选漏斗的行情闸门",
+            mechanism_switch.NOT_EXECUTION_SWITCH,
+            "那一档不辖制候选漏斗——把三条线写在它头上就是把别人的动作算到它头上",
+        )
 
     def test_pool_returns_no_cells_without_an_error(self):
         resp = self.pool()

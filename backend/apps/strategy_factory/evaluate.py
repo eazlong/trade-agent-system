@@ -115,7 +115,7 @@ class ReasonCode(str, Enum):
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
     # -- 行情闸门（spec #30 D1，跨 L2/L3 两个升档点） ---------------------- #
-    #: 三个码都来自同一次行情判定，但**结论的落点不同**，所以必须分成三个而不是
+    #: 四个码都来自同一次行情判定，但**结论的落点不同**，所以必须分成四个而不是
     #: 一个带参数的 `regime_*`：
     #:
     #: - `REGIME_UNFIT` → 停进 `regime_hold`。行情状态明确判为「不适用」，这是
@@ -129,9 +129,18 @@ class ReasonCode(str, Enum):
     #:   刻意**不**做成 `REGIME_UNFIT` 的反义（如 `regime_fit`）：豁免放行与「行情
     #:   本来就适用」是两件不同的事，合并之后「有多少候选是靠豁免过去的」就统计不
     #:   出来了。所以它的 `next_status` 与被豁免的那一步的正常升档目标一致。
+    #: - `REGIME_SHADOW` → **不拦人**：`REGIME_GATE` 这一档此刻是 `Shadow`，机制不对
+    #:   候选漏斗施加动作，所以判定结论**采纳但不生效**——候选照常升档（票 #50，
+    #:   方向 1）。它同样是纯留痕码，存在的唯一理由是让审计面能回答「这条当时是怎么
+    #:   过去的」，以及「有多少候选是在 Shadow 档下被放过去的」。**它与
+    #:   `REGIME_EXEMPT` 也必须分开**（人的决定 vs 档位不施加动作），更**不得**与
+    #:   「行情本来就适用」合并——合并之后这条统计就没了，而它恰恰是「Shadow 期真的
+    #:   没拦」唯一的证据。判定层自己**不读档位**（那是接线层的事，见
+    #:   `orchestrator._apply_regime_gate`）：本模块零 I/O、不碰 DB，档位不是判据的一部分。
     REGIME_UNFIT = "regime_unfit"
     REGIME_NO_EVIDENCE = "regime_no_evidence"
     REGIME_EXEMPT = "regime_exempt"
+    REGIME_SHADOW = "regime_shadow"
 
     @property
     def display(self) -> str:
@@ -169,6 +178,12 @@ _REASON_DISPLAY = {
     #: 放行口径的展示名也一样要说清是「豁免放行」而不是「行情本来就适用」：
     #: 读记录的人要能看出这一条是被人工开关放过去的。
     ReasonCode.REGIME_EXEMPT: "人工豁免在期，按放行处理（留痕）",
+    #: 档位那一支的展示名要说清「判了、但档位不让它生效」，**不能**读成「行情好转了」。
+    #: 括号里那半句与 `/regime` 卡片上 `MechanismMode.SHADOW.display` 同一个说法——
+    #: 用户在两处读到的是同一句话，而不是两套措辞。
+    ReasonCode.REGIME_SHADOW: (
+        "行情阶段 gate 档位为 Shadow（只记录，不执行）：判定不生效，按上一层结论放行（留痕）"
+    ),
 }
 
 

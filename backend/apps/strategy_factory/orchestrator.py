@@ -632,6 +632,28 @@ def _oos_verdict(
 #: 唯一两个会真的往前走的结论），而一个多字的集合在加层时会立刻需要有人决定。
 _REGIME_GATED_REASONS = frozenset({ReasonCode.OOS_PASSED, ReasonCode.PAPER_PASSED})
 
+#: 「闸门这一步放行了」的结论集合：候选停在 `regime_hold` 时，`_regime_hold_verdict` 用它
+#: 决定**把候选退回它进来的那一层**（`came_from`），让那一层照自己的尺再量一次。
+#:
+#: 为什么不直接复用上面那张：上面那张是**入口**口径（哪些码才值得去问闸门），这张是
+#: **出口**口径（闸门放行之后落到哪一格）——两者内容不同，合成一张就是「同一件事的
+#: 两个说法」的源头。三个码都在这一张里，而它们各自表示不同的来路：
+#:
+#: - `OOS_PASSED` / `PAPER_PASSED`：上一层自己判过了；
+#: - `REGIME_EXEMPT`：人按了在期豁免（spec #30 D5）；
+#: - `REGIME_SHADOW`：档位是 Shadow，机制不施加动作（票 #50）。
+#:
+#: 后两个都不是「上一层过了」，但它们的**放行语义**与前面两个完全一样：退回来处。
+#:
+#: 漏掉一个的后果是硬失败，而不是静默：`REGIME_HOLD` 的合法出边只有
+#: `oos_running` / `paper_running` / `cancelled` / `rejected`（`status.py` 那张穷举表），
+#: 所以放行结论的 `next_status`（`paper_pending` / `awaiting_live_approval`）在这里会
+#: 撞上非法边——`transition_to` 抛 `InvalidTransitionError`，这一轮被批任务记成一条
+#: warning，候选**永远停在 `regime_hold`**，而它在页面上看起来与「行情还没翻」一模一样。
+_REGIME_GATE_RELEASED_REASONS = _REGIME_GATED_REASONS | frozenset(
+    {ReasonCode.REGIME_EXEMPT, ReasonCode.REGIME_SHADOW}
+)
+
 
 def _apply_regime_gate(
     fresh: StrategyCandidate,
@@ -669,22 +691,66 @@ def _apply_regime_gate(
         # 地活着（spec：适用阶段时既有判定行为零变化）。
         return verdict
 
+    # 档位（票 #50，方向 1）：**本函数是全仓唯一一处把「候选漏斗受不受 `REGIME_GATE`
+    # 管辖」接起来的地方**。判据层（`evaluate.regime_verdict` / `apps.regime.admission`）
+    # 一个字都不改——档位不是判据的一部分，判据仍然只有一处、两个消费者共用。
+    #
+    # 延迟 import：`apps.regime` 那一串（models → halt）在本模块被启动路径拖进来时未必
+    # 可用，与 `regime/serializers.py` 里那句延迟 import 同一条理由。读档位（`switch_mode`）
+    # 与「哪一档算开」（`is_open_mode`）都走 `halt` 里那一处换算，漏斗侧**不自己写**
+    # `is MechanismMode.EXECUTING`——写了就是给「哪一档算开」造第二个答案，而本票要修的
+    # 正是这种分叉：同一档位下 halt 侧读、漏斗侧不读，于是「关一次 gate 只停了半个机制」。
+    from apps.regime import halt
+    from apps.regime.models import MechanismKind
+
+    mode = halt.switch_mode(MechanismKind.REGIME_GATE)
+    enforcing = halt.is_open_mode(mode)
+
     evidence = _read_regime_evidence(fresh, deps)
-    detail = _regime_detail(evidence)
-    if detail is not None:
-        verdict = replace(verdict, detail={**verdict.detail, **detail})
+    detail: dict[str, Any] = dict(verdict.detail)
+    regime_detail = _regime_detail(evidence)
+    if regime_detail is not None:
+        detail.update(regime_detail)
+    # **档位存档位**：`_regime_detail` 给 `None`（冷启动）时也要落。冷启动恰恰是最需要
+    # 它的时候——「当时判不了」与「当时判了不适用」都拦过候选，而「当时是哪一档」决定
+    # 了那次拦截究竟有没有生效。此前记录里**没有任何键**能回答这件事。
+    detail["mechanism_mode"] = mode.value
+    verdict = replace(verdict, detail=detail)
 
     # 采集侧给 None（冷启动：没有当代池化表、或当前没有生效阶段）→ **Hold 且原因码是
     # 「判不了」**。这正是 fail-closed：拿不到适用性结论与「结论是适用」是两件事，
     # 而 #34 的采集侧刻意用 `None` 把它们分开（合成一份中性能跑，但那样调用方再也
     # 分不开「机制没算过」与「算了、中性」）。注入的替身压根没接这个成员时同样落在
     # 这里：`deps.read_regime` 不存在是接线没做完，Fail Loud 的方向是**不放行**。
+    #
+    # 档位为 `SHADOW` 时**判据照样跑、结论照样算**，只是那个「拦」不生效——这就是
+    # 「只记录，不执行」的字面含义。所以这里**不**提前跳过判定：跳过的话依据栏会空掉，
+    # 而审计面再也分不出「机制没算过」与「算了、档位不让它生效」这两件事。
     regime_gate = evaluate_regime_verdict(fresh, evidence, resume)
     if regime_gate is None:
         return verdict
     # 闸门拦下时**沿用它给的结论**，但依据栏要合起来：既有的回测/paper 数字
     # （夏普、衰减、盈亏、风控命中）与行情那一侧（阶段、格子、豁免）都是「这一条
     # 为什么停在这里」的组成部分，只留一半的通知等于让人自己拼。
+    if regime_gate.next_status is StrategyCandidateStatus.REGIME_HOLD and not enforcing:
+        # 档位 Shadow → **降级为「记录不定论」，按上一层结论放行**（票 #50 的 Q2 拍板）。
+        # 落点 = `resume`，与豁免放行（spec #30 D5）走同一格：**「放行走哪」=「那一层的
+        # 正常升档目标」**，闸门与豁免都不自己合成一个目标。
+        #
+        # 原因码必须是**纯留痕码**而不是上一层那个升档码，也**不许**借 `REGIME_EXEMPT`：
+        # 「档位不让它生效」与「行情本来就适用」、与「人按了豁免」是三件不同的事，合并
+        # 之后「有多少候选是在 Shadow 档下被放过去的」就统计不出来了——而那正是
+        # 「Shadow 期真的没拦」唯一的证据。
+        #
+        # `regime_gate.detail`（含 `regime_hold_reason`）照样合并：那一轮判成了哪一支
+        # **必须留着**，否则这条记录读起来像「它本来就是通过的」，而这正是
+        # `REGIME_EXEMPT` 那条先例要防的形态。
+        return replace(
+            verdict,
+            next_status=resume,
+            reason_code=ReasonCode.REGIME_SHADOW,
+            detail={**verdict.detail, **regime_gate.detail},
+        )
     return replace(
         verdict,
         next_status=regime_gate.next_status,
@@ -798,9 +864,16 @@ def _regime_hold_verdict(fresh: StrategyCandidate, deps: AdvanceDeps) -> Verdict
     else:  # 来处是别的什么（记录被手改过）→ 停住，不猜
         return _verdict_for_hold(_regime_hold_reason_code(fresh), fresh, came_from)
 
-    # 闸门不拦（`inner` 是升档结论）→ 原路退回。这时**直接采用 `inner`**：它已经
-    # 是那一层的完整结论（含依据数字），而「回到来处」这个动作由 `next_status` 表达。
-    if inner.reason_code in _REGIME_GATED_REASONS:
+    # 闸门放行（`inner` 是升档 / 留痕放行结论）→ 原路退回。这时**直接采用 `inner`**：
+    # 它已经是那一层的完整结论（含依据数字），而「回到来处」这个动作由 `next_status`
+    # 表达。
+    #
+    # 口径走 `_REGIME_GATE_RELEASED_REASONS` 而不是只认那两个升档码：豁免放行
+    # （`REGIME_EXEMPT`）与档位 Shadow 的降级放行（`REGIME_SHADOW`，票 #50）与它们是
+    # 同一种「这一步被放过去了」，都必须退回来处。**不许**改成「凡不是停住就原样返回」：
+    # `REGIME_HOLD` 的合法出边只有那两条层内回边，原样返回一个 `paper_pending` /
+    # `awaiting_live_approval` 会撞非法边（见 `_REGIME_GATE_RELEASED_REASONS` 的注释）。
+    if inner.reason_code in _REGIME_GATE_RELEASED_REASONS:
         return replace(inner, next_status=came_from)
 
     # 那一层自己还没过（观察期没满 / 尚无结论）：也回那一层，但带着它自己的结论。
@@ -808,21 +881,55 @@ def _regime_hold_verdict(fresh: StrategyCandidate, deps: AdvanceDeps) -> Verdict
     if inner.reason_code in _REGIME_NON_PROMOTION_REASONS:
         return replace(inner, next_status=came_from)
 
-    # 那一层判了「不行」（回测失败 / 衰减超标 / 风控命中……）：**原样返回**，不退回。
-    # 一个被行情拦下过的候选，回来时仍然要照同一把尺量；闸门不该替它把一次
-    # 不合格洗成一次停住。
-    return inner
+    # ── 剩下两种情形共用这一个出口，必须先分开（票 #52）─────────────────────── #
+    #
+    # **这一条不能省，也不能挪到后面**：`_oos_verdict` / `_paper_running_step` 内部
+    # 自己就接了一遍行情闸门（`_apply_regime_gate`），所以「行情还没翻」时它们返回的
+    # 结论同样是 `REGIME_HOLD`。于是「那一层判了不行」与「闸门这一轮还是不行」在此
+    # **落到同一行 return 上**，而两者的正确动作相反：
+    #
+    #   * 还是持有 → 不动（自环不是边；动了会让候选每 5 分钟被弹回来处再弹回去，
+    #     行情没翻的整个持有期都在震荡，每轮还多一条审计记录）；
+    #   * 判了不行 → 退回 `came_from`，把失败码带回去让它下一轮自己落 `*_failed`。
+    #
+    # 判据取 `inner.next_status`（结论要落到哪一格）而不是枚举原因码：`ReasonCode`
+    # 是开放集合（每加一个失败签名都要回来改表，而漏改的表现正是本票要修的那种非法
+    # 边），而「结论是 `REGIME_HOLD`」在判定层已经是一个封闭事实。
+    if inner.next_status is StrategyCandidateStatus.REGIME_HOLD:
+        return inner
+
+    # 那一层判了「不行」（回测失败 / 衰减超标 / 风控命中……）：**原路退回它进来的
+    # 那一层**，结论（失败原因码 + 依据数字）原封不动带回去。下一轮由那一层照同一把
+    # 尺再量一次，把它判去 `oos_failed` / `paper_failed`。
+    #
+    # 为什么不是「原样返回」（本票修的就是这个）：`REGIME_HOLD` 的合法出边只有
+    # `oos_running` / `paper_running` / `cancelled` / `rejected`（`status.py` 那张
+    # 穷举表），原样返回一个 `oos_failed` / `paper_failed` 会在 `_persist_step` 写状态
+    # 那一步抛 `InvalidTransitionError`——**整步事务回滚**，失败码、行情依据、转移记录
+    # 一样都不落；批任务把它收成一条 warning，候选永远停在 `regime_hold`，而它在
+    # 页面上与「行情还没翻」一模一样。
+    #
+    # 代价说清楚：这次「判了不合格」晚一轮落库、多一条审计记录。这是既有纪律的直接
+    # 后果——`status.py` 明写「`regime_hold` 没有去 `*_failed` 的边：暂停不是判定」。
+    # 换来的是状态机形状不变（转移表 / 自校验 / 196 对穷举用例零改动）。
+    return replace(inner, next_status=came_from)
 
 
 #: `regime_hold` 的来处那一层「还没过、但也不是失败」的结论：停住类。这些结论下
 #: 候选回到来处，并且**带着自己的原因码**（`oos_pending` / `paper_observing` 等）——
 #: 所以不能走「强行升档」那条路（那会伪造一次通过），也不能留在 `regime_hold`
 #: （那会把它这一轮的证据丢掉）。
+#:
+#: **只收「结论本来就是停住」的码**（票 #52 之前这里多收了一个
+#: `PAPER_OBSERVATION_INCOMPLETE`，它对应的结论是 `PAPER_FAILED`——一个失败码住进
+#: 「不是失败」的集合，读代码的人只能靠翻判定层才发现）。失败码一律走上面那条
+#: 「判了不行」的出口：落点同样是 `came_from`，但它是**退回去让那一层自己重判**，
+#: 不是「这一层还在等」。这条边界由一条用例守着（断言集合里每个码的判定结论都不是
+#: `*_failed`），所以将来再有失败码被顺手塞进来会直接转红。
 _REGIME_NON_PROMOTION_REASONS = frozenset(
     {
         ReasonCode.OOS_PENDING,
         ReasonCode.PAPER_OBSERVING,
-        ReasonCode.PAPER_OBSERVATION_INCOMPLETE,
     }
 )
 
@@ -1369,6 +1476,10 @@ _DETAIL_ORDER = (
     # 静默退化——依据栏少了一行，而记录里明明有。
     "regime_hold_reason",
     "exempt",
+    # 档位（#50）。它回答的是「这一次拦截发生在哪一档」——转移记录里此前**没有任何键**
+    # 能回答这件事，于是「Shadow 期真的没拦」拿不出证据。放在最后：它是这条结论的
+    # **前提**（档位允许它生效吗），不是依据数字。
+    "mechanism_mode",
 )
 
 #: 结论 → 「下一步谁做什么」。写在这里而不是让提出人自己猜，是 D20 对可见性的要求：
@@ -1403,6 +1514,14 @@ _NEXT_STEP = {
     ),
     # 豁免放行（D5）：纯留痕。这一条读起来必须像「靠人放过去的」，而不是「行情适用」。
     ReasonCode.REGIME_EXEMPT: "当期人工豁免在期，按放行处理（留痕，不是「行情适用」）。",
+    # 档位那一支（#50）：同样是纯留痕放行。它读起来必须像「判了、但机制没在执行态」，
+    # 而不是「行情好起来了」——而这次放行的**后续**（去哪一格、谁动）与「本来就走
+    # 上一层结论」完全同路，所以这句话把人该知道的都说完，不留一句「详见依据」。
+    ReasonCode.REGIME_SHADOW: (
+        "**档位 Shadow，机制没在执行态**：行情这一侧判了不适用 / 判不了，但这一档下漏斗"
+        "不施加动作，已按上一层结论放行；后续与「行情本来就适用」走同一条路，无需你操作。"
+        "档位切到执行态之后，这一层才会真的拦人。"
+    ),
 }
 
 
