@@ -189,8 +189,16 @@ class CalculateIndicatorsTool(BaseTool):
 
     @staticmethod
     def _get_available_indicators() -> list[str]:
-        """Return list of all available pandas_ta indicator names."""
+        """Return list of all available pandas_ta indicator names.
+
+        ``DataFrame.ta`` accessor 只在 ``import pandas_ta`` 之后才存在。schema
+        先于 execute 构建，若不先 import 就会 AttributeError 被吞成 []，
+        enum 退化成只剩 legacy 的 ``['bollinger']``——模型因此被告知只有
+        bollinger 可用（2026-10 事故：EMA 等指标无法被请求）。
+        """
         try:
+            import pandas_ta  # noqa: F401  —— 注册 DataFrame.ta accessor
+
             df = pd.DataFrame()
             return df.ta.indicators(as_list=True) or []
         except Exception:
@@ -257,7 +265,8 @@ class CalculateIndicatorsTool(BaseTool):
         if ta_func is None:
             raise ValueError(f"pandas_ta 不支持的指标: {func_name}")
 
-        kwargs = params or {}
+        # 拷贝：调用方传入的 params 是它自己的 dict，不能就地塞 append。
+        kwargs = dict(params) if params else {}
         kwargs["append"] = False
         # Suppress pandas_ta verbose print output
         with (
@@ -353,12 +362,24 @@ class CalculateIndicatorsTool(BaseTool):
                     # Special handling for EMA: support multiple periods
                     if func_name == "ema":
                         ema_result = {}
-                        periods = indicator_params.pop("lengths", self._EMA_DEFAULTS)
+                        # 不要就地 pop 调用方的 params（那会让同一份 params 第二次
+                        # 使用时丢失 lengths，静默退回默认三档）。拷贝一份再取。
+                        ema_params = dict(indicator_params)
+                        periods = ema_params.pop("lengths", None)
+                        if periods is None:
+                            # 兼容 {"ema": {"length": 50}} 这种自然写法：
+                            # 单周期覆盖，而不是悄悄回退到默认三档。
+                            single = ema_params.get("length")
+                            periods = (
+                                [single]
+                                if single is not None
+                                else list(self._EMA_DEFAULTS)
+                            )
                         if isinstance(periods, int):
                             periods = [periods]
 
                         for period in periods:
-                            period_params = {"length": period, **indicator_params}
+                            period_params = {"length": period, **ema_params}
                             ema_series = self._call_indicator(df, "ema", period_params)
                             key = f"ema{period}"
                             if return_full_series:
@@ -395,12 +416,14 @@ class CalculateIndicatorsTool(BaseTool):
             if errors:
                 result["_errors"] = errors
 
-            # Cleanup temp file
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+            # 注意：**不要**在这里删除 temp_file。
+            # fetch_ohlcv 的返回契约是「数据写入临时文件，路径供
+            # calculate_indicators 读取」——它是一次抓取的共享产物，会话内可能被
+            # 反复使用（先算 RSI、再重算 EMA50/EMA200，box_range 也读同一路径）。
+            # 原实现在这里 unlink，导致第二次调用必然报「临时文件不存在」，
+            # 连续 3 次触发 _run_tool_loop 的同工具熔断，该工具在会话剩余时间里
+            # 被整体禁用（2026-10 生产事故）。
+            # 清理交给 fetch_ohlcv 侧的临时目录生命周期管理。
             return ToolResult(success=True, data=result)
 
         except Exception as e:

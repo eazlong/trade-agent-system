@@ -1073,6 +1073,12 @@ class BaseAgent(ABC):
                 else:
                     all_disabled = False
                     result_text = await self._execute_tool_call(tc)
+                # 成功与否只看真实执行结果；熔断通知/溯源拦截不是工具真实结果，
+                # 不能用来清零计数（否则禁用后计数被抹掉，提示里的次数失真）。
+                _really_executed = tc.name not in disabled_tools and not (
+                    metric_provenance_blocked
+                    and result_text == self._METRIC_PROVENANCE_ERROR
+                )
                 if result_text.startswith("Error"):
                     tool_failure_counts[tc.name] = (
                         tool_failure_counts.get(tc.name, 0) + 1
@@ -1090,19 +1096,25 @@ class BaseAgent(ABC):
                             tc.name,
                             tool_failure_counts[tc.name],
                         )
-                elif tc.name == "get_task_result":
-                    # 指标锚定（2026-09-18 事故）：get_task_result 成功且含指标时，
-                    # 在工具结果旁追加复算值锚定块 + 硬规则——后续每一轮
-                    # （含直接返回的最终轮）LLM 都能在原数据旁看到锚定值。
-                    task_metrics = self._extract_task_metrics(result_text)
-                    if task_metrics:
-                        result_text = (
-                            result_text
-                            + "\n\n[复算值锚定 · 报告唯一事实来源]\n"
-                            + "\n".join(f"{k}={v}" for k, v in task_metrics.items())
-                            + "\n"
-                            + self._METRIC_ANCHOR_RULE
-                        )
+                elif _really_executed:
+                    # 成功执行：清零该工具的**连续**失败计数。
+                    # 语义是「同一工具连续失败达阈值才熔断」（见阈值常量注释），
+                    # 原实现从不清零，于是 fail/ok/fail/ok/fail 这种累计 3 次
+                    # 但从未连续 3 次的情形也会被禁用，且提示语仍说「连续失败」。
+                    tool_failure_counts.pop(tc.name, None)
+                    if tc.name == "get_task_result":
+                        # 指标锚定（2026-09-18 事故）：get_task_result 成功且含指标时，
+                        # 在工具结果旁追加复算值锚定块 + 硬规则——后续每一轮
+                        # （含直接返回的最终轮）LLM 都能在原数据旁看到锚定值。
+                        task_metrics = self._extract_task_metrics(result_text)
+                        if task_metrics:
+                            result_text = (
+                                result_text
+                                + "\n\n[复算值锚定 · 报告唯一事实来源]\n"
+                                + "\n".join(f"{k}={v}" for k, v in task_metrics.items())
+                                + "\n"
+                                + self._METRIC_ANCHOR_RULE
+                            )
                 if on_tool_result:
                     await on_tool_result(tc.name, result_text)
                 tool_results.append(

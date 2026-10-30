@@ -49,7 +49,12 @@ grpcio==1.64.1
 grpcio-tools==1.64.1
 
 # Data / Backtest
-numpy>=1.26.4
+# numpy 上限 <2.3 是 pandas-ta 的硬约束：它依赖 numba==0.61.2，而 numba 要求
+# numpy>=1.24,<2.3。原先只写 numpy>=1.26.4，解析器会挑 numpy 2.5.x，导致
+# `pip install -r requirements.txt` 直接无解（pandas-ta 装不上）。镜像里一旦
+# 缺 pandas_ta，calculate_indicators 每次调用都返回「pandas_ta 未安装」，
+# 连续 3 次触发同工具熔断 —— 2026-10 生产事故的根因之一。
+numpy>=1.26.4,<2.3
 pandas>=2.2.2
 pandas-ta>=0.3.14b0
 
