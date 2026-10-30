@@ -80,12 +80,23 @@ class ReasonCode(str, Enum):
     AWAITING_HUMAN_APPROVAL = "awaiting_human_approval"
     AWAITING_REGISTRATION_RETRY = "awaiting_registration_retry"
     AWAITING_RERUN = "awaiting_rerun"
+    #: 既不是判定结论、也不是人的决定：**这一次推进根本没发生**——同一候选已有一次
+    #: 推进在飞（`advance_lock.candidate_advance_lock`）。它不改状态、不写转移记录，
+    #: 只让调用方（任务返回值 / 日志）看得出「本轮跳过了，不是判它不行」。
+    ADVANCE_LOCKED = "advance_locked"
 
     # -- 人工卡点（REST 端点的否决 / 取消，#23） ---------------------------- #
     #: 不是判定结论，是**人的决定**：进转移记录的 reason_code，让审计面能区分
     #: 「机器判它不合格」与「人把它叫停」（D20：推进动作可归因）。
     HUMAN_REJECTED = "human_rejected"
     HUMAN_CANCELLED = "human_cancelled"
+    #: 人工**放行**：判定层没通过（或压根没判），人看过依据之后明确要求往前推一步。
+    #: 与上面两个「人工收手」相对：那两条是把候选停掉，这条是不让这一层拦住它。
+    #:
+    #: 用它写的转移记录**必须**同时把「原判定是什么」放进 `detail`（见
+    #: `views._record_manual_decision` 的形状）：原因码只回答「谁放的」，detail 回答
+    #: 「放了什么」。只有原因码、没有原判定，事后读起来就像「它本来是通过的」。
+    HUMAN_OVERRIDE = "human_override"
 
     # -- L1 样本内 --------------------------------------------------------- #
     IN_SAMPLE_RUN_STARTED = "in_sample_run_started"
@@ -153,6 +164,7 @@ _REASON_DISPLAY = {
     ReasonCode.AWAITING_HUMAN_APPROVAL: "等人工卡点确认",
     ReasonCode.AWAITING_REGISTRATION_RETRY: "登记失败，等修好代码后重新登记",
     ReasonCode.AWAITING_RERUN: "该层未过，等改参数重跑或人工收尾",
+    ReasonCode.ADVANCE_LOCKED: "已有一次推进在飞，本轮跳过",
     ReasonCode.IN_SAMPLE_RUN_STARTED: "已登记，开始样本内回测",
     ReasonCode.IN_SAMPLE_PENDING: "样本内回测尚无结果",
     ReasonCode.IN_SAMPLE_PASSED: "样本内通过（夏普与样本量达标）",
@@ -173,6 +185,7 @@ _REASON_DISPLAY = {
     ReasonCode.INSUFFICIENT_EVIDENCE: "证据不足，判不了（不放行）",
     ReasonCode.HUMAN_REJECTED: "人工否决",
     ReasonCode.HUMAN_CANCELLED: "人工取消",
+    ReasonCode.HUMAN_OVERRIDE: "人工放行（该层未通过或未判，依据见 detail）",
     ReasonCode.REGIME_UNFIT: "当前行情不适用，暂缓推进",
     ReasonCode.REGIME_NO_EVIDENCE: "行情核对不了（切片缺数据），暂缓推进",
     #: 放行口径的展示名也一样要说清是「豁免放行」而不是「行情本来就适用」：

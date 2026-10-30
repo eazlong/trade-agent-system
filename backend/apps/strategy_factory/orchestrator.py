@@ -22,17 +22,37 @@
    「候选 × 层」，这里就是它的实现：同层第二次推进看到层记录就不再起跑，于是
    「同层推进两次 → 一组 fold 回测、一条 paper 会话」。
 
-3. **并发靠候选行的行锁 + 状态前置条件**（D18）。整个 `advance` 在
-   `select_for_update` 的候选行锁里跑：同一候选同一时刻只有一个推进（第二个推进会在
-   锁上等，醒来后**重新读**到新状态、从新状态继续）。`transition_to` 的合法边表是第二
-   道闸门——非法边直接抛 `InvalidTransitionError`，不静默吞掉。
+3. **并发靠三道闸门**（D18）。候选行的 `select_for_update` 仍然守着每一次「读-判-写」，
+   但它**不再覆盖长跑**（见下一节）；跨整段推进的互斥由
+   `advance_lock.candidate_advance_lock`（Redis SETNX）承担；`transition_to` 的合法边表
+   是第三道——非法边直接抛 `InvalidTransitionError`，不静默吞掉。
 
-## 为什么行锁里包含「跑回测」
+## 为什么长跑必须在事务外（2026-10-26 修；实测于 txy 生产，候选 0f5fb2f7）
 
-延迟写（先记「已起跑」、出锁再跑）会在进程中途死掉时留下**认领了却没产出**的层记录，
-而那种状态与「在飞」在库上长得一模一样——又是一个静默卡死。默认接线是**同步**的
-（`effects.py`），起跑返回时结果已落库，所以锁内跑完是可行且最简单的：崩溃即整体回滚，
-不留半个状态。代价是一次推进期间该候选的其它推进阻塞等锁，而那正是 D18 要的串行。
+原来的形状是「整个 `advance` 在 `select_for_update` 的事务里跑完，包括起跑回测」。
+它在本仓的真实引擎上**一次也跑不通**，两条原因指向同一个结论——引擎不能站在事务里：
+
+1. **引擎的 ORM 调用在另一个线程/连接上**（`sync_to_async`；见 `backtest_mode.py` 的
+   `_get_strategy_id_from_result` / `save_backtest_result`）。事务里刚 INSERT 的占位行
+   **未提交**，另一个连接看不见它：`BacktestResult matching query does not exist` →
+   `backtest completed but no Strategy model found …, result not persisted`。
+2. **引擎会 `close_old_connections()`，而它与调用方同线程**（`runner.py:143`）。调用方
+   持有事务时这一句会把连接关掉并置 `closed_in_transaction=True`（Django
+   `BaseDatabaseWrapper.close()`），此后该事务内**任何**查询都是
+   `InterfaceError: connection already closed`。
+
+于是形状改成三段：**短事务「锁行 + 只决定」→ 事务外「长跑」→ 短事务「判定 + 落库」**。
+
+为什么这次不怕「认领了却没产出」（原来那条顾虑）：长跑期间**不写任何认领记录**——
+层记录在第三段、拿到真实结论之后才写。进程死在长跑中途 = 什么都没写，下一轮扫描重新
+起跑，自愈且不留中间态。互斥改由 `advance_lock` 承担，它的失效模式是「多跑一次」而不是
+「卡死」（见该模块 docstring）。
+
+代价说清楚：长跑期间候选行锁不再被握着，所以闸门失效（Redis 不可达 / TTL 到期）时两个
+worker 可能同时跑第二段；两者的结果都带真实引擎产物，最后写入 `evidence.layers` 的那份
+胜出，不会把一条本该通过的候选判死。L3（paper 那一层）与人工收尾仍是**单事务**：它们的
+`deps` 不跑回测引擎，而建会话必须与状态同事务（`paper_session` 就是同一次 save 落的）。
+
 
 ## 通知为什么在 `on_commit` 里发
 
@@ -52,6 +72,7 @@ from typing import Any, Callable, Mapping
 from django.db import transaction
 from django.utils import timezone
 
+from apps.strategy_factory.advance_lock import candidate_advance_lock
 from apps.strategy_factory.config import CONFIG, FactoryConfig
 from apps.strategy_factory.evaluate import (
     CandidateEvidence,
@@ -268,6 +289,24 @@ class _Step:
     extra_detail: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _PendingRun:
+    """一次**必须搬到事务外**执行的长跑（L1 样本内 / L2 样本外分折）。
+
+    `run` 在 `advance` 的第 2 段被调用（无事务），返回的那份 `_Step` 再交给第 3 段落库。
+    为什么不能像别的层那样在一次事务里「起跑 + 落库」：见模块 docstring 的两条实证
+    （未提交的占位行对引擎的另一个连接不可见；引擎的 `close_old_connections()` 与调用方
+    同线程，会把调用方的事务连接关掉）。
+
+    `ctx` 随对象一起带走，是为了第 3 段还能把跑批判据钉进 `evidence`——它在第 1 段
+    （`_resolve_context`）算出来，第 3 段要用同一份，不能重算。
+    """
+
+    layer: StrategyCandidateLayer
+    ctx: RunContext
+    run: Callable[[StrategyCandidate, AdvanceDeps], _Step]
+
+
 def advance(
     candidate: StrategyCandidate, *, deps: AdvanceDeps | None = None
 ) -> AdvanceOutcome:
@@ -278,120 +317,171 @@ def advance(
 
     不抛「候选不合格」——那是结论（落 `*_failed` 状态 + 原因码）。抛的是**接线错误**：
     缺跑批判据、层记录指向的行不见、paper 账户不满足 `mode_account_mismatch` 这类。
+
+    ## 三段式（模块 docstring「为什么长跑必须在事务外」）
+
+    1. **短事务：锁行 + 只决定。** 不需要长跑的一步（读结论、建 paper 会话、人工收尾）
+       在这里就走完并落库——与状态同一个事务；
+    2. **事务外：长跑**（样本内回测 / 样本外分折）。默认接线是同步的，跑完才返回；
+    3. **短事务：判定 + 落库**——重新锁行后交给同一份 `_persist_step`。
+
+    整段推进由 `candidate_advance_lock` 独占：拿不到锁就原样返回一个 `ADVANCE_LOCKED`
+    的结论（**不改任何东西**），让调用方下一轮再来。那条路径不写转移记录。
     """
     if deps is None:
         deps = _default_deps()
 
     cfg = deps.config
-    with transaction.atomic():
-        fresh = StrategyCandidate.objects.select_for_update().get(pk=candidate.pk)
-        from_status = fresh.status_enum
-
-        # 终态不再推进：**不写记录、不发通知**。轮询会把终态候选一遍遍扫到，若每次都
-        # 落一行「终态不再自动推进」，审计面就被噪音淹掉，真正要看的那几行找不出来了。
-        if is_terminal(from_status):
-            verdict = evaluate_candidate(
-                CandidateEvidence(status=from_status, thresholds=cfg)
-            )
+    with candidate_advance_lock(candidate.pk) as held:
+        if not held:
+            fresh = StrategyCandidate.objects.get(pk=candidate.pk)
             return AdvanceOutcome(
-                candidate_id=str(fresh.pk),
+                candidate_id=str(candidate.pk),
                 layer=StrategyCandidateLayer.PIPELINE,
-                from_status=from_status,
-                to_status=from_status,
-                reason_code=verdict.reason_code,
+                from_status=fresh.status_enum,
+                to_status=fresh.status_enum,
+                reason_code=ReasonCode.ADVANCE_LOCKED,
             )
 
-        step = _step(fresh, deps)
-        at = deps.now()
+        # ── 第 1 段（短事务）：锁行 + 只决定 ──────────────────────────────── #
+        with transaction.atomic():
+            fresh = StrategyCandidate.objects.select_for_update().get(pk=candidate.pk)
+            from_status = fresh.status_enum
 
-        # ---- 落状态 + 证据（一次 save，同一个事务） -------------------------- #
-        evidence = dict(fresh.evidence or {})
-        if step.context is not None:
-            evidence[RUN_CONTEXT_KEY] = step.context.as_payload()
-        layers = dict(evidence.get(LAYERS_KEY) or {})
-        key = step.layer_key or _layer_key_of(step.layer)
-        spent = key is not None and _run_is_spent(step.layer, step.verdict.next_status)
-        if spent:
-            # 「这一层的这次起跑已经花掉了」：留着它会让状态机里那条「改参数重跑」的边
-            # （in_sample_failed → in_sample_running 等）变成一句空话——重进同一层时
-            # 编排层看到旧记录就不起跑，直接把上一次的失败结论再念一遍。
-            #
-            # 判据取自**这一步的结论**（而不是「当前状态是不是失败态」）：失败常常是在
-            # 「起跑 + 读结论」的同一次推进里定下来的，那时状态还没落库。
-            #
-            # 注意这一步**同时**起了跑的情形（起跑 → 结论是失败）：记录不能写回去，
-            # 否则刚作废的又原地复活。那次起跑的 id / 时刻进转移记录的 `detail`，
-            # 审计不丢（`_detail_payload` 会把层记录带进去）。
-            layers.pop(key, None)
-        if step.layer_record is not None and step.layer_key is not None and not spent:
-            layers[step.layer_key] = step.layer_record
-        evidence[LAYERS_KEY] = layers
-        evidence[VERDICT_KEY] = {
-            "layer": step.layer.value,
-            "from": from_status.value,
-            "to": step.verdict.next_status.value,
-            "reason_code": step.verdict.reason_code.value,
-            "detail": _detail_payload(step),
-            "at": at.isoformat(),
-        }
-        fresh.evidence = evidence
-
-        changed = step.verdict.next_status is not from_status
-        if changed:
-            # 非法边在这里 Fail Loud（`InvalidTransitionError`）：判定层只可能给出
-            # 转移表里的边，给不出来就说明有人把两边的表改分家了，不能静默跳过。
-            fresh.transition_to(step.verdict.next_status)
-
-        update_fields = ["status", "evidence", "updated_at"]
-        if step.paper_session is not None:
-            fresh.paper_session = step.paper_session
-            update_fields.append("paper_session")
-        if step.paper_session is not None or changed:
-            fresh.save(update_fields=update_fields)
-        else:
-            fresh.save(update_fields=["evidence", "updated_at"])
-
-        # ---- 写转移记录（同一结论连来时不重复写） ---------------------------- #
-        detail = _detail_payload(step)
-        recorded = False
-        if not _is_repeat(fresh, from_status, step.verdict):
-            StrategyCandidateTransition.objects.create(
-                candidate=fresh,
-                layer=step.layer.value,
-                from_status=from_status.value,
-                to_status=step.verdict.next_status.value,
-                reason_code=step.verdict.reason_code.value,
-                detail=detail,
-                at=at,
-            )
-            recorded = True
-
-        # ---- 通知（只在「真的发生了」时发，且挂 on_commit） ------------------ #
-        notify_message = None
-        if recorded and _should_notify(from_status, step.verdict):
-            notify_message = _message(fresh, from_status, step, cfg)
-            transaction.on_commit(
-                lambda message=notify_message, target=fresh: deps.notify(
-                    target, message
+            # 终态不再推进：**不写记录、不发通知**。轮询会把终态候选一遍遍扫到，若每次都
+            # 落一行「终态不再自动推进」，审计面就被噪音淹掉，真正要看的那几行找不出来了。
+            if is_terminal(from_status):
+                verdict = evaluate_candidate(
+                    CandidateEvidence(status=from_status, thresholds=cfg)
                 )
-            )
+                return AdvanceOutcome(
+                    candidate_id=str(fresh.pk),
+                    layer=StrategyCandidateLayer.PIPELINE,
+                    from_status=from_status,
+                    to_status=from_status,
+                    reason_code=verdict.reason_code,
+                )
 
-        return AdvanceOutcome(
-            candidate_id=str(fresh.pk),
-            layer=step.layer,
-            from_status=from_status,
-            to_status=step.verdict.next_status,
-            reason_code=step.verdict.reason_code,
-            changed=changed,
-            started_run=step.started_run,
-            created_paper_session=step.paper_session is not None,
-            paper_session_id=(
-                str(step.paper_session.pk) if step.paper_session is not None else None
-            ),
-            recorded=recorded,
-            notify_message=notify_message,
+            planned = _step(fresh, deps)
+
+            if not isinstance(planned, _PendingRun):
+                # 不需要长跑：决定与落库留在同一个事务里（L3 建会话必须如此——
+                # `paper_session` 与状态是同一次 save 落的，分家会留下一条没有主行的会话）。
+                return _persist_step(fresh, from_status, planned, deps, cfg)
+
+        # ── 第 2 段（事务外）：长跑 ───────────────────────────────────────── #
+        step = planned.run(fresh, deps)
+
+        # ── 第 3 段（短事务）：判定 + 落库 ────────────────────────────────── #
+        with transaction.atomic():
+            fresh = StrategyCandidate.objects.select_for_update().get(pk=candidate.pk)
+            # 重新读一次状态：长跑期间可能有别人动了这条候选（人工否决 / 取消）。
+            # 状态不再是判定时那个，`transition_to` 会在合法边表上 Fail Loud——
+            # 那是想要的结果：人的决定不被一次跑完的回测悄悄覆盖。
+            return _persist_step(fresh, fresh.status_enum, step, deps, cfg)
+
+
+def _persist_step(
+    fresh: StrategyCandidate,
+    from_status: StrategyCandidateStatus,
+    step: _Step,
+    deps: AdvanceDeps,
+    cfg: FactoryConfig,
+) -> AdvanceOutcome:
+    """把一步的结论落库：evidence + 状态 + 转移记录 + 通知。**只在事务里调用。**
+
+    从 `advance` 里拆出来，是因为它现在有**两个**调用点（第 1 段的单事务一步、第 3 段的
+    长跑之后），而两处要落的形状必须是同一份——抄两遍就是「同一口径两处实现」，
+    迟早会在只改一处时给出两种状态。
+    """
+    at = deps.now()
+
+    # ---- 落状态 + 证据（一次 save，同一个事务） -------------------------- #
+    evidence = dict(fresh.evidence or {})
+    if step.context is not None:
+        evidence[RUN_CONTEXT_KEY] = step.context.as_payload()
+    layers = dict(evidence.get(LAYERS_KEY) or {})
+    key = step.layer_key or _layer_key_of(step.layer)
+    spent = key is not None and _run_is_spent(step.layer, step.verdict.next_status)
+    if spent:
+        # 「这一层的这次起跑已经花掉了」：留着它会让状态机里那条「改参数重跑」的边
+        # （in_sample_failed → in_sample_running 等）变成一句空话——重进同一层时
+        # 编排层看到旧记录就不起跑，直接把上一次的失败结论再念一遍。
+        #
+        # 判据取自**这一步的结论**（而不是「当前状态是不是失败态」）：失败常常是在
+        # 「起跑 + 读结论」的同一次推进里定下来的，那时状态还没落库。
+        #
+        # 注意这一步**同时**起了跑的情形（起跑 → 结论是失败）：记录不能写回去，
+        # 否则刚作废的又原地复活。那次起跑的 id / 时刻进转移记录的 `detail`，
+        # 审计不丢（`_detail_payload` 会把层记录带进去）。
+        layers.pop(key, None)
+    if step.layer_record is not None and step.layer_key is not None and not spent:
+        layers[step.layer_key] = step.layer_record
+    evidence[LAYERS_KEY] = layers
+    evidence[VERDICT_KEY] = {
+        "layer": step.layer.value,
+        "from": from_status.value,
+        "to": step.verdict.next_status.value,
+        "reason_code": step.verdict.reason_code.value,
+        "detail": _detail_payload(step),
+        "at": at.isoformat(),
+    }
+    fresh.evidence = evidence
+
+    changed = step.verdict.next_status is not from_status
+    if changed:
+        # 非法边在这里 Fail Loud（`InvalidTransitionError`）：判定层只可能给出
+        # 转移表里的边，给不出来就说明有人把两边的表改分家了，不能静默跳过。
+        fresh.transition_to(step.verdict.next_status)
+
+    update_fields = ["status", "evidence", "updated_at"]
+    if step.paper_session is not None:
+        fresh.paper_session = step.paper_session
+        update_fields.append("paper_session")
+    if step.paper_session is not None or changed:
+        fresh.save(update_fields=update_fields)
+    else:
+        fresh.save(update_fields=["evidence", "updated_at"])
+
+    # ---- 写转移记录（同一结论连来时不重复写） ---------------------------- #
+    detail = _detail_payload(step)
+    recorded = False
+    if not _is_repeat(fresh, from_status, step.verdict):
+        StrategyCandidateTransition.objects.create(
+            candidate=fresh,
+            layer=step.layer.value,
+            from_status=from_status.value,
+            to_status=step.verdict.next_status.value,
+            reason_code=step.verdict.reason_code.value,
             detail=detail,
+            at=at,
         )
+        recorded = True
+
+    # ---- 通知（只在「真的发生了」时发，且挂 on_commit） ------------------ #
+    notify_message = None
+    if recorded and _should_notify(from_status, step.verdict):
+        notify_message = _message(fresh, from_status, step, cfg)
+        transaction.on_commit(
+            lambda message=notify_message, target=fresh: deps.notify(target, message)
+        )
+
+    return AdvanceOutcome(
+        candidate_id=str(fresh.pk),
+        layer=step.layer,
+        from_status=from_status,
+        to_status=step.verdict.next_status,
+        reason_code=step.verdict.reason_code,
+        changed=changed,
+        started_run=step.started_run,
+        created_paper_session=step.paper_session is not None,
+        paper_session_id=(
+            str(step.paper_session.pk) if step.paper_session is not None else None
+        ),
+        recorded=recorded,
+        notify_message=notify_message,
+        detail=detail,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -399,8 +489,37 @@ def advance(
 # --------------------------------------------------------------------------- #
 
 
-def _step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
-    """按候选当前状态分派到对应那一层的一步。"""
+def _stash_layer_record(candidate_pk: Any, key: str, record: Mapping[str, Any]) -> None:
+    """把这一层的**起跑记录**先落库（自己开一个短事务），供同一轮推进里的判定读取。
+
+    `effects.read_in_sample` 是从**库**里取这一层的 `result_id` 的（`_layers_from_db`），
+    而「起跑 + 读结论」发生在同一次推进里时，层记录这一刻还只在内存里——不先落库，判定
+    读到的是「样本内回测没有产出结果行（起跑记录：无）」这个**假失败**，而回测其实跑完
+    了。`_in_sample_verdict` 的 docstring 点出过这个陷阱（「那时这一层的记录还在内存里、
+    还没落库」），当时只修了审核字段那一处调用。
+
+    它同时是崩溃兜底：进程死在「跑完」与「判定」之间时，下一轮扫描看到层记录就不再重跑，
+    直接去读那一行判定（那一行此时已经有引擎产物）。
+
+    只给 L1 用：L2 的 `read_oos` 读的是**主行的 `metrics["walk_forward"]`**，主行 id 从
+    已提交的 `layers.in_sample` 回退取得，不依赖 `layers.oos` 是否已在库里。
+    """
+    with transaction.atomic():
+        fresh = StrategyCandidate.objects.select_for_update().get(pk=candidate_pk)
+        evidence = dict(fresh.evidence or {})
+        layers = dict(evidence.get(LAYERS_KEY) or {})
+        layers[key] = dict(record)
+        evidence[LAYERS_KEY] = layers
+        fresh.evidence = evidence
+        fresh.save(update_fields=["evidence", "updated_at"])
+
+
+def _step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step | _PendingRun:
+    """按候选当前状态分派到对应那一层的一步。
+
+    返回 `_PendingRun` 表示「这一步是长跑」——调用方（`advance`）必须把它搬到事务外执行；
+    其余情形返回的是**已经定好结论**的 `_Step`。
+    """
     status = fresh.status_enum
     cfg = deps.config
 
@@ -446,8 +565,8 @@ def _step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
     )
 
 
-def _in_sample_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
-    """L1 的那一步：还没起跑就起跑；起了就读结论并判定。"""
+def _in_sample_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step | _PendingRun:
+    """L1 的那一步：还没起跑就交出一次 `_PendingRun`；起了就读结论并判定。"""
     cfg = deps.config
     layers = _layers(fresh)
     ctx = _resolve_context(fresh, deps)
@@ -476,28 +595,14 @@ def _in_sample_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
         )
 
     if LAYER_IN_SAMPLE not in layers:
-        started = dict(deps.start_in_sample(fresh, ctx, plan) or {})
-        record = {
-            "result_id": _as_str(started.get("result_id")),
-            "started_at": deps.now().isoformat(),
-            "in_sample_end": plan.in_sample_end.isoformat(),
-        }
-        if started.get("error"):
-            record["error"] = str(started["error"])
-        # 起跑之后**立刻**读结论：默认接线是同步的（跑完才返回），异步接线则读到 None
-        # 而停在 in_sample_running 等下一轮——两条路径共用同一段代码。
-        verdict = _in_sample_verdict(fresh, deps, cfg, record)
-        return _Step(
+        # 起跑必须搬到**事务外**（模块 docstring「为什么长跑必须在事务外」）：这里只交出
+        # 「要跑什么」，真正的起跑 + 读结论在 `_in_sample_run`，由 `advance` 第 2 段调用。
+        return _PendingRun(
             StrategyCandidateLayer.IN_SAMPLE,
-            verdict,
-            layer_key=LAYER_IN_SAMPLE,
-            layer_record=record,
-            context=ctx,
-            started_run=True,
-            extra_detail={
-                "started": _public_start(started),
-                "in_sample_end": record["in_sample_end"],
-            },
+            ctx,
+            run=lambda fresh, deps, ctx=ctx, plan=plan: _in_sample_run(
+                fresh, deps, ctx, plan
+            ),
         )
 
     # 层记录已在：只读结论，**绝不重跑**（D18 的「候选 × 层」幂等键）。
@@ -506,6 +611,45 @@ def _in_sample_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
         _in_sample_verdict(fresh, deps, cfg, layers[LAYER_IN_SAMPLE]),
         context=ctx,
         extra_detail={"layer_record": _public_layer(layers[LAYER_IN_SAMPLE])},
+    )
+
+
+def _in_sample_run(
+    fresh: StrategyCandidate,
+    deps: AdvanceDeps,
+    ctx: RunContext,
+    plan: FoldPlan,
+) -> _Step:
+    """**事务外**跑样本内回测，跑完立刻读结论（原 `_in_sample_step` 的起跑分支）。
+
+    这一段不能站在事务里：它建的占位行必须**当场提交**（事务外即自动提交），否则引擎的
+    另一个连接看不见它（模块 docstring 第 1 条）；引擎的 `close_old_connections()` 还会把
+    调用方的事务连接关掉（第 2 条）。两条都是实测，不是推断。
+    """
+    started = dict(deps.start_in_sample(fresh, ctx, plan) or {})
+    record = {
+        "result_id": _as_str(started.get("result_id")),
+        "started_at": deps.now().isoformat(),
+        "in_sample_end": plan.in_sample_end.isoformat(),
+    }
+    if started.get("error"):
+        record["error"] = str(started["error"])
+    # 判定要从库里取这一层的 result_id，所以起跑记录必须先落库（见 `_stash_layer_record`）。
+    _stash_layer_record(fresh.pk, LAYER_IN_SAMPLE, record)
+    # 起跑之后**立刻**读结论：默认接线是同步的（跑完才返回），异步接线则读到 None
+    # 而停在 in_sample_running 等下一轮——两条路径共用同一段代码。
+    verdict = _in_sample_verdict(fresh, deps, deps.config, record)
+    return _Step(
+        StrategyCandidateLayer.IN_SAMPLE,
+        verdict,
+        layer_key=LAYER_IN_SAMPLE,
+        layer_record=record,
+        context=ctx,
+        started_run=True,
+        extra_detail={
+            "started": _public_start(started),
+            "in_sample_end": record["in_sample_end"],
+        },
     )
 
 
@@ -551,8 +695,8 @@ def _approve_in_sample_row(result_id: Any, at: datetime) -> int:
     )
 
 
-def _oos_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
-    """L2 的那一步：还没跑分折就跑；跑了就读结论并判定。"""
+def _oos_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step | _PendingRun:
+    """L2 的那一步：还没跑分折就交出一次 `_PendingRun`；跑了就读结论并判定。"""
     cfg = deps.config
     layers = _layers(fresh)
     ctx = _resolve_context(fresh, deps)
@@ -565,23 +709,13 @@ def _oos_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
         )
 
     if LAYER_OOS not in layers:
-        payload = dict(deps.start_oos(fresh, ctx, plan, in_sample_result_id) or {})
-        record = {
-            "started_at": deps.now().isoformat(),
-            "in_sample_result_id": str(in_sample_result_id),
-        }
-        verdict = _oos_verdict(fresh, deps, cfg, record)
-        return _Step(
+        # 同 L1：分折也是一次长跑（若干折回测相加），必须在事务外。
+        return _PendingRun(
             StrategyCandidateLayer.OOS,
-            verdict,
-            layer_key=LAYER_OOS,
-            layer_record=record,
-            context=ctx,
-            started_run=True,
-            extra_detail={
-                "start": _public_payload(payload),
-                "in_sample_result_id": str(in_sample_result_id),
-            },
+            ctx,
+            run=lambda fresh, deps, ctx=ctx, plan=plan, rid=in_sample_result_id: (
+                _oos_run(fresh, deps, ctx, plan, rid)
+            ),
         )
 
     return _Step(
@@ -589,6 +723,34 @@ def _oos_step(fresh: StrategyCandidate, deps: AdvanceDeps) -> _Step:
         _oos_verdict(fresh, deps, cfg, layers[LAYER_OOS]),
         context=ctx,
         extra_detail={"layer_record": _public_layer(layers[LAYER_OOS])},
+    )
+
+
+def _oos_run(
+    fresh: StrategyCandidate,
+    deps: AdvanceDeps,
+    ctx: RunContext,
+    plan: FoldPlan,
+    in_sample_result_id: Any,
+) -> _Step:
+    """**事务外**跑样本外分折，跑完立刻读结论（原 `_oos_step` 的起跑分支）。理由同 L1。"""
+    payload = dict(deps.start_oos(fresh, ctx, plan, in_sample_result_id) or {})
+    record = {
+        "started_at": deps.now().isoformat(),
+        "in_sample_result_id": str(in_sample_result_id),
+    }
+    verdict = _oos_verdict(fresh, deps, deps.config, record)
+    return _Step(
+        StrategyCandidateLayer.OOS,
+        verdict,
+        layer_key=LAYER_OOS,
+        layer_record=record,
+        context=ctx,
+        started_run=True,
+        extra_detail={
+            "start": _public_payload(payload),
+            "in_sample_result_id": str(in_sample_result_id),
+        },
     )
 
 
