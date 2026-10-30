@@ -307,6 +307,59 @@ class TestManagedSet(_Fixture):
         self.assertEqual(dru.running_strategy_ids(()), ())
 
 
+class TestActiveSessionStrategyIds(_Fixture):
+    """`active_session_strategy_ids`：**在跑策略**的取数口（横幅问的「有没有人在跑」）。
+
+    它与上面那组 `running_strategy_ids` 是两个问题，差别只有 `mode`：
+
+    * `running_strategy_ids` 问「有没有人**在真钱上**跑它」——被管集合第二条判据，停用
+      决策拿这个标记进日报，所以 `paper` 不算。
+    * `active_session_strategy_ids` 问「有没有人**在跑它**」——模拟盘一样会下单、一样会
+      被策略档拦住，所以 `paper` 必须算（用户原话里的「模拟实盘」正是这一档）。
+
+    合并成一个入口会让其中一侧被静默改口径：要么日报把模拟盘算成「在跑真钱」，要么横幅
+    把模拟盘上跑着的策略判成「没在跑」——后者方向恰好错向危险的那一侧（该看见的停止被
+    藏起来了）。所以两条各自钉住，且后者显式钉一条「窄到 live 时等于前者」。
+    """
+
+    def test_both_modes_count_by_default(self):
+        self.session(self.alpha, mode="paper", status="running")
+        self.session(self.beta, mode="live", status="running")
+
+        got = dru.active_session_strategy_ids()
+
+        self.assertEqual(set(got), {self.alpha.id, self.beta.id})
+
+    def test_narrowing_to_live_makes_it_the_running_set(self):
+        self.session(self.alpha, mode="paper", status="running")
+        self.session(self.beta, mode="live", status="running")
+
+        self.assertEqual(
+            dru.active_session_strategy_ids(modes=("live",)),
+            dru.running_strategy_ids((self.alpha.id, self.beta.id)),
+        )
+
+    def test_every_active_status_counts_and_stopped_does_not(self):
+        from apps.trading.models import LiveSession
+
+        for status in LiveSession.ACTIVE_STATUSES:
+            with self.subTest(status=status):
+                session = self.session(self.alpha, mode="paper", status=status)
+                self.assertEqual(dru.active_session_strategy_ids(), (self.alpha.id,))
+                session.delete()
+        self.session(self.alpha, mode="paper", status="stopped")
+        self.assertEqual(dru.active_session_strategy_ids(), ())
+
+    def test_no_ids_still_asks_the_database_nothing(self):
+        """空集合是「没人要问」，不是「谁在跑」——横幅传的是 `None`，那个才是「谁在跑」。"""
+        self.assertEqual(dru.active_session_strategy_ids(()), ())
+
+    def test_none_means_unbounded(self):
+        self.session(self.alpha, mode="paper", status="running")
+
+        self.assertEqual(dru.active_session_strategy_ids(None), (self.alpha.id,))
+
+
 # --------------------------------------------------------------------------- #
 # 三种「什么都不动」
 # --------------------------------------------------------------------------- #

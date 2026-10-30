@@ -539,6 +539,17 @@ def halt_state(request: Request) -> Response:
     「现在在拦什么」的唯一答案——生效期内 ∧ 未解除 ∧ **开关打开**——`query_halt` 与
     `pre_trade_check` 都从它出发。本视图只把它转述成 JSON，不另立一套筛选。
 
+    **这个读面是横幅的读面，所以走 `halt.banner_layers` 而不是裸的
+    `blocking_declarations`**（2026-10-30）：机制按**全部被管策略**产出策略档声明，
+    于是从没部署过的策略也在表里占一条，而那一层对任何一张单都是惰性的（`_matches`
+    的策略档判据要求调用方给的 `strategy_id`，而它只能由一条会话换出来）。用户原话：
+    「如果策略没有走到模拟实盘或者实盘状态，就不在顶部的判定状态中展示」。
+    筛选只做这一次、只在这个读面做——订单通路与 `query_halt` 仍走
+    `blocking_declarations`，它们答的是「库里在拦什么」，不是「横幅上该写几行」。
+
+    **被略去的条数照样发**（`omitted_strategy_layers`）：静默过滤会让「我明明停过它、
+    界面怎么不说」在界面上查无此事。它**不**参与「此刻放不放行」这个结论。
+
     **刻意不按 symbol 求值。** 问「这一张单挡不挡得住」要 `symbol` 与 `strategy_id`，
     那是 `halt.halt_layers` 的回答，由会话详情给。本读面回答的是「库里此刻有几层在拦」：
     作用域原样写在每层的 `text` 里（`HaltLayer.text`），读的人自己判断管不管他。换一个
@@ -549,13 +560,17 @@ def halt_state(request: Request) -> Response:
     """
     from apps.regime import halt
 
+    verdict = halt.banner_layers()
+
     return _no_store(
         Response(
             {
                 "halt_layers": [
-                    ser.halt_layer_payload(halt.layer_of(row))
-                    for row in halt.blocking_declarations()
-                ]
+                    ser.halt_layer_payload(layer) for layer in verdict.layers
+                ],
+                # 被略去的惰性策略档条数（0 时前端不渲染任何东西）。**不进**
+                # `halt_layers` 的规模，也不改变 `data-halt-state` 的四态。
+                "omitted_strategy_layers": verdict.omitted_strategy_layers,
             }
         )
     )

@@ -410,3 +410,104 @@ def block_reason(
 ) -> str:
     """``halt_layers`` 的便利包装：没在拦时返回空串（= 放行）。"""
     return halt_layers(symbol, strategy_id, now=now).reason
+
+
+# --------------------------------------------------------------------------- #
+# 读面：交易页横幅看到的那些层（**惰性策略档不占位**）
+# --------------------------------------------------------------------------- #
+
+#: 哪些触发源的策略档声明**会**惰性——机制按「全部被管策略」产出，所以从没部署过的策略
+#: 也占一条。只认机制自动产出的两档：`MANUAL` **不在此列**，理由见 `banner_layers`。
+#: `EVENT` / `BLANKET` 也在此列之外：它们写的是 `global` 或 `symbol:` 作用域，与有没有
+#: 会话无关（`_is_inert_strategy_layer` 的作用域判据是第二条闸，这里只列触发源）。
+_INERT_ELIGIBLE_TRIGGERS = (HaltTrigger.DEACTIVATION, HaltTrigger.REGIME_SUSPENSION)
+
+
+@dataclass(frozen=True)
+class BannerVerdict:
+    """交易页横幅要的答案：**看得到的层** + **没显示的惰性策略档条数**。
+
+    两个字段一起才是完整的答案。只给 `layers` 的话，「库里还有 N 条策略档声明」
+    这件事在界面上就查无此事——而它恰好是将来有人问「我明明停过它、界面怎么不说」
+    时唯一能指向的东西。
+    """
+
+    layers: tuple[HaltLayer, ...]
+    #: 被略去的惰性策略档条数（>0 时前端追加一行灰字）。**不是**「层数」——它不进
+    #: `layers` 的规模，也不改变「此刻放不放行」这个结论。
+    omitted_strategy_layers: int
+
+
+def _is_inert_strategy_layer(
+    row: HaltDeclaration, live_strategy_ids: frozenset[str]
+) -> bool:
+    """这条声明是不是「一条谁也拦不到的策略档声明」。
+
+    三个条件缺一不可：
+
+    1. **触发源是机制自动产出的**（`_INERT_PRONE_TRIGGERS`）。手动熔断不在此列：它是人
+       当场确认过的停止，而横幅是它唯一的可见出口——滤掉它等于让一次人工停止在界面上
+       静默消失。
+    2. **作用域是 `strategy:`**。`global` 与 `symbol:` 与「有没有会话」无关：它们拦的是
+       全场的答案 / 账户与品种上真实存在的单。
+    3. **该策略此刻没有在跑**（`active_session_strategy_ids`）。
+
+    判据 3 的「在跑」口径是 `deactivation_run.active_session_strategy_ids`（paper 与
+    live 都算、状态取 `LiveSession.ACTIVE_STATUSES`）——**不在这里重写一遍**：这里少算
+    一种模式，表现就是模拟盘会话的策略在横幅上被判成「没在跑」，方向恰好错向危险的那
+    一侧（该看见的停止被藏起来了）。
+    """
+    if trigger_of(row) not in _INERT_ELIGIBLE_TRIGGERS:
+        return False
+    kind, value = parse_scope(row.scope)
+    if kind != "strategy" or value is None:
+        return False
+    return value not in live_strategy_ids
+
+
+def banner_layers(*, now: datetime | None = None) -> BannerVerdict:
+    """交易页横幅的读口：**此刻在拦的层，略去惰性的策略档声明**。
+
+    ## 为什么要有它，以及它为什么不是「第二个判定」
+
+    池化与暂停两路都按**全部被管策略**产出声明行（`deactivation_run.managed_set` 的判据
+    是注册表能不能解析到实现类，与有没有会话无关）。于是从没部署过的策略也在声明表里
+    占一条，横幅上写着「策略 X 被停用」——而那一层**对任何一张单都是惰性的**：
+    `_matches` 的策略档判据要求调用方给的 `strategy_id` 等于这一行，而 `strategy_id`
+    只能由 `live_session_id` 换出来（`RiskGuard._strategy_of_session`）。没有会话 ⇒
+    没有单会带这个 id ⇒ 它拦不到任何东西。
+
+    所以**这**不是「放宽判定」，是**去掉一个恒为假的提示**：订单通路仍走 `halt_layers`，
+    一个字都没变；本函数只服务读面。
+
+    ## 两个字段，两类答案
+
+    `layers` 是横幅该显示的那些层；`omitted_strategy_layers` 是被略去的条数。后者只
+    报数、不报身份——本仓对「静默过滤」有成见（`HaltVerdict.reason` 的「只报一层会让
+    人排查错方向」是同一类事故），所以那条信息必须留下一个入口，只是不该占一条层。
+
+    `now` 只用于求生效期，与 `halt_layers` 同一条纪律：判定不看「今天是什么阶段」。
+    """
+    from apps.regime import deactivation_run
+
+    at = now or timezone.now()
+    rows = blocking_declarations(now=at)
+    # 只有存在策略档行时才去问会话表：多数时刻声明表里只有保命档/事件档，而「此刻有谁
+    # 在跑」是一次跨到 `trading` 的查询——为一次恒为空的过滤去查它没有意义。
+    needs_sessions = any(parse_scope(row.scope)[0] == "strategy" for row in rows)
+    live_ids: frozenset[str] = frozenset()
+    if needs_sessions:
+        live_ids = frozenset(
+            str(strategy_id)
+            for strategy_id in deactivation_run.active_session_strategy_ids()
+            if strategy_id is not None
+        )
+
+    shown: list[HaltLayer] = []
+    omitted = 0
+    for row in rows:
+        if _is_inert_strategy_layer(row, live_ids):
+            omitted += 1
+            continue
+        shown.append(layer_of(row))
+    return BannerVerdict(layers=tuple(shown), omitted_strategy_layers=omitted)

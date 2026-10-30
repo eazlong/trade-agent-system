@@ -66,6 +66,14 @@ class _Fixture(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         return response.json()["halt_layers"]
 
+    def body(self) -> dict:
+        response = self.get()
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    def omitted(self) -> int:
+        return self.body()["omitted_strategy_layers"]
+
 
 # --------------------------------------------------------------------------- #
 # 性质 1：认证
@@ -235,3 +243,165 @@ class TestLayerShape(_Fixture):
             layer["opened_at"],
             halt.layer_of(halt.blocking_declarations()[0]).opened_at.isoformat(),
         )
+
+
+# --------------------------------------------------------------------------- #
+# 性质 5：惰性策略档不在横幅上占位（2026-10-30）
+# --------------------------------------------------------------------------- #
+
+
+class TestInertStrategyLayers(_Fixture):
+    """「策略没走到模拟实盘/实盘，就不在顶部判定状态里展示」（用户原话）。
+
+    **这一条不是放宽判定**，是去掉一个恒为假的提示。机制按**全部被管策略**产出策略档
+    声明（池化与暂停两路都是），于是从没部署过的策略也在表里占一条；而那一层对任何一张
+    单都是惰性的——`halt._matches` 的策略档判据要求调用方给的 `strategy_id` 等于这一行，
+    而它只能由一条会话换出来（`RiskGuard._strategy_of_session`）。订单通路仍走
+    `halt_layers`，一个字都没变；收窄只发生在这个读面。
+
+    五件事各钉一条，每一件坏了都会让横幅说一句它没资格说的话：
+
+    1. **没会话的策略档不占位**，但**条数要报**（`omitted_strategy_layers`）——
+       静默过滤会让「我明明停过它、界面怎么不说」在界面上查无此事。
+    2. **模拟盘会话也算「在跑」**：`active_session_strategy_ids` 不传 `modes` 时两种模式
+       都算。这里若退化成只认 `live`，模拟盘上跑着的策略会在横幅上被判成「没在跑」，
+       方向恰好错向危险的那一侧。
+    3. **手动熔断永不滤**：它是人当场按下的停止，而横幅是它唯一的可见出口。
+    4. **global / symbol 档永不滤**：它们拦的是全场的答案与账户上真实存在的单，与有没有
+       会话无关。
+    5. **`REGIME_SUSPENSION` 与 `DEACTIVATION` 同等待遇**：两路都按被管策略产出，
+       只滤一路的话另一路会把同一条策略又摆回来。
+    """
+
+    def setUp(self):
+        super().setUp()
+        from apps.trading.models import Strategy
+
+        # 两个开关都要开：`DEACTIVATION` 与 `REGIME_SUSPENSION` 共用 `REGIME_GATE`。
+        _switch(MechanismKind.REGIME_GATE, MechanismMode.EXECUTING)
+        self.strategy = Strategy.objects.create(
+            name="BoxBreakout", code_path="/t/box.py", git_commit_hash="abc1234"
+        )
+
+    def session(self, *, mode: str = "paper", status: str = "running"):
+        from apps.trading.models import LiveSession
+
+        return LiveSession.objects.create(
+            user=self.user,
+            strategy=self.strategy,
+            symbol="BTC/USDT",
+            mode=mode,
+            status=status,
+            initial_capital="10000.00",
+        )
+
+    def declare_strategy_layer(
+        self, *, trigger: HaltTrigger = HaltTrigger.DEACTIVATION
+    ) -> None:
+        _declare(
+            trigger=trigger,
+            scope=halt.strategy_scope(self.strategy.id),
+            label="策略停用 BoxBreakout",
+            opened_at=AT - timedelta(hours=2),
+        )
+
+    # ── 1. 没在跑 ⇒ 不占位，但条数照样报 ────────────────────────────────── #
+
+    def test_a_strategy_layer_with_no_session_is_not_displayed(self):
+        self.declare_strategy_layer()
+
+        self.assertEqual(self.layers(), [])
+        self.assertEqual(self.omitted(), 1)
+
+    def test_the_omitted_count_is_zero_when_nothing_is_hidden(self):
+        """`omitted_strategy_layers` 恒在场（0 也是答案）：缺键会让前端把「没有隐藏」
+        与「这个后端还没升级」混起来，而那两件事看起来一模一样。"""
+        _declare(trigger=HaltTrigger.BLANKET, opened_at=AT - timedelta(hours=2))
+
+        body = self.body()
+
+        self.assertIn("omitted_strategy_layers", body)
+        self.assertEqual(body["omitted_strategy_layers"], 0)
+        self.assertEqual(len(body["halt_layers"]), 1)
+
+    # ── 2. 模拟盘与实盘都算「在跑」 ──────────────────────────────────────── #
+
+    def test_a_paper_session_puts_the_layer_back_on_the_banner(self):
+        """用户原话里的「模拟实盘」= `LiveSession.mode == "paper"`。它必须算在跑。"""
+        self.session(mode="paper", status="running")
+        self.declare_strategy_layer()
+
+        self.assertEqual(len(self.layers()), 1)
+        self.assertEqual(self.omitted(), 0)
+
+    def test_a_live_session_puts_the_layer_back_on_the_banner(self):
+        self.session(mode="live", status="running")
+        self.declare_strategy_layer()
+
+        self.assertEqual(len(self.layers()), 1)
+        self.assertEqual(self.omitted(), 0)
+
+    def test_a_pending_session_still_counts(self):
+        """`pending` 是「待启动但会启动」：它一起来就要吃这条声明，横幅提前一天说出来
+        比启动那一刻才冒出来好（`LiveSession.ACTIVE_STATUSES` 的口径）。"""
+        self.session(mode="paper", status="pending")
+        self.declare_strategy_layer()
+
+        self.assertEqual(len(self.layers()), 1)
+        self.assertEqual(self.omitted(), 0)
+
+    def test_a_stopped_session_does_not_count(self):
+        """`stopped` 的会话不会再下单，把它算进去等于保留了用户要消掉的那类噪声。"""
+        self.session(mode="paper", status="stopped")
+        self.declare_strategy_layer()
+
+        self.assertEqual(self.layers(), [])
+        self.assertEqual(self.omitted(), 1)
+
+    # ── 3. 手动熔断永不滤 ───────────────────────────────────────────────── #
+
+    def test_a_manual_strategy_layer_survives_without_any_session(self):
+        """`manage.py manual_halt --strategy` 写的也是 `strategy:` 作用域，但那是人当场
+        按下的停止。滤掉它等于让一次人工停止在界面上静默消失。"""
+        self.declare_strategy_layer(trigger=HaltTrigger.MANUAL)
+
+        self.assertEqual(len(self.layers()), 1)
+        self.assertEqual(self.omitted(), 0)
+
+    # ── 4. global / symbol 档永不滤 ──────────────────────────────────────── #
+
+    def test_global_and_symbol_layers_survive_without_any_session(self):
+        _declare(
+            trigger=HaltTrigger.BLANKET,
+            label="高波动",
+            opened_at=AT - timedelta(hours=3),
+        )
+        _declare(
+            trigger=HaltTrigger.MANUAL,
+            label="手动熔断",
+            scope=halt.symbol_scope("BTC/USDT"),
+            opened_at=AT - timedelta(hours=2),
+        )
+
+        self.assertEqual(len(self.layers()), 2)
+        self.assertEqual(self.omitted(), 0)
+
+    # ── 5. 两路策略档同等待遇 ───────────────────────────────────────────── #
+
+    def test_the_suspension_trigger_is_filtered_the_same_way(self):
+        self.declare_strategy_layer(trigger=HaltTrigger.REGIME_SUSPENSION)
+
+        self.assertEqual(self.layers(), [])
+        self.assertEqual(self.omitted(), 1)
+
+    def test_only_the_inert_one_is_hidden_when_both_kinds_are_present(self):
+        """保命档 + 一条惰性策略档：横幅上只留保命档，条数如实报 1——这正是
+        「不许只报一层就完事」与「惰性层不占位」两条纪律的交点。"""
+        _declare(trigger=HaltTrigger.BLANKET, opened_at=AT - timedelta(hours=3))
+        self.declare_strategy_layer()
+
+        body = self.body()
+
+        self.assertEqual(len(body["halt_layers"]), 1)
+        self.assertIn("高波动", body["halt_layers"][0]["text"])
+        self.assertEqual(body["omitted_strategy_layers"], 1)

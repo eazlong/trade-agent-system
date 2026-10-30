@@ -147,22 +147,63 @@ class ManagedSet:
 # --------------------------------------------------------------------------- #
 
 
-def running_strategy_ids(strategy_ids: Iterable[UUID]) -> tuple[UUID, ...]:
-    """被至少一个活跃实盘会话引用的策略 id（判据二，**只标记不筛选**）。"""
-    ids = list(strategy_ids)
-    if not ids:
+def active_session_strategy_ids(
+    strategy_ids: Iterable[UUID] | None = None,
+    *,
+    modes: Iterable[str] | None = None,
+    statuses: Iterable[str] | None = None,
+) -> tuple[UUID, ...]:
+    """**在跑策略**：被至少一个「状态 ∈ `statuses`」的会话引用的策略 id。
+
+    这是「这条策略此刻有没有人真的在跑」的**唯一取数口**（词条见 CONTEXT.md 的
+    `在跑策略`）。它与被管策略集合（`managed_set`）是**两件事**、两个问题：
+
+    * 被管集合问「这条策略值不值得被机制管」——判据是注册表能不能解析到实现类，
+      **与有没有会话无关**（`CONTEXT.md` 第 105 条：`is_active` 也不是集合依据）。
+    * 本函数问「这条策略此刻有没有一张单可能带它的身份出门」。
+
+    两者的差额就是交易页横幅上那批「在拦、却谁也拦不到」的策略档声明：池化与暂停两路
+    都按**全部被管策略**产出声明行，于是从没部署过的策略也在表里占一条。
+
+    `modes` / `statuses` 都可省：省掉 `statuses` 时取 `LiveSession.ACTIVE_STATUSES`
+    （**不是**手抄的字面量——那三个状态的定义只有一处）；省掉 `modes` 时**两种模式都算**
+    （`paper` 与 `live`）。省 `modes` 这件事是有意的：横幅要回答的是「有没有人在跑」，
+    而模拟盘会话里的策略一样会下单、一样会被这层拦住；把 `paper` 排除在外会让模拟盘
+    的策略在横幅上被判成「没在跑」，方向恰好错向危险的那一侧。
+
+    `strategy_ids=None` 表示**不限**：直接问「此刻有谁在跑」（横幅就是这么用的）。给了
+    一个集合时按它收窄（`running_strategy_ids` 的用法），空集合仍然**不查库**——那不是
+    「谁在跑」，是「没人要问」。
+    """
+    ids = None if strategy_ids is None else list(strategy_ids)
+    if ids is not None and not ids:
         return ()
+    queryset = LiveSession.objects.filter(
+        status__in=tuple(statuses)
+        if statuses is not None
+        else LiveSession.ACTIVE_STATUSES
+    )
+    if ids is not None:
+        queryset = queryset.filter(strategy_id__in=ids)
+    if modes is not None:
+        queryset = queryset.filter(mode__in=tuple(modes))
     rows = (
-        LiveSession.objects.filter(
-            strategy_id__in=ids,
-            mode="live",
-            status__in=LiveSession.ACTIVE_STATUSES,
-        )
-        .order_by("strategy_id")
+        queryset.order_by("strategy_id")
         .values_list("strategy_id", flat=True)
         .distinct()
     )
     return tuple(rows)
+
+
+def running_strategy_ids(strategy_ids: Iterable[UUID]) -> tuple[UUID, ...]:
+    """被至少一个活跃**实盘**会话引用的策略 id（判据二，**只标记不筛选**）。
+
+    `mode="live"` 是本函数与 `active_session_strategy_ids` 的**唯一**差别：被管集合的
+    第二条判据问的是「有没有人在真钱上跑它」（停用决策要拿这个标记进日报），而横幅问的
+    是「有没有人在跑它」（模拟盘也算）。两个问题不同，所以两个入口并存——但取数只有
+    一处，本函数是它的一个调用者。
+    """
+    return active_session_strategy_ids(strategy_ids, modes=("live",))
 
 
 def managed_set() -> ManagedSet:

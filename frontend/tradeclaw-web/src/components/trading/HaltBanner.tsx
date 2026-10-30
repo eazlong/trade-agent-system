@@ -21,6 +21,10 @@
  *      命中」：它是**放行**，而拿「不知道」冒充放行，方向恰好是最危险的那一侧。
  *   5. **状态变化给一次视觉强化**。从「无层」到「有层」（以及反向）时闪一下，让正在盯盘
  *      的人不必逐字重读就知道刚刚变了——但仍然**不靠它**传达结论：结论永远在那句话里。
+ *   6. **略去的惰性策略档要报数**。后端按「该策略此刻没有活跃会话」略去了一批策略档声明
+ *      （它们对任何一张单都拦不到），但条数一并送上来（`omittedStrategyLayers`）。这一行
+ *      **只在 >0 时出现**，且**不参与结论**——静默过滤会让「我明明停过它、界面怎么不说」
+ *      在界面上查无此事（详见 `HaltState.omitted_strategy_layers` 的注释）。
  *
  * 本组件是**受控的纯展示件，自己不发请求**（数据由页面从 `useHaltState` / `useRegimeOverview`
  * 传进来），所以下面每一条分支都能用一次 props 单测覆盖。
@@ -56,6 +60,16 @@ export interface HaltBannerProps {
   /** 取数错误原文。非空时内联显示，**但上面的旧数据照旧渲染**（配套 `useHaltState` 不清
    *  `data` 的纪律）。 */
   error: string | null;
+  /**
+   * 被后端略去的**惰性策略档**条数（`HaltState.omitted_strategy_layers`）。
+   *
+   * 「惰性」= 机制按全部被管策略产出的策略档声明，而该策略此刻没有活跃会话——它对任何一张
+   * 单都拦不到（订单通路要靠会话才换得出 `strategy_id`）。这一层不占 `haltLayers` 的位置，
+   * 但**条数要留一个入口**：静默过滤会让「我明明停过它、界面怎么不说」在界面上查无此事。
+   *
+   * **它不参与结论**：`data-halt-state` 的四态与那句总结都不看它。`0`（默认）时整段不渲染。
+   */
+  omittedStrategyLayers?: number;
 }
 
 export default function HaltBanner({
@@ -64,6 +78,7 @@ export default function HaltBanner({
   asOf,
   loading,
   error,
+  omittedStrategyLayers = 0,
 }: HaltBannerProps) {
   const hasLayers = haltLayers.length > 0;
 
@@ -207,6 +222,22 @@ export default function HaltBanner({
               : "停止状态还没成功读到过。"}
           </div>
         </div>
+      )}
+
+      {/* 被略去的惰性策略档：**只报数、不报身份**，且只在 >0 时出现。
+          它不进上面的结论（四态与那句总结都不看它），因为「惰性」的意思正是「拦不到任何
+          一张单」——把它算进「此刻被拦住」，就是让一个恒为假的提示占住答案的位置。
+          但它也不能消失：本仓对静默过滤有成见（`HaltVerdict.reason` 的「只报一层会让人
+          排查错方向」是同一类事故），所以留这一行，回答「我明明停过它、怎么没显示」。 */}
+      {omittedStrategyLayers > 0 && (
+        <p
+          data-testid="halt-omitted-strategy-layers"
+          data-omitted-strategy-layers={omittedStrategyLayers}
+          className="mt-1.5 text-[10px] text-text3 leading-relaxed"
+        >
+          另有 {omittedStrategyLayers} 条策略档停止声明未在这里列出——它们所属的策略此刻
+          没有在跑（没有模拟盘或实盘会话），拦不到任何一张单。
+        </p>
       )}
     </section>
   );

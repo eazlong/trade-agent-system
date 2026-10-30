@@ -76,6 +76,7 @@ type BannerProps = {
   asOf: string | null;
   loading: boolean;
   error: string | null;
+  omittedStrategyLayers?: number;
 };
 
 /** 默认是「加载完成、无层」（放行）那一帧；各用例只覆盖自己关心的那几个 prop。 */
@@ -349,6 +350,65 @@ describe("取数失败与旧数据", () => {
       />
     );
     expect(screen.queryByTestId("halt-as-of")).toBeNull();
+  });
+});
+
+// ── 被略去的惰性策略档：只报数、不占位、不参与结论（2026-10-30） ──
+
+describe("被略去的惰性策略档", () => {
+  it("默认（0）时整段不渲染——没有隐藏任何东西，就不该多一句话", () => {
+    renderBanner();
+
+    expect(screen.queryByTestId("halt-omitted-strategy-layers")).toBeNull();
+  });
+
+  it(">0 时追加一行灰字，条数如实报出", () => {
+    renderBanner({ omittedStrategyLayers: 3 });
+
+    const line = screen.getByTestId("halt-omitted-strategy-layers");
+    expect(line.getAttribute("data-omitted-strategy-layers")).toBe("3");
+    expect(line.textContent).toContain("另有 3 条策略档停止声明未在这里列出");
+    // 用户能读到的理由，不是一串 slug
+    expect(line.textContent).toContain("没有在跑");
+  });
+
+  it("**不参与结论**：四态与那句总结都不看它", () => {
+    renderBanner({ omittedStrategyLayers: 5 });
+
+    // 条数 > 0 但一条层都没有 ⇒ 仍然是「放行」，不是「被拦住」
+    expect(banner().getAttribute("data-halt-state")).toBe("clear");
+    expect(banner().getAttribute("data-halt-layers")).toBe("0");
+    expect(screen.getByText("当前无停止判定命中")).toBeTruthy();
+    expect(screen.queryAllByTestId("halt-layer").length).toBe(0);
+  });
+
+  it("有层时那行照旧出现，且不改变层的集合规模", () => {
+    renderBanner({ haltLayers: THREE_LAYERS, omittedStrategyLayers: 2 });
+
+    expect(screen.getAllByTestId("halt-layer").length).toBe(3);
+    expect(banner().getAttribute("data-halt-layers")).toBe("3");
+    expect(
+      screen.getByTestId("halt-omitted-strategy-layers").textContent
+    ).toContain("另有 2 条");
+  });
+
+  it("「还没读到」与「取不到」时它也不冒充任何结论", () => {
+    const view = renderBanner({ loading: true, omittedStrategyLayers: 1 });
+    expect(banner().getAttribute("data-halt-state")).toBe("pending");
+    expect(screen.queryByText("当前无停止判定命中")).toBeNull();
+
+    view.rerender(
+      <HaltBanner
+        regimeState={REGIME}
+        haltLayers={[]}
+        asOf={null}
+        loading={false}
+        error="API error: 500"
+        omittedStrategyLayers={1}
+      />
+    );
+    expect(banner().getAttribute("data-halt-state")).toBe("unknown");
+    expect(screen.queryByText("当前无停止判定命中")).toBeNull();
   });
 });
 

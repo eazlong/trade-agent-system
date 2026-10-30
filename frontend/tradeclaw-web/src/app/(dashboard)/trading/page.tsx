@@ -827,6 +827,9 @@ export default function TradingPage() {
         asOf={haltAsOf}
         loading={haltLoading}
         error={haltError}
+        // 被后端略去的惰性策略档条数。**只报数**：它们不占横幅上一条层的位置（所属策略
+        // 此刻没有在跑，拦不到任何一张单），但也不能无声消失——见 `HaltState` 的注释。
+        omittedStrategyLayers={haltState?.omitted_strategy_layers ?? 0}
       />
       {/* Header */}
       <div className="flex items-center justify-between">
