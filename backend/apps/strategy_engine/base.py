@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -282,7 +283,56 @@ class StrategyContext:
         return None
 
 
-class BaseStrategy(ABC):
+class _StrategyMeta(ABC.__class__):
+    """`BaseStrategy` 的元类：让老名字 `min_kline_length` 成为一个**只读别名**。
+
+    ## 为什么必须用元类，而不是在类体里写 `@property`
+
+    `base.py` 是 Django app 的一部分、常年有实例；但真正的原因是**读取方在类上取**：
+
+        # backend/scripts/backtest_smma_fractal.py:804
+        min_bars = int(getattr(cls, "min_kline_length", 0) or 0)
+
+    那是 `cls`，不是实例。类体里的 `property` 在类上取到的**是 property 对象**，
+    `int(...)` 会抛 TypeError；而如果只在实例上定义，类级 `getattr` 会落回 `0`——
+    脚本不会报错，只是预热根数静默变成 0，日志照样打得出来。所以：
+
+    * **类级读取**：由本元类的 `__getattr__` 回答，返回该策略在类上声明的老值（没有就
+      返回 `MIN_BARS_DEFAULT`）——普通整数，脚本照常用；
+    * **实例级读取**：由 `_StrategyMeta.__getattribute__` 之外的一层回答——见
+      `BaseStrategy.__getattr__`（实例上 `min_bars` 一定存在，别名读它）；
+    * **写入老名字**：`BaseStrategy.__setattr__` 捕获，给一条 `DeprecationWarning` 并把
+      值同步到 `min_bars`。**只警告不报错**：策略文件住在
+      `~/.tradelogx/strategies/`（不在 git 里，无法一次改全所有副本），让老策略起不来
+      是不可接受的。这是一次「可见的软收口」。
+
+    ## 为什么 `_legacy_min_kline_length` 要读 `__dict__` 链而不是 `getattr`
+
+    `getattr(cls, "min_kline_length")` 会先撞上本元类的 `__getattr__`（因为基类上已经没有
+    这个属性了），于是永远拿到默认值——老文件的 300 就丢了。所以这里显式沿
+    `cls.__mro__` 翻 `__dict__`，只看**类体里真的写了**什么。
+    """
+
+    def __getattr__(cls, name):
+        if name == "min_kline_length":
+            return cls._legacy_min_kline_length() or cls.MIN_BARS_DEFAULT
+        raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
+
+    def _legacy_min_kline_length(cls) -> int | None:
+        """这个策略**在类上**声明的老值（`min_kline_length = N`）；没写过返回 `None`。"""
+        for klass in cls.__mro__:
+            if klass is BaseStrategy:
+                break
+            if "min_kline_length" in klass.__dict__:
+                raw = klass.__dict__["min_kline_length"]
+                # `bool` 单独排掉：`min_kline_length=True` 是写错，不是「要 1 根」。
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    return None
+                return raw if raw > 0 else None
+        return None
+
+
+class BaseStrategy(ABC, metaclass=_StrategyMeta):
     """
     策略基类，所有策略必须继承。
 
@@ -309,10 +359,16 @@ class BaseStrategy(ABC):
     # 且下游引擎必须支持负持仓（回测 BacktestEngine / 实盘 LiveStrategyRunner）。
     # 打开前请确认：交易品种是合约（is_perp=True），且交易所侧允许双向持仓。
     supports_short: bool = False
-    # 策略启动前需要预加载的最小 K 线根数（warmup）。
-    # 指标（RSI/MACD/布林带等）需要足够历史才能产出首个有效值，
-    # 若启动时不预加载，策略会一直等待历史积累而无法发出信号。
-    min_kline_length: int = 500
+    #: 策略启动前需要预加载的最小 K 线根数（warmup）的**唯一默认值**。
+    #:
+    #: 指标（RSI/MACD/布林带等）需要足够历史才能产出首个有效值；不预加载的话策略会
+    #: 一直等历史积累，看起来「正常运行」但一根信号都不出。
+    #:
+    #: `live_mode.HISTORY_FLOOR` 直接引用它（那条用例 `test_the_default_is_one_constant`
+    #: 钉着）——默认值只能有一个来源，两份默认值分家之后「策略没声明时引擎留多少」
+    #: 就有两个答案。
+    MIN_BARS_DEFAULT: int = 500
+
     description_template = """策略类型：{均值回归/趋势跟踪/突破/动量/套利}
 核心指标：{RSI/MACD/布林带/均线/ATR/...}
 适用场景：{震荡行情/趋势行情/高波动/低波动/...}
@@ -329,6 +385,61 @@ class BaseStrategy(ABC):
         self.universe: BaseUniverseModel = FixedListUniverse([context.symbol])
         self.portfolio: BasePortfolioModel = SingleAssetPortfolio()
         self.risk_models: list[BaseRiskModel] = []
+
+        # ---- 历史需求量的**唯一名字**：`self.min_bars` ----
+        #
+        # 策略在 `__init__` 里按自己的参数算出来（`max(ema_period, …) + 10` 之类），
+        # 引擎读这个数决定「预加载多少、历史留多少」。
+        #
+        # 老写法是**类**属性 `min_kline_length`（本类上一版就是 `min_kline_length = 500`）。
+        # 两个名字并存时引擎只读了老的那一个，于是 9 个只写新名字的策略在实盘里永久
+        # 空转（`min_bars=730` vs 预加载 500，`on_bar` 第一行恒为假）。收口方向见下：
+        # 老名字降级成只读别名，仍在类上可读（`backtest_smma_fractal.py` 就是这么读的）。
+        #
+        # 这里先落默认值，再由元类决定要不要用老名字覆盖（老文件优先，不改变其行为）。
+        legacy = type(self)._legacy_min_kline_length()
+        self.min_bars = legacy if legacy is not None else self.MIN_BARS_DEFAULT
+
+    #: 老名字 → 新名字的映射。**只有这一条**：别名是过渡期的单向门，不再扩。
+    _DEPRECATED_ALIASES = {"min_kline_length": "min_bars"}
+
+    def __getattr__(self, name):
+        """实例上读老名字 → 返回 `min_bars`（新名字是唯一真值）。
+
+        只在正常查找失败后才进来（`__getattr__` 的语义），所以对存在的属性零开销。
+        `min_bars` 自己的查找要防递归：`__init__` 里给它赋值之前若有任何代码读它，
+        `_DEPRECATED_ALIASES` 之外的分支必须立刻放弃。
+        """
+        target = BaseStrategy._DEPRECATED_ALIASES.get(name)
+        if target is None:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        try:
+            return object.__getattribute__(self, target)
+        except AttributeError:
+            # `min_bars` 还没落（`__init__` 极早期）：退回默认值，不递归。
+            return self.MIN_BARS_DEFAULT
+
+    def __setattr__(self, name, value):
+        """实例上**写**老名字 → 弃用警告 + 同步写新名字。
+
+        只警告不报错：策略文件不在 git 里（`~/.tradelogx/strategies/` 是多份副本），
+        一条会让老策略起不来的硬化不可接受。但「静默接受」也不行——那样两个名字会
+        继续各自被写，而这正是本次收口要消灭的形状。
+        """
+        target = BaseStrategy._DEPRECATED_ALIASES.get(name)
+        if target is None:
+            object.__setattr__(self, name, value)
+            return
+        warnings.warn(
+            f"{type(self).__name__}.{name} 是弃用名字，请改用 self.{target}"
+            "（`min_bars` 是「策略需要多少历史」的唯一名字）",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        object.__setattr__(self, name, value)
+        object.__setattr__(self, target, value)
 
     def on_bar(self, kline: dict, history: list[dict]) -> "OrderSignal | None":
         """

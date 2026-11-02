@@ -59,7 +59,6 @@ class BoxTimeRangeBreakoutStrategy(BaseStrategy):
     核心指标：箱体（pivot 聚类 + 窗口粗筛 + 时间起止）
     适用场景：震荡后启动的突破行情
     入场逻辑：收盘价突破箱体上沿并清出容差带（close > upper×(1+tol×min_breakout_tol)）且前一根尚未突破时买入；出场参考线冻结在入场时刻（中线/下沿），持仓期间收盘跌破该线即平仓"""
-    min_kline_length = 300
 
     params_schema = {
         "lookback": {"type": "int", "default": 120, "description": "箱体检测窗口K线数"},
@@ -110,6 +109,13 @@ class BoxTimeRangeBreakoutStrategy(BaseStrategy):
         self.volume_filter: bool = bool(self.ctx.params.get("volume_filter", False))
         self.volume_ma_period: int = max(1, int(self.ctx.params.get("volume_ma_period", 20)))
         self.volume_mult: float = float(self.ctx.params.get("volume_mult", 1.0))
+        # 「策略需要多少历史」的**唯一声明处**（`BaseStrategy.min_bars`）。
+        #
+        # 此前这里是个 `on_bar` 里的局部变量，而类上另写着 `min_kline_length = 300`——
+        # 两个名字两个数（`lookback + atr_period + 2` 在默认参数下是 136，与 300 无关）。
+        # 引擎读的是类属性那一个，于是本类实际预热 300 根、而不是它自己算的 136：多预热
+        # 不致命，但「哪个数是对的」没人答得出。现在只留这一处，引擎直接读它。
+        self.min_bars: int = self.lookback + self.atr_period + 2
 
         self._box: dict | None = None  # 最近一次检测到的箱体（缓存，含时间字段）
         # 出场参考线：入场那一刻冻结（入场箱体的 mid 或 lower）。持仓期间只跟它比，
@@ -117,9 +123,10 @@ class BoxTimeRangeBreakoutStrategy(BaseStrategy):
         self._entry_ref: float | None = None
 
     def on_bar(self, kline: dict, history: list[dict]):
-        # ATR 需要预热：detect_box_range 的容差来自最新 ATR
-        min_bars = self.lookback + self.atr_period + 2
-        if len(history) < min_bars:
+        # ATR 需要预热：detect_box_range 的容差来自最新 ATR。
+        # 读 `self.min_bars`（`__init__` 里算定的那一份），不在两处各算一遍——
+        # 两处算式一旦分家，「引擎预加载了多少」与「on_bar 要求多少」就又是两个数。
+        if len(history) < self.min_bars:
             return None
 
         window = history[-self.lookback:]  # 尾部窗口，末根 = 当前 K 线（时间正序）
