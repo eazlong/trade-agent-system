@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import logging
 import time
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -846,3 +846,148 @@ class BinanceAdapter(BaseExchangeAdapter):
         # 兼容对象格式
         balance_info = data.get("balance", {})
         return {"USDT": Decimal(balance_info.get("walletBalance", "0"))}
+
+    async def get_balance_detail(self) -> dict[str, dict[str, Decimal]]:
+        """``/fapi/v2/balance`` 的原始细分字段（见 base 的 docstring）。
+
+        为什么不复用 ``get_balance`` 的解析：那一个必须挑一个字段当「余额」，于是
+        ``balance or walletBalance`` 那句把它变成了「有 balance 就用 balance」。而在
+        USDⓈ-M 上 ``balance`` 与 ``crossWalletBalance`` 在**全仓 + 有浮盈**时会分叉，
+        于是单选任何一个都答不出「到底哪一块变了」。这里把交易所给的字段原样吐出，
+        让对照表自己说话。
+        """
+        resp = await self._request("GET", "/fapi/v2/balance")
+        if resp.status_code != 200:
+            logger.error(f"Binance balance API error: {resp.status_code} - {resp.text}")
+            resp.raise_for_status()
+
+        data = resp.json()
+        if not isinstance(data, list):
+            # 对象格式下没有「其它资产」，只把 USDT 那一块按白名单投影。
+            info = data.get("balance") or {}
+            out = {}
+            for key, raw in info.items():
+                parsed = self._decimal_or_none(raw)
+                if parsed is not None:
+                    out[key] = parsed
+            return {"USDT": out} if out else {}
+
+        result: dict[str, dict[str, Decimal]] = {}
+        for row in data:
+            asset = row.get("asset") or "USDT"
+            fields: dict[str, Decimal] = {}
+            for key, raw in row.items():
+                if key == "asset":
+                    continue
+                parsed = self._decimal_or_none(raw)
+                if parsed is not None:
+                    fields[key] = parsed
+            if fields:
+                result[asset] = fields
+        return result
+
+    @staticmethod
+    def _decimal_or_none(value) -> Optional[Decimal]:
+        """尽力把交易所字段解析成 Decimal；不是数字（``updateTime`` 之类也走这条路）
+        或解析不了就返回 ``None`` —— 让调用方跳过它，而不是塞一个 0 进去。"""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+
+    async def fetch_income(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        income_type: Optional[str] = None,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """拉取资金流水（``GET /fapi/v1/income``），分页到尾部。
+
+        币安这个口有两条容易踩空的行为，都写在这里：
+
+        1. **不给 ``startTime`` 只回最近 7 天**。所以要查「上周那笔少了 23 USDT」必须
+           自己带起点。本方法把这一点如实向下传（``None`` 就是不传），不偷偷替你补一个
+           起点——补了就等于把「我查了 7 天」说成「我查了全部」。
+        2. **``startTime`` 与 ``endTime`` 都带上时，区间内的数据超过 ``limit`` 只会返回
+           前 ``limit`` 条**。所以分页要靠「把 ``startTime`` 推到本页最后一笔的 ``time``
+           + 1ms」推进，而不是靠 ``fromId``（这个口没有 ``fromId``）。
+
+        ## 去重键必须是**整行**，不能是 ``tranId``
+
+        ``tranId`` 在币安**不唯一**：同一笔成交会在不同 ``incomeType`` 下各占一行而共用
+        同一个 ``tranId``（实测 2026-11-02 生产数据：534 行只有 471 个不同 ``tranId``，
+        63 个重复全部是「REALIZED_PNL 与 COMMISSION 同属一笔成交」）。按 ``tranId`` 去重
+        会把这 63 行手续费**当成重复丢掉**，于是：
+
+        * 手续费合计少算（实测 -26.90 变成 -13.43，正好少一半）；
+        * 「流水合计 − 当前余额」不再为 0，对账表出现一个查不出原因的黑洞
+          （实测 13.46 USDT）。
+
+        这个 bug 的阴险之处是它**看起来完全正常**：条数、类型、字段都对，只是少了一半。
+        所以去重键取「``tranId`` + ``incomeType`` + ``time`` + ``income`` + ``orderId``
+        + ``tradeId`` + ``symbol``」整行签名——重放同一行会被去掉，而同 ``tranId`` 的
+        不同 ``incomeType`` 会留下。
+
+        与 ``fetch_user_trades`` 同一条纪律：**拿不到就抛，绝不返回空列表**。
+        """
+        out: list[dict] = []
+        seen: set[tuple] = set()
+        cursor = start_ms
+        page_limit = max(1, min(int(limit or 1000), 1000))
+
+        while True:
+            params: dict = {"limit": page_limit}
+            native = (symbol or "").upper().replace("/", "")
+            if native:
+                params["symbol"] = native
+            if income_type:
+                params["incomeType"] = income_type
+            if cursor is not None:
+                params["startTime"] = int(cursor)
+            if end_ms is not None:
+                params["endTime"] = int(end_ms)
+
+            resp = await self._request("GET", "/fapi/v1/income", params)
+            resp.raise_for_status()
+            page = resp.json() or []
+            if not isinstance(page, list):
+                raise RuntimeError(
+                    f"Binance income 返回了非列表（{type(page).__name__}），"
+                    "无法解析成流水"
+                )
+
+            added = 0
+            for row in page:
+                # 整行签名做去重键（见 docstring：`tranId` 单用会误删合法流水）。
+                sig = (
+                    str(row.get("tranId") or ""),
+                    str(row.get("incomeType") or ""),
+                    str(row.get("time") or ""),
+                    str(row.get("income") or ""),
+                    str(row.get("orderId") or ""),
+                    str(row.get("tradeId") or ""),
+                    str(row.get("symbol") or ""),
+                )
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                out.append(row)
+                added += 1
+
+            if len(page) < page_limit:
+                break
+            last_time = page[-1].get("time")
+            if last_time is None:
+                # 没有时间字段就无法推进游标，继续拉会死循环。
+                break
+            next_cursor = int(last_time) + 1
+            if cursor is not None and next_cursor <= int(cursor):
+                break
+            cursor = next_cursor
+
+        return out

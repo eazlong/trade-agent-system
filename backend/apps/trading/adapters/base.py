@@ -275,6 +275,69 @@ class BaseExchangeAdapter(ABC):
     async def get_balance(self) -> dict[str, Decimal]:
         """获取账户余额，key 为资产名称，value 为数量"""
 
+    async def get_balance_detail(self) -> dict[str, dict[str, Decimal]]:
+        """账户余额的**细分口径**（资产 → 交易所原始字段 → 数值）。只读。
+
+        存在的理由是一条会让用户指着屏幕问「钱去哪了」的缺口：``get_balance`` 只答得出
+        一个数，而「余额变了、订单里却什么都没有」恰恰要靠**它是由哪几块拼成的**才解释
+        得清。合约账户的 USDT 余额至少受四类流动影响，其中只有第一类会在本地落
+        ``Order`` 行：
+
+        * **成交**（平仓盈亏、手续费）→ 有 ``Order`` 行；
+        * **资金费**（FUNDING_FEE，每 8 小时结算一次）→ **没有**任何本地行；
+        * **划转 / 充值 / 提现**（TRANSFER）→ **没有**任何本地行；
+        * **未实现盈亏**（持仓浮盈浮亏）→ 不是「流水」，但它会改变可用余额。
+
+        所以「账实不符」在多数情况下不是账错了，而是**系统从来没有读过这两类流动**
+        （``fetch_income`` 是本仓第一个读它的口）。把细分字段吐出来，才能把「总额变了
+        多少」拆成「哪几块各变了多少」。
+
+        **键用交易所原始字段名**，不做语义重命名：``balance`` 到底是「钱包余额」还是
+        「保证金余额」在 USDⓈ-M 上是有歧义的（``crossWalletBalance`` 才明确是钱包余额），
+        把其中一个翻译成「总资产」就等于替交易所回答了一道它没被问过的问题——而这条
+        数据是要拿去和用户对账的，猜错一个口径会让整张对照表失去意义。
+
+        Returns:
+            ``{asset: {field: Decimal}}``。**默认返回 ``{}``**，意思是「本适配器不声明
+            细分口径」，调用方据此退回 ``get_balance`` 的单值口径——与 ``min_notional``
+            / ``symbol_rules`` 同一条纪律：取不到就说取不到，不编一个看起来正常的形状。
+        """
+        return {}
+
+    async def fetch_income(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        income_type: Optional[str] = None,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """拉取账户的**资金流水**（币安 ``GET /fapi/v1/income``），按交易所原始字段返回。
+
+        这是「余额变了但没有订单」那个问题的直接答案来源。``Order`` 行的语义是「系统
+        发出过一张单」；资金费、划转、强平清算这些**同样改变余额、却不是本系统下的单**
+        的流动，只有这个口答得出来。
+
+        与 ``fetch_user_trades`` 同一条纪律（同样给一个会抛的默认实现）：**拿不到就抛，
+        绝不返回空列表**——空列表的含义必须是「这段时间确实没有流水」，否则「一天少了
+        23 USDT」会被读成「什么都没发生」，而那正是这次要消灭的那类沉默。
+
+        Args:
+            symbol: 交易对（交易所口径，如 ``BTCUSDT``）；``None`` = 全部品种
+            income_type: ``FUNDING_FEE`` / ``REALIZED_PNL`` / ``COMMISSION`` /
+                ``TRANSFER`` / ``INSURANCE_CLEAR`` 等；``None`` = 全部类型
+            start_ms: 起始时间（毫秒）。**不给则交易所只回最近 7 天**——要查更早的账
+                必须显式给
+            end_ms: 截止时间（毫秒）
+            limit: 单页上限（币安最大 1000）
+
+        Returns:
+            交易所原始流水 dict 列表（币安：``symbol`` / ``incomeType`` / ``income`` /
+            ``asset`` / ``time`` / ``tranId`` / ``info`` / ``tradeId``）。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持拉取资金流水 income")
+
     @abstractmethod
     async def fetch_mid_price(self, symbol: str) -> Optional[Decimal]:
         """取该品种的**中间价** ``(best bid + best ask) / 2``（只读）。

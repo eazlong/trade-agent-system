@@ -341,8 +341,20 @@ export interface ExchangeAccountWithBalance {
   /** `null` = 这次没问过交易所（`OrderExecutor` 没跑），**不是**「余额是 0」。 */
   balance?: {
     total: string;
-    available: string;
-    used: string;
+    /**
+     * `null` = 这个数没取到（适配器不声明细分口径 / 交易所没回这个字段）。
+     * 它曾经恒等于 `total`，于是「全额可用」成了一句假话，而用户正是拿它判断能开多大仓。
+     */
+    available: string | null;
+    /** 已用保证金（钱包余额 − 可用余额）。`null` = 两个输入缺一个，算不出来。 */
+    used: string | null;
+    /** 钱包余额（不含浮盈浮亏）。 */
+    wallet: string | null;
+    /**
+     * 持仓未实现盈亏。它改的是「可用」而不是「钱包」——不单独列出来，一次浮亏
+     * 和一次资金费看起来会一模一样，而后者在流水里有一条、前者没有。
+     */
+    unrealized_pnl: string | null;
   } | null;
 }
 

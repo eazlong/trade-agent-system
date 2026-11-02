@@ -93,7 +93,11 @@ function AccountMiniCard({
   // `bal?.total ?? "0"` 把「不知道」渲染成了「你的实盘资产是 0 美元」，而这恰好就是
   // 2026-10-24「binance 实盘没有同步现有资产」那张截图的样子——用户看到 $0，以为
   // 系统没去同步，实际上系统压根没问过交易所。
-  const money = (v: string | undefined) =>
+  //
+  // `null` 与 `undefined` 都要落进「—」：后端对「这个字段取不到」（可用余额 / 已用
+  // 保证金 / 浮盈亏）显式回 `null`，那和「整块余额都没问过」是两种缺口，但**渲染上
+  // 同一条纪律**——不许拿 0 或总额顶替。
+  const money = (v: string | null | undefined) =>
     typeof v === "string" && v !== "" ? `$${formatNumber(v)}` : "—";
 
   const indicatorColor = account.testnet
@@ -144,6 +148,23 @@ function AccountMiniCard({
             <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">已用保证金</div>
             <div className="font-mono text-[11px] font-semibold text-text2 mt-0.5">
               {money(account.balance?.used)}
+            </div>
+          </div>
+          {/* 浮盈亏单独一格：它改的是「可用」而不是「钱包」，而这一格是区分
+              「钱被浮亏吃掉了」和「钱被资金费扣走了」的唯一线索——后者的流水在
+              交易记录里找不到任何订单，前者连流水都没有。 */}
+          <div>
+            <div className="text-[9px] text-text3 uppercase tracking-wider font-semibold">未实现盈亏</div>
+            <div
+              className={`font-mono text-[11px] font-semibold mt-0.5 ${
+                account.balance?.unrealized_pnl == null
+                  ? "text-text3"
+                  : Number(account.balance.unrealized_pnl) < 0
+                    ? "text-red"
+                    : "text-green"
+              }`}
+            >
+              {money(account.balance?.unrealized_pnl)}
             </div>
           </div>
           <div>

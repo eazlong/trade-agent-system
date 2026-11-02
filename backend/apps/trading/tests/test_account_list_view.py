@@ -103,3 +103,80 @@ class TestTradingAccountsView(APITestCase):
         by_label = {a["label"]: a for a in resp.json()}
         self.assertEqual(by_label["实盘账户"]["balance"]["total"], "1234.5")
         self.assertEqual(by_label["模拟账户"]["balance"]["total"], "7")
+
+    def test_available_and_used_are_not_fabricated(self):
+        """`available` / `used` 曾经是把总额抄两遍、再把已用写死 `"0"`。
+
+        `available == total` 会让「全额可用」成为一句假话，而用户正是拿它判断能开多大仓。
+        有细分口径时必须问真值；问不到时必须是 `null`（「没取到」），不许退回总额。
+        """
+        adapter = MagicMock()
+        adapter.get_balance = AsyncMock(return_value={"USDT": Decimal("1000")})
+        adapter.get_balance_detail = AsyncMock(
+            return_value={
+                "USDT": {
+                    "balance": Decimal("1000"),
+                    "crossWalletBalance": Decimal("1010"),
+                    "availableBalance": Decimal("800"),
+                    "crossUnPnl": Decimal("-10"),
+                }
+            }
+        )
+        executor = MagicMock()
+        executor._running = True
+        executor.account_adapters.return_value = {str(self.live.id): adapter}
+
+        with patch(
+            "apps.trading.executor.OrderExecutor.get_instance",
+            return_value=executor,
+        ):
+            resp = self.client.get("/api/trading/accounts/")
+
+        bal = {a["label"]: a for a in resp.json()}["实盘账户"]["balance"]
+        self.assertEqual(bal["available"], "800")
+        # 钱包口径取 crossWalletBalance（不含浮盈），不是含糊的 `balance`
+        self.assertEqual(bal["wallet"], "1010")
+        self.assertEqual(bal["unrealized_pnl"], "-10")
+        # 已用保证金 = 钱包 − 可用
+        self.assertEqual(bal["used"], "210")
+
+    def test_detail_fields_are_null_when_adapter_has_no_detail(self):
+        """适配器不声明细分口径（base 默认 `{}`）→ 三个字段都是 `null`，不是 0 也不是总额。"""
+        adapter = MagicMock()
+        adapter.get_balance = AsyncMock(return_value={"USDT": Decimal("1000")})
+        adapter.get_balance_detail = AsyncMock(return_value={})
+        executor = MagicMock()
+        executor._running = True
+        executor.account_adapters.return_value = {str(self.live.id): adapter}
+
+        with patch(
+            "apps.trading.executor.OrderExecutor.get_instance",
+            return_value=executor,
+        ):
+            resp = self.client.get("/api/trading/accounts/")
+
+        bal = {a["label"]: a for a in resp.json()}["实盘账户"]["balance"]
+        self.assertEqual(bal["total"], "1000")
+        self.assertIsNone(bal["available"], "不许拿总额冒充可用余额")
+        self.assertIsNone(bal["used"], "不许用 0 顶替「算不出来」")
+        self.assertIsNone(bal["wallet"])
+        self.assertIsNone(bal["unrealized_pnl"])
+
+    def test_detail_failure_does_not_break_the_total(self):
+        """细分口径取炸了，总额照常回——两者的失败不能互相拖累。"""
+        adapter = MagicMock()
+        adapter.get_balance = AsyncMock(return_value={"USDT": Decimal("1000")})
+        adapter.get_balance_detail = AsyncMock(side_effect=RuntimeError("boom"))
+        executor = MagicMock()
+        executor._running = True
+        executor.account_adapters.return_value = {str(self.live.id): adapter}
+
+        with patch(
+            "apps.trading.executor.OrderExecutor.get_instance",
+            return_value=executor,
+        ):
+            resp = self.client.get("/api/trading/accounts/")
+
+        bal = {a["label"]: a for a in resp.json()}["实盘账户"]["balance"]
+        self.assertEqual(bal["total"], "1000")
+        self.assertIsNone(bal["available"])

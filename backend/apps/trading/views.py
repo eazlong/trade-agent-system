@@ -252,10 +252,32 @@ def account_list(request):
                 balance = async_to_sync(adapter.get_balance)()
                 # balance is dict[str, Decimal], e.g. {"USDT": Decimal("100.0")}
                 usdt_balance = balance.get("USDT", Decimal("0"))
+                # `available` / `used` 过去是把总额抄两遍、再把已用写死 "0"——三个字段
+                # 里两个是编的。而「已用保证金」恰恰是解释「总额没变、可用怎么少了」
+                # 的那一块（挂单 + 持仓占用的保证金）。有细分口径就问一次真值；问不到
+                # 就**留空**（`None`），不拿总额冒充可用：`available == total` 会让
+                # 「全额可用」成为一句假话，而用户拿它判断能开多大仓。
+                detail = _usdt_balance_detail(adapter)
                 balances[account_id] = {
                     "total": str(usdt_balance),
-                    "available": str(usdt_balance),
-                    "used": "0",
+                    "available": (
+                        str(detail["available"])
+                        if detail.get("available") is not None
+                        else None
+                    ),
+                    "used": (
+                        str(detail["used"]) if detail.get("used") is not None else None
+                    ),
+                    "wallet": (
+                        str(detail["wallet"])
+                        if detail.get("wallet") is not None
+                        else None
+                    ),
+                    "unrealized_pnl": (
+                        str(detail["unrealized_pnl"])
+                        if detail.get("unrealized_pnl") is not None
+                        else None
+                    ),
                 }
             except Exception:
                 pass
@@ -265,6 +287,48 @@ def account_list(request):
         acc["balance"] = balances.get(str(acc["id"]))
 
     return Response(account_data)
+
+
+def _usdt_balance_detail(adapter) -> dict:
+    """从适配器的细分口径里挑出 USDT 的几块，**取不到就留 `None`**。
+
+    这是「余额变了、订单里没有」这条问题的读面：`unrealized_pnl` 单独列出来，是因为
+    浮盈浮亏改的是「可用」而不是「钱包」——不把它拆开，一次 −23 USDT 的浮亏看起来
+    就和一次 −23 USDT 的资金费一模一样，而前者没有流水、后者有一条 `FUNDING_FEE`。
+    """
+    out: dict = {
+        "available": None,
+        "used": None,
+        "wallet": None,
+        "unrealized_pnl": None,
+    }
+    try:
+        detail = async_to_sync(adapter.get_balance_detail)()
+    except Exception:
+        return out
+    if not isinstance(detail, dict):
+        return out
+    row = detail.get("USDT")
+    if not isinstance(row, dict):
+        return out
+
+    # `crossWalletBalance` 优先于 `balance`：前者明确是**钱包**余额（不含浮盈），而
+    # `balance` 在 USDⓈ-M 上口径含糊。两个都没有才算没有。
+    for key in ("crossWalletBalance", "walletBalance", "balance"):
+        value = row.get(key)
+        if value is not None:
+            out["wallet"] = value
+            break
+    if row.get("availableBalance") is not None:
+        out["available"] = row["availableBalance"]
+    if row.get("crossUnPnl") is not None:
+        out["unrealized_pnl"] = row["crossUnPnl"]
+
+    # 「已用保证金」= 钱包余额 − 可用余额。两个都有了才是算得出来的数；缺一个就留空，
+    # 绝不用 0 顶替——0 在这里的意思是「一分钱都没占用」，那是一句具体的话。
+    if out["wallet"] is not None and out["available"] is not None:
+        out["used"] = out["wallet"] - out["available"]
+    return out
 
 
 #: 会话详情里内嵌的订单条数上限。**必须连同 `orders_total` 一起回**，否则这张表看起来
