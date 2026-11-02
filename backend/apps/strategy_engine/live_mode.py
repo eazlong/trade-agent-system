@@ -21,10 +21,54 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _declared_history_demand(strategy) -> int | None:
+    """策略**自己算出来的**最小历史根数（`min_bars`），没有就 `None`。
+
+    ## 为什么需要这个函数
+
+    策略声明「我需要多少历史才决策」有两个名字，而引擎此前只读了一个：
+
+    * `BaseStrategy.min_kline_length`（**类**属性，默认 500）—— 引擎一直读它；
+    * `self.min_bars`（**实例**属性，在 `__init__` 里按参数算出来）—— 引擎一个都没读。
+
+    `min_bars` 才是随参数变的那一个（`momentum_mean_reversion_dynamic_sl` 的
+    `max(ema_trend_period=720, …) + 10 = 730`）。两者分家的后果是**实盘永久空转**：
+    预加载 500 根、`on_kline` 又把历史截在 500 根，于是 `len(history) < 730` 恒真，
+    `on_bar` 第一行就 `return None`。回测不空转（吃整段 OHLCV），所以这类缺陷的表
+    现是「回测通过、实盘一根信号都没有，而两边日志都干净」。
+
+    ## 只读、不推断
+
+    这里**不重算**任何策略的公式（每个策略不同：`max(a×3, b×3, 100)` /
+    `lookback + atr + 2` / …）：公式属于策略。也不把 `min_bars` 补进基类——那会让
+    「策略没声明」与「策略声明了 None」变成同一件事。取不到就返回 `None`，由调用方
+    退回基类那个默认值。
+    """
+    value = getattr(strategy, "min_bars", None)
+    # `bool` 单独排掉：`min_bars=True` 是写错，不是「要 1 根」。
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
 class LiveStrategyRunner:
     # 持仓同步的最小间隔（秒）。同一根 K 线的多次 tick 推送、以及高频验证事件
     # 都按此节流；**新 K 线到来时强制刷新**（每 bar 至少一次真值）。
     POSITION_SYNC_MIN_INTERVAL = 15.0
+
+    #: 历史保留上限的**下限**（根）。历史深度不能低于策略需求（见
+    #: `_declared_history_demand`），也不能低于这个数——它是「哪怕策略没声明，也留够
+    #: 指标能用的量」的地板，与 `BaseStrategy.min_kline_length` 的默认值是同一个数。
+    #:
+    #: **不再是一个天花板。** 此前 `on_kline` 把它当硬上限（`max_history = 500`），
+    #: 于是任何需求超过 500 的策略在实盘里永远攒不够历史、永不决策（txy 上
+    #: `61d2662b` 的 `min_bars=730` 就是这么空转 6 天的）。
+    HISTORY_FLOOR = 500
+
+    #: 上限相对需求的**余量倍数**。留余量而不是刚好等于需求：策略的指标实现会用
+    #: 「历史尾部若干根」做大窗口计算（如 `history[-ema_period*5:]`），刚好卡在需求线上
+    #: 会让那些窗口短一截。
+    HISTORY_HEADROOM = 2
 
     def __init__(
         self,
@@ -45,6 +89,14 @@ class LiveStrategyRunner:
         self._kline_history: list[dict] = []
         self._dispatcher = None
         self._validation_task: "asyncio.Task | None" = None
+        # 历史深度（见 `history_requirement` / `history_limit`）。两者都在构造时算好：
+        # 策略的 `min_bars` 在它自己的 `__init__` 里就定了，此后不会变（参数在会话期间
+        # 不重载），所以没必要每次 on_kline 都重算。
+        self._history_requirement = max(
+            _declared_history_demand(strategy) or 0,
+            int(getattr(strategy, "min_kline_length", 0) or 0),
+            self.HISTORY_FLOOR,
+        )
         # 防止同方向重复开仓：记录每个 symbol 最近的入场方向
         # "buy" | "sell" | None，平仓（target_qty=0）时清除
         self._entry_direction: dict[str, str] = {}
@@ -86,8 +138,13 @@ class LiveStrategyRunner:
 
         self._dispatcher = SignalDispatcher()
 
-        # 预加载历史 K 线（warmup），让指标能立即产出有效值
-        await self.load_initial_history(limit=self.strategy.min_kline_length)
+        # 预加载历史 K 线（warmup），让指标能立即产出有效值。
+        #
+        # **根数取 `history_requirement`，不是 `min_kline_length`**：后者是基类默认值
+        # （500），而策略真正要多少写在它自己算的 `min_bars` 里（如 730）。只按 500 拉
+        # 的话，多出来的需求在实盘里**永远补不上**——`on_kline` 的历史上限同样要跟着
+        # 需求走（见 `history_limit`），否则攒到上限就停，`on_bar` 的前置判断恒为假。
+        await self.load_initial_history(limit=self.history_requirement)
 
         # 从交易所同步当前持仓到 ctx
         await self._sync_position_from_exchange()
@@ -146,6 +203,30 @@ class LiveStrategyRunner:
 
         logger.info(f"[LiveStrategyRunner] stopped: {self.strategy.name}")
 
+    @property
+    def history_requirement(self) -> int:
+        """策略**决策所需**的历史根数：它自己声明的、基类默认的、地板，三者取最大。
+
+        「够不够」这件事只有一个答案，就住在这里；`start()` 的预加载与 `on_kline` 的
+        保留上限都读它，所以两者不可能给出两个数（此前一个读 `min_kline_length`、
+        另一个写死 500，两个都小于策略要的 730）。
+        """
+        return self._history_requirement
+
+    @property
+    def history_limit(self) -> int:
+        """历史**保留上限**（根）：需求 × 余量。
+
+        **这是上限，不是需求。** 两者的差决定了「攒到上限时还够不够决策」：相等时只要
+        有一根 K 线在截断与决策之间被挤掉，`len(history) < requirement` 就会短暂为真。
+        留一倍余量（`HISTORY_HEADROOM`）让那段抖动落在需求线之上。
+
+        为什么仍然要有一个上限：无界增长的 `_kline_history` 会把长跑会话的内存吃光，
+        而那种故障在短测试里看不出来。上限跟着策略参数走，所以「需求更大的策略留更多
+        历史」这件事自动成立，不需要为每个策略配一个数。
+        """
+        return self._history_requirement * self.HISTORY_HEADROOM
+
     async def on_kline(self, kline: dict) -> None:
         """
         K 线数据回调入口。
@@ -189,10 +270,15 @@ class LiveStrategyRunner:
             self._kline_history[-1] = kline
         else:
             self._kline_history.append(kline)
-        # 限制历史长度，避免内存无限增长
-        max_history = 500
-        if len(self._kline_history) > max_history:
-            self._kline_history = self._kline_history[-max_history:]
+        # 限制历史长度，避免内存无限增长。
+        #
+        # **上限取 `history_limit`，不是一个常量 500。** 常量版的后果是一整类策略在
+        # 实盘里永久空转：`momentum_mean_reversion_dynamic_sl` 按 config 算出
+        # `min_bars = 730`，而历史攒到 500 就停 ⇒ `len(history) < 730` 恒真 ⇒
+        # `on_bar` 第一行 `return None`。txy 上 `61d2662b`（AVAX/USDT）就这样跑了
+        # 6.14 天、0 单、0 拒绝——回测侧因为吃整段 OHLCV 而正常，于是缺陷只在实盘可见。
+        if len(self._kline_history) > self.history_limit:
+            self._kline_history = self._kline_history[-self.history_limit :]
 
         # 只在 K 线收盘时决策：@kline 流每次成交都推送（约 1~2 秒一次），若 bar 内
         # tick 也跑完整决策，策略的「收盘价」语义会退化成实时价——2026-10 BNB/USDT
@@ -1187,9 +1273,15 @@ class LiveStrategyRunner:
         )
 
         try:
-            # 确保有足够的历史数据
+            # 确保有足够的历史数据。
+            #
+            # 补拉根数同样取 `history_requirement`：这里此前写的是 `limit=200`，而它是
+            # 同一个概念的**第三个**数（前两个是 `min_kline_length` 与写死的 500）。补
+            # 200 根对 `min_bars=730` 的策略毫无用处——它补完仍然不够决策，只是让日志
+            # 看起来「做了点什么」。而且 `load_initial_history` 会**整体替换**
+            # `_kline_history`，所以补少了还会把已有的更长历史**缩短**。
             if len(self._kline_history) < 10:
-                await self.load_initial_history(limit=200)
+                await self.load_initial_history(limit=self.history_requirement)
                 if len(self._kline_history) < 10:
                     logger.warning(
                         "[LiveStrategyRunner] insufficient kline history for validation"
