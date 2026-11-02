@@ -180,6 +180,54 @@ class TestTheAliasIsReadableFromTheClass:
         assert isinstance(value, int)
         assert value == BaseStrategy.MIN_BARS_DEFAULT
 
+    def test_class_level_default_matches_an_instance_that_declares_nothing(self):
+        """类级与实例级在「没声明」时必须给出**同一个数**。
+
+        这是分级读取的一致性底线：类级回答「这个类没写老值」，实例级回答「这个实例
+        没写新值」，两条都该落到 `MIN_BARS_DEFAULT`。若是分家，`backtest_smma_fractal.py`
+        按类级读到的预热根数会与实盘 runner 按实例算的不一致，而两边日志都正常。
+        """
+        cls_value = getattr(_DeclaresNothing, "min_kline_length", 0)
+        instance = _DeclaresNothing(_ctx())
+        assert cls_value == instance.min_bars == instance.min_kline_length
+
+
+class TestClassLevelAliasCannotKnowAnInstanceValue:
+    """在**类**上读老名字，只能拿到「类上写过的」或默认值，拿不到实例算出来的值。
+
+    这是别名机制的**固有边界**，不是缺陷：`min_bars = lookback + atr_period + 2` 依赖
+    实例参数，类上根本不存在那个数。但边界必须被明确写下，否则下一个人会以为「类级读取
+    也该给出 136」而去改实现。
+
+    `backtest_smma_fractal.py:804` 正踩在这个边界上：它按类级取，所以对一个**只写
+    `self.min_bars`** 的策略，它拿到的是默认值 500 而不是策略实际要的数。方向见
+    `test_the_age_of_this_limitation_is_safe_not_silent`。
+    """
+
+    def test_a_strategy_declaring_only_min_bars_reports_the_default_at_class_level(
+        self,
+    ):
+        instance = _DeclaredViaMinBars(_ctx())
+        assert instance.min_bars == 730
+        assert instance.min_kline_length == 730
+        # 类上不存在这个数，只能给默认值
+        assert getattr(_DeclaredViaMinBars, "min_kline_length", 0) == (
+            BaseStrategy.MIN_BARS_DEFAULT
+        )
+
+    def test_the_age_of_this_limitation_is_safe_not_silent(self):
+        """把边界的方向钉下来：类级默认 500 < 真实需求 730 ⇒ 脚本会**少**预热。
+
+        这条用例的价值不在断言本身，而在它写清了后果方向：少预热对
+        `backtest_smma_fractal.py` 的「信号形态诊断」影响有限（它只喂数据看形状），
+        但若有人把这个脚本当性能基准读，那 230 根的差异就是不成立的。
+        """
+        instance = _DeclaredViaMinBars(_ctx())
+        cls_value = getattr(_DeclaredViaMinBars, "min_kline_length", 0)
+        assert cls_value < instance.min_bars, (
+            "类级默认已 >= 真实需求时，这条边界不再有害，可以删掉本用例"
+        )
+
 
 class TestNoStrategyFileUsesBothNames:
     """真实策略文件里不许**同时**写两个名字。

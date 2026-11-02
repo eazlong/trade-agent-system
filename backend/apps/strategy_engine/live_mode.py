@@ -51,6 +51,68 @@ def _declared_history_demand(strategy) -> int | None:
     return value if value > 0 else None
 
 
+def _resolve_history_requirement(strategy) -> int:
+    """这条策略**实际需要**多少历史根数（预加载与保留上限都以它为基准）。
+
+    ## 两档，判据是「策略说没说」，不是「值等不等于默认值」
+
+    * **策略自己声明了**（`declares_min_bars`）→ 用它的数，**不套全局地板**。
+      `box_time_range_breakout_strategy` 声明 136 而地板是 500：把 136 抬到 500 意味着
+      每条这样的会话每次预热都多拉 364 根 1h K 线，而 `on_bar` 一根都用不上。
+    * **没声明** → 地板兜底（`HISTORY_FLOOR`，与 `BaseStrategy.MIN_BARS_DEFAULT` 同源）。
+      这是「策略作者没算过这件事」时的安全网，不能退化成 0。
+
+    判据**不能写成** `min_bars == MIN_BARS_DEFAULT`：一个策略完全可能声明恰好 500，
+    那是它算出来的数，被误判成「没声明」之后一旦地板调整就会跟着漂。
+
+    ## 声明了但值不可用
+
+    `None` / `0` / 写错类型（`"730"`、`True`）都退回地板。这是刻意的方向：一个坏声明
+    应该回到「保守但能用」，**不能**把历史压到底——那会复现 454f7a4 修掉的空转缺陷。
+
+    ## 没有 `declares_min_bars` 的对象（鸭子类型策略 / 测试替身）
+
+    `getattr(..., False)` 会把它们判成「没声明」，于是**只按地板预加载**——一个鸭子类型
+    替身只要写了 `min_bars = 730` 就会被静默砍到 500，而那正是本票要修的缺陷原形。
+    所以检测不到那个标记时，退回「取 `min_bars` 与老名字的最大值，且不低于地板」：
+    既不会截短任何声明，也不会让「什么都没声明」掉到 0。
+
+    这条分支在**生产**里走不到（`LiveStrategyRunner` 的入参永远是 `BaseStrategy`），
+    但它是测试替身与外部脚本的接缝，静默砍半的代价远高于这里多写五行。
+    """
+    floor = LiveStrategyRunner.HISTORY_FLOOR
+    declares = getattr(strategy, "declares_min_bars", None)
+
+    if declares is False:
+        # 明确的「没声明」：地板兜底，顺带不截短类级老值。
+        return max(floor, _legacy_floor_hint(strategy))
+
+    if declares is True:
+        declared = _declared_history_demand(strategy)
+        if declared is not None:
+            return declared
+        return max(floor, _legacy_floor_hint(strategy))
+
+    # 没有这个标记（不是 `BaseStrategy`）：取两者的 max，不截短也不抬高到地板。
+    return max(
+        _declared_history_demand(strategy) or 0,
+        _legacy_floor_hint(strategy),
+        floor,
+    )
+
+
+def _legacy_floor_hint(strategy) -> int:
+    """类级 `min_kline_length`（老名字）的可读值；读不到就 0。
+
+    单独成函数是因为它是**第二个名字**的唯一读取点：散在调用处会让「老名字还能不能读」
+    变成一个要翻几处才能回答的问题。
+    """
+    raw = getattr(strategy, "min_kline_length", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw if raw > 0 else 0
+
+
 class LiveStrategyRunner:
     # 持仓同步的最小间隔（秒）。同一根 K 线的多次 tick 推送、以及高频验证事件
     # 都按此节流；**新 K 线到来时强制刷新**（每 bar 至少一次真值）。
@@ -92,11 +154,12 @@ class LiveStrategyRunner:
         # 历史深度（见 `history_requirement` / `history_limit`）。两者都在构造时算好：
         # 策略的 `min_bars` 在它自己的 `__init__` 里就定了，此后不会变（参数在会话期间
         # 不重载），所以没必要每次 on_kline 都重算。
-        self._history_requirement = max(
-            _declared_history_demand(strategy) or 0,
-            int(getattr(strategy, "min_kline_length", 0) or 0),
-            self.HISTORY_FLOOR,
-        )
+        #
+        # **分两档**：策略自己声明了就听它的（可以低于全局地板——box 只声明 136，抬到
+        # 500 意味着每根 1h 都多一次用不上的网络请求）；没声明才由 `HISTORY_FLOOR` 兜底。
+        # 判据走 `declares_min_bars`，**不靠「值等不等于默认值」**：一个策略完全可以声明
+        # 恰好等于 500 的需求，那是它算出来的，不该被当成「没声明」。
+        self._history_requirement = _resolve_history_requirement(strategy)
         # 防止同方向重复开仓：记录每个 symbol 最近的入场方向
         # "buy" | "sell" | None，平仓（target_qty=0）时清除
         self._entry_direction: dict[str, str] = {}

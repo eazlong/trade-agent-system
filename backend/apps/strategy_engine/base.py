@@ -396,9 +396,51 @@ class BaseStrategy(ABC, metaclass=_StrategyMeta):
         # 空转（`min_bars=730` vs 预加载 500，`on_bar` 第一行恒为假）。收口方向见下：
         # 老名字降级成只读别名，仍在类上可读（`backtest_smma_fractal.py` 就是这么读的）。
         #
-        # 这里先落默认值，再由元类决定要不要用老名字覆盖（老文件优先，不改变其行为）。
+        # ## 这里**不落**默认值（除非策略写了老名字）
+        #
+        # 「引擎该预加载多少」要分两档：**策略声明了就听它的**（可以低于全局地板——box
+        # 只要 136，硬拉到 500 是每根 1h 一次的多余网络请求），没声明才由地板兜底。
+        #
+        # 要分这两档，引擎就必须能回答「这个数是不是策略自己算的」。而只要基类无条件
+        # `self.min_bars = 500`，每个实例的 `__dict__` 里都有一份，「声明了」与「没声明」
+        # 就再也分不开。所以：没声明时**不写实例属性**，让读取方走 `__getattr__` 兜到
+        # `MIN_BARS_DEFAULT`；声明时由策略自己覆盖。
+        # 于是「`min_bars` 在实例 `__dict__` 里」精确等于「策略自己写过」——见
+        # `declares_min_bars`。
+        #
+        # 老写法要在这里代它落一份：否则类属性那句话在引擎眼里不算「声明」。
         legacy = type(self)._legacy_min_kline_length()
-        self.min_bars = legacy if legacy is not None else self.MIN_BARS_DEFAULT
+        if legacy is not None:
+            self.min_bars = legacy
+
+    @property
+    def min_bars(self) -> int:
+        """策略需要多少根历史才决策。**唯一的名字。**
+
+        声明了（策略在 `__init__` 里写过）读它写的；没声明读 `MIN_BARS_DEFAULT`。
+
+        **必须是 property**：读取方要在「实例上有自己的值」与「回落到默认值」之间分派，
+        而一个类级整数做不到这件事——它会让「没声明」也变成一个看得见的值，
+        `declares_min_bars` 就再也答不出真假了。
+        """
+        try:
+            return object.__getattribute__(self, "__dict__")["declared_min_bars"]
+        except KeyError:
+            return self.MIN_BARS_DEFAULT
+
+    @min_bars.setter
+    def min_bars(self, value: int) -> None:
+        object.__setattr__(self, "declared_min_bars", value)
+
+    @property
+    def declares_min_bars(self) -> bool:
+        """这个策略**自己**声明了需求量吗（而不是落到默认值）。
+
+        引擎用它决定要不要套全局地板：声明了就听声明的，没声明才兜底。
+        `__dict__` 里有 `declared_min_bars` 等价于「策略自己写过 `self.min_bars`」，
+        理由见 `__init__` 那段注释。
+        """
+        return "declared_min_bars" in object.__getattribute__(self, "__dict__")
 
     #: 老名字 → 新名字的映射。**只有这一条**：别名是过渡期的单向门，不再扩。
     _DEPRECATED_ALIASES = {"min_kline_length": "min_bars"}
