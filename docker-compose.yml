@@ -110,7 +110,34 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: celery -A celery_app worker -l info --concurrency=4 -Q celery,grid_search
+    # 子进程回收是**兜底**，不是主修复（主修复见 handler.py 的日志管道与
+    # tasks.py 的 `_scalar_stats`）：
+    # - `--max-tasks-per-child`：跑满 N 个任务就换一个新的子进程，把 Python
+    #   堆碎片和任何残留的进程内状态（如 `_prev_results`、业务层缓存）一起还回去。
+    # - `--max-memory-per-child`：单个子进程 RSS 超过这个数（KB）就在任务边界
+    #   被回收。注意这是**每个子进程**的上限，不是容器总量，`--concurrency=4`
+    #   时最坏情况是 4 倍。
+    # - 容器级 memory limit：让「漏到失控」的表现是容器重启而不是整机 OOM
+    #   （旧版这里没有任何 limit，漏内存直接打死宿主机，txy 两次「端口通但不响应」
+    #   即此形态）。
+    #
+    # **`--concurrency` 与主机核数对齐（txy 是 2 核）**：原先是 4，但整机只有 2
+    # vCPU（`nproc` = 2，AMD EPYC 9754 切片）——4 个 prefork 子进程在 2 核上互相
+    # 抢占，CPU 得不到并行收益，却要多养 2 份「基线常驻」（每个子进程 import 完
+    # Django + pandas_ta + ccxt 后约 180MB，实测进程 RSS 268~538MB）。而整机只有
+    # 3.6GiB 内存、没有 swap 余量（1.9G swap 已用 800M+）——这才是 11-05 OOM
+    # 杀死 uvicorn、11-06 整机卡死的资源底板。核数与内存都指向 2。
+    # 若将来扩容到 4+ 核 / 8G+ 内存，再把这里调回 4。
+    command: >
+      celery -A celery_app worker -l info --concurrency=2 -Q celery,grid_search
+      --max-tasks-per-child=50
+      --max-memory-per-child=800000
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 512M
     volumes:
       - ./backend:/app
       - ~/.tradelogx:/root/.tradelogx
@@ -126,6 +153,11 @@ services:
       - WEB_PROXY=http://host.docker.internal:7890
       - DATASOURCE_AUTO_WS=false       # WS 行情供给仅 backend 进程需要
       - CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP=true
+      # 日志管道上界：队列满即丢并计数（见 apps/logging_app/handler.py）。
+      # 默认 10000 足够吸收一次日志风暴；让它显式可见，是为了排障时能一眼看出
+      # 「丢了多少」（`get_handler_stats()["dropped"]`）。
+      - LOG_DB_QUEUE_MAX=10000
+      - LOG_DB_BATCH_SIZE=200
     env_file:
       - ./backend/.env
     extra_hosts:
