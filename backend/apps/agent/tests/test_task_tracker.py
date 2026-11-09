@@ -25,10 +25,20 @@ def _make_tracker(**kwargs):
 
 @pytest.fixture(autouse=True)
 def _clear_context():
-    """Reset context before and after each test."""
+    """Reset context before and after each test.
+
+    同时清空 `apps.core.redis_pool` 的客户端缓存：`task_tracker` 现在**按 URL 复用**
+    客户端（旧写法每次 ``redis.from_url`` 都新建）。缓存若跨用例存活，上一个用例
+    ``patch("redis.from_url")`` 产出的 MagicMock 会被下一个用例拿去用——表现为
+    「未 patch 的用例读到了别的用例的 mock」，而不是它本该走的真实路径。
+    """
+    from apps.core.redis_pool import reset_for_tests
+
     tracker_context.set(None)
+    reset_for_tests()
     yield
     tracker_context.set(None)
+    reset_for_tests()
 
 
 @pytest.fixture()

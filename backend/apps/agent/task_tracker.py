@@ -29,16 +29,13 @@ _PROGRESS_CHANNEL = "task:progress:notifications"
 
 def _send_notification_redis(user_id: str, text: str) -> None:
     """Publish notification request to Redis pubsub for ASGI to consume."""
-    import redis
-
+    from apps.core.redis_pool import get_sync_redis, url_with_db
     from django.conf import settings
 
-    url = settings.REDIS_URL
-    if url.rsplit("/", 1)[-1].isdigit():
-        url = url.rsplit("/", 1)[0] + "/3"
+    url = url_with_db(settings.REDIS_URL, 3)
 
     try:
-        r = redis.from_url(url, decode_responses=True)
+        r = get_sync_redis(url)
         r.publish(
             _PROGRESS_CHANNEL,
             json.dumps(
@@ -248,15 +245,13 @@ class TaskTracker:
 
         Returns True if the task was found and marked, False otherwise.
         """
-        import redis
+        from apps.core.redis_pool import get_sync_redis, url_with_db
         from django.conf import settings
 
-        url = settings.REDIS_URL
-        if url.rsplit("/", 1)[-1].isdigit():
-            url = url.rsplit("/", 1)[0] + "/3"
+        url = url_with_db(settings.REDIS_URL, 3)
 
         try:
-            r = redis.from_url(url, decode_responses=True)
+            r = get_sync_redis(url)
             key = f"task:progress:{task_id}"
             if not r.exists(key):
                 return False
@@ -271,15 +266,13 @@ class TaskTracker:
 
     def is_cancelled(self) -> bool:
         """Check if this task has been cancelled by the user."""
-        import redis
+        from apps.core.redis_pool import get_sync_redis, url_with_db
         from django.conf import settings
 
-        url = settings.REDIS_URL
-        if url.rsplit("/", 1)[-1].isdigit():
-            url = url.rsplit("/", 1)[0] + "/3"
+        url = url_with_db(settings.REDIS_URL, 3)
 
         try:
-            r = redis.from_url(url, decode_responses=True)
+            r = get_sync_redis(url)
             status = r.hget(self._redis_key, "status")
             return status == "cancelled"
         except Exception:
@@ -306,12 +299,10 @@ class TaskTracker:
         Called from submit_backtest / submit_grid_search right after
         apply_async succeeds.
         """
-        import redis
+        from apps.core.redis_pool import get_sync_redis, url_with_db
         from django.conf import settings
 
-        url = settings.REDIS_URL
-        if url.rsplit("/", 1)[-1].isdigit():
-            url = url.rsplit("/", 1)[0] + "/3"
+        url = url_with_db(settings.REDIS_URL, 3)
 
         data: dict[str, Any] = {
             "task_id": task_id,
@@ -325,7 +316,7 @@ class TaskTracker:
             data["metadata"] = json.dumps(metadata, ensure_ascii=False)
 
         try:
-            r = redis.from_url(url, decode_responses=True)
+            r = get_sync_redis(url)
             pipe = r.pipeline()
             pipe.hset(f"task:progress:{task_id}", mapping=data)
             pipe.expire(f"task:progress:{task_id}", 86400)  # 24h TTL
@@ -350,15 +341,13 @@ class TaskTracker:
             'submitted' | 'running' | 'completed' | 'failed' | 'zombie' |
             'zombie_retrying' | 'dlq' | None (key not found)
         """
-        import redis
+        from apps.core.redis_pool import get_sync_redis, url_with_db
         from django.conf import settings
 
-        url = settings.REDIS_URL
-        if url.rsplit("/", 1)[-1].isdigit():
-            url = url.rsplit("/", 1)[0] + "/3"
+        url = url_with_db(settings.REDIS_URL, 3)
 
         try:
-            r = redis.from_url(url, decode_responses=True)
+            r = get_sync_redis(url)
             key = f"task:progress:{task_id}"
             if not r.exists(key):
                 return None
@@ -389,16 +378,13 @@ class TaskTracker:
 
     def _save_redis(self, status: str, data: dict) -> None:
         """Write progress to Redis Hash with TTL."""
-        import redis
-
+        from apps.core.redis_pool import get_sync_redis, url_with_db
         from django.conf import settings
 
-        url = settings.REDIS_URL
-        if url.rsplit("/", 1)[-1].isdigit():
-            url = url.rsplit("/", 1)[0] + "/3"
+        url = url_with_db(settings.REDIS_URL, 3)
 
         try:
-            r = redis.from_url(url, decode_responses=True)
+            r = get_sync_redis(url)
             pipe = r.pipeline()
             pipe.hset(
                 self._redis_key,
@@ -526,26 +512,22 @@ class TaskTracker:
 
     def _get_current_status(self) -> str:
         try:
-            import redis
+            from apps.core.redis_pool import get_sync_redis, url_with_db
             from django.conf import settings
 
-            url = settings.REDIS_URL
-            if url.rsplit("/", 1)[-1].isdigit():
-                url = url.rsplit("/", 1)[0] + "/3"
-            r = redis.from_url(url, decode_responses=True)
+            url = url_with_db(settings.REDIS_URL, 3)
+            r = get_sync_redis(url)
             return r.hget(self._redis_key, "status") or "unknown"
         except Exception:
             return "unknown"
 
     def _get_current_progress(self) -> float:
         try:
-            import redis
+            from apps.core.redis_pool import get_sync_redis, url_with_db
             from django.conf import settings
 
-            url = settings.REDIS_URL
-            if url.rsplit("/", 1)[-1].isdigit():
-                url = url.rsplit("/", 1)[0] + "/3"
-            r = redis.from_url(url, decode_responses=True)
+            url = url_with_db(settings.REDIS_URL, 3)
+            r = get_sync_redis(url)
             val = r.hget(self._redis_key, "progress")
             return float(val) if val else 0.0
         except Exception:
