@@ -279,6 +279,47 @@ def run_backtest_task(
 # 并在文件顶部 re-export（既有调用方仍可从 apps.backtest.tasks import）。
 
 
+#: 网格搜索在内存里**保留**的 `stats` 键。只列标量。
+#:
+#: 反面清单是这份白名单存在的理由：`equity_curve`（逐 bar）、`trades`（逐笔）、
+#: `benchmark.curve`（逐 bar 的基准曲线）都是全量列表，而 `results` 要留到组合
+#: 循环跑完才消费。1 年 15m 的 `equity_curve` 实测 7.2MB，100 个组合同时驻留
+#: 就是 650MB 以上——而它们写库时本来就截断到 2000 点，内存里这份全量副本
+#: 对任何下游都没有用处。
+#:
+#: 用白名单而不是黑名单：新增一个「大列表」字段时，黑名单要有人记得补，
+#: 白名单自动把它挡在外面。函数参数里保留 `sort_by` 认的那个键，是为了
+#: `_finalize_partial_grid` 的排序——`sort_by` 允许自定义，白名单不能假定。
+_GRID_RESULT_SCALAR_KEYS = frozenset(
+    {
+        "final_equity",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "win_rate",
+        "sharpe_ratio",
+        "total_trades",
+        "profit_factor",
+        "payoff_ratio",
+    }
+)
+
+
+def _scalar_stats(stats: dict, sort_key: str | None = None) -> dict:
+    """从回测 `stats` 里摘出标量，丢掉逐 bar / 逐笔的全量列表。
+
+    `sort_key` 非空时额外保留它那一个键：`GridSearchJob.sort_by` 是自由字符串
+    （历史数据里出现过 ``-sharpe_ratio`` 这种带方向的写法），白名单不能假定
+    它一定在里面——排不上序的表现是「best_result 恒为第一个组合」，比浪费
+    一点内存糟得多。
+    """
+    out = {k: v for k, v in stats.items() if k in _GRID_RESULT_SCALAR_KEYS}
+    if sort_key:
+        key = str(sort_key).lstrip("-")
+        if key in stats and key not in out:
+            out[key] = stats[key]
+    return out
+
+
 def _parse_date_utc(value: str) -> datetime | None:
     """``YYYY-MM-DD``（或 ISO 时间串）→ aware-UTC datetime；失败返回 None。
 
@@ -888,6 +929,11 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
         loop = asyncio.new_event_loop()
         start_time = timezone.now().timestamp()
 
+        # 排序键在**循环之前**解析一次：循环内要按它决定每个组合保留哪个额外
+        # 标量（见 `_scalar_stats`），循环之后又用它排序。两处必须是同一个值，
+        # 且 `sort_by` 可能带方向前缀（``-sharpe_ratio``）。
+        sort_key = (job.sort_by or "sharpe_ratio").lstrip("-")
+
         try:
             for idx, params in enumerate(combinations):
                 # DB 连接在长时间的 OHLCV 抓取 / 上一个组合回测期间可能被
@@ -938,8 +984,24 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
                         BacktestResult.objects.filter(id=result_id).update(
                             grid_search_id=job.id, is_grid_search=True
                         )
+                        # **只留标量，不留大列表**：`stats` 里 `equity_curve` /
+                        # `trades` / `benchmark.curve` 是逐 bar / 逐笔的全量列表，
+                        # 而 `results` 要留到这个循环跑完（排序、best_result、切片
+                        # 投递都在循环之后）。实测 1 年 15m 的 `equity_curve` 是
+                        # 7.2MB，100 个组合同时驻留就是 650MB 以上——这些数据在
+                        # `save_backtest_result` 时本来就已截断到 2000 点写库，内存
+                        # 里这份全量副本对下游一点用都没有。
+                        #
+                        # 下游真正读的键只有三样（见本函数的排序段与
+                        # `_finalize_partial_grid`）：`result_id`、`params`、
+                        # `sort_by` 认的那个标量。`sort_by` 的枚举是
+                        # sharpe_ratio / total_return_pct / win_rate，全是标量。
                         results.append(
-                            {"result_id": result_id, "params": params, **stats}
+                            {
+                                "result_id": result_id,
+                                "params": params,
+                                **_scalar_stats(stats, sort_key),
+                            }
                         )
                 except SoftTimeLimitExceeded:
                     raise
@@ -959,7 +1021,7 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
             loop.close()
 
         # 排序并标记最优结果
-        sort_key = job.sort_by or "sharpe_ratio"
+        best_val = "N/A"
         if results:
             sorted_results = sorted(
                 results,
@@ -967,6 +1029,10 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
                 reverse=True,
             )
             best = sorted_results[0]
+            # `best_val` 取的是**排好序的第一个**，不是 `results[0]`（`results` 是
+            # 循环顺序，与 sort_by 无关）。旧写法在「最优组合不是第一个跑的那个」
+            # 时会报错一个错的指标值，日志与完成提示里的「最优 xxx=」因此不可信。
+            best_val = best.get(sort_key, "N/A")
             best_result_id = best.get("result_id")
             if best_result_id:
                 try:
@@ -976,7 +1042,6 @@ def run_grid_search_task(self, job_id: str, user_id: str | None = None) -> dict:
                     pass
 
         elapsed = int(timezone.now().timestamp() - start_time)
-        best_val = results[0].get(sort_key) if results else "N/A"
         job.status = "completed"
         job.save(update_fields=["status", "completed_combinations", "best_result"])
 
