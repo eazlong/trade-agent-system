@@ -208,3 +208,206 @@ describe("401 刷新流程（不许被这次改动碰坏）", () => {
     expect(failure.status).toBe(400);
   });
 });
+
+/**
+ * 令牌刷新必须是**单飞**的，且「刷不出来」与「被限流」是两件事。
+ *
+ * ## 这一份钉的是什么缺陷（txy 生产实测，2026-11-05 16:41–16:55 CST）
+ *
+ * 那一刻后端日志里 `/api/...` 每分钟 50–128 条 `401 Unauthorized`，其中
+ * `Unauthorized: /api/trading/klines/` 在 16:42 / 16:44 / 16:45 / 16:47 各一发——
+ * 用户看到的就是「K 线一直加载不出来」。
+ *
+ * 根因不在 K 线接口本身（24 个 symbol×interval 组合逐个 curl 全是 200）：交易页一次
+ * 挂载会同时发 10 个请求（positions / accounts / orders / frame-status / sessions /
+ * halt / overview / agent-list / summary / me）。访问令牌过期时这 10 个**各自**走
+ * `tryRefreshToken()`，于是**一次页面挂载打 10 发刷新**（浏览器实测 refresh 状态码
+ * 十连 200）。`/api/auth/token/refresh/` 是 `AllowAny`，落在 `AnonRateThrottle`
+ * 的 20/min 上——两次页面挂载就把匿名桶打穿，随后的刷新拿到 429。
+ *
+ * 而 429 在旧代码里与「刷新令牌真的过期」走同一条路（`!res.ok → false`）：
+ * `clearTokens()` + 跳登录。**一次本该自愈的瞬时限流，把已登录用户踢下线**，
+ * 之后的每一次请求（包括那发 K 线）都只剩 401。
+ *
+ * 所以两条契约：
+ *   1. 并发 401 共用**同一次**刷新（单飞）。否则线程数 = 刷新数 = 限流自杀。
+ *   2. 刷新被限流 / 5xx / 网络类失败 → **不清令牌、不跳登录**，把错误如实抛出去。
+ *      只有刷新端点明确回 401（刷新令牌本身无效）才让用户重新登录。
+ */
+describe("令牌刷新：单飞 + 区分「刷不出来」与「被限流」", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+    localStorage.clear();
+  });
+
+  it("10 个请求同时 401 → 只打 1 发刷新，不是 10 发", async () => {
+    localStorage.setItem(ACCESS_KEY, "stale-access");
+    localStorage.setItem(REFRESH_KEY, "refresh-token");
+
+    let refreshCalls = 0;
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/auth/token/refresh/")) {
+        refreshCalls += 1;
+        // 让刷新「慢一点」，把并发窗口撑开：否则单飞可能靠微任务顺序蒙对
+        await new Promise((r) => setTimeout(r, 5));
+        return response(JSON.stringify({ access: "fresh-access" }), { status: 200 });
+      }
+      // 带**旧**令牌 → 401；带刷新后的新令牌 → 200。这才是一次真实的过期挂载。
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      if (auth === "Bearer fresh-access") {
+        return response(JSON.stringify({ switches: [] }), { status: 200 });
+      }
+      return response(JSON.stringify({ detail: "expired" }), { status: 401 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = await import("@/lib/api");
+    // 交易页一次挂载的 10 个并发请求的等价物
+    const calls = await Promise.all([
+      api.regimeApi.getOverview(),
+      api.regimeApi.getHaltState(),
+      api.tradingApi.getOrders(),
+      api.tradingApi.getPositions(),
+      api.tradingApi.getSummary(),
+      api.tradingApi.getAccounts(),
+      api.authApi.me(),
+      api.marketApi.ticker({ source: "binance", symbol: "BTC/USDT" }),
+      api.tradingApi.getKlines("BTC/USDT", "1h", 500),
+      api.notificationApi.unreadCount(),
+    ]);
+
+    expect(calls).toHaveLength(10);
+    expect(refreshCalls).toBe(1);
+    expect(localStorage.getItem(ACCESS_KEY)).toBe("fresh-access");
+  });
+
+  it("刷新被限流（429）→ 不清令牌、不跳登录，错误如实抛出", async () => {
+    localStorage.setItem(ACCESS_KEY, "stale-access");
+    localStorage.setItem(REFRESH_KEY, "refresh-token");
+
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/api/auth/token/refresh/")) {
+        return response(JSON.stringify({ detail: "请求过于频繁" }), { status: 429 });
+      }
+      return response(JSON.stringify({ detail: "expired" }), { status: 401 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = await import("@/lib/api");
+    const failure = await api.tradingApi.getKlines("BTC/USDT", "1h", 500).catch((e) => e);
+
+    expect(failure).toBeInstanceOf(Error);
+    // 会话还在：限流是瞬时的，下一次 401 还能靠同一个刷新令牌自愈
+    expect(localStorage.getItem(ACCESS_KEY)).toBe("stale-access");
+    expect(localStorage.getItem(REFRESH_KEY)).toBe("refresh-token");
+  });
+
+  it("刷新端点明确回 401（刷新令牌失效）→ 才清令牌、跳登录", async () => {
+    localStorage.setItem(ACCESS_KEY, "stale-access");
+    localStorage.setItem(REFRESH_KEY, "refresh-token");
+
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes("/api/auth/token/refresh/")) {
+        return response(JSON.stringify({ detail: "Token is invalid" }), { status: 401 });
+      }
+      return response(JSON.stringify({ detail: "expired" }), { status: 401 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const api = await import("@/lib/api");
+    const failure = await api.tradingApi.getKlines("BTC/USDT", "1h", 500).catch((e) => e);
+
+    expect(failure).toBeInstanceOf(api.ApiError);
+    expect(failure.message).toBe("Unauthorized");
+    expect(failure.status).toBe(401);
+    expect(localStorage.getItem(ACCESS_KEY)).toBeNull();
+    expect(localStorage.getItem(REFRESH_KEY)).toBeNull();
+  });
+});
+
+describe("preferencesApi（顶栏行情币种偏好）", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+    localStorage.clear();
+  });
+
+  it("读偏好走 GET，并把后端回来的边界原样带出", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      response(
+        JSON.stringify({
+          header_symbols: ["BTC/USDT", "ETH/USDT", "DOGE/USDT"],
+          is_default: false,
+          min: 3,
+          max: 5,
+          default: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+        })
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { preferencesApi } = await import("@/lib/api");
+    const pref = await preferencesApi.headerSymbols();
+
+    // `request()` 会把尾部斜杠去掉（DRF 路由仍认），所以断言不带尾斜杠的前缀
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/api/auth/preferences");
+    expect(fetchMock.mock.calls[0][1].method).toBe("GET");
+    expect(pref.header_symbols).toEqual(["BTC/USDT", "ETH/USDT", "DOGE/USDT"]);
+    expect(pref.is_default).toBe(false);
+    // 边界是后端的硬门槛，前端只信它回的值，不自己写死一份
+    expect(pref.min).toBe(3);
+    expect(pref.max).toBe(5);
+  });
+
+  it("保存偏好走 PUT，body 是整份替换而不是增量", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      response(
+        JSON.stringify({
+          header_symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+          is_default: false,
+          min: 3,
+          max: 5,
+          default: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"],
+        })
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { preferencesApi } = await import("@/lib/api");
+    await preferencesApi.saveHeaderSymbols(["BTC/USDT", "ETH/USDT", "SOL/USDT"]);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain("/api/auth/preferences");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({
+      header_symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    });
+  });
+
+  it("后端 400 那句话原样进 ApiError.message（含条数范围）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        response(
+          JSON.stringify({
+            error: "顶栏行情币种至少 3 个，最多 5 个（当前 2 个）",
+          }),
+          { status: 400 }
+        )
+      )
+    );
+
+    const { preferencesApi, ApiError } = await import("@/lib/api");
+    const failure = await preferencesApi
+      .saveHeaderSymbols(["BTC/USDT", "ETH/USDT"])
+      .catch((e) => e);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect(failure.message).toBe("顶栏行情币种至少 3 个，最多 5 个（当前 2 个）");
+    expect(failure.status).toBe(400);
+  });
+});

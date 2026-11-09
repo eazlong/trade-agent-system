@@ -1,6 +1,7 @@
 "use client";
 
 import DashboardShell from "@/components/layout/DashboardShell";
+import HeaderSymbolsEditor from "@/components/settings/HeaderSymbolsEditor";
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -340,6 +341,7 @@ export default function SettingsPage() {
       {/* Content */}
       <div className="bg-bg1 border border-[rgba(255,255,255,0.07)] rounded-xl overflow-hidden">
         {activeTab === "general" && (
+          <>
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -423,6 +425,15 @@ export default function SettingsPage() {
               />
             </div>
           </form>
+
+          {/* 顶栏行情币种（3–5 个，默认 BTC/ETH/SOL/BNB）。自成一个 form 与保存按钮：
+              它走 `/api/auth/preferences/`（有后端），而上面那份 LLM 配置尚无后端 API；
+              两条链路不能共用一次提交。**form 不能嵌套**，所以这里是兄弟节点而不是子节点
+              （嵌进去按「保存币种」会连带提交 LLM 那一份）。 */}
+          <div className="px-5 pb-5">
+            <HeaderSymbolsEditor />
+          </div>
+          </>
         )}
 
         {activeTab === "exchange" && (

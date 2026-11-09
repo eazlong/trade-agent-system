@@ -156,19 +156,23 @@ class ChatWebSocket {
     }
     this.refreshing = true;
     try {
-      const ok = await tryRefreshToken();
+      const result = await tryRefreshToken();
       this.refreshing = false;
-      if (ok) {
+      if (result.ok) {
         this.reconnectAttempt = 0;
         this.connect();
-      } else {
+      } else if (result.kind === "invalid") {
+        // 刷新令牌真的失效了 —— 只有这一种情况需要重新登录
         clearTokens();
         window.location.href = "/login";
+      } else {
+        // 限流 / 5xx / 断网：会话还在，靠指数退避重连，别把用户踢下线
+        this._scheduleReconnect();
       }
     } catch {
       this.refreshing = false;
-      clearTokens();
-      window.location.href = "/login";
+      // 刷新通路本身出错 ≠ 令牌失效，同样走退避重连
+      this._scheduleReconnect();
     }
   }
 

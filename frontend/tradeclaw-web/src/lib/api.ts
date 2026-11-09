@@ -108,9 +108,17 @@ async function request<T>(
   });
 
   if (res.status === 401) {
-    // Try refresh
-    const refreshed = await tryRefreshToken();
-    if (!refreshed) {
+    // **先看别人是不是已经刷过了**：交易页一次挂载会并发发十几个请求（orders /
+    // positions / sessions / halt / overview / tickers / me...）。令牌过期时它们会
+    // 同时 401，若每个都打一发刷新，就是「刷新端点被自己的并发打死」——见下面
+    // `tryRefreshToken` 的单飞说明。令牌已经变了就直接用新的重试，不碰刷新端点。
+    const alreadyRefreshed = getAccessToken();
+    const result: RefreshResult =
+      alreadyRefreshed && alreadyRefreshed !== token
+        ? { ok: true, access: alreadyRefreshed }
+        : await tryRefreshToken();
+
+    if (!result.ok && result.kind === "invalid") {
       clearTokens();
       window.location.href = "/login";
       // 仍然是同一句话、同一个类型（`ApiError` 是 `Error` 的子类），只是多带了状态码。
@@ -118,6 +126,12 @@ async function request<T>(
       // 通常是 `{"detail": "Given token not valid..."}`——把它显示给人只会盖住「请重新登录」。
       throw new ApiError("Unauthorized", 401);
     }
+    if (!result.ok) {
+      // 刷新**没能得出答案**（429 限流 / 5xx / 网络断）：会话并没有失效，清令牌跳登录
+      // 会把一个本来下一分钟就能自愈的瞬时限流变成一次强制下线。错误照实抛出去。
+      throw result.error;
+    }
+
     // Retry with new token
     const newToken = getAccessToken();
     if (newToken) {
@@ -149,22 +163,94 @@ async function request<T>(
   return res.json() as Promise<T>;
 }
 
-export async function tryRefreshToken(): Promise<boolean> {
+/**
+ * 一次刷新的结论。
+ *
+ * 「刷不出来」有**两个完全不同的成因**，混成一个 `false` 是本仓踩过的坑
+ * （txy 生产 2026-11-05 16:41–16:55 CST：交易页十几个请求并发 401 → 十几个并发刷新
+ *  → `/api/auth/token/refresh/` 是 `AllowAny`、落 `AnonRateThrottle` 20/min → 429
+ * → 旧代码把 429 当「刷新令牌失效」→ `clearTokens` + 跳登录。于是一次瞬时限流
+ * 把已登录用户踢下线，前端随后每个请求都只剩 401，页面上的 K 线永远加载不出来）：
+ *
+ *   - `invalid`：刷新令牌本身无效 / 过期 / 被拉黑（端点明确回 401）。**只能重新登录。**
+ *   - `transient`：限流 / 5xx / 网络异常。**会话还在**，下一次请求还能自愈。
+ */
+export type RefreshResult =
+  | { ok: true; access: string }
+  | { ok: false; kind: "invalid" }
+  | { ok: false; kind: "transient"; error: ApiError };
+
+/**
+ * 进行中的那次刷新。**单飞**：并发 401 共享同一个 promise。
+ *
+ * 不做单飞，刷新数就等于并发请求数，而刷新端点按 IP 限流 20/min——
+ * 两次页面挂载就能把自己的刷新通路打限流，然后所有人一起被踢下线。
+ */
+let refreshInFlight: Promise<RefreshResult> | null = null;
+
+async function performRefresh(): Promise<RefreshResult> {
   const refresh = getRefreshToken();
-  if (!refresh) return false;
+  if (!refresh) return { ok: false, kind: "invalid" };
+
+  let res: Response;
   try {
-    const res = await fetch(`${API_BASE}/api/auth/token/refresh/`, {
+    res = await fetch(`${API_BASE}/api/auth/token/refresh/`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh }),
     });
-    if (!res.ok) return false;
-    const data = await res.json();
-    setTokens(data.access, refresh);
-    return true;
-  } catch {
-    return false;
+  } catch (e) {
+    // 断网 / DNS / 连接被重置：跟令牌没关系，别把用户踢下线
+    return {
+      ok: false,
+      kind: "transient",
+      error: new ApiError(e instanceof Error ? e.message : "刷新令牌请求失败", 0),
+    };
   }
+
+  if (res.status === 401 || res.status === 403) {
+    return { ok: false, kind: "invalid" };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      kind: "transient",
+      error: new ApiError(await messageFrom(res), res.status),
+    };
+  }
+
+  let data: { access?: unknown };
+  try {
+    data = await res.json();
+  } catch {
+    return {
+      ok: false,
+      kind: "transient",
+      error: new ApiError("刷新返回无法解析", res.status),
+    };
+  }
+  if (typeof data.access !== "string" || !data.access) {
+    return {
+      ok: false,
+      kind: "transient",
+      error: new ApiError("刷新返回里没有 access", res.status),
+    };
+  }
+
+  setTokens(data.access, refresh);
+  return { ok: true, access: data.access };
+}
+
+/** 刷新访问令牌。并发调用共享同一次请求（单飞）。 */
+export function tryRefreshToken(): Promise<RefreshResult> {
+  if (refreshInFlight) return refreshInFlight;
+  const p = performRefresh();
+  refreshInFlight = p;
+  // 结束就放开：下一次（真的又过期了）能再刷一次，但同一批并发只会有一发。
+  void p.then(() => {
+    if (refreshInFlight === p) refreshInFlight = null;
+  });
+  return p;
 }
 
 // ── Auth API ──
@@ -219,6 +305,37 @@ export const authApi = {
       refresh,
     });
   },
+};
+
+// ── 用户偏好（顶栏行情币种） ──
+
+/**
+ * 后端 `GET/PUT /api/auth/preferences/` 的响应形状。
+ *
+ * `min` / `max` / `default` 由后端一并回：边界是后端的硬门槛（3–5），前端要是自己写死
+ * 一份，收紧规则那天页面上的按钮状态就会先于后端撒谎。「恢复默认」按钮的置灰同理读
+ * `is_default`，不从「与 DEFAULT_HEADER_SYMBOLS 逐个比对」推——那种推导在默认值变更时
+ * 会把一个改过偏好的用户显示成「没改过」。
+ */
+export interface HeaderSymbolsPreference {
+  header_symbols: string[];
+  is_default: boolean;
+  min: number;
+  max: number;
+  default: string[];
+}
+
+export const preferencesApi = {
+  /** 读偏好。后端读路径会**顺手补 WS 订阅**（幂等）：ticker 只读 WS 内存存储、
+   *  不做 REST 回退，这次调用是「用户配过的那几档在新进程里被重新订阅」的唯一机会。 */
+  headerSymbols: () =>
+    request<HeaderSymbolsPreference>("/api/auth/preferences/"),
+
+  /** 整份替换。清单是**有序的**，顺序即顶栏显示顺序，所以不做增量接口。 */
+  saveHeaderSymbols: (symbols: string[]) =>
+    request<HeaderSymbolsPreference>("/api/auth/preferences/", "PUT", {
+      header_symbols: symbols,
+    }),
 };
 
 // ── Trading API ──

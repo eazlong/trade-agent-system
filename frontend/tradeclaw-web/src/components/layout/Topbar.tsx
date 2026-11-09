@@ -2,9 +2,19 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState, useEffect, useRef } from "react";
+import dynamic from "next/dynamic";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useRightPanel } from "@/components/layout/DashboardShell";
+import { useHeaderSymbols } from "@/hooks/useHeaderSymbols";
+import { formatHeaderPrice } from "@/lib/headerSymbols";
 import { marketApi, notificationApi, type Notification } from "@/lib/api";
+
+/** K 线弹窗按需加载：lightweight-charts 只在真的点开某个行情条时才进包。
+ *  顶栏是每页都在的常驻组件，不为它扛一整张图表库。 */
+const SymbolKlineModal = dynamic(
+  () => import("@/components/market/SymbolKlineModal"),
+  { ssr: false }
+);
 
 const NAV_ITEMS = [
   { key: "overview", label: "总览" },
@@ -18,25 +28,50 @@ const NAV_ITEMS = [
   { key: "settings", label: "配置" },
 ];
 
+/**
+ * 顶栏实时行情品种 **不再是常量**：它是用户级偏好（`User.header_symbols`，
+ * 在「配置 → 通用 → 顶栏行情币种」里改，3–5 个，默认 BTC/ETH/SOL/BNB）。
+ *
+ * 这里只消费 `useHeaderSymbols()`，不自己存一份默认值——默认值/归一/边界都在
+ * `lib/headerSymbols.ts` 与后端 `apps/authentication/preferences.py`，同一件事只许有一个说法。
+ *
+ * 与订阅清单的关系仍然是要命的那一条：`GET /api/datasource/api/market/ticker/` 只从
+ * WS 内存存储取数、不做 REST 回退，没订阅的品种永远是一个「—」（2026-11-05 加 BNB 时
+ * 撞上过：前端画了四档，WS 只订阅了三档）。用户把某个品种配进顶栏时，补订阅由
+ * 偏好接口负责（读/写两条路径都会调 `ensure_feed_symbols`，幂等），不靠前端。
+ */
+
+interface Quote {
+  price: number | null;
+  chg: number | null;
+}
+
 export default function Topbar() {
   const pathname = usePathname();
   const activeTab = pathname.split("/").pop() || "overview";
   const { show, toggle } = useRightPanel();
+  const { symbols } = useHeaderSymbols();
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
   const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [markets, setMarkets] = useState<{ sym: string; price: number | null; chg: number | null }[]>([
-    { sym: "BTC/USDT", price: null, chg: null },
-    { sym: "ETH/USDT", price: null, chg: null },
-    { sym: "SOL/USDT", price: null, chg: null },
-  ]);
 
-  const MARKET_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"];
+  /** 按品种存报价，而不是按「第几条」存：用户把清单从 [BTC,ETH,SOL] 改成
+   *  [BTC,ETH,BNB] 时，BTC/ETH 已有的价格应当留在原地（而不是先闪一帧「—」）。 */
+  const [quotes, setQuotes] = useState<Record<string, Quote>>({});
 
-  const fetchMarkets = async () => {
-    try {
+  // 点开的行情条 → 弹 K 线。null = 没开。
+  const [klineSymbol, setKlineSymbol] = useState<string | null>(null);
+  const closeKline = useCallback(() => setKlineSymbol(null), []);
+
+  useEffect(() => {
+    if (symbols.length === 0) return;
+    let cancelled = false;
+
+    // 取数函数定义在 effect 里（而不是 useCallback）：它只服务这一个轮询循环，
+    // 依赖只有 `symbols`，不需要一个组件级稳定的引用。
+    const tickQuotes = async () => {
       const results = await Promise.all(
-        MARKET_SYMBOLS.map(async (sym) => {
+        symbols.map(async (sym) => {
           try {
             const t = await marketApi.ticker({ source: "binance", symbol: sym });
             const price = Number(t.last_price);
@@ -50,22 +85,23 @@ export default function Topbar() {
           }
         })
       );
-      setMarkets((prev) =>
-        prev.map((m) => {
-          const r = results.find((x) => x?.sym === m.sym);
-          return r ? { ...m, price: r.price, chg: r.chg } : m;
-        })
-      );
-    } catch {
-      // keep last good values on a batch failure
-    }
-  };
+      if (cancelled) return;
+      setQuotes((prev) => {
+        const next = { ...prev };
+        for (const r of results) {
+          if (r) next[r.sym] = { price: r.price, chg: r.chg };
+        }
+        return next;
+      });
+    };
 
-  useEffect(() => {
-    fetchMarkets();
-    const timer = setInterval(fetchMarkets, 5000);
-    return () => clearInterval(timer);
-  }, []);
+    void tickQuotes();
+    const timer = setInterval(() => void tickQuotes(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [symbols]);
 
   // Fetch unread count
   useEffect(() => {
@@ -115,11 +151,7 @@ export default function Topbar() {
     return ts.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   };
 
-  const formatPrice = (price: number, sym: string) => {
-    if (sym.startsWith("BTC")) return price.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-    if (sym.startsWith("ETH")) return price.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-    return price.toFixed(1);
-  };
+  const formatPrice = (price: number) => formatHeaderPrice(price);
 
   return (
     <div className="fixed top-0 left-0 right-0 h-[52px] bg-bg1 border-b border-[rgba(255,255,255,0.07)] flex items-center px-4 z-50 gap-0">
@@ -158,18 +190,26 @@ export default function Topbar() {
 
       {/* Right section */}
       <div className="ml-auto flex items-center gap-3">
-        {markets.map((m) => (
-          <div
-            key={m.sym}
-            className="flex items-center gap-1.5 px-2.5 py-1 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-md font-mono text-xs"
-          >
-            <span className="text-text2">{m.sym.split("/")[0]}</span>
-            <span className="font-semibold">{m.price === null ? "—" : formatPrice(m.price, m.sym)}</span>
-            <span className={`font-semibold ${m.chg === null ? "text-text2" : m.chg >= 0 ? "text-green" : "text-red"}`}>
-              {m.chg === null ? "—" : `${m.chg >= 0 ? "+" : ""}${m.chg.toFixed(2)}%`}
-            </span>
-          </div>
-        ))}
+        {symbols.map((sym) => {
+          const q = quotes[sym];
+          const price = q?.price ?? null;
+          const chg = q?.chg ?? null;
+          return (
+            <button
+              type="button"
+              key={sym}
+              onClick={() => setKlineSymbol(sym)}
+              title={`查看 ${sym} K 线`}
+              className="flex items-center gap-1.5 px-2.5 py-1 bg-bg2 border border-[rgba(255,255,255,0.07)] rounded-md font-mono text-xs cursor-pointer transition-all hover:bg-bg3 hover:border-green/30"
+            >
+              <span className="text-text2">{sym.split("/")[0]}</span>
+              <span className="font-semibold">{price === null ? "—" : formatPrice(price)}</span>
+              <span className={`font-semibold ${chg === null ? "text-text2" : chg >= 0 ? "text-green" : "text-red"}`}>
+                {chg === null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`}
+              </span>
+            </button>
+          );
+        })}
 
         {/* Notification bell */}
         <div className="relative" ref={notifRef}>
@@ -243,6 +283,11 @@ export default function Topbar() {
           )}
         </button>
       </div>
+
+      {/* K 线对话框（点行情条打开） */}
+      {klineSymbol && (
+        <SymbolKlineModal symbol={klineSymbol} onClose={closeKline} />
+      )}
     </div>
   );
 }

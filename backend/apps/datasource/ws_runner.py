@@ -33,7 +33,7 @@ import threading
 import time
 from concurrent.futures import Future
 from datetime import datetime, timezone
-from typing import Any, Coroutine, List, Optional, TypeVar
+from typing import Any, Coroutine, Dict, List, Optional, TypeVar
 
 from apps.datasource.base import DataType, MarketType
 
@@ -41,8 +41,18 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# 默认实时行情交易对（现货，head bar 展示）
-DEFAULT_FEED_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+# 默认实时行情交易对（现货，head bar 展示）。
+#
+# 顶栏画哪几档是**用户级偏好**（`User.header_symbols`，归一/校验见
+# `apps/authentication/preferences.py`），不再是前端的硬编码常量。这份清单只保证
+# **出厂默认四档在进程启动时就已经被订阅**：top bar 读的
+# `/api/datasource/api/market/ticker/` **只从 WS 内存存储取数、不做 REST 回退**
+# （`views.py::ticker`），没订阅的品种永远是 503/「—」而不是看得懂的错（2026-11-05
+# 加 BNB 时就撞上过：`subscriptions=3` 而前端已经画了四档）。
+#
+# 用户把顶栏换成别的品种时，补订阅由 `ensure_feed_symbols()` 负责（保存偏好与读取
+# 偏好两条路径都会调，幂等）——不是靠改这份清单，它只代表「出厂默认」。
+DEFAULT_FEED_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
 # 看门狗参数
 _WATCHDOG_INTERVAL = 10.0  # 每 10 秒检查一次
@@ -53,6 +63,17 @@ _engine: Optional["_WSEngine"] = None
 _engine_lock = threading.Lock()
 _feed_started = False
 _feed_lock = threading.Lock()
+
+# 当前供给实际负责的品种清单 —— **与 supervisor 收到的是同一个 list 对象**。
+# `ensure_feed_symbols()` 往里追加（幂等），supervisor 的看门狗用它判数据龄，
+# 于是「用户新加的品种」在下一轮看门狗里就被当成自己的一档来盯（不会被别人的
+# 新鲜数据喂活）。见 `ensure_feed_symbols`。
+_feed_state: Dict[str, Any] = {
+    "source": None,
+    "data_type": None,
+    "market_type": None,
+    "symbols": [],
+}
 
 
 class _WSEngine:
@@ -371,6 +392,13 @@ def start_market_feed(
             logger.error("[WSRunner] failed to start WS engine loop: %s", e)
             return False
 
+        # 共享这一个 list 对象（不是复制）：`ensure_feed_symbols()` 往它上面追加，
+        # supervisor 的看门狗读的也是它。
+        _feed_state["source"] = source
+        _feed_state["data_type"] = data_type
+        _feed_state["market_type"] = market_type
+        _feed_state["symbols"] = syms
+
         fut = asyncio.run_coroutine_threadsafe(
             _supervise_feed(source, syms, data_type, market_type), loop
         )
@@ -383,3 +411,99 @@ def start_market_feed(
             syms,
         )
         return True
+
+
+def ensure_feed_symbols(symbols: List[str]) -> List[str]:
+    """把一批品种补进当前实时行情供给（幂等、尽力而为）。返回**新增**的品种。
+
+    为什么需要它：顶栏画哪几档是用户偏好（`User.header_symbols`），而 ticker 端点
+    只读 WS 内存存储、不做 REST 回退。用户把顶栏换成 DOGE 之后，DOGE 若从未被订阅，
+    那一档就永远是「—」，且是 503 而不是看得懂的错——与 2026-11-05 加 BNB 时同一形态。
+
+    两条路各司其职，缺一条都会漏：
+
+    1. **登记进 `_feed_state["symbols"]`**：supervisor 的看门狗按这份清单判数据龄，
+       没登记的话新品种断流也没人管（它可能被别的订阅的新鲜数据喂活，永远不重连）。
+       这一步不碰网络，任何情况下都能做成。
+    2. **立即补发 SUBSCRIBE**：不等下一次断线重连。走 `DataSourceRegistry.get()` 拿
+       单例（与 supervisor 是同一个对象，订阅状态共享），并把调用委托到引擎循环上
+       （`run_ws_coroutine`），因为 WS 与订阅状态属于那个循环。
+
+    完整性守卫：`DataSourceRegistry` 里没有这个数据源（未注册/未加载）或供给没起来时
+    直接返回，**不在 API 请求线程里拉起一条真实 WS 连接**——那是 supervisor 的活。
+    """
+    if not symbols:
+        return []
+
+    with _feed_lock:
+        state_symbols = _feed_state.get("symbols")
+        source = _feed_state.get("source")
+        data_type = _feed_state.get("data_type")
+        market_type = _feed_state.get("market_type")
+        started = _feed_started
+
+    if not isinstance(state_symbols, list):
+        state_symbols = []
+        _feed_state["symbols"] = state_symbols
+
+    added = [s for s in symbols if s and s not in state_symbols]
+    for symbol in added:
+        state_symbols.append(symbol)
+
+    if not added:
+        return []
+    if not started or not source:
+        # 供给没起来（pytest / DATASOURCE_AUTO_WS=False）：清单已登记，等真正启动时
+        # `start_market_feed` 拿走的是另一份 list，所以这里只保证不崩、并如实记录。
+        logger.info(
+            "[WSRunner] feed not running; recorded symbols for later: %s", added
+        )
+        return added
+
+    try:
+        from apps.datasource.registry import DataSourceRegistry
+
+        if not DataSourceRegistry.is_loaded(source):
+            logger.info(
+                "[WSRunner] source %s not loaded yet; %s will be subscribed on next "
+                "connect",
+                source,
+                added,
+            )
+            return added
+
+        ds = DataSourceRegistry.get(source)
+    except Exception as e:  # noqa: BLE001 —— 取实例失败不该冒泡成 500
+        logger.warning(
+            "[WSRunner] ensure_feed_symbols: cannot load '%s': %s", source, e
+        )
+        return added
+
+    async def _subscribe_all() -> List[str]:
+        ok_syms: List[str] = []
+        failed: List[str] = []
+        for symbol in added:
+            try:
+                ok = await ds.subscribe(symbol, data_type, market_type=market_type)
+                (ok_syms if ok else failed).append(symbol)
+            except Exception as e:  # noqa: BLE001
+                failed.append(symbol)
+                logger.error("[WSRunner] subscribe %s error: %s", symbol, e)
+        if failed:
+            logger.warning(
+                "[WSRunner] ensure_feed_symbols: %d/%d not confirmed: %s "
+                "(watchdog will retry on next reconnect)",
+                len(failed),
+                len(added),
+                failed,
+            )
+        else:
+            logger.info("[WSRunner] ensure_feed_symbols: subscribed %s", ok_syms)
+        return ok_syms
+
+    try:
+        run_ws_coroutine(_subscribe_all(), timeout=15)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[WSRunner] ensure_feed_symbols: dispatch failed: %s", e)
+
+    return added

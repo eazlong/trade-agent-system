@@ -154,6 +154,12 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "20/min",
         "user": "200/min",
+        # 令牌刷新的独立配额（`apps/authentication/views.py::RefreshRateThrottle`）。
+        # **不能挂在 `anon` 桶上**：那个桶是「未登录访客」的 20/min，访问令牌过期时
+        # 交易页的十几个并发请求会一起 401、一起求刷新，与访客流量互相挤兑
+        # （txy 生产 2026-11-05 16:41–16:55 CST 的 401 风暴即此）。续会话是用户的
+        # 正常动作，频率上限只需挡住「把刷新端点当免费 CPU 打点」的情形。
+        "auth-refresh": "60/min",
     },
 }
 
