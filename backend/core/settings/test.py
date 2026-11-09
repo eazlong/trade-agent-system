@@ -4,6 +4,28 @@ from .base import *  # noqa: F401, F403
 import tempfile
 import os
 
+# 缓存落到进程内，**不连 Redis**。
+#
+# 单测不保证本机有 Redis，而基类的 ``CACHES`` 指向 ``redis://localhost:6379/1``。
+# 后果不是「某个用例少了缓存」，而是**跨文件的顺序依赖**：DRF 的
+# ``AnonRateThrottle`` 把计数写进这个缓存，于是任何在 ``test_logging.py`` 之前
+# **发出过匿名请求**的用例都会在共享桶里留下计数，而 ``test_logging.py`` 自己的
+# 那组 API 用例（靠 ``patch.object(api_settings, "DEFAULT_THROTTLE_CLASSES", [])``
+# 绕开限流）此后一律拿到 ``ConnectionRefusedError``——红的文件与被改的代码毫无关系。
+#
+# 实测触发者不止一处：``apps/authentication/tests/test_refresh_throttle.py``
+# （既有文件）同样会把它带红。这些是**同一类**缺陷，修在源头而不是逐个文件绕。
+#
+# 用 LocMem 之后，桶仍然存在、限流语义仍然生效（``test_refresh_throttle`` 那两条
+# 「打满 20 发再断言 429」照样成立），只是不再依赖外部进程。需要 Redis 的集成测试
+# 应当显式打 ``integration`` 标记，而不是让整个测试套件默认依赖它。
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "tradeclaw-tests",
+    }
+}
+
 # Use a temp file for SQLite so multiple connections (from sync_to_async) can share data
 _temp_db = os.path.join(tempfile.gettempdir(), f"tradeclaw_test_{os.getpid()}.db")
 DATABASES = {
