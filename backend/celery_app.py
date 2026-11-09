@@ -25,6 +25,7 @@ import apps.signal_monitor.tasks  # noqa: F401
 import apps.channel.tasks  # noqa: F401
 import apps.trading.tasks  # noqa: F401
 import apps.regime.tasks  # noqa: F401
+import apps.logging_app.tasks  # noqa: F401  — system_logs 保留策略（见该模块 docstring）
 
 # Grid search independent queue
 app.conf.task_routes = {
@@ -45,11 +46,23 @@ app.conf.beat_schedule = {
     #     'schedule': crontab(minute=0),
     # },
     # Clean old audit logs every day at 02:00 UTC
-    # TODO: apps.agent.tasks.clean_old_audit_logs 尚未实现
-    # 'clean-audit-logs': {
-    #     'task': 'apps.agent.tasks.clean_old_audit_logs',
-    #     'schedule': crontab(hour=2, minute=0),
-    # },
+    # **落点是 apps.logging_app 而不是 apps.agent**：这条注释一直指向
+    # `apps.agent.tasks.clean_old_audit_logs`（尚未实现），但那句注释真正要清理的是
+    # 统一日志表 `system_logs`——它归 `apps.logging_app` 管。`agent_audit_logs` 是
+    # 另一张表（当前 0 行），需要时另开一条，不在这里顺手删别人的数据。
+    #
+    # **不用 crontab 的整点，用固定间隔**：这条任务只关心「多久清一次」，不关心
+    # 「几点几分」。改成 1 天一轮的固定间隔，免得踩 `CELERY_TIMEZONE=UTC` 而
+    # `crontab(hour=2)` 实际在北京时间 10:00 触发那个口译坑（本文件里已有同类注释）。
+    #
+    # 频率与清理量是一对：`RETENTION_DAYS` 按等级（ERROR 90 天 / INFO 14 天），
+    # 一轮最多清 `MAX_BATCHES × BATCH_SIZE` 行（默认 20×10000），
+    # 一天多轮足够追上日常产出（txy 实测近期 ≈1000 行/天，9 月风暴期 ≈6 万行/天）。
+    # 真正的上界保护在「保留窗口」而不在「跑多密」——把窗口调短才是删得快。
+    "clean-audit-logs": {
+        "task": "apps.logging_app.tasks.clean_old_audit_logs",
+        "schedule": 3600.0,
+    },
     # Check task health every 30 seconds — heartbeat, zombie detection, auto-retry
     "check-task-health": {
         "task": "apps.agent.tasks.check_task_health",
