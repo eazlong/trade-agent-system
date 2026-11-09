@@ -202,25 +202,23 @@ def _client(user=None):
 
 
 @pytest.fixture
-def local_cache(settings):
-    """把限流计数落在 LocMem 上。
+def no_throttle(monkeypatch):
+    """让限流直接放行——这条链路不测限流，且不该为此依赖缓存后端。
 
-    `DEFAULT_THROTTLE_CLASSES` 走 Django cache，而 `core.settings.test` 的 `CACHES`
-    指向 Redis——单测不保证本机有 Redis，不换就是一个 `ConnectionError` 冒充业务失败
-    （同一个坑与 `test_refresh_throttle.py` 一致：**先换再清**，`clear()` 会去实例化
-    后端）。限流本身不是这条链路要测的东西。
+    早先这里写的是「把 `CACHES` 换成 LocMem」，那是错的做法：`CACHES` 是**进程级**
+    设置，在 fixture 里改它等于给整次 pytest 会话换后端，属于「用一个全局副作用解决
+    一个局部问题」。真正的根因在 `core/settings/test.py`（默认缓存指向 Redis），已在那
+    一处修掉（见 `apps/core/tests/test_settings_isolation.py`）。
+
+    这里之所以仍然打桩而不是依赖「缓存已经不依赖 Redis」：这条链路要验的是偏好接口的
+    读写与边界，限流只会让「多发几发请求」变成一个与断言无关的失败源。打桩作用域只有
+    本用例，`monkeypatch` 负责还原，不产生任何全局状态。
     """
-    from django.core.cache import cache
+    from rest_framework.throttling import SimpleRateThrottle
 
-    settings.CACHES = {
-        "default": {
-            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-            "LOCATION": "header-symbols-tests",
-        }
-    }
-    cache.clear()
-    yield cache
-    cache.clear()
+    monkeypatch.setattr(
+        SimpleRateThrottle, "allow_request", lambda self, request, view: True
+    )
 
 
 @pytest.fixture
@@ -248,7 +246,7 @@ def subscribed(monkeypatch):
 
 
 @pytest.mark.django_db
-@pytest.mark.usefixtures("local_cache")
+@pytest.mark.usefixtures("no_throttle")
 class TestPreferencesEndpoint:
     def _user(self, username, symbols=None):
         return User.objects.create_user(
