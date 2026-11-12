@@ -37,6 +37,7 @@ from apps.regime.judgement import (
     _REASON_MIN_DWELL,
     apply_escalation,
     apply_min_dwell,
+    base_regime_since,
     build_evidence,
     current_judgement,
     in_force_days,
@@ -652,12 +653,21 @@ class TestMinDwellRule(TestCase):
         self.assertIs(base, BaseRegime.DOWNTREND)
         self.assertEqual(reason, "")
 
-    def test_the_comparison_uses_the_effective_stage_not_the_base_stage(self):
-        """当前记录被资讯抬升过时，比较对象是「现在真正在起作用的阶段」。
+    def test_the_comparison_uses_the_base_stage_not_the_effective_stage(self):
+        """当前记录被资讯抬升过时，比较对象是**量化阶段**，不是生效阶段。
 
-        这条记录的基础阶段是上行趋势（纯量化口径），但生效阶段是高波动（资讯抬上来的）。
-        今天的候选也是上行趋势：与**生效**阶段比，这是一次切换（要受持续期约束）；
-        与基础阶段比，则会被读成「没变」而直接采纳。真正在拦人的是高波动。
+        这条记录的基础阶段是上行趋势（纯量化口径），生效阶段是高波动（资讯抬上来的）。
+        今天的候选也是上行趋势：与**基础**阶段比，量化没有切换（`base_regime` 照旧写
+        上行趋势，只是不经过持续期这一道闸）；与生效阶段比，则会凭空多出一条
+        「载体维持 min_dwell 天」的要求——而资讯抬升按 CONTEXT.md 第 104 条**不受**持续期
+        约束，理由写着「若要求抬升自身维持 5 天，会出现『第 2 天资讯已撤回、抬升却撤不掉』
+        的怪状态」。
+
+        实测代价：生产库 32 条记录里 10 天处于高波动，其中 6 天是持续期借着资讯抬升
+        把量化轴一起锁住的尾巴——11-07 与 11-08 那两天资讯自己判的是「不抬」（被引用
+        的标题原文是「分析师看不到传染」），系统仍在全场停开新仓。豁免按 `effective_regime`
+        算，那 6 行还在 `base_regime` 列写着 `high_vol`（量化明明判的是 range），
+        三值留痕里负责回答「是量化判的还是资讯抬上来的」的那一列就此失真。
         """
         current = make_judgement(
             RUN_DAY, BaseRegime.UPTREND, escalation=Escalation.NEWS.value
@@ -668,8 +678,60 @@ class TestMinDwellRule(TestCase):
         base, reason, _ = apply_min_dwell(
             BaseRegime.UPTREND, self.candidate_effective_at, current, self.MIN
         )
-        self.assertIs(base, BaseRegime.HIGH_VOL)
-        self.assertEqual(reason, _REASON_MIN_DWELL)
+        self.assertIs(base, BaseRegime.UPTREND, "量化没变，持续期这一道闸不该开")
+        self.assertEqual(reason, "")
+
+    def test_an_escalated_stage_does_not_get_a_dwell_protection_of_its_own(self):
+        """资讯抬升**不得**借用持续期获得免疫——这是上面那条的端到端后果。
+
+        昨天的量化是箱体震荡、资讯抬升成了高波动。今天的量化仍然是箱体震荡（只是
+        `base_regime` 与昨天相同），持续期不许把它锁在高波动上：量化阶段根本没变。
+
+        反过来说，量化**真的**换了档时持续期照常生效（`test_a_switch_before_the_dwell_
+        elapses_is_carried` 钉着那一条）——两条一起才说明这把尺子还在，只是量对了对象。
+        """
+        current = make_judgement(
+            RUN_DAY, BaseRegime.RANGE, escalation=Escalation.NEWS.value
+        )
+        current.effective_regime = BaseRegime.HIGH_VOL.value
+        current.save(update_fields=["effective_regime"])
+
+        base, reason, _ = apply_min_dwell(
+            BaseRegime.RANGE, self.candidate_effective_at, current, self.MIN
+        )
+        self.assertIs(base, BaseRegime.RANGE)
+        self.assertEqual(
+            reason,
+            "",
+            "量化轴没换档，持续期无从谈起——被锁住的是资讯抬升，而它按日生效",
+        )
+
+    def test_the_dwell_clock_is_not_restarted_by_an_escalation(self):
+        """`base_regime_since` 按量化轴回溯：资深知抬升不打断量化的持续天数。
+
+        与 `in_force_since`（按生效阶段回溯、抬升会重启它）是刻意的一对：那个回答
+        「此刻真正在拦人的这一档站了多久」，这个回答「量化在这个档位上站了多久」。
+        持续期要的是后者。
+        """
+        first = make_judgement(RUN_DAY, BaseRegime.RANGE)
+        escalated = make_judgement(
+            RUN_DAY + timedelta(days=1),
+            BaseRegime.RANGE,
+            escalation=Escalation.NEWS.value,
+        )
+        escalated.effective_regime = BaseRegime.HIGH_VOL.value
+        escalated.save(update_fields=["effective_regime"])
+
+        self.assertEqual(
+            in_force_since(escalated),
+            escalated.effective_at,
+            "生效阶段变了，`in_force_since` 从抬升那一刻重新起算",
+        )
+        self.assertEqual(
+            base_regime_since(escalated),
+            first.effective_at,
+            "量化阶段没变，持续期不许被资讯抬升重启",
+        )
 
     def test_in_force_days_is_measured_at_the_candidate_moment(self):
         """`in_force_days` 与 `min_dwell_days` 同尺度：都是「候选生效那天已经站了几天」。
@@ -771,6 +833,78 @@ class TestRunDailyJudgementSkipsWhatItCannotJudge(TestCase):
         persist(series(n=100, calm_from=90), last_day=SIGNED_DAY)
         run_daily_judgement(now=NOW)
         self.assertEqual(current_judgement(now=NOW), previous)
+        self.assertEqual(RegimeJudgement.objects.count(), 1)
+
+
+class TestRunDayIsTheBusinessDayNotTheCalendarDay(TestCase):
+    """`run_day` 必须是业务日（日界北京 08:00），不是业务时区的日历日。
+
+    这两者在北京时间 00:00–08:00 那 8 小时里差一天，而这 8 小时正好是判定的常态运行
+    时段（心跳落在 UTC 16:03 = 北京 00:03）。取日历日的后果是**每一天的结论都慢一天
+    且永不自愈**：`effective_at` 是 `run_day` 的函数，而 `get_or_create` 永不更新，
+    日线换线之后那一天的记录已经被写死。实测生产库 32 条记录全部 `effective_at −
+    attribute_date = 3 天`，契约是 2 天。
+    """
+
+    #: 北京 2026-09-22 00:03 == UTC 2026-09-21 16:03。日历日是 09-22，业务日是 09-21。
+    LATE_NIGHT = datetime(2026, 9, 21, 16, 3, tzinfo=timezone.utc)
+
+    def test_a_tick_before_the_day_start_belongs_to_the_previous_business_day(self):
+        from apps.common.time_utils import business_day
+
+        moment = self.LATE_NIGHT
+        self.assertEqual(
+            to_business(moment).date(),
+            date(2026, 9, 22),
+            "按业务时区的日历日，此刻已经是 09-22",
+        )
+        self.assertEqual(
+            business_day(moment),
+            date(2026, 9, 21),
+            "但 09-22 的日界（北京 08:00）还没到，业务日仍是 09-21",
+        )
+
+    def test_a_tick_after_the_day_start_belongs_to_the_new_business_day(self):
+        from apps.common.time_utils import business_day
+
+        moment = business_midnight(date(2026, 9, 22)) + timedelta(minutes=3)
+        self.assertEqual(business_day(moment), date(2026, 9, 22))
+        self.assertEqual(to_business(moment).date(), date(2026, 9, 22))
+
+    def test_the_mapping_is_two_days_mathematically(self):
+        """`effective_at − attribute_date` 恒为 2 天——这是模型与 CONTEXT.md 的契约。
+
+        上面那两条只钉了 `business_day` 的口径，这一条钉的是**结果**：在凌晨那个
+        真实的运行时刻上跑一次判定，落库记录的映射必须是 2 天而不是 3 天。少了它，
+        `business_day` 的测试可以全绿而判定链路仍然用错。
+        """
+        # 日线在 UTC 00:00 收盘：北京 09-22 00:03 那一刻，最新已收盘的是 09-20。
+        persist(series(), last_day=date(2026, 9, 20))
+        result = run_daily_judgement(now=self.LATE_NIGHT)
+
+        self.assertTrue(result.get("recorded"), f"应当落库，实际 {result}")
+        record = RegimeJudgement.objects.get()
+        self.assertEqual(record.attribute_date, date(2026, 9, 20))
+        self.assertEqual(record.run_day, date(2026, 9, 21))
+        self.assertEqual(
+            (record.effective_at.date() - record.attribute_date).days,
+            2,
+            "签署日 → 生效时刻恒为 2 天；3 天意味着 run_day 取了日历日而不是业务日",
+        )
+
+    def test_the_same_business_day_stays_idempotent_across_the_boundary(self):
+        """日界前后的两个 tick 落在同一条记录上——`business_day` 是分段常函数。
+
+        幂等性靠的是「同一业务日只写一条」，而 `(symbol, effective_at)` 的唯一约束
+        来自 `run_day`。若日界前后被算成两个业务日，同一个业务日会写两条记录，
+        而两条都会出现在「哪一条在生效」的查询里。
+        """
+        persist(series(), last_day=date(2026, 9, 20))
+        before = run_daily_judgement(now=self.LATE_NIGHT)
+        after = run_daily_judgement(now=self.LATE_NIGHT + timedelta(minutes=5))
+
+        self.assertTrue(before["recorded"])
+        self.assertFalse(after["recorded"], "同一业务日的第二个 tick 什么都不写")
         self.assertEqual(RegimeJudgement.objects.count(), 1)
 
 

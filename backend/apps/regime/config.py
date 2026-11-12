@@ -140,14 +140,40 @@ class CandleConfig:
     # ccxt 单次请求上限。分页游标推进（而非固定窗口）由调用方保证。
     page_limit: int = 1000
 
-    # 「已收盘」的宽容带：判定任务排在 UTC 00:00 整（北京 08:00），而那一刻
-    # 前一日线刚收盘，时钟微偏就会让游标永远落后一天。留一点余量让它仍算收盘，
-    # 落库是幂等 upsert，值若尚未最终化，下一次运行会自愈。
-    close_tolerance: timedelta = timedelta(minutes=5)
+    # 「已收盘」的判定余量。**默认 0，且方向不是「提前接受」。**
+    #
+    # 这个数原先取 5 分钟，理由是「判定排在 UTC 00:00 整，时钟微偏就会让游标永远落后
+    # 一天」。那个理由站不住，而代价在 2026-11-12 实测出来了：
+    #
+    # `_is_closed` 的判据是 `close_time <= now + tolerance`。宽容带是**加法**，意思是
+    # 「即使还没到收盘也算收盘」。心跳实测落在 23:58（`snapshot_daily_equity` 下一轮是
+    # 00:03，那 2 分钟的空档正好被 5 分钟余量吃掉），于是
+    #
+    #     23:58 + 5min = 00:03 > 00:00 = 当日日线的收盘时刻 → 判为「已收盘」
+    #
+    # 那根日线被以 23:58 的价格写进库，而它的真实收盘还在 2 分钟之后。生产库
+    # 2026-11-07 → 11-11 五根日线的 close 与交易所最终值差 12 ~ 130 USDT。
+    #
+    # 而「下一次运行会自愈」这句安慰是错的：同步游标是「库里最后一根 + 1 天」，
+    # **永不回头**，那根错值就永久留在库里。于是错误既被产生、又被固化。
+    #
+    # 取 0 之后，23:58 那一轮的行为是：`latest_complete_date` 给的是**前天**，而库里
+    # 最后一条是昨天 → `start > end` → **不取数、不写库**（这一支本来就有，也本来就不
+    # 发请求）。等 00:03 那轮，昨天那根才第一次被写，而且写的就是交易所的最终值。
+    # 所以不需要任何「回补」机制：**在正确时刻只写一次**比「写错了再修」简单得多。
+    #
+    # 时钟微偏的担忧也不成立：心跳 5 分钟一轮，晚一轮没有任何后果——判定按业务日幂等，
+    # 日报有看门狗，日线晚 5 分钟入库不影响任何下游。而「早一轮」的后果是永久性的。
+    close_tolerance: timedelta = timedelta(0)
 
     def __post_init__(self) -> None:
         if self.page_limit < 1:
             raise ValueError(f"page_limit 必须 >= 1，当前 {self.page_limit}")
+        if self.close_tolerance < timedelta(0):
+            raise ValueError(
+                "close_tolerance 不能为负——负值等于「必须比收盘时刻更晚才算收盘」，"
+                f"会让日线入库系统性晚一天，当前 {self.close_tolerance}"
+            )
         if self.timeframe != "1d":
             # 判定与切片的自然日口径建立在「日线」上：D 的 date 就是它的开盘日，
             # 且业务日 == UTC 开盘日 == 北京同日。换成别的周期，这个等式不成立。
@@ -524,14 +550,28 @@ NEWS_KEYWORDS: tuple[str, ...] = (
 NEWS_SOURCES: tuple[NewsSource, ...] = (
     # ---- 第一类：交易所公告 ------------------------------------------------ #
     # 这两个源只有走 `settings.WEB_PROXY` 才可达（容器里配着，见模块 docstring）。
-    # `pageSize=40` 与 `NewsConfig.max_items_per_source` 同值：前者是接口一次给多少，
-    # 后者是采集器收多少，配成一样是为了让「接口明明有更多、我们却只看到 40 条」这种
-    # 情况不出现——真被 `max_items_per_source` 截断时，那是一次可见的截断。
+    #
+    # ## binance 的 `pageSize` 上限是 20，不是 `max_items_per_source`
+    #
+    # 曾经写成 `pageSize=40`（「与采集器收的条数同值」），那个想法看着合理，实际是
+    # **这个源 100% 失败**：2026-11-12 在 txy 生产容器里逐档实测，该接口
+    #
+    #     pageSize=5/10/15/20 → 200；pageSize=30/40 → 400 + 0 字节
+    #
+    # 而失败的形状最坏：`failed_sources` 里只是多了个名字，采集缺口再落进 `news_ref`
+    # 就没人看了——生产库 32 条判定记录**每一条**的 `failed_sources` 都含 binance，
+    # 持续了好几周，没有任何出口报过这件事。于是资讯白名单里的「交易所公告」这一类
+    # 只剩 okx（两周 3 条），输入被三家加密媒体主导（cointelegraph 156 / decrypt 76 /
+    # theblock 75），同质化又反过来放大了「同一事件被反复引用」。
+    #
+    # 所以这个数是**接口契约**，不是我们的偏好，不能与 `max_items_per_source` 绑定：
+    # 20 条对 96 小时的窗口够用（实测交易所公告远慢于此），真要更多就翻页，不能靠
+    # 调大 pageSize —— 那只会把 200 变成 400。
     NewsSource(
         name="binance",
         url=(
             "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-            "?type=1&pageNo=1&pageSize=40&catalogId=48"
+            "?type=1&pageNo=1&pageSize=20&catalogId=48"
         ),
         kind=NewsSourceKind.EXCHANGE,
         parser="binance_announcements",
@@ -624,6 +664,32 @@ class NewsConfig:
     # ---- 白名单源 ----
     sources: tuple[NewsSource, ...] = NEWS_SOURCES
 
+    # ---- 抬升的历史上下文 ----
+    #: 判定时回看多少天内**已经抬升过**的日子，把它们作为上下文喂给模型。
+    #:
+    #: 通道原本是**每日独立、无状态**的：每次只看 24 小时窗口，不告诉模型「这件事
+    #: 昨天已经抬过 5 次了」。而一个持续发酵的事件（实测：Binance 63 亿美元被盗案
+    #: 从 10-29 绵延到 11-09，衍生报道占入库资讯的 23%）每天都会产出**新的 URL**，
+    #: 于是每天都通过 url 级去重、每天都构成一次"新的"抬升判断——32 个判定日里抬升
+    #: 了 8 次，全部指向同一个事件簇。
+    #:
+    #: 修复**刻意不做代码侧的硬冷却**（「同一事件 N 天内最多抬 1 次」）：那要给
+    #: 「同一事件」下一个可判定定义，而那只能靠标题相似度猜——猜错的方向是**压掉一次
+    #: 真实的抬升**，而资讯抬升是唯一通向保守方向的通道，压掉它等于让系统更激进。
+    #: 更糟的是它违反 CONTEXT.md「资讯不得直接沿用事件的高影响结论」：一条代码规则
+    #: 凭字符串相似度替模型做了「这是同一件事」的判断，那段推理就绕过了模型。
+    #:
+    #: 所以补的是**输入**而不是**结论**：让模型看见自己前几天的判断，由它回答
+    #: 「这条是同一件事的又一篇报道，还是新的事态」。这既保住了可回放（历史抬升也进
+    #: `news_ref` 快照），又把「要不要继续保守」留在该做判断的那一层。
+    escalation_context_days: int = 7
+
+    #: 历史上下文里最多列几天。与 `escalation_context_days` 分开的理由：天数管「看多远」，
+    #: 条数管「输入别失控」——一个连续抬升两周的行情会攒出十条以上，而每一条都要占
+    #: token 与模型的注意力。取 5 与 `escalation_context_days=7` 同量级：正常情况下
+    #: 近 7 天里的抬升日不会超过 5 天（连续抬升本身就是要被看见的信号）。
+    escalation_context_max_days: int = 5
+
     def __post_init__(self) -> None:
         if self.window_floor_hours < 1:
             raise ValueError(
@@ -643,6 +709,25 @@ class NewsConfig:
         for name in ("max_items_per_source", "max_items_to_llm", "body_max_chars"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} 必须 >= 1，当前 {getattr(self, name)}")
+        # 0 是**合法**取值，含义是「关掉历史上下文」——那不是配置错误，是一个明确的
+        # 选择（比如怀疑上下文在诱导模型继续抬升时）。负数才是错。
+        if self.escalation_context_days < 0:
+            raise ValueError(
+                f"escalation_context_days 不能为负，当前 {self.escalation_context_days}"
+                "——0 表示关掉历史上下文，负天数没有含义"
+            )
+        if self.escalation_context_max_days < 0:
+            raise ValueError(
+                "escalation_context_max_days 不能为负，"
+                f"当前 {self.escalation_context_max_days}"
+            )
+        if self.escalation_context_days > 0 and self.escalation_context_max_days == 0:
+            # 这两条配反了的表现是「配了 7 天上下文，但一条都不给模型看」——安静地
+            # 什么都不做，与「这段时间没抬升过」在日志里长得一样。
+            raise ValueError(
+                "escalation_context_days > 0 时 escalation_context_max_days 必须 >= 1："
+                "否则窗口开着却永远列不出任何一天，等于静默关掉这个功能"
+            )
         if not self.keywords:
             raise ValueError(
                 "keywords 不能为空——空词表等于「所有条目都命中」，"

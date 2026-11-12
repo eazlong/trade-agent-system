@@ -111,6 +111,8 @@ class TestSnapshot(SimpleTestCase):
                 "keywords",
                 "max_items_to_llm",
                 "body_max_chars",
+                "escalation_context_days",
+                "escalation_context_max_days",
                 "sources",
                 "kinds_covered",
             ),
@@ -168,8 +170,16 @@ class TestSnapshot(SimpleTestCase):
                 self.assertEqual(set(snap[name]), set(keys))
 
     def test_timedelta_becomes_seconds(self):
+        """timedelta 进快照时翻成秒：JSON 没有 timedelta 类型，而记录必须能序列化。"""
         self.assertEqual(
-            config.snapshot("candles")["candles"]["close_tolerance"], 300.0
+            config.snapshot("judgement_lifecycle")["judgement_lifecycle"][
+                "stale_after_days"
+            ],
+            config.JUDGEMENT_LIFECYCLE.stale_after_days,
+        )
+        self.assertEqual(
+            config.snapshot("candles")["candles"]["close_tolerance"],
+            config.CANDLES.close_tolerance.total_seconds(),
         )
 
     def test_decimal_becomes_a_lossless_string(self):
@@ -234,7 +244,12 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.CANDLES.symbol, "BTC/USDT")
         self.assertEqual(config.CANDLES.exchange, "binance")
         self.assertEqual(config.CANDLES.page_limit, 1000)
-        self.assertEqual(config.CANDLES.close_tolerance, timedelta(minutes=5))
+        self.assertEqual(
+            config.CANDLES.close_tolerance,
+            timedelta(0),
+            "余量必须为 0：给正值等于允许「还没收盘就算收盘」，"
+            "而增量游标永不回头，那根错值会永久留在库里（2026-11-07~11-11 实测差 12~130 USDT）",
+        )
 
     def test_judgement_defaults(self):
         self.assertEqual(config.JUDGEMENT.atr_period, 14)

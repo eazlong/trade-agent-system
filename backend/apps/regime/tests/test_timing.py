@@ -27,7 +27,13 @@ from django.conf import settings
 from django.test import TestCase
 from django.utils import timezone as django_timezone
 
-from apps.common.time_utils import business_tz, business_tz_name
+from apps.common.time_utils import (
+    business_day,
+    business_day_start,
+    business_tz,
+    business_tz_name,
+    to_business,
+)
 from apps.regime.candles import latest_complete_date
 from apps.regime.models import business_midnight
 
@@ -88,6 +94,61 @@ class TestBusinessDayBoundaryIsTheCandleBoundary(TestCase):
         `CrontabSchedule.timezone`（TimeZoneField 只收 IANA 名）。"""
         self.assertEqual(business_tz().key, business_tz_name())
         self.assertTrue(business_tz().key and "/" in business_tz().key)
+
+
+class TestBusinessDayIsNotTheCalendarDay(TestCase):
+    """业务日是**日界切出来的**，不是业务时区的日历日。
+
+    这两个口径在本仓库里已经制造过一次系统性错误（见
+    `run_daily_judgement` 的 docstring）：判定拿日历日推 `run_day`、拿日线收盘推
+    `attribute_date`，两者在北京 00:00–08:00 这 8 小时里差一天，而错位永不自愈
+    ——每一天的结论都比行情晚两天。这里钉的是那条口径本身。
+    """
+
+    def test_the_two_helpers_are_inverse_at_the_boundary(self):
+        """日界当刻归属它自己那一天：`business_day(business_day_start(d)) == d`。"""
+        for day in (date(2026, 1, 1), date(2026, 9, 22), date(2027, 3, 1)):
+            with self.subTest(day=day):
+                start = business_day_start(day)
+                self.assertEqual(business_day(start), day)
+                self.assertEqual(
+                    business_day(start - timedelta(seconds=1)),
+                    day - timedelta(days=1),
+                    "日界前一秒还属于前一天——差一秒就跨业务日，正是它存在的理由",
+                )
+
+    def test_it_agrees_with_business_midnight(self):
+        """`business_day_start` 与判定链路的 `business_midnight` 是同一句话。
+
+        两处各写一份 08:00 会在有人改动时静默错开，而错开的表现是判定结论整体平移
+        一天。`business_midnight` 现在委托给前者，这条测试钉住那层委托没被撤掉。
+        """
+        for day in (date(2026, 1, 1), date(2026, 9, 22)):
+            with self.subTest(day=day):
+                self.assertEqual(business_midnight(day), business_day_start(day))
+
+    def test_the_calendar_day_and_the_business_day_disagree_for_eight_hours(self):
+        """北京 00:00–08:00 这段时间里两者差一天，其余时间相同。
+
+        这 8 小时不是边角情形：判定挂在 5 分钟心跳上，实测生产库每条记录都落在
+        UTC 16:03（= 北京 00:03），**全部**在这段里。
+        """
+        day_start = business_day_start(RUN_DAY)
+
+        self.assertEqual(business_day(day_start), RUN_DAY)
+        self.assertEqual(to_business(day_start).date(), RUN_DAY)
+
+        late_night = day_start - timedelta(hours=8)  # 北京 00:00
+        self.assertEqual(
+            to_business(late_night).date(),
+            RUN_DAY,
+            "按日历日它已经是 RUN_DAY",
+        )
+        self.assertEqual(
+            business_day(late_night),
+            RUN_DAY - timedelta(days=1),
+            "但业务日还是前一天",
+        )
 
 
 class TestSignedCandleIsTheLastClosedOne(TestCase):

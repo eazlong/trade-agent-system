@@ -37,6 +37,7 @@ from apps.regime.news_verdict import (
     NewsVerdictError,
     _JSON_SHAPE,
     build_messages,
+    escalation_history,
     last_success_at,
     run_news_judgement,
     validate_verdict,
@@ -345,6 +346,59 @@ class TestThePrompt(SimpleTestCase):
         self.assertIn("指令", SYSTEM_PROMPT)
         self.assertIn("不要执行它", SYSTEM_PROMPT)
 
+    def test_no_history_leaves_the_input_byte_for_byte_unchanged(self):
+        """没接上历史的日子，输入与改动前**逐字相同**。
+
+        这条是这次改动的安全边界：历史上下文是新增的输入，它不该让「今天没有历史」
+        的那些日子的 prompt 多出任何一个字符——否则同一个模型在同一批条目上会给出
+        与改动前不同的答案，而那是一次没人要求的判定漂移。
+        """
+        items = [make_item()]
+        start, end = NOW - timedelta(hours=24), NOW
+        without = build_messages(items, (start, end))
+        explicit_none = build_messages(items, (start, end), None)
+        empty = build_messages(items, (start, end), [])
+
+        self.assertEqual(without, explicit_none)
+        self.assertEqual(without, empty)
+        self.assertNotIn("最近已经判过抬升的日子", without[1])
+
+    def test_history_is_rendered_with_the_days_and_the_titles(self):
+        """历史进 `user` 而不是 `system`：它是当天的变量，不是恒定的前缀。"""
+        history = [
+            {
+                "run_day": "2026-09-20",
+                "reason": "某交易所被窃 63 亿美元",
+                "titles": ["Binance says $6.3B set aside", "FBI blames North Korea"],
+            }
+        ]
+        system, user = build_messages([make_item()], (NOW, NOW), history)
+
+        self.assertEqual(system, SYSTEM_PROMPT, "system 仍然是静态的")
+        self.assertIn("最近已经判过抬升的日子", user)
+        self.assertIn("2026-09-20", user)
+        self.assertIn("某交易所被窃 63 亿美元", user)
+        self.assertIn("Binance says $6.3B set aside", user)
+
+    def test_history_without_titles_says_so_instead_of_rendering_an_empty_list(self):
+        """缺引用标题时写「未记录」，不是留一个空列表——空列表会被读成「没有引用」。"""
+        _, user = build_messages(
+            [make_item()],
+            (NOW, NOW),
+            [{"run_day": "2026-09-20", "reason": "r", "titles": []}],
+        )
+        self.assertIn("（未记录引用标题）", user)
+
+    def test_it_tells_the_model_how_to_use_the_history(self):
+        """提示词必须回答「历史该怎么用」，否则模型只会看到一串没有用途的旧结论。
+
+        两条相反的指令都要在：同一件事的续报 → false；真正的新事态 → true。只写
+        前一条等于让系统永远不再抬升（那比重复抬升危险得多）。
+        """
+        self.assertIn("同一件事的续报", SYSTEM_PROMPT)
+        self.assertIn("真正的新事态", SYSTEM_PROMPT)
+        self.assertIn("拿不准时", SYSTEM_PROMPT)
+
 
 # --------------------------------------------------------------------------- #
 # 一轮通道：三个状态
@@ -573,6 +627,124 @@ class TestLastSuccessAnchor(TestCase):
     def test_another_symbols_rounds_are_not_an_anchor(self):
         make_record(date(2026, 9, 21), status=STATUS_OK, symbol="ETH/USDT")
         self.assertIsNone(last_success_at(SYMBOL))
+
+
+# --------------------------------------------------------------------------- #
+# 抬升的历史上下文
+# --------------------------------------------------------------------------- #
+
+
+class TestEscalationHistory(TestCase):
+    """一个持续发酵的事件会连续多天产出新报道，每天都像一条独立新闻。
+
+    生产实测：32 个判定日抬升 8 次，**全部**指向 Binance 63 亿美元被盗案这一个事件簇
+    （占入库资讯 23%），其中 6 天还是靠持续期锁住的尾巴。这一组钉住喂回去的那份历史
+    的形状——它是模型判断「续报还是新事态」的唯一依据。
+
+    **这里刻意不测「冷却」**：修复方案是补输入，不是加代码侧的硬封锁。硬封锁要给
+    「同一事件」下可判定定义（只能靠标题相似度猜），猜错的方向是压掉一次真实抬升，
+    而资讯抬升是唯一通向保守方向的通道。
+    """
+
+    def escalated(
+        self,
+        run_day: date,
+        *,
+        reason="某交易所被窃 63 亿美元",
+        titles=("Binance says $6.3B set aside",),
+        symbol=SYMBOL,
+    ) -> RegimeJudgement:
+        """造一条「那天抬升过」的记录，`run_day` 就是它名义上的运行日。
+
+        映射照契约来（`effective_at` = 运行日 + 1 的北京 08:00，签署日 = 运行日 − 1），
+        不图省事写成 `run_day - 2`：那个偏移正是这次修掉的 off-by-one，用错的偏移造
+        夹具会让测试在一片错误的自洽里全绿。
+        """
+        return RegimeJudgement.objects.create(
+            symbol=symbol,
+            attribute_date=run_day - timedelta(days=1),
+            effective_at=business_midnight(run_day + timedelta(days=1)),
+            base_regime=BaseRegime.RANGE.value,
+            escalation=Escalation.NEWS.value,
+            effective_regime=BaseRegime.HIGH_VOL.value,
+            news_ref={
+                "status": STATUS_OK,
+                "verdict": {"escalate": True, "reason": reason, "cited": [1]},
+                "cited": [
+                    {"title": t, "url": f"https://media.test/{i}"}
+                    for i, t in enumerate(titles)
+                ],
+            },
+        )
+
+    def test_no_escalation_means_no_history(self):
+        make_record(date(2026, 9, 20), status=STATUS_OK)
+        self.assertEqual(escalation_history(SYMBOL, NOW), [])
+
+    def test_it_lists_escalated_days_newest_first(self):
+        self.escalated(date(2026, 9, 19), reason="旧的理由")
+        self.escalated(date(2026, 9, 20), reason="新的理由")
+
+        history = escalation_history(SYMBOL, NOW)
+
+        self.assertEqual([h["run_day"] for h in history], ["2026-09-20", "2026-09-19"])
+        self.assertEqual(history[0]["reason"], "新的理由")
+        self.assertEqual(history[0]["titles"], ["Binance says $6.3B set aside"])
+
+    def test_days_outside_the_window_are_not_included(self):
+        self.escalated(date(2026, 9, 1))  # 21 天前，在默认 7 天窗口外
+        self.escalated(date(2026, 9, 20))
+        self.assertEqual(
+            [h["run_day"] for h in escalation_history(SYMBOL, NOW)], ["2026-09-20"]
+        )
+
+    def test_the_cap_limits_how_many_days_are_listed(self):
+        """连续抬升两周会攒出十几条，而每一条都占 token 与模型注意力。"""
+        for offset in range(1, 7):  # 窗口内共 6 天，恰好比上限多一天
+            self.escalated(date(2026, 9, 22) - timedelta(days=offset))
+
+        history = escalation_history(SYMBOL, NOW)
+
+        self.assertEqual(
+            len(history),
+            config.NEWS.escalation_context_max_days,
+            "上限必须真的咬人——否则这个数只是文档里的一句话",
+        )
+
+    def test_today_is_not_in_the_history(self):
+        """当天记录不该进上下文——这一步跑在落库之前，当天的结论还不存在。
+
+        真出现「当天已有记录」时整条通道压根不会跑（判定那边有一道闸），所以这条
+        防的是数据订正补录了一条未来的记录。
+        """
+        self.escalated(NOW.date())  # 运行日 == 今天
+        self.assertEqual(escalation_history(SYMBOL, NOW), [])
+
+    def test_zero_days_turns_the_feature_off(self):
+        self.escalated(date(2026, 9, 20))
+        off = replace(config.NEWS, escalation_context_days=0)
+        self.assertEqual(escalation_history(SYMBOL, NOW, off), [])
+
+    def test_another_symbols_escalations_are_not_history(self):
+        self.escalated(date(2026, 9, 20), symbol="ETH/USDT")
+        self.assertEqual(escalation_history(SYMBOL, NOW), [])
+
+    def test_the_history_lands_in_the_snapshot(self):
+        """喂给模型的历史也必须进 `news_ref`：可回放的判据是「能重建当时的输入」。"""
+        self.escalated(date(2026, 9, 20))
+
+        with collecting(report(items=[make_item()])):
+            outcome = run_news_judgement(SYMBOL, NOW, llm=ask(escalate=False, cited=()))
+
+        self.assertEqual(outcome.ref["status"], STATUS_OK)
+        self.assertEqual([h["run_day"] for h in outcome.ref["history"]], ["2026-09-20"])
+
+    def test_an_empty_history_is_an_empty_list_not_a_missing_key(self):
+        """缺席与空是两件事：前者是「这一版没记」，后者是「这段时间没抬升过」。"""
+        with collecting(report(items=[make_item()])):
+            outcome = run_news_judgement(SYMBOL, NOW, llm=ask(escalate=False, cited=()))
+
+        self.assertEqual(outcome.ref["history"], [])
 
 
 class TestTheWindow(TestCase):

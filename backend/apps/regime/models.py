@@ -27,14 +27,14 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Iterable
 
 from django.db import models
 
-from apps.common.time_utils import business_tz
+from apps.common.time_utils import business_day_start
 from apps.regime.config import NewsSourceKind
 from apps.regime.quant import BaseRegime
 
@@ -175,11 +175,12 @@ def business_midnight(day: date) -> datetime:
     BTC 日线换线的那一刻，于是「运行日 D / 签署日 D−1 / 生效时刻」三者对齐到同一套
     自然日上，不需要在判定链路里做任何跨日推断。
 
-    显式构造业务时区而不是写 `datetime(..., tzinfo=utc)`：偏移量今天是 +8 不代表永远
-    是 +8（改偏移等于改全部历史生效时刻的含义），而 `apps/common/time_utils.py` 是
-    「业务时区」的唯一口径。
+    实现委托给 `apps.common.time_utils.business_day_start`：判定 / Shadow / 日报三处
+    都要用同一句话，而**这个函数与 `business_day()` 必须互为反函数**（日界当刻归属它
+    自己那一天）。两处各写一份 08:00，改动时必然静默错开，错开的表现是判定结论整体
+    平移一天。名字保留是因为调用点遍布本仓库，改名的收益抵不上改动的噪音。
     """
-    return datetime.combine(day, time(8, 0), tzinfo=business_tz())
+    return business_day_start(day)
 
 
 class RegimeJudgement(models.Model):

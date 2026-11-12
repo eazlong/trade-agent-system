@@ -107,7 +107,7 @@ from datetime import date, datetime, timedelta
 from django.db import transaction
 from django.utils import timezone
 
-from apps.common.time_utils import to_business
+from apps.common.time_utils import business_day
 from apps.regime import config
 from apps.regime.candles import latest_complete_date
 from apps.regime.models import (
@@ -290,13 +290,28 @@ def apply_min_dwell(
 ) -> tuple[BaseRegime, str, dict]:
     """最小持续期：阶段是慢变量，切换要等当前阶段站稳 `min_dwell_days` 个自然日。
 
-    返回 `(采用的基础阶段, 原因, 说明数字)`。被拦下时**沿用当前生效阶段**并说明原因——
+    返回 `(采用的基础阶段, 原因, 说明数字)`。被拦下时**沿用当前的量化阶段**并说明原因——
     拦下不等于不记录：今天确实得出了结论，结论内容是「维持不变，因为持续期不够」，
     这是一条该被 Shadow 看到的信息，不是缺失。
 
-    `in_force_days` 是「候选结论生效的那一刻，当前阶段已经站了几天」，也就是本规则实际
-    比较的那个量——它与 `min_dwell_days` 同尺度，读日志时不必再做换算。比较的是绝对时刻
-    之差而不是自然日序号：两端的 `effective_at` 都是业务日界（北京 08:00），差必定是
+    ## 约束的是**量化轴**，不是资讯轴
+
+    这条规则的比较对象是 `base_regime`（纯量化口径），返回值也写进 `base_regime`。三条
+    理由，任何一条单独成立就够：
+
+    1. CONTEXT.md 第 104 条：**资讯抬升不受最小持续期约束、按日生效**，理由写着「若要求
+       抬升自身维持 5 天，会出现『第 2 天资讯已撤回、抬升却撤不掉』的怪状态」。拿
+       `effective_regime` 当尺子，抬升立刻把生效阶段变成高波动，而持续期量的正是这个
+       阶段——于是抬升**事实上**被锁了 5 天，那一条规则被实现悄悄取消了。
+    2. 三值留痕（基础 / 抬升 / 生效）存在的唯一目的是回答「今天这个阶段是量化判出来的，
+       还是资讯抬上来的」。把 `effective_regime` 写进 `base_regime`，这一列就在撒谎：
+       量化明明判的是箱体震荡，库里记着高波动，归因只能靠翻 `evidence` JSON。
+    3. 持续期防的是「量化在阈值附近来回抖」。资讯轴是单向的、且按日生效，它没有「抖」
+       可言，拿一把防抖的尺子去量它，量的是一个不存在的属性。
+
+    `in_force_days` 是「候选结论生效的那一刻，当前量化阶段已经站了几天」，也就是本规则
+    实际比较的那个量——它与 `min_dwell_days` 同尺度，读日志时不必再做换算。比较的是绝对
+    时刻之差而不是自然日序号：两端的 `effective_at` 都是业务日界（北京 08:00），差必定是
     24 小时的整数倍，所以这里不会出现「差 4 天 23 小时算几天」的问题。
 
     冷启动（`current is None`）直接采纳：没有「当前阶段」可站，持续期无从谈起。CONTEXT.md
@@ -306,18 +321,18 @@ def apply_min_dwell(
     if current is None:
         return candidate, "", {"in_force_days": None, "carried_from_effective_at": None}
 
-    start = in_force_since(current)
+    start = base_regime_since(current)
     in_force_days = (candidate_effective_at - start).days
     numbers = {"in_force_days": in_force_days, "carried_from_effective_at": None}
 
-    if candidate is _regime_of(current):
+    if candidate is _base_regime_of(current):
         return candidate, "", numbers
 
     if in_force_days >= min_dwell_days:
         return candidate, "", numbers
 
     return (
-        _regime_of(current),
+        _base_regime_of(current),
         _REASON_MIN_DWELL,
         {
             "in_force_days": in_force_days,
@@ -326,14 +341,42 @@ def apply_min_dwell(
     )
 
 
-def _regime_of(record: RegimeJudgement) -> BaseRegime:
-    """记录上的生效阶段还原成枚举。
+def _base_regime_of(record: RegimeJudgement) -> BaseRegime:
+    """记录上的**基础阶段**（纯量化口径）还原成枚举。
 
-    取的是 `effective_regime` 而不是 `base_regime`：**规则本身比较的对象是「现在真正
-    在起作用的阶段」**。拿基础阶段去比会在资讯抬升过的日子里错位——那天真正在拦人的是
-    高波动，而基础阶段可能还是箱体震荡。
+    取 `base_regime` 而不是 `effective_regime`：持续期约束的是量化判定的抖动，而
+    `effective_regime` 混进了资讯那根轴。完整理由见 `apply_min_dwell` 的 docstring。
+
+    **不要再加一个 `_regime_of` 读 `effective_regime` 的兄弟函数给这里用**：那样
+    「这条规则比的是哪根轴」又只剩 docstring 记得，而这次修的正是那个错误
+    （拿 `effective_regime` 当尺子 → 资讯抬升借走 5 天免疫期）。
     """
-    return BaseRegime(record.effective_regime)
+    return BaseRegime(record.base_regime)
+
+
+def base_regime_since(record: RegimeJudgement) -> datetime:
+    """`record.base_regime` 这个**量化阶段**是从哪一刻开始站住的。
+
+    与 `in_force_since` 的区别只有一列：那个按 `effective_regime` 回溯（资讯抬升会打断
+    它），这个按 `base_regime` 回溯（资讯抬升**不**打断它）。持续期要的是后者——它问的
+    是「量化已经在这个档位上待了几天」，而资讯那根轴自己按日生效，与持续期无关。
+
+    中途**没有记录**的日子同样不打断：那些天判定缺失、状态按查询语义保持原样，阶段并没有
+    变过。
+    """
+    start = record.effective_at
+    regime = record.base_regime
+    rows = (
+        _records(record.symbol)
+        .filter(effective_at__lte=record.effective_at)
+        .order_by("-effective_at")
+        .values_list("effective_at", "base_regime")
+    )
+    for effective_at, value in rows:
+        if value != regime:
+            break
+        start = effective_at
+    return start
 
 
 # --------------------------------------------------------------------------- #
@@ -396,9 +439,30 @@ def run_daily_judgement(
     **同一个运行日只会写一条记录**：`(symbol, effective_at)` 上有唯一约束，写入走
     `get_or_create`。心跳每 5 分钟一次，一天里绝大多数 tick 都会走到这里，因此这条路
     必须便宜且无副作用——判不出来时它只读不写，已判过时连资讯通道都不跑。
+
+    ## `run_day` 是**业务日**，不是业务时区的日历日
+
+    这两者差着业务日的日界（北京 08:00 == UTC 00:00 == 日线换线），而北京时间
+    00:00–08:00 那 8 小时正是两者错开的地方。取日历日的后果不是「偶尔早一天」，是
+    **每一天的签署日都比应得的慢一天，且永不自愈**：
+
+    - 心跳在北京 00:03（UTC 16:03）跑，`to_business(now).date()` 已经翻到新的一天；
+    - 但那一刻最新已收盘的日线还停在**前天**（今天的日线要到 UTC 00:00 才收盘）；
+    - 于是 `attribute_date`（来自日线）与 `run_day`（来自墙上时钟）相差 2 天而不是 1 天；
+    - `effective_at` 是 `run_day + 1` 的函数，`get_or_create` 又**永不更新**——北京 08:00
+      日线换线之后，运行日对应的那条记录已经被 00:03 那个 tick 写死了，这一天的结论
+      永久地晚一天。实测生产库 32 条记录**全部** `effective_at − attribute_date = 3 天`，
+      而契约是 2 天。
+
+    改用 `business_day()`（先换算业务时区、再看是否已过日界）之后，00:03 那个 tick
+    归属的是**昨天**这个业务日——它与「此刻已收盘的日线是前天」是一致的，于是映射回到
+    契约的 2 天。08:00 之后的 tick 归属新业务日，那时新日线也已收盘，同样一致。
+
+    这不改变「同一业务日只写一条」的幂等性：`business_day()` 是 `now` 的分段常函数，
+    分段点正是日界，而日界前后 `attribute_date` 也恰好一起变。
     """
     now = now or timezone.now()
-    run_day = to_business(now).date()
+    run_day = business_day(now)
 
     candles = load_candles(symbol)
     if not candles:

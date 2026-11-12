@@ -134,6 +134,50 @@ class TestIncompleteCandleIsNeverPersisted(TestCase):
         self.assertEqual([c.date for c in result.candles], [TODAY - timedelta(days=1)])
         self.assertEqual(result.incomplete, 1)
 
+    def test_two_minutes_before_close_is_still_forming(self):
+        """23:58 那根日线还没收盘——`close_tolerance` 不许把它当成已收盘。
+
+        这是 2026-11-12 在生产库上查出来的那个 bug：余量取 5 分钟时
+        `23:58 + 5min > 00:00`，于是那根还差 2 分钟才收盘的日线被以 23:58 的价格写进
+        库；而增量游标是「最后一根 + 1 天」，**永不回头**，错值永久固化。实测
+        2026-11-07 → 11-11 五根日线的 close 与交易所最终值差 12 ~ 130 USDT，
+        而 EMA 的输入因此持续带偏（判定读的是全序列，误差会传播）。
+
+        心跳落在 23:58 是因为 `snapshot_daily_equity` 每 300 秒一轮、实测偏移到
+        :58 而不是 :00——那 2 分钟的空档正好被旧的 5 分钟余量吃掉。
+        """
+        just_before = datetime(2026, 9, 21, 23, 58, tzinfo=timezone.utc)
+        yesterday = TODAY - timedelta(days=1)
+
+        result = fetch_daily_candles(
+            start=yesterday,
+            end=TODAY,
+            fetch_page=FakePages([[row(yesterday)]]),
+            now=just_before,
+        )
+
+        self.assertEqual(
+            [c.date for c in result.candles],
+            [],
+            "23:58 时昨天那根还差 2 分钟收盘，一根都不该接受",
+        )
+        self.assertEqual(result.incomplete, 1)
+
+    def test_the_boundary_itself_is_inclusive(self):
+        """恰好 00:00 就算收盘——余量取 0 不等于「必须晚于收盘」。
+
+        余量为 0 之后 `close_time <= now` 仍然成立（`<=` 不是 `<`），所以此刻不会
+        出现「日线永远晚一天」的反向故障。
+        """
+        yesterday = TODAY - timedelta(days=1)
+        result = fetch_daily_candles(
+            start=yesterday,
+            end=TODAY,
+            fetch_page=FakePages([[row(yesterday)]]),
+            now=datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual([c.date for c in result.candles], [yesterday])
+
     def test_just_closed_candle_is_included_at_the_boundary(self):
         """日线 D-1 恰在 UTC 00:00 收盘；判定任务就在那一刻跑，不能漏掉它。"""
         self.assertEqual(latest_complete_date(NOW), TODAY - timedelta(days=1))
