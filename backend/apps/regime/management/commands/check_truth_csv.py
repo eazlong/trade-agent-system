@@ -128,6 +128,28 @@ def _pick(header: list[str], candidates: Iterable[str]) -> int | None:
     return None
 
 
+def _parse_date(raw: str) -> date | None:
+    """CSV 里的日期 → `date`；认不出返回 None。
+
+    **不只认 `YYYY-MM-DD`**：Excel 把 `2020-03-12` 显示成 `2020/3/12` 是常态（它自己的
+    默认日期格式），手工敲也一样。只认一种写法会把「格式不对」变成最强的假警报——142 行
+    全是同一个问题，人第一反应是「这工具不能用」，而不是「我去改一下日期」。
+
+    只认这四种：带零填充与不带的斜杠、横杠两种。不引 `dateutil` 之类的宽松解析：
+    那会把 `3/4/2020` 这种有歧义的写法按某个默认顺序猜掉，而美式 `3/4` 与欧式 `3/4`
+    是两个不同的日子——猜错的日子会变成一条假真值，比报错难查得多。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d ", "%Y/%m/%d "):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_regime(raw: str) -> BaseRegime | None:
     """中文名或 slug → 枚举。认不出返回 None（由调用方记成一条问题）。"""
     text = (raw or "").strip()
@@ -200,15 +222,14 @@ def parse(path: Path) -> tuple[list[Row], list[Problem]]:
         if not raw_regime:
             continue
 
-        try:
-            day = datetime.strptime(raw_date, "%Y-%m-%d").date()
-        except ValueError:
+        day = _parse_date(raw_date)
+        if day is None:
             problems.append(
                 Problem(
                     offset,
                     "格式",
-                    f"日期解析不了，期望 YYYY-MM-DD：{raw_date!r}"
-                    f"（这一行填了档位 {raw_regime!r}）",
+                    f"日期解析不了：{raw_date!r}"
+                    f"（这一行填了档位 {raw_regime!r}；认得 2020-03-12 / 2020/3/12）",
                 )
             )
             continue

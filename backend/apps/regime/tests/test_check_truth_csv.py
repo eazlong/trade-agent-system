@@ -110,6 +110,47 @@ class TestParsing(TestCase):
         self.assertIn("极端波动", problems[0].detail)
         self.assertIn("高波动/下行趋势", problems[0].detail, "要列出现行词表")
 
+    def test_a_slash_date_in_the_excel_style_is_accepted(self):
+        """`2020/1/14` 与 `2020-01-14` 是同一个日子，都要认。
+
+        Excel 把 `2020-03-12` 显示成 `2020/3/12` 是它自己的默认日期格式，手工敲也一样。
+        只认横杠一种写法会把「格式不对」变成最强的假警报——实测一份 142 行的表**全部**
+        因为这一点被拒，而人第一反应是「这工具不能用」，不是「我去改一下日期」。
+        """
+        path = write_csv(
+            self.tmp,
+            "2020/1/14,上行趋势,a\n2021/05/19,高波动,b\n2022/11/9,高波动,c\n",
+        )
+        rows, problems = mod.parse(path)
+
+        self.assertEqual(problems, [], "两种写法都该认")
+        self.assertEqual(
+            [r.day for r in rows],
+            [date(2020, 1, 14), date(2021, 5, 19), date(2022, 11, 9)],
+            "不补零的月份/日期要正确解析，不能被当成非法",
+        )
+
+    def test_only_the_year_first_form_is_accepted(self):
+        """`3/4/2020` 这种歧义写法**不认**，报错而不是猜。
+
+        美式 `3/4` 是 3 月 4 日、欧式是 4 月 3 日。猜错的日子会变成一条假真值，
+        而假真值比报错难查得多——它看起来完全正常，只是把不同的一天记成了另一档。
+        所以这里只认年在前面的写法，歧义的一律拒绝。
+        """
+        path = write_csv(self.tmp, "3/4/2020,高波动,a\n")
+        _, problems = mod.parse(path)
+
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0].kind, "格式")
+        self.assertIn("日期解析不了", problems[0].detail)
+        self.assertIn("2020-03-12", problems[0].detail, "报错要给出可用的例子")
+
+    def test_an_impossible_date_is_rejected(self):
+        """`2020-02-30` 不存在。`strptime` 自己会拒，这里钉住那条路不被吞掉。"""
+        path = write_csv(self.tmp, "2020-02-30,高波动,a\n")
+        _, problems = mod.parse(path)
+        self.assertEqual(len(problems), 1)
+
     def test_a_bom_in_the_header_does_not_break_the_date_column(self):
         """Excel 另存出来的 CSV 带 BOM。不剥掉的话第一列表头变成 `\\ufeff日期`。"""
         path = write_csv(self.tmp, "2020-03-12,高波动,a\n")
