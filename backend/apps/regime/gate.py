@@ -76,7 +76,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from apps.regime import admission, deactivation
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_DISPLAY, BaseRegime
 from apps.regime.slice import REASON_DISPLAY, STATE_DISPLAY
 
 # --------------------------------------------------------------------------- #
@@ -196,8 +196,18 @@ class Situation:
     #: 开关「开」的那一刻——`RegimeMechanismSwitch` 最新一行的 `at`。`gate_open` 时必有值
     #: （没有那条流水就开不了，见 `RegimeMechanismSwitch.current`）。
     switch_at: datetime | None = None
-    #: 当前生效阶段；`None` = 冷启动。
+    #: 当前生效阶段（四档）；`None` = 冷启动。
+    #:
+    #: **它是保命档判据与展示口径的载体，不是池化表格子的键**。#66 之后格子轴是 cycle
+    #: 三格，找那一格要用 `cell`：拿 `downtrend` 去新代里查必然落「没有这一格」——
+    #: 而那条路径是 fail-closed 拦人的，理由会是一句错话。
     regime: str | None = None
+    #: 当前该读的**格子键**（cycle 三格之一，见 `deactivation.RegimeState.cell`）。
+    #:
+    #: `None` = 这条判定判不出方向（`unclear`，或旧行没有 `cycle`）。它与 `regime is None`
+    #: **不是同一件事**：后者是冷启动（连阶段都没有），前者是「有阶段、但这一列没有方向」，
+    #: 两者的收场都是「本轮什么都不动」，但写给人看的那句话不同。
+    cell: str | None = None
     #: 当前那条判定的生效时刻（北京 08:00 那个业务日边界）。
     regime_effective_at: datetime | None = None
     #: 当前代池化表落地的时刻。
@@ -307,6 +317,18 @@ def _regime_display(regime: str | None) -> str:
         return str(regime)
 
 
+def _cell_display(cell: str | None) -> str:
+    """格子键 → 中文（周期方向）。取不到就原样回显 slug，**不猜**。
+
+    与 `_regime_display` 并列而不是合并：格子键现在是 cycle 三格，四档是生效阶段，
+    两个词表不是同一个东西（#66）。合并成一个 `BaseRegime(...)` 会让 `bear` 落进
+    「认不出的阶段」那一支，而它其实是一个完全正常的格子键。
+    """
+    if not cell:
+        return "（无方向）"
+    return CYCLE_DISPLAY.get(cell, str(cell))
+
+
 def _label(row: DecisionRef) -> str:
     """声明行的 `label`：进 `HaltLayer.text`（下单拒绝理由与 `query_halt`），带上策略名。"""
     head = f"{LABEL_PREFIX}{row.strategy_name}"
@@ -321,15 +343,24 @@ def _reason(situation: Situation, row: DecisionRef) -> str:
     「作用域 策略 <uuid>」。
     """
     detail = f"：{row.cell_reason}" if row.cell_reason else ""
+    # 展示用**格子那一格的名字**（周期方向），不是生效阶段（#66）：这句话回答的是
+    # 「它在哪个方向上不适用」，而那正是格子的维度。`situation.regime` 是四档，
+    # 拿它印出来会让这句话说一个池化表里不存在的维度。
     return (
-        f"{row.strategy_name} 在当前「{_regime_display(situation.regime)}」阶段判为不适用"
+        f"{row.strategy_name} 在当前「{_cell_display(situation.cell)}」上判为不适用"
         f"{detail}。机制按策略停用决策拦它的开仓（减仓放行）。"
     )
 
 
 def _declared(situation: Situation, row: DecisionRef) -> bool:
-    """这一行此刻该不该有一条声明。三个条件缺一不可。"""
-    if row.regime != situation.regime:
+    """这一行此刻该不该有一条声明。三个条件缺一不可。
+
+    **比的是格子键（`situation.cell`），不是生效阶段（`situation.regime`）**（#66）。
+    决策行上的 `regime` 存的是格子键：三条路径（迁移过的旧行、新写入的行）都是 cycle 的
+    三格之一，所以拿四档去比会**每一行都不相等**——那会让所有声明被解除，一次换轴成为
+    一次静默放开。
+    """
+    if row.regime != situation.cell:
         return False
     if row.warrant != STILL_TARGET:
         return False
@@ -357,10 +388,12 @@ def _untouched(row: DecisionRef, target: str) -> bool:
 def _close_reason(situation: Situation, row: DecisionRef) -> str:
     """这一行此刻不该有声明时，活行该记的解除原因。**顺序有意义**：
 
-    阶段先于一切（行上的阶段不是当前阶段时，「它还算不算建议」都没意义了），豁免次之
+    格子先于一切（行上的格子不是当前那一格时，「它还算不算建议」都没意义了），豁免次之
     （豁免是「人按住了它」，比「判据变了」更靠前也更可执行），最后才分判据与归属。
+
+    比较用的是 `situation.cell`（格子键），理由见 `_declared`。
     """
-    if row.regime != situation.regime:
+    if row.regime != situation.cell:
         return CLOSE_REGIME_LEFT
     exemption = situation.exemptions.get(row.strategy_id)
     if exemption and exemption.in_force:
@@ -443,6 +476,15 @@ def derive(situation: Situation, decisions: Iterable[DecisionRef]) -> GatePlan:
 
     if deactivation.is_blanket(situation.regime):
         return GatePlan(blocked=BLOCKED_BLANKET, note=NOTE_BLANKET)
+
+    if situation.cell is None:
+        # 判不出方向：没有可问的那一列，什么都不动。与 `blocked` 同一条收场，但它不是
+        # 「说不清」也不是「不该动手」，是「这一列不存在」——所以借用同一个字段、不同的
+        # 码，让页面能说出是哪一种（`gate_switch` 按码取话）。
+        return GatePlan(
+            blocked=deactivation.BLOCKED_NO_CELL,
+            note=f"本轮什么都不动：{deactivation.BLOCKED_DISPLAY[deactivation.BLOCKED_NO_CELL]}",
+        )
 
     declarations: list[Declaration] = []
     statuses: list[StatusWrite] = []
@@ -531,7 +573,9 @@ def _suspension_reason(
     没有这条策略这一阶段」（新策略 / 新阶段 / 窗口未覆盖），一个是「有结论但证据不足」。
     两者都 fail-closed，但读的人该知道该去补哪一样。
     """
-    regime = _regime_display(situation.regime)
+    # 展示用格子那一格的名字（周期方向，`situation.cell`），不是生效阶段：这句话回答的
+    # 是「它在这个方向上有没有资格开仓」，而那正是格子的维度（#66）。
+    cell = _cell_display(situation.cell)
     detail = _cell_detail(ref)
     if ref.cell_state is None:
         judged = "判不了（池化表里没有这一格：策略新、阶段新、或窗口未覆盖）"
@@ -542,7 +586,7 @@ def _suspension_reason(
     else:
         judged = f"判不了（{detail}）" if detail else "判不了"
         tail = "机制暂停它的开仓；减仓照常放行——「判不了」不等于「放它过去」。"
-    return f"{ref.strategy_name} 在当前「{regime}」阶段{judged}。{tail}"
+    return f"{ref.strategy_name} 在当前「{cell}」上{judged}。{tail}"
 
 
 def _suspension_close_reason(verdict: admission.Verdict) -> str:
@@ -599,6 +643,13 @@ def derive_suspensions(situation: Situation, refs: Iterable[SuspensionRef]) -> G
     if deactivation.is_blanket(situation.regime):
         return GatePlan(blocked=BLOCKED_BLANKET, note=NOTE_BLANKET)
 
+    if situation.cell is None:
+        # 判不出方向：没有可问的那一列。与 `derive` 同一条收场（理由那边写得细）。
+        return GatePlan(
+            blocked=deactivation.BLOCKED_NO_CELL,
+            note=f"本轮什么都不动：{deactivation.BLOCKED_DISPLAY[deactivation.BLOCKED_NO_CELL]}",
+        )
+
     declarations: list[Declaration] = []
     close_reasons: dict[Any, str] = {}
     for ref in rows:
@@ -609,6 +660,9 @@ def derive_suspensions(situation: Situation, refs: Iterable[SuspensionRef]) -> G
             # （看起来完全正常，且永远不会自己好）。取向与停用路的 `GONE` 逐字一致。
             close_reasons[ref.strategy_id] = CLOSE_STRATEGY_GONE
             continue
+        # **两个参数喂的是两个不同的轴**（#66）：第一个是「此刻是不是保命档」的判据来源
+        # （波动维投影出的生效阶段），第二个是这一代里那一格的结论。喂同一个值会让
+        # `admission` 拿 `bear` 去问 `is_blanket`，而那永远为假——保命档那一支静默失效。
         verdict = admission.admission(
             situation.regime, ref.cell_state, exempt=ref.exempt
         )

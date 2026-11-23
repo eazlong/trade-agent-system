@@ -8,8 +8,9 @@
 2. **池化门槛不缩放**，而且两条门槛**并列**不是乘积。单元 6 按 `day_share` 缩放笔数
    门槛，池化没有这个量，于是用未缩放的 `min_trades`；而并列判据挡掉「300 笔挤在
    一个月里也能过」。两条都是「门槛是唯一天然刹车」的具体形态。
-3. **判定顺序与单元 6 逐条对齐**：该阶段没出现 → 保命档 → 门槛 → 比对。四态各有
-   各的成因，两层同序日报才能用同一句话解释。
+3. **判定顺序与单元 6 逐条对齐**：该阶段没出现 → 门槛 → 比对。四态各有各的成因，
+   两层同序日报才能用同一句话解释。**#66 起池化不再产出保命档**：格子轴是 cycle
+   三格，没有高波动那一格，保命档整体由 halt 层按波动维承担。
 4. **冲突阻塞建议、不阻塞结论**：方向相反且**两侧都过门槛**才标 `needs_review`，
    而 `state` 照常产出。一侧不过门槛是样本噪声，不是冲突。
 5. **原型兜底**：样本不足时改用「原型 × 阶段」的样本，覆盖表优先于映射表，映射表
@@ -52,12 +53,12 @@ from apps.regime.pool import (
     normalize_archetype,
     resolve_archetype,
 )
-from apps.regime.quant import PRIORITY, BaseRegime
+from apps.regime.quant import CYCLE_CELLS, Cycle
 
-HIGH_VOL = BaseRegime.HIGH_VOL
-DOWNTREND = BaseRegime.DOWNTREND
-UPTREND = BaseRegime.UPTREND
-RANGE = BaseRegime.RANGE
+#: 格子轴的三个键（#66）。池化与切片同一套轴——高波动不进格子、`unclear` 不进格子。
+BULL = Cycle.BULL
+BEAR = Cycle.BEAR
+SIDEWAYS = Cycle.SIDEWAYS
 
 #: 缩小后的证据门槛：3 笔 / 1 个自然月。见模块 docstring。
 SMALL = EvidenceConfig(min_trades=3, min_months=1)
@@ -83,14 +84,14 @@ def same_day(n: int, pnl: float) -> sl.SliceTrade:
     return sl.SliceTrade(entry_time=at(n), exit_time=at(n), pnl=pnl)
 
 
-def tags_span(span: int, overrides: dict[int, BaseRegime] | None = None) -> dict:
-    """`d(0)~d(span-1)` 的标签，默认全是箱体震荡，`overrides` 按偏移覆盖。
+def tags_span(span: int, overrides: dict[int, Cycle] | None = None) -> dict:
+    """`d(0)~d(span-1)` 的标签，默认全是横盘，`overrides` 按偏移覆盖。
 
-    默认全标签是刻意的：没被 `overrides` 提到的阶段在窗口里**一天都没有**，于是
-    那些格子正好是「该阶段未出现」（`unknown`）的用例。
+    默认全标签是刻意的：没被 `overrides` 提到的方向在窗口里**一天都没有**，于是
+    那些格子正好是「该方向未出现」（`unknown`）的用例。
     """
-    tags = {d(i): RANGE for i in range(span)}
-    tags.update({d(offset): regime for offset, regime in (overrides or {}).items()})
+    tags = {d(i): SIDEWAYS for i in range(span)}
+    tags.update({d(offset): cycle for offset, cycle in (overrides or {}).items()})
     return tags
 
 
@@ -130,23 +131,23 @@ def matches_for(*pairs: tuple[int, str]) -> dict[int, pool.ArchetypeMatch]:
 
 
 def cell_of(
-    result: pool.PoolResult, strategy_id: int, regime: BaseRegime
+    result: pool.PoolResult, strategy_id: int, regime: Cycle
 ) -> pool.PooledCell:
     return result.cells[(strategy_id, regime.value)]
 
 
-def span_with(regime: BaseRegime, days: int = 6) -> int:
-    """前 `days` 天是 `regime`、其余是箱体震荡的窗口长度。"""
+def span_with(regime: Cycle, days: int = 6) -> int:
+    """前 `days` 天是 `regime`、其余是横盘的窗口长度。"""
     return days * 2
 
 
 def downtrend_profit_then_range_loss(
     *, symbol: str = "BTC/USDT", result_id: str = "r1", strategy_id: int = 1
 ) -> pool.SliceSample:
-    """一份「箱体不适用、下行趋势适用」的样本：下行趋势三笔平稳盈利，箱体三笔连亏。
+    """一份「横盘不适用、下行周期适用」的样本：下行周期三笔平稳盈利，横盘三笔连亏。
 
-    构造的关键是**让箱体那格比全样本更差**，而不是让全样本也亏：下行趋势那三笔
-    +10% 把全样本曲线的峰抬到 1.3，箱体那三笔 -5% 从这个峰上下来，回撤 15% 大于
+    构造的关键是**让横盘那格比全样本更差**，而不是让全样本也亏：下行周期那三笔
+    +10% 把全样本曲线的峰抬到 1.3，横盘那三笔 -5% 从这个峰上下来，回撤 15% 大于
     全样本的 11.54%，Calmar 也从正翻负——两个维度一致指向「更差」，`_fitness` 才落
     `unfit`。
 
@@ -154,8 +155,8 @@ def downtrend_profit_then_range_loss(
     大，两个指标一个不差一个更差，落的是中性（方向矛盾），而不是不适用。这个区别在
     测试里很容易糊过去——`unfit` 断言会红成一个看不出原因的中性。
     """
-    span = span_with(DOWNTREND)
-    tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+    span = span_with(BEAR)
+    tags = tags_span(span, {i: BEAR for i in range(6)})
     trades = [same_day(0, 1000.0), same_day(1, 1000.0), same_day(2, 1000.0)]
     trades += [same_day(n, -500.0) for n in (7, 8, 9)]
     return sample(
@@ -175,8 +176,8 @@ class TestWeightedMerge(SimpleTestCase):
     """把成交合起来、按合并后的样本重算（CONTEXT.md 的「加权合并」）。"""
 
     def test_pooled_trades_are_the_sum_of_the_parts(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         a = sample(
             payload(
                 [same_day(7, 250.0), same_day(8, 250.0), same_day(9, 250.0)], tags, span
@@ -191,7 +192,7 @@ class TestWeightedMerge(SimpleTestCase):
         )
 
         result = build_pool([a, b], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["trades"], 6)
         self.assertEqual(cell.evidence["symbols"], ["BTC/USDT", "ETH/USDT"])
@@ -210,8 +211,8 @@ class TestWeightedMerge(SimpleTestCase):
         得到的会是一个被本金加权的数（0.5% 量级），与这里差一个数量级——这条用例
         就是那个数量级。
         """
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         days = [7, 8, 9]
         a = sample(
             payload([same_day(n, 250.0) for n in days], tags, span, capital=10000.0)
@@ -223,7 +224,7 @@ class TestWeightedMerge(SimpleTestCase):
         )
 
         result = build_pool([a, b], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertAlmostEqual(cell.evidence["metrics"]["total_pnl"], 0.0825)
         self.assertEqual(cell.evidence["metrics"]["span_days"], 3)
@@ -231,8 +232,8 @@ class TestWeightedMerge(SimpleTestCase):
     def test_the_full_sample_baseline_is_the_same_batch(self):
         """分段与全样本必须覆盖同一批样本，否则「分段比全样本差」里混进了
         「这家的全样本比那家的分段」这种不可比的比较。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         # A 只在下行趋势里交易，B 只在箱体里交易：合并后的全样本必须两天都算上。
         a = sample(payload([same_day(0, 200.0)], tags, span))
         b = sample(
@@ -240,7 +241,7 @@ class TestWeightedMerge(SimpleTestCase):
         )
 
         result = build_pool([a, b], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         # 全样本 = 0.02 + 0.04 = 0.06，跨 d0 与 d7 两天；分段（箱体）只有 d7 那天。
         self.assertAlmostEqual(cell.evidence["full_sample"]["total_pnl"], 0.06)
@@ -261,13 +262,13 @@ class TestThresholdIsConjunctive(SimpleTestCase):
 
         乘积读法（`trades × months >= 3 × 2`）会算出 `6 × 1 = 6 >= 6` 而放行——
         这条用例的存在就是为了让那个读法红。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         one_month = [same_day(7, 300.0) for _ in range(6)]
         data = sample(payload(one_month, tags, span, params=TWO_MONTHS))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=TWO_MONTHS)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["trades"], 6)
         self.assertEqual(cell.evidence["months"], 1)
@@ -284,7 +285,7 @@ class TestThresholdIsConjunctive(SimpleTestCase):
         data = sample(payload(trades, tags, span, params=TWO_MONTHS))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=TWO_MONTHS)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["months"], 2)
         self.assertTrue(cell.evidence["threshold"]["met"])
@@ -299,8 +300,8 @@ class TestPoolingDoesNotScaleTheThreshold(SimpleTestCase):
 
     def test_a_rare_stage_passes_the_slice_but_not_the_pool(self):
         # d(5) 是下行趋势（1/12 天），其余是箱体震荡。
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {5: DOWNTREND})
+        span = span_with(BEAR)
+        tags = tags_span(span, {5: BEAR})
         # 箱体里三笔盈利先把曲线的峰抬起来（d0~d2），下行趋势那两笔亏损落在这个峰
         # 之后 → 下行趋势这一格在切片层被判「不适用」。
         trades = [same_day(n, 1000.0) for n in (0, 1, 2)]
@@ -308,7 +309,7 @@ class TestPoolingDoesNotScaleTheThreshold(SimpleTestCase):
         data = payload(trades, tags, span)
 
         # 切片层：day_share = 1/12，门槛缩到 max(1, round(3/12)) = 1 → 2 笔即过。
-        slice_cell = data["cells"][DOWNTREND.value]
+        slice_cell = data["cells"][BEAR.value]
         self.assertTrue(slice_cell["threshold"]["scaled"])
         self.assertEqual(slice_cell["threshold"]["min_trades"], 1)
         self.assertTrue(slice_cell["threshold"]["met"])
@@ -316,7 +317,7 @@ class TestPoolingDoesNotScaleTheThreshold(SimpleTestCase):
 
         # 池化层：同一格、同样的 2 笔，未缩放的门槛是 3 → 不够。
         result = build_pool([sample(data)], matches_for((1, "海龟突破")), params=SMALL)
-        pooled = cell_of(result, 1, DOWNTREND)
+        pooled = cell_of(result, 1, BEAR)
 
         self.assertEqual(pooled.evidence["threshold"]["min_trades"], 3)
         self.assertFalse(pooled.evidence["threshold"]["met"])
@@ -326,12 +327,12 @@ class TestPoolingDoesNotScaleTheThreshold(SimpleTestCase):
 
     def test_the_unscaled_threshold_is_stated_in_the_evidence(self):
         """证据里写出用的是哪一套门槛，读的人不必去猜是哪一层的数字。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(payload([same_day(7, 250.0)], tags, span))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
-        threshold = cell_of(result, 1, RANGE).evidence["threshold"]
+        threshold = cell_of(result, 1, SIDEWAYS).evidence["threshold"]
 
         self.assertEqual(threshold["min_trades"], 3)
         self.assertEqual(threshold["min_months"], 1)
@@ -344,16 +345,17 @@ class TestPoolingDoesNotScaleTheThreshold(SimpleTestCase):
 
 
 class TestStateVocabulary(SimpleTestCase):
-    """四态与保命档各有各的成因，顺序与 `slice._cell` 逐条对齐。"""
+    """四态各有各的成因，顺序与 `slice._cell` 逐条对齐。"""
 
     def test_a_stage_that_never_appeared_is_unknown(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(payload([same_day(0, 300.0)], tags, span))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
 
-        for regime in (UPTREND, HIGH_VOL):
+        # 窗口里只有 bear 与 sideways；bull 一天都没出现 ⇒ unknown。
+        for regime in (BULL,):
             with self.subTest(regime=regime.value):
                 cell = cell_of(result, 1, regime)
                 self.assertEqual(cell.state, sl.STATE_UNKNOWN)
@@ -363,58 +365,58 @@ class TestStateVocabulary(SimpleTestCase):
     def test_a_stage_that_appeared_without_trades_is_insufficient_not_unknown(self):
         """「这个阶段出现了但没交易」与「这个阶段没出现」是两件事，靠 `regime_days`
         分开——聚合层的 `merge_inputs` 只有成交日，看不到前者。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
-        # 只在下行趋势里交易，箱体那 6 天有标签、没成交。
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
+        # 只在下行周期里交易，横盘那 6 天有标签、没成交。
         data = sample(payload([same_day(0, 300.0)], tags, span))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["regime_days"], 6)
         self.assertEqual(cell.evidence["trades"], 0)
         self.assertEqual(cell.state, sl.STATE_NEUTRAL)
         self.assertEqual(cell.reason, sl.REASON_INSUFFICIENT)
 
-    def test_high_vol_is_blanket_regardless_of_sample_size(self):
-        """保命档不做适用性判断（ADR 0002）：样本再薄也是 `blanket`。
+    def test_the_blanket_tier_is_not_produced_by_pooling(self):
+        """保命档自 #66 起**不再由池化产出**：格子轴是 cycle 三格，没有高波动那一格。
 
-        这一档**不等门槛**：被门槛改写成中性等于说「样本够了就能判适用性」，
-        而那正是保命档要否掉的话。"""
-        span = span_with(HIGH_VOL)
-        tags = tags_span(span, {i: HIGH_VOL for i in range(6)})
-        thin = sample(payload([same_day(0, -500.0)], tags, span))
-        thick = sample(
-            payload([same_day(i, -500.0) for i in range(3)], tags, span),
-            result_id="r2",
-            symbol="ETH/USDT",
-        )
+        高波动是叠加层（ADR 0007），那些日子按它当天的方向落进 bull/bear/sideways；
+        「保命档不做适用性判断」整体搬到 halt 层（`deactivation.is_blanket`）。所以
+        池化的键集恒为三格，且没有任何一格会带着 `blanket` 这个状态。
+        """
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
+        data = sample(payload([same_day(0, -500.0)], tags, span))
 
-        result = build_pool([thin, thick], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, HIGH_VOL)
+        result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
 
-        self.assertEqual(cell.state, sl.STATE_BLANKET)
-        self.assertEqual(cell.reason, sl.REASON_HIGH_VOL_BLANKET)
+        keys = {regime for _, regime in result.cells}
+        self.assertEqual(keys, {cycle.value for cycle in CYCLE_CELLS})
+        self.assertNotIn("high_vol", keys)
+        for (strategy_id, regime), cell in result.cells.items():
+            with self.subTest(strategy=strategy_id, regime=regime):
+                self.assertNotEqual(cell.state, sl.STATE_BLANKET)
 
     def test_a_worse_stage_is_unfit(self):
         """分段两维都比全样本差 → 不适用。这是唯一会推出停用建议的状态。
 
         样本的构造见 `downtrend_profit_then_range_loss`。同一份样本里两个格子状态
-        并存（下行趋势适用、箱体不适用），所以这两种状态确实来自比对，而不是来自
+        并存（下行周期适用、横盘不适用），所以这两种状态确实来自比对，而不是来自
         某个默认值。"""
         result = build_pool(
             [downtrend_profit_then_range_loss()],
             matches_for((1, "海龟突破")),
             params=SMALL,
         )
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["trades"], 3)
         self.assertEqual(cell.state, sl.STATE_UNFIT)
         self.assertEqual(cell.reason, "")
         self.assertEqual(cell.source, POOL_SOURCE_STRATEGY)
         self.assertFalse(cell.needs_review)
-        self.assertEqual(cell_of(result, 1, DOWNTREND).state, sl.STATE_FIT)
+        self.assertEqual(cell_of(result, 1, BEAR).state, sl.STATE_FIT)
 
 
 # --------------------------------------------------------------------------- #
@@ -426,8 +428,8 @@ class TestConflictNeedsReview(SimpleTestCase):
     """方向相反**且**两侧都过门槛 → 待复核；结论照常产出（Q3）。"""
 
     def _two_symbols(self, eth_range_days: list[int]) -> pool.PoolResult:
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         btc = [
             same_day(0, 2000.0),
             same_day(1, 2000.0),
@@ -463,7 +465,7 @@ class TestConflictNeedsReview(SimpleTestCase):
         # 这条用例同时钉住那个易犯的回归：把绝对门后的状态传给 `_conflict`，
         # `_direction("neutral")` 返回 0，冲突判定直接静默退出。
         result = self._two_symbols([7, 8, 9])
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertTrue(cell.needs_review)
         self.assertEqual(cell.state, sl.STATE_NEUTRAL)
@@ -480,7 +482,7 @@ class TestConflictNeedsReview(SimpleTestCase):
         噪声与信号的判据。把不过门槛的那一侧也算成冲突，待复核会变成一个没人看的
         标记——每条策略都能因为某个只跑了 3 笔的品种挂上它。"""
         result = self._two_symbols([7, 8])  # ETH 只有 2 笔箱体成交
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertFalse(cell.needs_review)
         self.assertIsNone(cell.evidence["conflict"])
@@ -496,7 +498,7 @@ class TestConflictNeedsReview(SimpleTestCase):
             matches_for((1, "海龟突破")),
             params=SMALL,
         )
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.state, sl.STATE_UNFIT)
         self.assertFalse(cell.needs_review)
@@ -668,8 +670,8 @@ class TestArchetypeFallback(SimpleTestCase):
     """样本不足时改用「原型 × 阶段」的样本，并标记来源（Q4/Q5）。"""
 
     def _pool(self) -> pool.PoolResult:
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         # s1：均值回归，只 1 笔 → 自己不够。
         s1 = sample(
             payload([same_day(7, -500.0)], tags, span),
@@ -718,7 +720,7 @@ class TestArchetypeFallback(SimpleTestCase):
         是安全的（见 `pool._pool_cell` 的兜底分支）。
         """
         result = self._pool()
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.source, POOL_SOURCE_ARCHETYPE)
         self.assertEqual(cell.state, sl.STATE_NEUTRAL)
@@ -730,7 +732,7 @@ class TestArchetypeFallback(SimpleTestCase):
     def test_the_fallback_sample_excludes_other_archetypes(self):
         """兜底引用的是同原型的样本，且**含自己**：自己那几笔也是这类策略的真实观测。"""
         result = self._pool()
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["trades"], 4)  # 1 + 3，不含 s3 的 3 笔
         self.assertEqual(cell.evidence["symbols"], ["BTC/USDT", "ETH/USDT"])
@@ -739,7 +741,7 @@ class TestArchetypeFallback(SimpleTestCase):
     def test_the_rejected_own_sample_stays_readable(self):
         """「本策略自己为什么不够格」必须能在同一条记录里读到。"""
         result = self._pool()
-        own = cell_of(result, 1, RANGE).evidence["own_sample"]
+        own = cell_of(result, 1, SIDEWAYS).evidence["own_sample"]
 
         self.assertEqual(own["trades"], 1)
         self.assertEqual(own["months"], 1)
@@ -747,21 +749,21 @@ class TestArchetypeFallback(SimpleTestCase):
 
     def test_a_strategy_of_a_healthy_archetype_does_not_borrow(self):
         result = self._pool()
-        cell = cell_of(result, 3, RANGE)
+        cell = cell_of(result, 3, SIDEWAYS)
 
         self.assertEqual(cell.source, POOL_SOURCE_STRATEGY)
         self.assertNotIn("archetype", cell.evidence)
 
     def test_unclassified_strategies_are_counted_not_swallowed(self):
         """未归类要计数并进日报第④段（Q5）——它是一条结论，不是噪声。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(
             payload([same_day(7, 300.0)], tags, span), strategy_id=7, symbol="BTC/USDT"
         )
 
         result = build_pool([data], matches_for((7, "随便写点什么")), params=SMALL)
-        cell = cell_of(result, 7, RANGE)
+        cell = cell_of(result, 7, SIDEWAYS)
 
         self.assertEqual(result.unclassified, {7})
         self.assertEqual(result.unclassified_strategy_ids, (7,))
@@ -774,15 +776,15 @@ class TestArchetypeFallback(SimpleTestCase):
         self.assertEqual(cell.state, sl.STATE_NEUTRAL)
         self.assertEqual(cell.reason, sl.REASON_INSUFFICIENT)
 
-    def test_the_fallback_does_not_borrow_the_blanket_state(self):
+    def test_the_fallback_flags_no_cell_for_review(self):
         """兜底这一格不产生待复核：它的争议不是「有争议」，是「没证据」。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(payload([same_day(7, -500.0)], tags, span), strategy_id=7)
 
         result = build_pool([data], matches_for((7, "随便写点什么")), params=SMALL)
 
-        for regime in PRIORITY:
+        for regime in CYCLE_CELLS:
             with self.subTest(regime=regime.value):
                 self.assertFalse(cell_of(result, 7, regime).needs_review)
 
@@ -806,8 +808,8 @@ class TestLoadSampleExclusions(SimpleTestCase):
 
     def test_a_version_one_payload_is_its_own_reason(self):
         """版本 1 没有 `merge_inputs` 这一节：跑一次重算入口就好，与本金为 0 不同。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = payload([same_day(7, 300.0)], tags, span)
         for cell in data["cells"].values():
             del cell["merge_inputs"]
@@ -818,8 +820,8 @@ class TestLoadSampleExclusions(SimpleTestCase):
         self.assertEqual(loaded.excluded, EXCLUDED_NO_MERGE_INPUTS)
 
     def test_an_unusable_capital_is_its_own_reason(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = payload([same_day(7, 300.0)], tags, span, capital=0.0)
 
         loaded = load_sample(data, result_id="r1", strategy_id=1, symbol="BTC/USDT")
@@ -835,11 +837,11 @@ class TestLoadSampleExclusions(SimpleTestCase):
         的样本形状不对」（少了 `trades` 键）。后者尤其不能按缺省空值读下去——那会得到
         一份「这一格没有交易」的样本，笔数与胜率都算得出来，看起来完全正常。
         """
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
 
         nulled = payload([same_day(7, 300.0)], tags, span)
-        nulled["cells"][HIGH_VOL.value]["merge_inputs"] = None
+        nulled["cells"][BULL.value]["merge_inputs"] = None
         self.assertEqual(
             load_sample(
                 nulled, result_id="r1", strategy_id=1, symbol="BTC/USDT"
@@ -848,7 +850,7 @@ class TestLoadSampleExclusions(SimpleTestCase):
         )
 
         truncated = payload([same_day(7, 300.0)], tags, span)
-        del truncated["cells"][HIGH_VOL.value]["merge_inputs"]["trades"]
+        del truncated["cells"][BULL.value]["merge_inputs"]["trades"]
         self.assertEqual(
             load_sample(
                 truncated, result_id="r1", strategy_id=1, symbol="BTC/USDT"
@@ -857,8 +859,8 @@ class TestLoadSampleExclusions(SimpleTestCase):
         )
 
     def test_a_usable_payload_round_trips(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = payload([same_day(7, 300.0)], tags, span)
 
         loaded = load_sample(data, result_id="r9", strategy_id=4, symbol="BTC/USDT")
@@ -869,7 +871,7 @@ class TestLoadSampleExclusions(SimpleTestCase):
         self.assertEqual(loaded.sample.strategy_id, 4)
         self.assertEqual(loaded.sample.window, (d(0), d(11)))
         # 日收益的键必须是 `date`：`_segment_metrics` 要拿它做日期减法。
-        for regime in PRIORITY:
+        for regime in CYCLE_CELLS:
             for day in loaded.sample.cell_daily[regime.value]:
                 self.assertIsInstance(day, date)
 
@@ -883,8 +885,11 @@ class TestVocabularyMatchesTheModel(SimpleTestCase):
     """`state`/`reason` 在模型上是裸 `CharField`（模型的 import 链不能碰 `slice`，
     见 `RegimePoolCell` 的 docstring），所以「两处同集合」由这里钉住。"""
 
-    #: 池化可能产出的全部状态与原因。前三个直接来自本模块的常量，后两个由
-    #: `slice._fitness` 返回——池化复用它，所以它也在池化的取值范围内。
+    #: 词表里的全部状态与原因（含旧世代只读的那几个）。前三个直接来自本模块的常量，
+    #: 其余由 `slice._fitness` 返回——池化复用它，所以它们也在取值范围内。
+    #:
+    #: `STATE_BLANKET` / `REASON_HIGH_VOL_BLANKET` 自 #66 起**池化不再产出**，但它们仍
+    #: 留在展示词表里（旧载荷读得懂），所以这条「展示词表 == 可计状态」的等式仍成立。
     POOL_STATES = (
         sl.STATE_FIT,
         sl.STATE_UNFIT,
@@ -905,6 +910,19 @@ class TestVocabularyMatchesTheModel(SimpleTestCase):
     def test_states_and_reasons_are_exactly_the_displayed_vocabulary(self):
         self.assertEqual(set(self.POOL_STATES), set(sl.STATE_DISPLAY))
         self.assertEqual(set(self.POOL_REASONS), set(sl.REASON_DISPLAY))
+
+    def test_the_producible_states_are_the_new_four_state_set(self):
+        """真正的**产出**词表是四态（`STATE_VALUES`），`blanket` 只在 `LEGACY_STATES`。
+
+        池化可能产出的状态（`fit` / `unfit` / `neutral` / `unknown`）必须与新词表一致；
+        `blanket` 只服务旧载荷，多产出一个就是换轴没换干净。
+        """
+        self.assertEqual(
+            sl.STATE_VALUES,
+            {sl.STATE_FIT, sl.STATE_UNFIT, sl.STATE_NEUTRAL, sl.STATE_UNKNOWN},
+        )
+        self.assertEqual(sl.LEGACY_STATES, {sl.STATE_BLANKET})
+        self.assertNotIn(sl.STATE_BLANKET, sl.STATE_VALUES)
 
     def test_the_columns_deliberately_have_no_choices(self):
         """加 `choices` 需要先把整份词表搬过来；没搬之前这里必须一直是空的，
@@ -929,8 +947,8 @@ class TestVocabularyMatchesTheModel(SimpleTestCase):
     def test_every_emitted_cell_stays_inside_the_vocabulary(self):
         """行为面：真跑一遍，产出的每一格都在词表里。上面那条是静态的集合相等，
         这条挡住「新加一个状态却忘了进词表」。"""
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         trades = [same_day(0, -500.0) for _ in range(3)]
         trades += [same_day(7, 2000.0) for _ in range(3)]
         data = sample(payload(trades, tags, span))
@@ -941,7 +959,10 @@ class TestVocabularyMatchesTheModel(SimpleTestCase):
         for key, cell in result.cells.items():
             with self.subTest(cell=key):
                 self.assertIn(cell.state, sl.STATE_DISPLAY)
+                # 产出侧必须落在**新**词表里：`blanket` 只是旧载荷的读侧词。
+                self.assertIn(cell.state, sl.STATE_VALUES)
                 self.assertTrue(cell.reason == "" or cell.reason in sl.REASON_DISPLAY)
+                self.assertNotEqual(cell.reason, sl.REASON_HIGH_VOL_BLANKET)
                 self.assertIn(
                     cell.source, (POOL_SOURCE_STRATEGY, POOL_SOURCE_ARCHETYPE)
                 )
@@ -950,24 +971,24 @@ class TestVocabularyMatchesTheModel(SimpleTestCase):
 class TestCoverage(SimpleTestCase):
     """每个策略的每一格都产出——缺格在日报里表现为「这一行没有」，而它有好几种意思。"""
 
-    def test_every_strategy_gets_all_four_cells(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+    def test_every_strategy_gets_all_three_cells(self):
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(payload([same_day(7, 300.0)], tags, span))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
 
-        self.assertEqual(len(result.cells), len(PRIORITY))
-        for regime in PRIORITY:
+        self.assertEqual(len(result.cells), len(CYCLE_CELLS))
+        for regime in CYCLE_CELLS:
             self.assertIn((1, regime.value), result.cells)
 
     def test_an_empty_sample_still_says_why(self):
-        span = span_with(DOWNTREND)
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        span = span_with(BEAR)
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         data = sample(payload([], tags, span))
 
         result = build_pool([data], matches_for((1, "海龟突破")), params=SMALL)
-        cell = cell_of(result, 1, RANGE)
+        cell = cell_of(result, 1, SIDEWAYS)
 
         self.assertEqual(cell.evidence["trades"], 0)
         self.assertEqual(cell.state, sl.STATE_NEUTRAL)

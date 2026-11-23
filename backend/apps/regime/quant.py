@@ -131,6 +131,10 @@ VOLATILITY_DISPLAY = {
 }
 
 #: 判定优先级，高到低；`RANGE` 是兜底因而居末。改这个顺序等于改机制语义，不要顺手动。
+#:
+#: **#66 之后它只剩兼容层的用途**：切片与池化的格子轴换成了 `CYCLE_CELLS`（按 cycle
+#: 分三格），`PRIORITY` 继续服务四档兼容读面（判定记录的 `effective_regime`、真相比对、
+#: 矩阵旧列序）。拿它当格子的维度就会把「高波动单独占一格」这个缺陷装回来。
 PRIORITY: tuple[BaseRegime, ...] = (
     BaseRegime.HIGH_VOL,
     BaseRegime.DOWNTREND,
@@ -160,6 +164,29 @@ class Cycle(str, Enum):
     def display(self) -> str:
         """展示层的中文名。与 `BaseRegime.display` 同一约定：取值不动中文。"""
         return CYCLE_DISPLAY[self.value]
+
+
+#: 切片与池化的**格子轴**（#66）：按 cycle 分三格，bull → bear → sideways。
+#:
+#: 为什么是这一组常量而不是 `PRIORITY`：
+#:
+#: - **波动不进格子。** ADR 0007 确认高波动是叠加状态，不是「这条策略在高波动阶段表现
+#:   如何」的一格。让高波动单独占一格会让那一格的样本极稀（本就不该做适用性判断），
+#:   而 `PRIORITY` 把 `HIGH_VOL` 排第一位，照它遍历就是在给那一格攒证据。
+#: - **`unclear` 也不进格子。** 它说的是「判不出方向」，不是第三个方向。把它当第四格
+#:   会让「判不出来」暴露成一种可比较的适用性，而 `#64` 已经把它定为「按没有结论计」。
+#:
+#: 顺序即矩阵列序：上行 → 下行 → 横盘。这个顺序**没有判定含义**（三格互斥且平等），
+#: 它只是让页面上固定的列序由后端给，前端不必自己再排一遍。
+CYCLE_CELLS: tuple[Cycle, ...] = (
+    Cycle.BULL,
+    Cycle.BEAR,
+    Cycle.SIDEWAYS,
+)
+
+#: `CYCLE_CELLS` 的取值集合。判定「这一格是不是格子轴上的合法键」时用它，比逐个比字面量
+#: 安全：加一格就自动进集合。
+CYCLE_CELL_VALUES: frozenset[str] = frozenset(c.value for c in CYCLE_CELLS)
 
 
 class Volatility(str, Enum):

@@ -13,8 +13,8 @@
 2. **同一代只评一次**。第二次跑同一代，`written` 必须是 0——没有 `already` 那一读的话，
    `ignore_conflicts=True` 会拦下写入但返回值照报条数，于是「报告说评了 8 条」与
    「库里 0 行」同时成立，而这种谎在日报上看起来完全正常。
-3. **重放不读「当前阶段」**。一条决策问的是**它自己记的那个阶段**，与今天生效的是哪
-   个阶段无关——所以整个重放里一行 `RegimeJudgement` 都不需要（本文件用「库里一条
+3. **重放不读「当前阶段」**。一条决策问的是**它自己记的那个格子**（`regime` 字段
+   存的是 cycle 键），与今天生效的是哪个阶段无关——所以整个重放里一行 `RegimeJudgement` 都不需要（本文件用「库里一条
    判定都没有」钉住这件事）。同时这也是「不走 `deactivation.derive`」的实证：那条路
    的冷启动短路会让所有重放安静地什么都不做。
 4. **`reviewed_at` 必须写**。模型上它没有默认值，忘了传就是 `IntegrityError`——这一条
@@ -62,11 +62,14 @@ from apps.regime.models import (
     ReviewVerdict,
 )
 from apps.regime.pool import POOL_SOURCE_STRATEGY
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import Cycle
 from apps.trading.models import Strategy
 
-DOWNTREND = BaseRegime.DOWNTREND
-UPTREND = BaseRegime.UPTREND
+#: 格子键（cycle 三格）：池化格的 `regime` 与决策行的 `regime` 都读它（#66）。
+#: 重放比的正是「决策记的那一格」在新表里变成了什么，所以这里必须是格子键，
+#: 不能是四档——四档值查不到三格表里的任何一格，会静默退成中性。
+BEAR = Cycle.BEAR
+BULL = Cycle.BULL
 
 NOW = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
 
@@ -154,7 +157,7 @@ class _Fixture(TestCase):
     def decision(
         self,
         strategy,
-        regime=DOWNTREND,
+        regime=BEAR,
         *,
         status: str = DecisionStatus.SUGGESTED.value,
         pool_rebuild_id: int | None = None,
@@ -231,7 +234,7 @@ class TestNothingToReplay(_Fixture):
     def test_a_released_decision_is_not_replayed(self):
         """性质 1：已解除的决策重放没有意义——没有人在等它的答案。"""
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
         self.decision(self.alpha, status=DecisionStatus.RELEASED.value)
         summary = self.replay(generation=generation)
         self.assertEqual(summary["decisions"], 0)
@@ -240,7 +243,7 @@ class TestNothingToReplay(_Fixture):
     def test_an_inactive_strategy_is_not_replayed(self):
         """性质 1：`is_active` 是人工总退役开关，退役的不该再收到「要不要放它跑」。"""
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
         self.decision(self.alpha)
         # 走 `.update()` 而不是改属性再 `save()`：这里要的是**库里那一行**变成退役，
         # 与真人拨开关的效果一致。顺带避免 `_Fixture` 共享的那个 Python 对象被改坏后
@@ -256,7 +259,7 @@ class TestNothingToReplay(_Fixture):
         for status in (DecisionStatus.SUGGESTED.value, DecisionStatus.APPLIED.value):
             with self.subTest(status=status):
                 generation = make_generation()
-                add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+                add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
                 self.decision(self.alpha, status=status)
                 self.assertEqual(self.replay(generation=generation)["decisions"], 1)
                 DeactivationReview.objects.all().delete()
@@ -273,8 +276,8 @@ class TestWhatIsWritten(_Fixture):
 
     def test_it_writes_one_row_per_live_decision(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
-        add_cell(generation, self.beta, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
+        add_cell(generation, self.beta, BEAR, state=sl.STATE_FIT)
         self.decision(self.alpha)
         self.decision(self.beta)
         summary = self.replay(generation=generation)
@@ -285,7 +288,7 @@ class TestWhatIsWritten(_Fixture):
     def test_reviewed_at_round_trips(self):
         """性质 4：`reviewed_at` 没有默认值，必须显式传——落库之后要读得回来。"""
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.replay(generation=generation)
         row = DeactivationReview.objects.get()
@@ -294,7 +297,7 @@ class TestWhatIsWritten(_Fixture):
     def test_the_same_generation_is_replayed_only_once(self):
         """性质 2：第二次跑同一代，`written` 是 0 而不是「报了 1 条」。"""
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.assertEqual(self.replay(generation=generation)["written"], 1)
 
@@ -309,7 +312,7 @@ class TestWhatIsWritten(_Fixture):
         self.decision(self.alpha)
         for _ in range(2):
             generation = make_generation()
-            add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+            add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
             self.assertEqual(self.replay(generation=generation)["written"], 1)
         self.assertEqual(DeactivationReview.objects.count(), 2)
 
@@ -320,7 +323,7 @@ class TestWhatIsWritten(_Fixture):
         add_cell(
             generation,
             self.alpha,
-            DOWNTREND,
+            BEAR,
             state=sl.STATE_UNFIT,
             reason="segment_calmar",
             evidence={"trades": 41, "months": 6},
@@ -341,15 +344,15 @@ class TestWhatIsWritten(_Fixture):
 
     def test_stale_basis_is_false_when_the_decision_froze_this_generation(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha, pool_rebuild_id=generation.id)
         self.replay(generation=generation)
         self.assertFalse(DeactivationReview.objects.get().evidence["stale_basis"])
 
     def test_the_verdict_is_the_replay_tier(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
-        add_cell(generation, self.beta, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
+        add_cell(generation, self.beta, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.decision(self.beta)
         self.replay(generation=generation)
@@ -361,11 +364,11 @@ class TestWhatIsWritten(_Fixture):
         self.assertEqual(by_strategy[self.beta.id], ReviewVerdict.STILL_UNFIT.value)
 
     def test_it_reads_the_cell_of_the_decisions_own_regime(self):
-        """性质 3 的 DB 侧：决策记在上涨段，读的就是上涨段那一格。"""
+        """性质 3 的 DB 侧：决策记在上行周期，读的就是上行周期那一格。"""
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
-        add_cell(generation, self.alpha, UPTREND, state=sl.STATE_FIT)
-        self.decision(self.alpha, regime=UPTREND)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BULL, state=sl.STATE_FIT)
+        self.decision(self.alpha, regime=BULL)
         self.replay(generation=generation)
         self.assertEqual(
             DeactivationReview.objects.get().verdict, ReviewVerdict.BECAME_FIT.value
@@ -393,7 +396,7 @@ class TestWhatIsWritten(_Fixture):
         )
 
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         summary = self.replay(generation=generation)
         self.assertEqual(
             DeactivationReview.objects.get(rebuild=generation).evidence[
@@ -406,7 +409,7 @@ class TestWhatIsWritten(_Fixture):
 
     def test_first_replay_counts_as_changed(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.assertEqual(self.replay(generation=generation)["changed"], 1)
 
@@ -417,14 +420,14 @@ class TestWhatIsWritten(_Fixture):
             decision, history, verdict=ReviewVerdict.STILL_UNFIT.value, at=days(0)
         )
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_UNFIT)
         summary = self.replay(generation=generation)
         self.assertEqual(summary["changed"], 0)
 
     def test_the_invalidated_list_names_the_affected_strategies(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
-        add_cell(generation, self.beta, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
+        add_cell(generation, self.beta, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.decision(self.beta)
         summary = self.replay(generation=generation)
@@ -432,7 +435,7 @@ class TestWhatIsWritten(_Fixture):
         item = summary["invalidated"][0]
         self.assertEqual(item["strategy_id"], str(self.alpha.id))
         self.assertEqual(item["name"], "AlphaStem")
-        self.assertEqual(item["regime"], DOWNTREND.value)
+        self.assertEqual(item["regime"], BEAR.value)
         self.assertIsNone(item["previous_verdict"])
 
     def test_replay_does_not_need_a_judgement(self):
@@ -445,7 +448,7 @@ class TestWhatIsWritten(_Fixture):
 
         self.assertEqual(RegimeJudgement.objects.count(), 0)
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
         self.decision(self.alpha)
         self.assertEqual(self.replay(generation=generation)["written"], 1)
 
@@ -453,9 +456,9 @@ class TestWhatIsWritten(_Fixture):
         """不传 `generation` 时取**当前**那一代（最近翻成 ready 的），与
         `deactivation_run` 同一个口径。"""
         stale = make_generation(status=RebuildStatus.BUILDING.value, finished_at=None)
-        add_cell(stale, self.alpha, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(stale, self.alpha, BEAR, state=sl.STATE_FIT)
         current = make_generation(finished_at=days(1))
-        add_cell(current, self.alpha, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(current, self.alpha, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
 
         summary = self.replay()
@@ -522,7 +525,7 @@ class TestTheSummaryShape(_Fixture):
         generation = make_generation()
         no_decision = self.replay(generation=generation)
 
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
         self.decision(self.alpha)
         with_decision = self.replay(generation=generation)
         return {
@@ -559,8 +562,8 @@ class TestTheSummaryShape(_Fixture):
 
     def test_the_verdict_counts_add_up_to_what_was_written(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
-        add_cell(generation, self.beta, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
+        add_cell(generation, self.beta, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.decision(self.beta)
         summary = self.replay(generation=generation)
@@ -570,8 +573,8 @@ class TestTheSummaryShape(_Fixture):
 
     def test_the_invalidated_list_matches_the_became_fit_count(self):
         generation = make_generation()
-        add_cell(generation, self.alpha, DOWNTREND, state=sl.STATE_FIT)
-        add_cell(generation, self.beta, DOWNTREND, state=sl.STATE_UNFIT)
+        add_cell(generation, self.alpha, BEAR, state=sl.STATE_FIT)
+        add_cell(generation, self.beta, BEAR, state=sl.STATE_UNFIT)
         self.decision(self.alpha)
         self.decision(self.beta)
         summary = self.replay(generation=generation)
@@ -624,7 +627,7 @@ class TestTheCommandAlerts(_Fixture):
         return {
             "strategy_id": str(strategy.id),
             "name": strategy.name if name is None else name,
-            "regime": DOWNTREND.value,
+            "regime": BEAR.value,
             "previous_verdict": None,
         }
 

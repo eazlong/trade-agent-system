@@ -85,6 +85,7 @@ from apps.regime.models import (
     CandidateEvent,
     CandidateStatus,
     DailyReport,
+    cell_display,
     Escalation,
     EventImpact,
     EventStatus,
@@ -618,13 +619,17 @@ def _parse(raw: str) -> datetime:
 
 
 def _regime_display(value: object) -> str:
-    """slug → 中文展示名。取不到展示名时原样回显 slug，**不猜**。"""
-    if not value:
+    """slug → 中文展示名。**两套词表都认**（#66），实现收在 `models.cell_display`。
+
+    停用决策行上存的是**格子键**（新世代 cycle 三格、旧世代四档），而判定记录与真值区间
+    仍用四档。只认四档会让日报把每一条新决策印成「bear（认不出的阶段）」，而 agent 侧的
+    `_decision_lines` 直接复用了本函数——同一个错误会在两个入口同时出现。
+
+    这个薄壳留着是因为调用点都按 `_regime_display` 读它（含 `agent/tools/regime_queries`）。
+    """
+    if value is None or value == "":
         return "（无）"
-    try:
-        return BaseRegime(value).display
-    except ValueError:
-        return str(value)
+    return cell_display(str(value))
 
 
 def _escalation_display(value: object) -> str:
@@ -671,9 +676,15 @@ def _landscape(
 
     ## 键是「层」
 
-    `by_regime` 的键是建议里的 `regime`（阶段 slug），值是那一层的策略清单——CONTEXT.md
+    `by_regime` 的键是建议里的 `regime`，值是那一层的策略清单——CONTEXT.md
     第 173 条要的「将新停用 / 将解除〈某层〉」里的「层」正是它。`state` 一并冻结：「为什么
     这天说它不适用」在决策行被后世覆盖之后就只剩这一份了。
+
+    **那个键自 #66 起是格子键（cycle 三格），不是四档**：`suggestions` 来自
+    `deactivation.derive`，它的 `regime` 填的是格子。所以这一段的措辞是「下行周期」而不是
+    「下行趋势」。旧日报（换轴之前写的）里那些键仍是四档，`_regime_display` 两套都认，
+    于是做差时同一个方向会在换轴那天出现一条「解除旧档 + 新停新档」的差异——那一次差异
+    是**真实发生过的事实**（口径换了），不该被抹掉，也不该被当成行情变化去解释。
 
     被豁免的（`exempt`）照落在清单里：豁免改变的是「这条建议会不会真咬人」，不是「机制
     说过什么」。第②段按结构做差，把这两件事混起来会让「豁免到期」看起来像「新停用」。

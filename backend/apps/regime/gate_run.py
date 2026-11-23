@@ -73,6 +73,8 @@ from apps.regime.models import (
     HaltTrigger,
     RegimeMechanismSwitch,
     RegimePoolRebuild,
+    cell_keys_for,
+    legacy_cell_regime,
 )
 from apps.regime.slice import STATE_UNFIT
 from apps.trading.models import Strategy
@@ -157,7 +159,24 @@ def _regime_exemptions(regime: str, *, now: datetime) -> dict[UUID, gate.Exempti
 # --------------------------------------------------------------------------- #
 
 
-def _warrant(decision: DeactivationDecision, *, managed: frozenset, cells: dict) -> str:
+def _cell_of(regime: str) -> str:
+    """决策行上的键 → **格子键**（能换算就换算，换算不出来原样返回）。
+
+    `high_vol` 换算不出来（`legacy_cell_regime` 返回 `None`）时原样返回：它是一个真实的
+    历史取值，改写成任何方向都是编造。这样的行永远匹配不上 `situation.cell`，于是被按
+    「格子离开」解除——那是**如实**的收场（高波动独占一格的口径已经不存在了），
+    而解除会被记成一条可追溯的 `became_fit`。
+    """
+    return legacy_cell_regime(regime) or regime
+
+
+def _warrant(
+    decision: DeactivationDecision,
+    *,
+    managed: frozenset,
+    cells: dict,
+    generation_pool_version: int | None = None,
+) -> str:
     """这一格此刻还算不算「该停用」。三态，取值见 `gate.GONE` / `LAPSED` / `STILL_TARGET`。
 
     两个来源缺一不可，所以先判归属再判判据：
@@ -176,7 +195,20 @@ def _warrant(decision: DeactivationDecision, *, managed: frozenset, cells: dict)
     """
     if decision.strategy_id not in managed or not decision.strategy.is_active:
         return gate.GONE
-    cell = cells.get((decision.strategy_id, decision.regime))
+    # **决策行上的键可能还是旧四档**（迁移 0019 之前写下的行，或 `high_vol` 那种刻意不映射的）：
+    # 拿它直接去新代里查必然落空 ⇒ LAPSED ⇒ 解除 ⇒ 静默放开。所以先换算成新口径的格子键，
+    # 换不出来（`high_vol`、脏值）才认 LAPSED——那是**如实**的收场：那一格今天确实不存在了，
+    # 而解除会被记成一条可追溯的 `became_fit`。
+    # **决策行上的键可能仍是旧四档**（迁移 0019 之前写下的行、刻意不映射的 `high_vol`），
+    # 也可能已经是 cycle 键、而**读的那一代还是旧代**（迁移已跑、池化还没重建）。两个方向
+    # 都要认，否则「查不到这一格」会被判成 LAPSED ⇒ 解除 ⇒ 静默放开开仓。
+    # `cell_keys_for` 按那一代的口径给候选键，与 `replay.plan_reviews` 用同一个函数：
+    # 两处各写一份的话，「重放说没事、gate 说该停」会同时出现在同一条决策上。
+    cell = None
+    for cell_key in cell_keys_for(generation_pool_version, decision.regime):
+        cell = cells.get((decision.strategy_id, cell_key))
+        if cell is not None:
+            break
     if cell is None:
         return gate.LAPSED
     if cell.get("state") == STATE_UNFIT and not cell.get("needs_review"):
@@ -186,7 +218,12 @@ def _warrant(decision: DeactivationDecision, *, managed: frozenset, cells: dict)
     return gate.LAPSED
 
 
-def _refs(*, managed: frozenset, cells: dict) -> tuple[gate.DecisionRef, ...]:
+def _refs(
+    *,
+    managed: frozenset,
+    cells: dict,
+    generation_pool_version: int | None = None,
+) -> tuple[gate.DecisionRef, ...]:
     """全部决策行的只读快照。**已解除的也要**——那正是 `applied` / `released` 两个取值的
     用处：一条被机制撤回过、后来又因为阶段回来而重新成立的，必须能回到 `applied`
     （否则「撤回过的不能再声明」会让这一格永久哑掉）。
@@ -198,19 +235,35 @@ def _refs(*, managed: frozenset, cells: dict) -> tuple[gate.DecisionRef, ...]:
     rows = DeactivationDecision.objects.select_related("strategy").order_by(
         "strategy_id", "regime"
     )
-    return tuple(
-        gate.DecisionRef(
+
+    def one(row: DeactivationDecision) -> gate.DecisionRef:
+        # 比较层与「这一格为什么是这个结论」查表**共用同一个换算**（`cell_keys_for`）：
+        # 一处用 `row.regime`、一处用换过的键，会让 `warrant` 说「仍该停」而
+        # `cell_reason` 恒为空——那句话在拒单理由里就是「为什么拦我」的答案。
+        matched = None
+        for cell_key in cell_keys_for(generation_pool_version, row.regime):
+            matched = cells.get((row.strategy_id, cell_key))
+            if matched is not None:
+                break
+        return gate.DecisionRef(
             decision_id=row.pk,
             strategy_id=row.strategy_id,
             strategy_name=row.strategy.name,
-            regime=row.regime,
+            # **归一成格子键**：`gate._declared` / `_close_reason` 拿它比 `situation.cell`。
+            # 留着旧四档会让一条 `downtrend` 决策行与 `bear` 那一格恒不相等，
+            # 于是它被按「格子离开」解除——而那可能只是它还没被迁移。
+            regime=_cell_of(row.regime),
             status=row.status,
-            warrant=_warrant(row, managed=managed, cells=cells),
-            cell_reason=(cells.get((row.strategy_id, row.regime)) or {}).get("reason")
-            or "",
+            warrant=_warrant(
+                row,
+                managed=managed,
+                cells=cells,
+                generation_pool_version=generation_pool_version,
+            ),
+            cell_reason=(matched or {}).get("reason") or "",
         )
-        for row in rows
-    )
+
+    return tuple(one(row) for row in rows)
 
 
 def _suspension_refs(
@@ -234,7 +287,8 @@ def _suspension_refs(
     都要它，而那是策略名**唯一**进得了用户眼睛的地方。查不到名字的策略（理论上不会发生，
     FK 保证存在）退回 id 字面量，而不是抛——一份快照不该因为一句措辞缺失就让整轮停摆。
     """
-    if situation.regime is None:
+    if situation.regime is None or situation.cell is None:
+        # 冷启动，或判不出方向：两条都答不出「该问哪一列」，本层连「谁该被问」都答不出来。
         return ()
     rows = {
         strategy_id: (name, is_active)
@@ -244,7 +298,9 @@ def _suspension_refs(
     }
     out: list[gate.SuspensionRef] = []
     for strategy_id in managed.ids:
-        cell = cells.get((strategy_id, situation.regime)) or {}
+        # 读的是**格子键**（cycle 三格），不是生效阶段（#66）。生效阶段留在 `situation.regime`
+        # 供 `admission` 判保命档与展示，两个轴不能互相顶替。
+        cell = cells.get((strategy_id, situation.cell)) or {}
         exemption = situation.exemptions.get(strategy_id)
         # `is_active` 在这里读，而不是在 `managed_set()` 里筛：**被管集合的定义不滤它**
         # （CONTEXT.md 明写「`is_active` 不作为集合依据」），而「退不退役」是**求值**那一层
@@ -311,13 +367,17 @@ def _write_statuses(
 
 
 def _is_target(ref: gate.DecisionRef, situation: gate.Situation) -> bool:
-    """这条决策行此刻「该停」——落在当前阶段上，且判据还成立。**不含豁免这一条**。
+    """这条决策行此刻「该停」——落在当前格子上，且判据还成立。**不含豁免这一条**。
 
     「该停」与「会被声明」的差别就是豁免（`gate._declared` 在此之上再排掉在期豁免）。
     两个数在页面上并排出现（「会拦住 N 个；另有 M 个该停但在人工豁免期」），所以这里
     给的是那个更大的 N + M。
+
+    **比的是格子键**（`situation.cell`），不是四档生效阶段（#66）：`ref.regime` 来自
+    池化格（cycle 键），拿 `downtrend` 去比会恒不相等——页面上「会拦住 N 个」永远是 0，
+    而它下面明明列着停用的策略。
     """
-    return ref.regime == situation.regime and ref.warrant == gate.STILL_TARGET
+    return ref.regime == situation.cell and ref.warrant == gate.STILL_TARGET
 
 
 def _is_exempt(ref: gate.DecisionRef, situation: gate.Situation) -> bool:
@@ -461,17 +521,31 @@ def plan_round(
     situation = gate.Situation(
         gate_open=gate_open,
         switch_at=switch_at,
+        # 四档生效阶段：保命档判据与展示口径的来源（`admission` 的第一个参数读它）。
         regime=state.regime,
+        # **格子键**（cycle 三格）：本轮要问的那一列，也是决策行比对的尺子（#66）。
+        # 与上一个参数是两个轴，不能互相顶替——喂同一个值会让「拿 `bear` 问保命档」
+        # 永远为假，而「拿 `high_vol` 找格子」永远落空。
+        cell=state.cell,
         # 判定的**生效时刻**（北京 08:00 那个业务日边界），不是它被算出来的时刻：
         # `attitude_since` 问的是「机制从哪一刻起有理由拦」。
         regime_effective_at=state.effective_at,
         generation_at=generation.finished_at,
+        # 豁免的键是（策略 × 格子），所以这里问的是**格子键**（#66）。拿生效阶段去问会
+        # 一条也匹配不到：库里迁过的豁免存 `bear`，而 `downtrend` 是四档的名字。
         exemptions=(
-            _regime_exemptions(state.regime, now=at) if state.regime is not None else {}
+            _regime_exemptions(state.cell, now=at) if state.cell is not None else {}
         ),
         blocked=derivation.blocked,
     )
-    refs = _refs(managed=frozenset(managed.ids), cells=cells)
+    # 把**这一代的口径**一路带进决策行比对：换轴窗口里决策行可能已经是 cycle 键、而
+    # 当前代还是旧四档键（或反过来），不带版本就有一侧会被判成「没有这一格」并解除。
+    generation_pool_version = getattr(generation, "pool_version", None)
+    refs = _refs(
+        managed=frozenset(managed.ids),
+        cells=cells,
+        generation_pool_version=generation_pool_version,
+    )
     suspension_refs = _suspension_refs(
         managed=managed, cells=cells, situation=situation
     )

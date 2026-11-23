@@ -57,7 +57,7 @@ from apps.regime.models import (
     RegimePoolRebuild,
 )
 from apps.regime.pool import POOL_SOURCE_ARCHETYPE, POOL_SOURCE_STRATEGY
-from apps.regime.quant import PRIORITY, BaseRegime
+from apps.regime.quant import CYCLE_CELLS, CYCLE_DISPLAY, BaseRegime, Cycle
 from apps.regime.tests.test_gate_run import (
     NOW,
     _Fixture as _GateRunFixture,
@@ -65,8 +65,14 @@ from apps.regime.tests.test_gate_run import (
     days,
 )
 
+#: 四档生效阶段：`RegimeJudgement` 的 `base_regime` / `effective_regime` 读它，
+#: `overview.regime_state` 回显的也是它。这条轴**不是**格子（#66）。
 DOWNTREND = BaseRegime.DOWNTREND
-RANGE = BaseRegime.RANGE
+#: 格子键（cycle 三格）：池化格的 `regime` 字段读它。池化表整表换了维度，
+#: 夹具再写四档的话读面会把它当「旧世代键」原样回显，列序断言就测不到三格顺序了。
+BEAR = Cycle.BEAR
+BULL = Cycle.BULL
+SIDEWAYS = Cycle.SIDEWAYS
 
 OVERVIEW = "/api/regime/overview/"
 POOL = "/api/regime/pool/"
@@ -271,13 +277,16 @@ class TestColdStart(_Fixture):
         self.assertEqual(body["display"], views.EMPTY_POOL_DISPLAY)
         self.assertEqual(body["cells"], [])
 
-    def test_pool_still_gives_the_four_columns(self):
-        """冷启动下矩阵仍要有四列——否则前端要么画一个 0 列表格，要么自己补四档，
-        而那就是「顺序的第二处真相」。"""
+    def test_pool_still_gives_the_three_columns(self):
+        """冷启动下矩阵仍要有三列——否则前端要么画一个 0 列表格，要么自己补一格，
+        而那就是「顺序的第二处真相」。
+
+        #66 之后列是 cycle 三格，不再是四档：格子的维度换了，列跟着换。"""
         body = self.pool().json()
 
         self.assertEqual(
-            [row["value"] for row in body["regimes"]], [m.value for m in PRIORITY]
+            [row["value"] for row in body["regimes"]],
+            [cell.value for cell in CYCLE_CELLS],
         )
 
     def test_generations_is_an_empty_page_not_an_error(self):
@@ -302,12 +311,12 @@ class TestGenerationRead(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "reason": sl.REASON_INSUFFICIENT},
                 ),
                 (
                     self.beta,
-                    RANGE,
+                    SIDEWAYS,
                     {
                         "state": sl.STATE_NEUTRAL,
                         "reason": sl.REASON_ARCHETYPE_NOT_FIT,
@@ -342,20 +351,20 @@ class TestGenerationRead(_Fixture):
             for cell in self.pool().json()["cells"]
         }
 
-        alpha = cells[("AlphaStem", DOWNTREND.value)]
+        alpha = cells[("AlphaStem", BEAR.value)]
         self.assertEqual(alpha["state"]["display"], sl.STATE_DISPLAY[sl.STATE_UNFIT])
         self.assertEqual(
             alpha["reason"]["display"], sl.REASON_DISPLAY[sl.REASON_INSUFFICIENT]
         )
         self.assertEqual(alpha["source"]["display"], "本策略切片")
-        self.assertEqual(alpha["regime"]["display"], DOWNTREND.display)
+        self.assertEqual(alpha["regime"]["display"], CYCLE_DISPLAY[BEAR.value])
         self.assertEqual(alpha["source"]["value"], POOL_SOURCE_STRATEGY)
 
     def test_a_reasonless_cell_has_an_empty_display_not_a_placeholder(self):
         """`fit` 那类格子本来就没有原因码。给空串配一句「（无）」会让前端把「没有原因」
         显示成一个像缺数据的占位符。"""
         generation = self.make_gen(
-            cells=((self.gamma, RANGE, {"state": sl.STATE_FIT}),)
+            cells=((self.gamma, SIDEWAYS, {"state": sl.STATE_FIT}),)
         )
 
         body = self.pool(generation=generation.pk).json()
@@ -388,11 +397,24 @@ class TestGenerationRead(_Fixture):
         self.assertEqual(beta["source"]["display"], "原型兜底")
 
     def test_the_matrix_columns_follow_the_backend_order(self):
-        """列序由后端给（`quant.PRIORITY`），前端按数组排。"""
-        body = self.pool().json()
+        """列序由后端给（`quant.CYCLE_CELLS`），前端按数组排。
+
+        列只取**这一代真有**的格子（旧世代是四档键，不能硬塞三列），
+        所以这里造一代三格齐全、且插入顺序与列序不同的，才看得到后端的排序本身。
+        """
+        generation = self.make_gen(
+            cells=(
+                (self.alpha, SIDEWAYS, {"state": sl.STATE_FIT}),
+                (self.beta, BULL, {"state": sl.STATE_FIT}),
+                (self.gamma, BEAR, {"state": sl.STATE_FIT}),
+            )
+        )
+
+        body = self.pool(generation=generation.pk).json()
 
         self.assertEqual(
-            [row["value"] for row in body["regimes"]], [m.value for m in PRIORITY]
+            [row["value"] for row in body["regimes"]],
+            [cell.value for cell in CYCLE_CELLS],
         )
 
     def test_cells_are_ordered_by_strategy_name_then_regime(self):
@@ -404,7 +426,7 @@ class TestGenerationRead(_Fixture):
     def test_a_named_generation_reads_that_one_not_the_current(self):
         """`?generation=` 指定一代时读的是那一代，**不是当前代**——这是代际历史的读法。"""
         older = self.make_gen(
-            cells=((self.alpha, RANGE, {"state": sl.STATE_FIT}),),
+            cells=((self.alpha, SIDEWAYS, {"state": sl.STATE_FIT}),),
             finished_at=days(-5),
         )
 
@@ -412,7 +434,7 @@ class TestGenerationRead(_Fixture):
 
         self.assertEqual(body["generation"]["id"], older.pk)
         self.assertEqual(len(body["cells"]), 1)
-        self.assertEqual(body["cells"][0]["regime"]["value"], RANGE.value)
+        self.assertEqual(body["cells"][0]["regime"]["value"], SIDEWAYS.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -477,7 +499,7 @@ class TestDisplayVocabularyIsSingleSourced(TestCase):
         # 同样**不回落**成四档之一。
         self.assertEqual(
             ser.regime_payload("not_a_regime"),
-            {"value": "not_a_regime", "display": "not_a_regime（认不出的阶段）"},
+            {"value": "not_a_regime", "display": "not_a_regime（认不出的格子）"},
         )
 
     def test_mode_and_status_displays_come_from_their_enums(self):
@@ -561,9 +583,9 @@ class TestPoolDoesNotRepeatEvidence(_Fixture):
         shared = self._evidence("shared")
         generation = self.make_gen(
             cells=(
-                (self.alpha, DOWNTREND, {"evidence": shared}),
-                (self.alpha, RANGE, {"evidence": shared}),
-                (self.beta, DOWNTREND, {"evidence": self._evidence("beta")}),
+                (self.alpha, BEAR, {"evidence": shared}),
+                (self.alpha, SIDEWAYS, {"evidence": shared}),
+                (self.beta, BEAR, {"evidence": self._evidence("beta")}),
             )
         )
 
@@ -611,7 +633,7 @@ class TestPoolDoesNotRepeatEvidence(_Fixture):
                         )
                     },
                 )
-                for i, regime in enumerate((DOWNTREND, RANGE))
+                for i, regime in enumerate((BEAR, SIDEWAYS))
             )
         )
 
@@ -633,7 +655,7 @@ class TestPoolDoesNotRepeatEvidence(_Fixture):
     def test_the_cell_no_longer_carries_its_own_copy(self):
         """格子上**不再有** `evidence` 内联：留着它，去重就只是「多给一份」。"""
         generation = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"evidence": self._evidence("a")}),)
+            cells=((self.alpha, BEAR, {"evidence": self._evidence("a")}),)
         )
 
         cell = self.pool(generation=generation.pk).json()["cells"][0]
@@ -647,8 +669,8 @@ class TestPoolDoesNotRepeatEvidence(_Fixture):
         冷启动与「一格都没有」时，重复的空对象同样是 N 份副本。"""
         generation = self.make_gen(
             cells=(
-                (self.alpha, DOWNTREND, {"evidence": {}}),
-                (self.beta, RANGE, {"evidence": {}}),
+                (self.alpha, BEAR, {"evidence": {}}),
+                (self.beta, SIDEWAYS, {"evidence": {}}),
             )
         )
 
@@ -691,8 +713,8 @@ class TestPoolEvidenceIsLazy(_Fixture):
     def test_evidence_zero_omits_both_tables_and_keeps_the_matrix(self):
         generation = self.make_gen(
             cells=(
-                (self.alpha, DOWNTREND, {"evidence": self.shared_evidence()}),
-                (self.beta, RANGE, {"evidence": self.shared_evidence()}),
+                (self.alpha, BEAR, {"evidence": self.shared_evidence()}),
+                (self.beta, SIDEWAYS, {"evidence": self.shared_evidence()}),
             )
         )
 
@@ -702,7 +724,7 @@ class TestPoolEvidenceIsLazy(_Fixture):
         self.assertEqual(len(body["cells"]), 2)
         self.assertEqual(
             sorted(cell["regime"]["value"] for cell in body["cells"]),
-            sorted([DOWNTREND.value, RANGE.value]),
+            sorted([BEAR.value, SIDEWAYS.value]),
         )
         for cell in body["cells"]:
             self.assertTrue(cell["strategy"]["name"])
@@ -714,7 +736,7 @@ class TestPoolEvidenceIsLazy(_Fixture):
     def test_the_default_still_ships_the_evidence(self):
         """不传 `evidence` 时默认**发**：别的调用方（脚本、导出）不该被界面优化改掉。"""
         generation = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"evidence": self.shared_evidence()}),)
+            cells=((self.alpha, BEAR, {"evidence": self.shared_evidence()}),)
         )
 
         body = self.pool(generation=generation.pk).json()
@@ -724,17 +746,15 @@ class TestPoolEvidenceIsLazy(_Fixture):
 
     def test_the_cell_endpoint_returns_the_resolved_evidence(self):
         evidence = self.shared_evidence()
-        generation = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"evidence": evidence}),)
-        )
+        generation = self.make_gen(cells=((self.alpha, BEAR, {"evidence": evidence}),))
 
         resp = self._cell(
-            generation=generation.pk, strategy=self.alpha.pk, regime=DOWNTREND.value
+            generation=generation.pk, strategy=self.alpha.pk, regime=BEAR.value
         )
 
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body["key"], f"{self.alpha.pk}|{DOWNTREND.value}")
+        self.assertEqual(body["key"], f"{self.alpha.pk}|{BEAR.value}")
         self.assertEqual(body["evidence"], evidence)
 
     def test_the_two_paths_agree_byte_for_byte(self):
@@ -744,9 +764,7 @@ class TestPoolEvidenceIsLazy(_Fixture):
         最容易出的错就是某一处「顺手整理了一下」——而审计看到的依据会因此随入口而变。
         """
         evidence = self.shared_evidence()
-        generation = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"evidence": evidence}),)
-        )
+        generation = self.make_gen(cells=((self.alpha, BEAR, {"evidence": evidence}),))
 
         listed = self.pool(generation=generation.pk).json()
         cell = listed["cells"][0]
@@ -757,19 +775,19 @@ class TestPoolEvidenceIsLazy(_Fixture):
         from_list["results"] = results[cell["results_key"]]
 
         from_cell = self._cell(
-            generation=generation.pk, strategy=self.alpha.pk, regime=DOWNTREND.value
+            generation=generation.pk, strategy=self.alpha.pk, regime=BEAR.value
         ).json()["evidence"]
 
         self.assertEqual(from_list, from_cell)
 
     def test_an_unknown_regime_is_a_400_and_a_missing_cell_is_a_404(self):
-        generation = self.make_gen(cells=((self.alpha, DOWNTREND, {"evidence": {}}),))
+        generation = self.make_gen(cells=((self.alpha, BEAR, {"evidence": {}}),))
 
         bad = self._cell(
             generation=generation.pk, strategy=self.alpha.pk, regime="not_a_regime"
         )
         missing = self._cell(
-            generation=generation.pk, strategy=self.beta.pk, regime=RANGE.value
+            generation=generation.pk, strategy=self.beta.pk, regime=SIDEWAYS.value
         )
 
         # 阶段拼错 → 请求拼错（400）；这一格不存在 → 404。两者不混。
@@ -777,7 +795,7 @@ class TestPoolEvidenceIsLazy(_Fixture):
         self.assertEqual(missing.status_code, 404)
 
     def test_the_required_params_are_required(self):
-        generation = self.make_gen(cells=((self.alpha, DOWNTREND, {"evidence": {}}),))
+        generation = self.make_gen(cells=((self.alpha, BEAR, {"evidence": {}}),))
 
         self.assertEqual(self._cell(generation=generation.pk).status_code, 400)
         self.assertEqual(
@@ -792,7 +810,7 @@ class TestPoolEvidenceIsLazy(_Fixture):
         anonymous = APIClient()
 
         resp = anonymous.get(
-            POOL_CELL, {"strategy": self.alpha.pk, "regime": DOWNTREND.value}
+            POOL_CELL, {"strategy": self.alpha.pk, "regime": BEAR.value}
         )
 
         self.assertEqual(resp.status_code, 401)
@@ -825,7 +843,7 @@ class TestPoolResponseIsCompressed(_Fixture):
 
     def setUp(self):
         super().setUp()
-        self.make_gen(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        self.make_gen(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
 
     def test_the_response_is_gzipped_when_the_client_asks_for_it(self):
         plain = self.client.get(POOL)
@@ -865,7 +883,7 @@ class TestOverviewStaysCheap(_Fixture):
         super().setUp()
         self.judged()
         self.switch_row(MechanismKind.REGIME_GATE, MechanismMode.EXECUTING)
-        self.make_gen(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        self.make_gen(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
 
     def test_the_query_count_has_a_hard_ceiling(self):
         """实测值就是 `OVERVIEW_QUERY_BUDGET`：三个开关各一次 + 当前代一次 + 生效判定一次。
@@ -957,10 +975,10 @@ class TestGenerations(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "reason": sl.REASON_INSUFFICIENT},
                 ),
-                (self.beta, RANGE, {"state": sl.STATE_FIT}),
+                (self.beta, SIDEWAYS, {"state": sl.STATE_FIT}),
             ),
             finished_at=days(-9),
             started_at=days(-9),
@@ -969,10 +987,10 @@ class TestGenerations(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_NEUTRAL, "reason": sl.REASON_INCOMPARABLE},
                 ),
-                (self.beta, RANGE, {"state": sl.STATE_FIT}),
+                (self.beta, SIDEWAYS, {"state": sl.STATE_FIT}),
             ),
             finished_at=days(-5),
             started_at=days(-5),
@@ -981,7 +999,7 @@ class TestGenerations(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_NEUTRAL, "reason": sl.REASON_INCOMPARABLE},
                 ),
             ),
@@ -1095,7 +1113,7 @@ class TestGenerations(_Fixture):
             status=RebuildStatus.BUILDING.value,
             finished_at=None,
             started_at=days(-1),
-            cells=((self.gamma, RANGE, {"state": sl.STATE_UNKNOWN}),),
+            cells=((self.gamma, SIDEWAYS, {"state": sl.STATE_UNKNOWN}),),
         )
 
         body = self.generations().json()
@@ -1182,11 +1200,9 @@ class TestPairingIsPinnedInsideOneRequest(_Fixture):
         翻了一代」。端点若把 `None` 递给 `current_cells()`，它自己会再问一次当前代、
         读到 `newer`，于是 id 说第 1 代、格子却是第 2 代的——那就是这条要挡的形状。
         """
-        asked = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),)
-        )
+        asked = self.make_gen(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         newer = self.make_gen(
-            cells=((self.beta, RANGE, {"state": sl.STATE_FIT}),),
+            cells=((self.beta, SIDEWAYS, {"state": sl.STATE_FIT}),),
             finished_at=days(1),
         )
 
@@ -1249,9 +1265,7 @@ class TestBadParameters(_Fixture):
     def test_an_empty_generation_param_means_current(self):
         """`?generation=`（空值）是「没传」，不是「找 id 为空的那一代」。表单与前端常常
         会带一个空串。"""
-        current = self.make_gen(
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),)
-        )
+        current = self.make_gen(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
 
         body = self.pool(generation="").json()
 

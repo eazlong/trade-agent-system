@@ -4,13 +4,15 @@
 
 1. **每个被管策略恰好一条结论**——不多不少。少了会让某条策略静默地逃出机制，多了
    会让「这条策略被停了几次」变成一个算不出来的数。
-2. **`TARGET` 是唯一会落决策的取值**。`neutral`/`fit`/`unknown`/`blanket`/`no_cell`
-   都不是停用理由：门槛没过是「没结论」，不是「不好」；该阶段没有交易日是「说不出来」，
+2. **`TARGET` 是唯一会落决策的取值**。`neutral`/`fit`/`unknown`/`no_cell` 都不是
+   停用理由：门槛没过是「没结论」，不是「不好」；该阶段没有交易日是「说不出来」，
    不是「不适用」。
 3. **冲突格子阻塞建议、不阻塞结论**（Q3）：`unfit + needs_review` 落成 `NEEDS_REVIEW`，
    不在 `targets` 里，但那格的摘要照旧带着走。
-4. **保命档不产出建议是结构性的**，不是一道额外的闸：高波动档的格子恒为 `blanket`，
-   而 `blanket` 不是 `TARGET`。这里钉的是「这条路径到不了」，不是「我们记得跳过它」。
+4. **保命档与「判不出方向」是两条显式早退**（#66）：保命档 → `BLOCKED_BLANKET`，
+   `state.cell is None`（`unclear` / 旧行无 cycle）→ `BLOCKED_NO_CELL`。换轴之后
+   「高波动恒为一格」那个结构性保证不存在了，这两道闸必须显式写出来，否则会按
+   一个方向给出停用建议——理由完全不同，而动作要人工恢复。
 5. **冷启动与状态过期都不产出建议，但都必须留下可说的一句话**——不静默是这条纪律的
    一半，另一半是这句话得由调用方带出去。
 6. **被管策略集合的两条判据是一筛一标**：解析不到实现类的（不在 `strategy_ids` 里）
@@ -32,11 +34,17 @@ from django.test import SimpleTestCase
 from apps.regime import deactivation as dea
 from apps.regime import slice as sl
 from apps.regime.config import JudgementLifecycleConfig
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 
+#: 四档生效阶段的 slug。保命档判据、展示、日报快照仍在读它。
 HIGH_VOL = BaseRegime.HIGH_VOL.value
 DOWNTREND = BaseRegime.DOWNTREND.value
 UPTREND = BaseRegime.UPTREND.value
+
+#: 格子轴（#66）：池化表的键是 cycle 三格，与上面的四档阶段**不是**同一个东西。
+BULL = Cycle.BULL.value
+BEAR = Cycle.BEAR.value
+SIDEWAYS = Cycle.SIDEWAYS.value
 
 #: 生命周期参数：过期门槛 3 天（默认值）+ 一个不参与本模块的待机天数（同为默认值）。
 LIFE = JudgementLifecycleConfig(min_dwell_days=3, stale_after_days=3)
@@ -70,11 +78,16 @@ def cell(
     }
 
 
-def derive(cells, *, state=DOWNTREND, ids=(1,), now=None, **kwargs):
-    """把 `derive` 的调用压到一行，好让每个用例只剩它真正在问的那一件事。"""
+def derive(cells, *, state=DOWNTREND, cell_key=BEAR, ids=(1,), now=None, **kwargs):
+    """把 `derive` 的调用压到一行，好让每个用例只剩它真正在问的那一件事。
+
+    `state` 是四档的**生效阶段**（保命档、过期判据读它），`cell_key` 是池化表的
+    **格子键**（cycle 三格之一）。两者必须分开传：#66 之后拿四档去查新代必然落空，
+    而那个空落恰是我们特意要覆盖的 `BLOCKED_NO_CELL` 分支。
+    """
     return dea.derive(
         cells,
-        state=dea.RegimeState(regime=state, effective_at=at()),
+        state=dea.RegimeState(regime=state, cycle=cell_key, effective_at=at()),
         strategy_ids=ids,
         now=now or at(),
         params=LIFE,
@@ -87,8 +100,8 @@ class TestOneOutcomePerManagedStrategy(SimpleTestCase):
 
     def test_every_managed_strategy_gets_exactly_one_outcome(self):
         cells = {
-            (1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT),
-            (2, DOWNTREND): cell(2, DOWNTREND, sl.STATE_FIT),
+            (1, BEAR): cell(1, BEAR, sl.STATE_UNFIT),
+            (2, BEAR): cell(2, BEAR, sl.STATE_FIT),
         }
         got = derive(cells, ids=(1, 2, 3))
         self.assertEqual([o.strategy_id for o in got.outcomes], [1, 2, 3])
@@ -109,20 +122,24 @@ class TestOneOutcomePerManagedStrategy(SimpleTestCase):
 
     def test_only_the_managed_set_is_derived(self):
         cells = {
-            (1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT),
-            (99, DOWNTREND): cell(99, DOWNTREND, sl.STATE_UNFIT),
+            (1, BEAR): cell(1, BEAR, sl.STATE_UNFIT),
+            (99, BEAR): cell(99, BEAR, sl.STATE_UNFIT),
         }
         got = derive(cells, ids=(1,))
         self.assertEqual([o.strategy_id for o in got.outcomes], [1])
         self.assertEqual(got.unmanaged, (99,))
 
-    def test_a_cell_in_another_regime_neither_leaks_in_nor_counts_as_managed(self):
-        """只读当前阶段那一列。别的阶段的行进来只是为了算 `unmanaged`，不是候选。"""
+    def test_a_cell_in_another_cycle_neither_leaks_in_nor_counts_as_managed(self):
+        """只读当前那一格。别的格的行进来只是为了算 `unmanaged`，不是候选。
+
+        「另一个格」在 #66 之后是另一个**周期**（这里当前是 `bear`、表里有 `bull`），
+        不再是「另一个档位」——格子轴换成 cycle 之后，四档那套键根本进不了这张表。
+        """
         cells = {
-            (1, UPTREND): cell(1, UPTREND, sl.STATE_UNFIT),
-            (99, UPTREND): cell(99, UPTREND, sl.STATE_FIT),
+            (1, BULL): cell(1, BULL, sl.STATE_UNFIT),
+            (99, BULL): cell(99, BULL, sl.STATE_FIT),
         }
-        got = derive(cells, ids=(1,), state=DOWNTREND)
+        got = derive(cells, ids=(1,), cell_key=BEAR)
         self.assertEqual(got.outcomes[0].verdict, dea.NO_CELL)
         self.assertEqual(got.unmanaged, (99,))
 
@@ -131,34 +148,30 @@ class TestWhatIsNotAGroundForDeactivation(SimpleTestCase):
     """性质 2 + 7：只有 `unfit` 会变成建议，且池化的词表被覆盖全了。"""
 
     def test_every_pool_state_is_mapped_and_unfit_is_the_one_handled_apart(self):
-        """池化的五个状态一个不落地有归宿，`unfit` 是唯一在表外单独处理的那个。
+        """池化**可产出**的四个状态一个不落地有归宿，`unfit` 是唯一在表外单独处理的那个。
 
         这条红了通常意味着有人给 `pool` 加了第五种状态而没告诉这一层——那时
         `_verdict` 会把新状态当 `unknown`（fail-safe），而不会变成「该停」。
+
+        #66 之后预期集合就是 `slice.STATE_VALUES` 本身（`fit`/`unfit`/`neutral`/
+        `unknown`）：`blanket` 已不在那个集合里，池化也不再产出它。
         """
         self.assertEqual(
             set(dea.VERDICT_OF_STATE) | {sl.STATE_UNFIT},
-            {
-                sl.STATE_FIT,
-                sl.STATE_UNFIT,
-                sl.STATE_NEUTRAL,
-                sl.STATE_UNKNOWN,
-                sl.STATE_BLANKET,
-            },
+            set(sl.STATE_VALUES),
         )
         self.assertNotIn(sl.STATE_UNFIT, dea.VERDICT_OF_STATE)
 
     def test_state_to_verdict_is_one_to_one(self):
+        """表里的三档逐一对应，`unfit` 走另一条路（`TARGET`／`NEEDS_REVIEW`）。"""
         expected = {
             sl.STATE_FIT: dea.FIT,
             sl.STATE_NEUTRAL: dea.NEUTRAL,
             sl.STATE_UNKNOWN: dea.UNKNOWN,
-            sl.STATE_BLANKET: dea.BLANKET,
-            sl.STATE_UNFIT: dea.TARGET,
         }
         for state, verdict in expected.items():
             with self.subTest(state=state):
-                got = derive({(1, DOWNTREND): cell(1, DOWNTREND, state)}, ids=(1,))
+                got = derive({(1, BEAR): cell(1, BEAR, state)}, ids=(1,))
                 self.assertEqual(got.outcomes[0].verdict, verdict)
 
     def test_only_target_reaches_the_suggestion_list(self):
@@ -167,16 +180,15 @@ class TestWhatIsNotAGroundForDeactivation(SimpleTestCase):
             sl.STATE_FIT,
             sl.STATE_NEUTRAL,
             sl.STATE_UNKNOWN,
-            sl.STATE_BLANKET,
         ):
             with self.subTest(state=state):
-                got = derive({(1, DOWNTREND): cell(1, DOWNTREND, state)}, ids=(1,))
+                got = derive({(1, BEAR): cell(1, BEAR, state)}, ids=(1,))
                 self.assertEqual(got.targets, ())
                 self.assertEqual(got.writable, ())
 
     def test_an_unrecognized_state_never_becomes_a_suggestion(self):
         """词表漂移时**失败的方向**是「不停」，不是「停」。"""
-        got = derive({(1, DOWNTREND): cell(1, DOWNTREND, "brand_new_state")}, ids=(1,))
+        got = derive({(1, BEAR): cell(1, BEAR, "brand_new_state")}, ids=(1,))
         self.assertEqual(got.outcomes[0].verdict, dea.UNKNOWN)
         self.assertEqual(got.targets, ())
         # 原样留着，好让人看见那一格到底写了什么。
@@ -203,7 +215,7 @@ class TestConflictBlocksTheSuggestionNotTheConclusion(SimpleTestCase):
 
     def test_a_conflicted_unfit_cell_is_not_a_target(self):
         got = derive(
-            {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT, needs_review=True)},
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT, needs_review=True)},
             ids=(1,),
         )
         self.assertEqual(got.outcomes[0].verdict, dea.NEEDS_REVIEW)
@@ -214,9 +226,9 @@ class TestConflictBlocksTheSuggestionNotTheConclusion(SimpleTestCase):
         """结论照常产出、照常被引用：状态与原因原样带着走。"""
         got = derive(
             {
-                (1, DOWNTREND): cell(
+                (1, BEAR): cell(
                     1,
-                    DOWNTREND,
+                    BEAR,
                     sl.STATE_UNFIT,
                     reason=sl.REASON_DIRECTION_CONFLICT,
                     needs_review=True,
@@ -229,27 +241,31 @@ class TestConflictBlocksTheSuggestionNotTheConclusion(SimpleTestCase):
 
     def test_a_clean_unfit_cell_is_still_a_target(self):
         """对照组：同一条 `unfit`，只是不冲突。否则上一条可能是「unfit 都不产建议」。"""
-        got = derive({(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)}, ids=(1,))
+        got = derive({(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)}, ids=(1,))
         self.assertEqual([o.strategy_id for o in got.targets], [1])
 
 
-class TestBlanketIsStructural(SimpleTestCase):
-    """性质 4：保命档到不了。"""
+class TestBlanketIsAnExplicitGate(SimpleTestCase):
+    """性质 4：保命档到不了——#66 起这条闸是**显式**的，不再靠池化的结构保证。"""
 
     def test_a_high_vol_regime_produces_no_target_even_from_an_unfit_shaped_cell(self):
-        """高波动档下就算有人手工塞了一格「不适用」，那一格也不是 `blanket`——
-        而这里要钉的是**真实形状**：`pool` 对高波动档恒返回 `blanket`。"""
+        """保命档期间就算表里有一格「不适用」，也不产出任何结论。
+
+        换轴之前这是结构性的：池化对高波动那一格恒返回 `blanket`，而 `blanket` 不是
+        `TARGET`，所以没有代码路径能产建议。格子换成 cycle 之后保命档期间
+        `state.cell` 仍是一个有效方向键，照走就会按那个方向给出 `unfit` 建议——
+        于是这道闸只能由 `derive` 显式早退（`BLOCKED_BLANKET`）来顶。
+        """
         got = derive(
-            {
-                (1, HIGH_VOL): cell(
-                    1, HIGH_VOL, sl.STATE_BLANKET, reason=sl.REASON_HIGH_VOL_BLANKET
-                )
-            },
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
             ids=(1,),
             state=HIGH_VOL,
         )
-        self.assertEqual(got.outcomes[0].verdict, dea.BLANKET)
+        self.assertEqual(got.blocked, dea.BLOCKED_BLANKET)
+        self.assertEqual(got.outcomes, ())
         self.assertEqual(got.targets, ())
+        self.assertEqual(got.writable, ())
+        self.assertTrue(got.blocked_note)
 
     def test_the_state_knows_it_is_the_blanket(self):
         """日报要写一句「全场停用由保命档负责」，那句的依据是**阶段本身**，
@@ -257,6 +273,28 @@ class TestBlanketIsStructural(SimpleTestCase):
         state = dea.RegimeState(regime=HIGH_VOL, effective_at=at())
         self.assertTrue(state.blanket)
         self.assertFalse(dea.RegimeState(regime=DOWNTREND, effective_at=at()).blanket)
+
+
+class TestTheCellKeyIsTheCycle(SimpleTestCase):
+    """`RegimeState.cell` 是「四档生效阶段 → cycle 格子键」的唯一一处换算（#66）。
+
+    散成两处的话，总有一处会拿 `downtrend` 去新代找格子——那必然落 `no_cell`，
+    于是一条本该正常推导的策略被 fail-closed 拦下，而拦它的理由还是错的。
+    """
+
+    def test_the_three_cycle_cells_pass_through(self):
+        for cycle in (BULL, BEAR, SIDEWAYS):
+            with self.subTest(cycle=cycle):
+                self.assertEqual(dea.RegimeState(cycle=cycle).cell, cycle)
+
+    def test_no_direction_has_no_cell(self):
+        """`unclear` 与 `None` 都不是第三、第四个方向：没有格子键可问。"""
+        self.assertIsNone(dea.RegimeState(cycle="unclear").cell)
+        self.assertIsNone(dea.RegimeState().cell)
+
+    def test_the_four_tier_regime_is_not_mistaken_for_a_cell(self):
+        """生效阶段是四档，与格子键不同名。`downtrend` 不是 cycle，不能直接当键用。"""
+        self.assertIsNone(dea.RegimeState(regime=DOWNTREND, cycle=None).cell)
 
 
 class TestBlanketReadsTheVolatilityAxis(SimpleTestCase):
@@ -323,7 +361,7 @@ class TestBlocked(SimpleTestCase):
         """没有当前阶段可问：逐策略全落成「没有这一格」是一句真的废话，而且会把一次
         「没有阶段」摊成几十条噪声。收场只有一条 `blocked`。"""
         got = dea.derive(
-            {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)},
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
             state=dea.RegimeState(),
             strategy_ids=(1,),
             now=at(),
@@ -340,8 +378,8 @@ class TestBlocked(SimpleTestCase):
         """过期不是「算不出来」：格子还在，结论照样算出来，只是不可写。日报要能说
         「若状态仍有效则会有 N 条」——那正是让人知道该去查判定任务的数字。"""
         got = dea.derive(
-            {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)},
-            state=dea.RegimeState(regime=DOWNTREND, effective_at=at()),
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
+            state=dea.RegimeState(regime=DOWNTREND, cycle=BEAR, effective_at=at()),
             strategy_ids=(1,),
             now=at(days=4),
             params=LIFE,
@@ -355,7 +393,7 @@ class TestBlocked(SimpleTestCase):
         """「日志不算被看见」的另一半：这句话要带上能让人动手的数字。"""
         got = dea.derive(
             {},
-            state=dea.RegimeState(regime=DOWNTREND, effective_at=at()),
+            state=dea.RegimeState(regime=DOWNTREND, cycle=BEAR, effective_at=at()),
             strategy_ids=(),
             now=at(days=4),
             params=LIFE,
@@ -378,7 +416,9 @@ class TestBlocked(SimpleTestCase):
             with self.subTest(age_days=age_days):
                 got = dea.derive(
                     {},
-                    state=dea.RegimeState(regime=DOWNTREND, effective_at=at()),
+                    state=dea.RegimeState(
+                        regime=DOWNTREND, cycle=BEAR, effective_at=at()
+                    ),
                     strategy_ids=(),
                     now=at(days=age_days),
                     params=LIFE,
@@ -389,13 +429,50 @@ class TestBlocked(SimpleTestCase):
         """说不清从哪一刻开始的结论，不拿来停人。"""
         got = dea.derive(
             {},
-            state=dea.RegimeState(regime=DOWNTREND, effective_at=None),
+            state=dea.RegimeState(regime=DOWNTREND, cycle=BEAR, effective_at=None),
             strategy_ids=(),
             now=at(days=99),
             params=LIFE,
         )
         self.assertEqual(got.blocked, dea.BLOCKED_COLD_START)
         self.assertEqual(got.age_days, None)
+
+    def test_a_state_without_a_cycle_direction_blocks_on_no_cell(self):
+        """判不出方向（`unclear` / 旧行 `cycle` 为空）→ 没有可问的那一格。
+
+        #66 之后格子键是 cycle，`unclear` 不在三格里。逐策略各落一条 `no_cell` 会把
+        一次「判不出方向」摊成几十条噪声，收场与冷启动同形：一条 `blocked`。
+        它与冷启动必须**分开**——冷启动是「从没判过」，这里是「判过了，但没判出方向」。
+        """
+        got = dea.derive(
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
+            # `state.cell` 会是 None：`unclear` 不是三格之一。
+            state=dea.RegimeState(regime=DOWNTREND, cycle="unclear", effective_at=at()),
+            strategy_ids=(1,),
+            now=at(),
+            params=LIFE,
+        )
+        self.assertEqual(got.blocked, dea.BLOCKED_NO_CELL)
+        self.assertEqual(got.outcomes, ())
+        self.assertEqual(got.targets, ())
+        self.assertEqual(got.writable, ())
+        self.assertTrue(got.blocked_note)
+
+    def test_a_legacy_row_without_a_cycle_blocks_the_same_way(self):
+        """旧行（两列存在之前写的）`cycle` 是 NULL，与 `unclear` 落到同一档。
+
+        拿 `regime`（四档）去查新代必然落空，所以这是**如实**：那一代对这些日子没有
+        结论。把它读成「中性 → 不用停」或「读成某个方向 → 该停」都错。
+        """
+        got = dea.derive(
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
+            state=dea.RegimeState(regime=DOWNTREND, effective_at=at()),
+            strategy_ids=(1,),
+            now=at(),
+            params=LIFE,
+        )
+        self.assertEqual(got.blocked, dea.BLOCKED_NO_CELL)
+        self.assertEqual(got.outcomes, ())
 
     def test_no_note_when_nothing_is_blocked(self):
         got = derive({}, ids=())
@@ -413,21 +490,21 @@ class TestExemptionAndRunningAreMarks(SimpleTestCase):
         而不是只活在某一期日报里。
         """
         got = derive(
-            {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)},
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
             ids=(1,),
-            exemptions={(1, DOWNTREND): 77},
+            exemptions={(1, BEAR): 77},
         )
         self.assertEqual([o.strategy_id for o in got.targets], [1])
         self.assertEqual([o.strategy_id for o in got.writable], [1])
         self.assertEqual([o.strategy_id for o in got.exempt], [1])
         self.assertEqual(got.targets[0].exempt_id, 77)
 
-    def test_an_exemption_for_another_regime_does_not_apply(self):
-        """豁免键是（策略 × 阶段）：在别的阶段被豁免过，不构成这个阶段的挡箭牌。"""
+    def test_an_exemption_for_another_cell_does_not_apply(self):
+        """豁免键是（策略 × 格子）：在别的格被豁免过，不构成这一格的挡箭牌。"""
         got = derive(
-            {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)},
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)},
             ids=(1,),
-            exemptions={(1, UPTREND): 77},
+            exemptions={(1, BULL): 77},
         )
         self.assertIsNone(got.targets[0].exempt_id)
         self.assertEqual(got.exempt, ())
@@ -435,7 +512,7 @@ class TestExemptionAndRunningAreMarks(SimpleTestCase):
     def test_running_is_a_mark_not_a_filter(self):
         """判据二只标记。若它变成筛选，第①段（零执行、可能没有任何活跃会话）
         会天天产出空记录——而每日记录是这一段唯一的产出。"""
-        cells = {(1, DOWNTREND): cell(1, DOWNTREND, sl.STATE_UNFIT)}
+        cells = {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT)}
         both = derive(cells, ids=(1, 2), running_ids=(2,))
         self.assertEqual([o.strategy_id for o in both.outcomes], [1, 2])
         by_id = {o.strategy_id: o for o in both.outcomes}
@@ -447,11 +524,7 @@ class TestExemptionAndRunningAreMarks(SimpleTestCase):
     def test_cell_digest_is_carried_but_not_invented(self):
         """格子上的依据原样带着走；没有格子时是空字典，不是编一份出来。"""
         got = derive(
-            {
-                (1, DOWNTREND): cell(
-                    1, DOWNTREND, sl.STATE_UNFIT, evidence={"trades": 7}
-                )
-            },
+            {(1, BEAR): cell(1, BEAR, sl.STATE_UNFIT, evidence={"trades": 7})},
             ids=(1, 2),
         )
         self.assertEqual(got.outcomes[0].evidence, {"trades": 7})
@@ -460,9 +533,9 @@ class TestExemptionAndRunningAreMarks(SimpleTestCase):
     def test_the_pool_vocabulary_is_carried_through_verbatim(self):
         got = derive(
             {
-                (1, DOWNTREND): cell(
+                (1, BEAR): cell(
                     1,
-                    DOWNTREND,
+                    BEAR,
                     sl.STATE_UNFIT,
                     reason=sl.REASON_INSUFFICIENT,
                     source="archetype",

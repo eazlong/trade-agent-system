@@ -310,11 +310,14 @@ class TestPureRendering(TestCase):
         self.assertTrue(report._ready(pending, RUN_DAY, AFTER_DEADLINE))
 
     def test_regime_display_never_guesses(self):
+        # 四档（旧口径）与 cycle 三格（#66）都要认：前者是判定记录、后者是决策行上的格子键。
         self.assertEqual(report._regime_display("downtrend"), "下行趋势")
+        self.assertEqual(report._regime_display("bear"), "下行周期")
         self.assertEqual(report._regime_display(""), "（无）")
         self.assertEqual(report._regime_display(None), "（无）")
-        # 认不出来就原样回显，不编一个中文名。
-        self.assertEqual(report._regime_display("whatever"), "whatever")
+        # 认不出来时**不编一个中文名**，而是原样回显并标出「认不出」（`models.cell_display`
+        # 的唯一口径）：一个陌生的格子键是给人查的线索，凭空编一句中文会把它盖掉。
+        self.assertEqual(report._regime_display("whatever"), "whatever（认不出的格子）")
 
     def test_escalation_display_comes_from_the_model_layer(self):
         # **`Escalation` 是 `str` 枚举**：`f"{escalation}"` 不报错，只是把 slug「news」

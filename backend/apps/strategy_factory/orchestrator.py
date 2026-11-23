@@ -948,6 +948,8 @@ def evaluate_regime_verdict(
         evidence.cell,
         evidence.exemptions,
         resume,
+        # 豁免的键是格子键（#66）。`regime` 是四档（判保命档），两者不是同一个轴。
+        cell_key=evidence.cell_key,
     )
 
 

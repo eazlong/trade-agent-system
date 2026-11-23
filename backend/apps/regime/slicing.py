@@ -3,8 +3,8 @@
 ## 这一步在整条链路里的位置
 
     日线（全量历史，判定源唯一）
-        ↓  judgement.load_candles + slice.build_tags
-    「日期 → 阶段」（派生映射，不落库）
+        ↓  judgement.load_candles + slice.build_cycle_tags
+    「日期 → 周期方向」（派生映射，不落库）
         ↓  本模块：把一次回测的已平仓成交喂给 slice.slice_backtest
     切片载荷（纯函数算出来的那一半）
         ↓  本模块：盖 computed_at / config_snapshot / 标签指纹
@@ -13,8 +13,8 @@
 
 `slice.py` 是纯函数（不吃 DB、不读时钟、不碰 `BacktestResult`），本模块是它的适配层，
 也是**唯一**写 `metrics["regime_slice"]` 的地方。本模块自己也不是铁板一块：`slice_result`
-与 `adapt_trades` 仍是纯的（行传进来，载荷传出去），只有 `load_tags` / `compute_slice` /
-`save_slice` / `is_stale` 碰 DB。
+与 `adapt_trades` 仍是纯的（行传进来，载荷传出去），只有 `load_cycle_tags` /
+`compute_slice` / `save_slice` / `is_stale` 碰 DB。
 
 ## 为什么切片要独立成一个任务
 
@@ -39,8 +39,12 @@ CONTEXT.md 的原话：切片计算**不放在回测任务的收尾里**，而�
 
 `judgement.load_candles(judgement.SYMBOL)`——**判定源唯一（BTC），不是回测的 symbol**。
 一个策略在 ETH 上回测，它的适用性仍然按 BTC 的行情阶段归档：阶段是**全市场**的宏观
-描述（CONTEXT.md），按品种各判一套会得出互相矛盾的结论，而停用决策是按「策略 × 阶段」
+描述（CONTEXT.md），按品种各判一套会得出互相矛盾的结论，而停用决策是按「策略 × 格子」
 池化的，池子里不能混着几种「阶段」的定义。
+
+**取的是周期维（`cycle`）而不是四档**（#66）：切片的格子轴是三个方向，高波动是叠加层、
+不进格子（ADR 0007）。所以本模块的标签入口是 `load_cycle_tags`；`load_tags`（四档）留着
+给真值比对那条读面。
 
 取全量历史而不是「窗口内那几根」，预热（`config.JUDGEMENT.warmup_days = 250`）就天然
 满足了：窗口起点之前本来就有日线，`label_series` 对窗口第一天也能给出结论。代价是每次
@@ -95,7 +99,7 @@ from apps.common.time_utils import as_utc
 from apps.regime import config
 from apps.regime import slice as slice_core
 from apps.regime.judgement import SYMBOL, load_candles
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +116,11 @@ FINGERPRINT_LENGTH = 16
 
 
 def load_tags(params: config.JudgementConfig | None = None) -> dict[date, BaseRegime]:
-    """当前参数下、全量历史日线给出的「日期 → 阶段」。
+    """当前参数下、全量历史日线给出的「日期 → 四档」。
+
+    **#66 之后它不是切片的格子轴**（那是 `load_cycle_tags`）。留着它给**真值比对**那条
+    读面：人工区间是四档标的，ADR 0007 的一致率口径也是四档——把那条换成 cycle 是改
+    口径，属于 #67 的范围。
 
     **每次调用都重算**，不缓存：缓存会把「标签与当前算法一致」这条保证换成「标签与
     缓存建立那一刻的算法一致」，而后者是静默的——改完参数重跑切片会拿到旧标签，
@@ -121,7 +129,24 @@ def load_tags(params: config.JudgementConfig | None = None) -> dict[date, BaseRe
     return slice_core.build_tags(load_candles(SYMBOL), params or config.JUDGEMENT)
 
 
-def tag_fingerprint(tags: Mapping[date, BaseRegime], window: tuple[date, date]) -> str:
+def load_cycle_tags(
+    params: config.JudgementConfig | None = None,
+) -> dict[date, Cycle]:
+    """当前参数下、全量历史日线给出的「日期 → 周期方向」。**切片的格子轴**（#66）。
+
+    与 `load_tags` 分两个入口而不是加一个参数：两者返回的**键的类型不同**（`Cycle` 与
+    `BaseRegime`），混在一个函数里靠参数切换，调用点读起来是「拿了个映射不知道是哪一种」，
+    而 `slice_backtest` 恰好是那种喂错了也照跑、只是结论全错的地方。
+
+    `unclear` 与未就绪的日子不进映射（`build_cycle_tags` 的约定），所以三格的样本分母
+    只算判得出方向的天。
+    """
+    return slice_core.build_cycle_tags(load_candles(SYMBOL), params or config.JUDGEMENT)
+
+
+def tag_fingerprint(
+    tags: Mapping[date, BaseRegime | Cycle], window: tuple[date, date]
+) -> str:
     """窗口内标签的指纹。按日期排序拼接，所以与构造顺序无关。
 
     取窗口内的标签而不是全量：见模块 docstring。空窗口（一天都没判定出来）的指纹是
@@ -201,7 +226,8 @@ def slice_result(
     rows: Sequence,
     window: tuple[date, date],
     initial_capital: float,
-    tags: Mapping[date, BaseRegime],
+    # 格子轴是 cycle（#66）：调用方必须传 `load_cycle_tags()` 的产物。
+    tags: Mapping[date, Cycle],
     params: config.EvidenceConfig | None = None,
     now: datetime | None = None,
 ) -> dict:
@@ -283,7 +309,7 @@ def save_slice(result_id, payload: dict) -> None:
 
 def is_stale(
     result,
-    tags: Mapping[date, BaseRegime],
+    tags: Mapping[date, Cycle],
     params: config.EvidenceConfig | None = None,
 ) -> bool:
     """结果里那份切片是否该重算。
@@ -320,7 +346,7 @@ def is_stale(
 
 def compute_slice(
     result,
-    tags: Mapping[date, BaseRegime] | None = None,
+    tags: Mapping[date, Cycle] | None = None,
     *,
     params: config.EvidenceConfig | None = None,
     now: datetime | None = None,
@@ -331,7 +357,7 @@ def compute_slice(
     共用**的一份（同一个 symbol、同一套参数）。让每个结果各自 `load_tags()` 会把一次
     全量 `label_series` 变成一千次。
     """
-    tags = tags if tags is not None else load_tags()
+    tags = tags if tags is not None else load_cycle_tags()
     payload = slice_result(
         rows=list(result.trades.all()),
         window=(result.start_date, result.end_date),

@@ -1025,9 +1025,8 @@ def test_exemption_beats_an_unfit_cell():
     # 格子照抄：豁免覆盖的是**结论**，不是事实。依据栏里两个数都要能读到。
     assert verdict.detail["cell_state"] == "unfit"
     assert verdict.detail["cell_reason"] == "direction_conflict"
-    assert verdict.detail["exempt"] == [
-        {"strategy_id": "strat-1", "regime": "downtrend"}
-    ]
+    # 命中的那一对点出来的是**格子键**（#66）：豁免的键是格子，不是生效阶段。
+    assert verdict.detail["exempt"] == [{"strategy_id": "strat-1", "cell": "downtrend"}]
 
 
 def test_exempt_trace_carries_only_the_matching_pair():
@@ -1048,9 +1047,7 @@ def test_exempt_trace_carries_only_the_matching_pair():
         exemptions,
         resume=S.AWAITING_LIVE_APPROVAL,
     )
-    assert verdict.detail["exempt"] == [
-        {"strategy_id": "strat-1", "regime": "downtrend"}
-    ]
+    assert verdict.detail["exempt"] == [{"strategy_id": "strat-1", "cell": "downtrend"}]
     assert verdict.next_status is S.AWAITING_LIVE_APPROVAL
 
 

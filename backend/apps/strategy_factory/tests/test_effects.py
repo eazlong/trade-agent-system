@@ -647,7 +647,7 @@ class TestReadRegime:
         """
         candidate = self._candidate(_strategy_row)
         generation = self._generation()
-        self._cell(generation, _strategy_row, "downtrend", state="unfit")
+        self._cell(generation, _strategy_row, "bear", state="unfit")
 
         with patch.object(
             deactivation_run_module, "current_regime_state", return_value=RegimeState()
@@ -672,7 +672,7 @@ class TestReadRegime:
         """`current_cells` 必须收到**显式取过的**那一代，不许它自己再问一次。"""
         candidate = self._candidate(_strategy_row)
         generation = self._generation()
-        self._cell(generation, _strategy_row, "downtrend", state="unfit")
+        self._cell(generation, _strategy_row, "bear", state="unfit")
 
         seen: list[object] = []
         real = pool_rebuild_module.current_cells
@@ -686,7 +686,11 @@ class TestReadRegime:
             patch.object(
                 deactivation_run_module,
                 "current_regime_state",
-                return_value=RegimeState(regime="downtrend", effective_at=FIXED_NOW),
+                return_value=RegimeState(
+                    regime="downtrend",
+                    cycle="bear",
+                    effective_at=FIXED_NOW,
+                ),
             ),
         ):
             evidence = effects.read_regime(candidate)
@@ -710,13 +714,17 @@ class TestReadRegime:
         old = self._generation(finished_at=FIXED_NOW - timedelta(days=1))
         new = self._generation(finished_at=FIXED_NOW)
         # 两代各有这一格，但结论不同——配对错了读到的就是另一份结论。
-        self._cell(old, _strategy_row, "downtrend", state="fit")
-        self._cell(new, _strategy_row, "downtrend", state="unfit")
+        self._cell(old, _strategy_row, "bear", state="fit")
+        self._cell(new, _strategy_row, "bear", state="unfit")
 
         with patch.object(
             deactivation_run_module,
             "current_regime_state",
-            return_value=RegimeState(regime="downtrend", effective_at=FIXED_NOW),
+            return_value=RegimeState(
+                regime="downtrend",
+                cycle="bear",
+                effective_at=FIXED_NOW,
+            ),
         ):
             evidence = effects.read_regime(candidate)
 
@@ -732,7 +740,7 @@ class TestReadRegime:
         self._cell(
             generation,
             _strategy_row,
-            "range",
+            "sideways",
             state="unfit",
             reason="direction_conflict",
             source="archetype",
@@ -741,12 +749,18 @@ class TestReadRegime:
         with patch.object(
             deactivation_run_module,
             "current_regime_state",
-            return_value=RegimeState(regime="range", effective_at=FIXED_NOW),
+            return_value=RegimeState(
+                regime="range",
+                cycle="sideways",
+                effective_at=FIXED_NOW,
+            ),
         ):
             evidence = effects.read_regime(candidate)
 
         assert evidence == RegimeEvidence(
             regime="range",
+            # 格子键（#66）：`regime` 是四档，`cell_key` 才是查格子与匹配豁免的那一维。
+            cell_key="sideways",
             effective_at=FIXED_NOW,
             cell=RegimePoolCellEvidence(
                 state="unfit",
@@ -760,10 +774,10 @@ class TestReadRegime:
         """在期豁免原样进证据（D5）。"""
         candidate = self._candidate(_strategy_row)
         generation = self._generation()
-        self._cell(generation, _strategy_row, "downtrend", state="unfit")
+        self._cell(generation, _strategy_row, "bear", state="unfit")
         exemption = DeactivationExemption.objects.create(
             strategy=_strategy_row,
-            regime="downtrend",
+            regime="bear",
             granted_at=FIXED_NOW - timedelta(days=1),
             expires_at=FIXED_NOW + timedelta(days=9),
             granted_by="ticket34-probe",
@@ -773,14 +787,19 @@ class TestReadRegime:
         with patch.object(
             deactivation_run_module,
             "current_regime_state",
-            return_value=RegimeState(regime="downtrend", effective_at=FIXED_NOW),
+            return_value=RegimeState(
+                regime="downtrend",
+                cycle="bear",
+                effective_at=FIXED_NOW,
+            ),
         ):
             # `now` 与造库用的 FIXED_NOW 是同一个时刻：豁免的「在期」是相对现在的量，
             # 两处各读一次时钟就会让「恰在到期那一刻」这条边界随运行时刻漂移。
             evidence = effects.read_regime(candidate, now=FIXED_NOW)
 
         assert evidence is not None
-        assert evidence.exemptions == {(_strategy_row.pk, "downtrend"): exemption.pk}
+        # 豁免的键是**格子键**（#66）：`read_regime` 从 `state.cell` 取，不是四档。
+        assert evidence.exemptions == {(_strategy_row.pk, "bear"): exemption.pk}
 
     def test_regime_known_but_no_cell_is_not_a_fabricated_neutral(self, _strategy_row):
         """阶段说得清、当代没有这一格 → `cell is None`，而不是一份合成中性。
@@ -795,13 +814,17 @@ class TestReadRegime:
         other = Strategy.objects.create(
             name="regime_other", code_path="strategies/regime_other.py"
         )
-        self._cell(generation, other, "downtrend", state="unfit")
-        self._cell(generation, _strategy_row, "uptrend", state="fit")
+        self._cell(generation, other, "bear", state="unfit")
+        self._cell(generation, _strategy_row, "bull", state="fit")
 
         with patch.object(
             deactivation_run_module,
             "current_regime_state",
-            return_value=RegimeState(regime="downtrend", effective_at=FIXED_NOW),
+            return_value=RegimeState(
+                regime="downtrend",
+                cycle="bear",
+                effective_at=FIXED_NOW,
+            ),
         ):
             evidence = effects.read_regime(candidate)
 

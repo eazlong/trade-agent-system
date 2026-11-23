@@ -448,10 +448,16 @@ def read_regime(
     if state.regime is None:
         return None
 
-    cell = cells.get((candidate.strategy_id, state.regime))
+    # **取格子键（cycle 三格），不是生效阶段**（#66）。判不出方向时 `state.cell` 是 `None`：
+    # 那一片天没有任何一格可问，`RegimeEvidence` 的 `cell` 留 `None`——`admission` 会把
+    # 「没有格子」读成 fail-closed 的「判不了」，与「这一代没覆盖这只策略」同一条处置。
+    cell = cells.get((candidate.strategy_id, state.cell)) if state.cell else None
 
     return RegimeEvidence(
+        # 四档：保命档判据与展示用。
         regime=state.regime,
+        # 格子键：查格子与匹配豁免用（#66）。两者不能互相顶替。
+        cell_key=state.cell,
         effective_at=state.effective_at,
         cell=(
             None

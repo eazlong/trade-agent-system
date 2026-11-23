@@ -213,7 +213,8 @@ def compute_regime_slice_task(self, result_ids, only_stale: bool = True) -> dict
     summary: dict = {"sliced": 0, "skipped": 0, "missing": [], "failed": []}
     try:
         # 标签全批共用一份：同一个 symbol、同一套参数，算一次就够（见 slicing.compute_slice）。
-        tags = slicing.load_tags()
+        # **取周期维**（#66）：切片的格子轴是 cycle 三格，不是四档。
+        tags = slicing.load_cycle_tags()
 
         for result_id in ids:
             # 长循环里的连接纪律（CLAUDE.md）：批可能上百条，每条都在上一次事务边界之外。

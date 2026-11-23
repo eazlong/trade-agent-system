@@ -36,7 +36,111 @@ from django.db import models
 
 from apps.common.time_utils import business_day_start, business_tz
 from apps.regime.config import JUDGEMENT_LIFECYCLE, NewsSourceKind
-from apps.regime.quant import BaseRegime, Cycle, Volatility
+from apps.regime.quant import CYCLE_CELLS, CYCLE_DISPLAY, BaseRegime, Cycle, Volatility
+
+#: 池化格子与停用决策上 `regime` 列的取值集合：**新世代（cycle 三格）∪ 旧世代（四档）**。
+#:
+#: 为什么是并集而不是直接换成三格：这两张表的行都带「那一代/那一刻算出了什么」的历史
+#: 语义，改写旧行等于篡改审计依据。新旧靠各自的世代/时间戳分开，读路径按代过滤，所以
+#: 两套键集共存是安全的；而 `choices` 只是表单校验与文档，并集才不撒谎。
+#:
+#: 顺序即矩阵列序：三格在前（新），四档在后（旧）。
+CELL_REGIME_CHOICES: list[tuple[str, str]] = [
+    (c.value, c.display) for c in CYCLE_CELLS
+] + [(m.value, m.display) for m in BaseRegime]
+
+#: 新世代的格子键集合。**读路径判「这一格是不是当前口径」时用它**，不要去比 `BaseRegime`。
+CELL_REGIME_VALUES: frozenset[str] = frozenset(c.value for c in CYCLE_CELLS)
+
+#: 旧世代（四档）的格子键。只在读存量行时遇到；新写入一个字都不许产生它们。
+LEGACY_CELL_REGIMES: frozenset[str] = frozenset(m.value for m in BaseRegime)
+
+
+def cell_display(value: str | None) -> str:
+    """格子/阶段取值 → 中文。**两套词表都认**，认不出来原样回显（带一句提示）。
+
+    ## 为什么收成一处
+
+    这个兜底原先在四个地方各写一遍（`deactivation_run.regime_display`、
+    `report._regime_display`、`replay._cell_name`、`serializers.cell_label_payload`）。
+    换轴时漏掉其中一处，那一条路径就会把每一条新决策印成「bear（认不出的阶段）」——
+    `deactivation_run` 当初正是这样漏的。四份各自演化时，下一次加词表还会漏同一处。
+
+    `None` / 空串给「（无）」，与 `report._regime_display` 的既有口径一致：调用方拿它
+    拼句子，空串会拼出「当前「」上」这种半截话。
+    """
+    if not value:
+        return "（无）"
+    if value in CYCLE_DISPLAY:
+        return CYCLE_DISPLAY[value]
+    try:
+        return BaseRegime(value).display
+    except ValueError:
+        return f"{value}（认不出的格子）"
+
+
+#: 四档 → 三格的**迁移映射**（#66）。`high_vol` **不在表里**，见 `legacy_cell_regime`。
+_LEGACY_TO_CYCLE: dict[str, str] = {
+    BaseRegime.UPTREND.value: Cycle.BULL.value,
+    BaseRegime.DOWNTREND.value: Cycle.BEAR.value,
+    BaseRegime.RANGE.value: Cycle.SIDEWAYS.value,
+}
+
+
+def legacy_cell_regime(regime: str) -> str | None:
+    """旧四档的格子键 → cycle 格子键；映射不出来（含 `high_vol`）时 `None`。
+
+    `high_vol` 刻意**不映射**：它在旧结构里是「保命档独占一格」，那天没有任何方向结论
+    可言（`cycle` 留 NULL 是同一条理由）。给它编一个 `sideways` 会把「那天判不出来」
+    伪造成「那天是横盘」，而这条伪造会直接参与停用决策。
+    """
+    return _LEGACY_TO_CYCLE.get(regime)
+
+
+#: 反向映射：cycle 格子键 → 旧四档。**只给「读旧世代」用**，见 `cell_keys_for`。
+_CYCLE_TO_LEGACY: dict[str, str] = {v: k for k, v in _LEGACY_TO_CYCLE.items()}
+
+
+def cell_keys_for(generation_pool_version: int | None, cell: str) -> tuple[str, ...]:
+    """在某一代池化表里查 `cell` 时**应该试哪些键**。
+
+    ## 为什么需要这个换算（换轴窗口的真实风险）
+
+    `POOL_VERSION` 5 起格子键是 cycle 三格；第 5 代之前的存量代仍是四档键。于是存在一个
+    **窗口**：迁移 0019 已经把决策行与豁免行的键改写成 cycle，而池化表还停在旧代（重建
+    要人跑一次入口，也可能跑到一半）。这个窗口里读侧如果只认一种键：
+
+    - 只认 cycle：拿 `bear` 去旧代里查 → 落「当前代没有这一格」→ `_warrant` 判 `LAPSED`
+      → 活声明被解除、决策行被写成 `released`。**解除的方向是放开开仓**，于是一次换轴
+      成为一次静默放开，而页面上只会显示「已解除」。
+    - 只认四档：新代里查 `downtrend` 永远落空——那是本该被消除的那个缺陷。
+
+    所以按**那一代的口径**挑键：新代用 cycle 键，旧代用四档键（并保留原键，兼容混部
+    期间写进来的行）。返回的是**有序候选**，调用方按序取第一个命中的。
+
+    `generation_pool_version` 为 `None`（旧行没记版本 / 手工造的数据）时**两套都试**：
+    猜一个口径的风险比多查一次大得多。
+    """
+    keys: list[str] = [cell]
+    if generation_pool_version is None:
+        keys.extend(
+            filter(None, (legacy_cell_regime(cell), _CYCLE_TO_LEGACY.get(cell)))
+        )
+    elif generation_pool_version < CELL_AXIS_POOL_VERSION:
+        # 旧代：那一代只可能是四档键。
+        keys.extend(
+            filter(None, (legacy_cell_regime(cell), _CYCLE_TO_LEGACY.get(cell)))
+        )
+    # 新代：只可能是 cycle 键，原键就是正确的那一个。
+    return tuple(dict.fromkeys(keys))
+
+
+#: 格子轴换成 cycle 三格的那一代池化版本号（`pool.POOL_VERSION` 进位到它时生效）。
+#: 放在这里而不是 import `pool`：`pool` 依赖 `slice`，本模块是它的上游（`models` 被
+#: `slice` 之外的整条链路引用），反向 import 会成环。取值必须与 `pool.POOL_VERSION`
+#: 一致，由 `test_pool` 钉住。
+CELL_AXIS_POOL_VERSION = 5
+
 
 # 必须与下面 DecimalField 的 decimal_places 一致：写入方按这个精度量化后再落库，
 # 否则「刚从交易所解析出的值」与「从库里读回的值」不相等，幂等同步会每次运行都
@@ -576,8 +680,16 @@ class RegimePoolCell(models.Model):
         related_name="regime_pool_cells",
         verbose_name="策略",
     )
+    # 取值是**格子轴的键**：新世代写 `quant.CYCLE_CELLS`（bull / bear / sideways，#66），
+    # 第 5 代之前的存量世代写的仍是四档（high_vol / downtrend / uptrend / range）。
+    #
+    # **存量行不迁移**：格子键是那一代的产物，把它改写成映射值等于篡改历史，而审计要的
+    # 正是「那一代当时算出了什么」。新旧世代靠 `rebuild` 外键分开，读路径永远按代过滤，
+    # 所以两套键集在同一张表里共存是安全的——由这里并集化的 choices 表达。
     regime = models.CharField(
-        "阶段", max_length=16, choices=[(m.value, m.display) for m in BaseRegime]
+        "格子（周期方向；旧世代为四档）",
+        max_length=16,
+        choices=CELL_REGIME_CHOICES,
     )
 
     source = models.CharField("结论来源", max_length=16, choices=PoolSource.choices())
@@ -681,8 +793,16 @@ class DeactivationDecision(models.Model):
         related_name="regime_deactivation_decisions",
         verbose_name="策略",
     )
+    # 取值是**格子轴的键**：新决策写 cycle 三格（#66）。存量四档决策由迁移 0019 映射
+    # 过来（downtrend→bear / uptrend→bull / range→sideways），原值留在 `evidence`
+    # 的 `legacy_regime` 里——映射是**为了让它继续拦**，留痕是**为了它仍然答得出当初
+    # 按哪一档判的**。不映射的代价是不对称的：新代里没有 `downtrend` 这一格，
+    # `gate_run._warrant` 会判它 LAPSED 并解除，而解除方向是「放开开仓」——
+    # 一次换轴就成了静默放开，正是这条设计一路在防的形状。
     regime = models.CharField(
-        "阶段", max_length=16, choices=[(m.value, m.display) for m in BaseRegime]
+        "格子（周期方向；旧决策为四档）",
+        max_length=16,
+        choices=CELL_REGIME_CHOICES,
     )
 
     status = models.CharField(
@@ -838,8 +958,13 @@ class DeactivationExemption(models.Model):
         related_name="regime_deactivation_exemptions",
         verbose_name="策略",
     )
+    # 豁免的键是（策略 × 阶段），#66 之后那个「阶段」是**格子轴的键**（cycle 三格）。
+    # 存量四档豁免由迁移 0019 一起映射——只迁决策不迁豁免会让豁免期内的策略在换轴当天
+    # 被立刻重新停用（豁免落在 `downtrend`，而当前格子是 `bear`，两边撞不上）。
     regime = models.CharField(
-        "阶段", max_length=16, choices=[(m.value, m.display) for m in BaseRegime]
+        "格子（周期方向；已迁移旧四档）",
+        max_length=16,
+        choices=CELL_REGIME_CHOICES,
     )
 
     granted_at = models.DateTimeField("发出时刻")

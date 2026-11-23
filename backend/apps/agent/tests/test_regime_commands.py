@@ -96,7 +96,8 @@ from apps.regime.models import (
     RegimeMechanismSwitch,
     RegimeTruthInterval,
 )
-from apps.regime.quant import BaseRegime
+from apps.regime import models as models_module
+from apps.regime.quant import BaseRegime, Cycle
 from apps.trading.models import Strategy
 
 SENDER = "tg:42"
@@ -191,6 +192,11 @@ def _judge(regime: str = BaseRegime.UPTREND.value) -> RegimeJudgement:
         base_regime=regime,
         escalation="",
         effective_regime=regime,
+        # **`cycle` 必须跟着填**（#66）：豁免登记的是格子键（cycle 三格）。不给它时
+        # `RegimeState.cell` 是 `None`，`/regime exempt grant` 不带阶段那一支会（正确地）
+        # 拒绝推断——那不是缺陷，是「判不出方向就没有可登记的那一格」。
+        cycle=models_module.legacy_cell_regime(regime),
+        volatility="normal",
         evidence={},
         config_snapshot={},
     )
@@ -626,7 +632,9 @@ class TestTheExemptSubcommands:
 
         row = DeactivationExemption.objects.get()
         assert row.strategy_id == strategy.id
-        assert row.regime == BaseRegime.DOWNTREND.value, "中文名要在这里翻成 slug"
+        # 中文名「下行趋势」（四档那一套）在这一层翻成 slug，再在共享层换算成格子键
+        # （#66）：库里只该有一种口径，读侧按 `state.cell` 匹配。
+        assert row.regime == Cycle.BEAR.value, "落库的必须是格子键"
         assert row.note == "回测里这个阶段还行"
         assert row.granted_by == SENDER, "落款是人（聊天渠道的 sender id）"
         assert row.expires_at - row.granted_at == timedelta(
@@ -643,10 +651,10 @@ class TestTheExemptSubcommands:
         _judge(BaseRegime.UPTREND.value)
         result = _run(_call("/regime exempt grant AlphaStem"))
         assert result.success, result.error
-        # 「取的是当前生效阶段」必须打出来，否则一条取来的阶段会被当成人的决定。
-        assert "未给阶段，取当前生效阶段" in result.data
-        assert BaseRegime.UPTREND.display in result.data
-        assert DeactivationExemption.objects.get().regime == BaseRegime.UPTREND.value
+        # 「取的是当前格子」必须打出来，否则一条取来的格子会被当成人的决定。
+        assert "未给格子，取当前格子" in result.data
+        assert Cycle.BULL.display in result.data
+        assert DeactivationExemption.objects.get().regime == Cycle.BULL.value
 
     def test_cold_start_refuses_to_guess_and_writes_nothing(self):
         _strategy()
@@ -706,7 +714,7 @@ class TestTheExemptSubcommands:
             ("/regime exempt grant", "要指明给哪条策略"),
             ("/regime exempt grant NoSuchStem 下行趋势", "找不到策略名"),
             # 备注写在阶段那个位置上：第二个词只能放阶段，这一句是那个约定的代价。
-            ("/regime exempt grant AlphaStem 回测过得去", "认不出的阶段"),
+            ("/regime exempt grant AlphaStem 回测过得去", "认不出的格子"),
             ("/regime exempt revoke", "要指明收回哪几条"),
             ("/regime exempt revoke abc", "必须是整数"),
         ):

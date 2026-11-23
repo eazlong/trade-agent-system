@@ -39,7 +39,6 @@ from typing import Any, Iterable, Mapping
 from apps.regime import deactivation_run
 from apps.regime import quant
 from apps.regime import slice as sl
-from apps.regime.quant import PRIORITY
 from apps.regime.models import (
     ActorKind,
     EventImpact,
@@ -50,7 +49,9 @@ from apps.regime.models import (
     RebuildStatus,
     RegimeMechanismSwitch,
     RegimePoolRebuild,
+    cell_display,
 )
+from apps.regime.quant import CYCLE_CELLS
 
 
 # --------------------------------------------------------------------------- #
@@ -121,8 +122,25 @@ def _enum_display(enum_cls, value: Any) -> str:
 
 
 def regime_payload(value: Any) -> dict[str, str]:
-    """行情阶段。展示名走 `deactivation_run.regime_display`（脏值有「认不出的阶段」后缀）。"""
+    """行情阶段（四档）。展示名走 `deactivation_run.regime_display`（脏值有「认不出的阶段」后缀）。
+
+    **#66 之后它不再是池化表的列**：格子轴是 `cell_payload`。留着它服务判定记录与真值
+    区间——那两处的取值口径仍然是四档。
+    """
     return _labelled(value, deactivation_run.regime_display(value))
+
+
+def cell_label_payload(value: Any) -> dict[str, str]:
+    """池化格子键 → `{value, display}`（#66）。
+
+    **两个口径都要读得懂**：新世代给 cycle 三格，旧世代的存量行给四档。两个词表的取值
+    不重叠（bull/bear/sideways 与 high_vol/downtrend/uptrend/range），所以合表不会撞键；
+    **查不到就原样回显**，与 `_from_table` 同一条纪律：一个陌生的格子键是给人查的线索，
+    凭空编一句中文会把它盖掉。
+    """
+    # 展示兜底收在 `models.cell_display`（**只有一处**）：四份拷贝各自演化时，换轴漏掉
+    # 其中一处就会让某条路径把每条新决策印成「bear（认不出的格子）」。
+    return _labelled(value, cell_display(str(value)))
 
 
 def cycle_payload(value: Any) -> dict[str, str] | None:
@@ -603,7 +621,8 @@ def cell_payload(
     evidence_key, results_key = key
     return {
         "strategy": strategy_payload(row, info),
-        "regime": regime_payload(row["regime"]),
+        # 格子键（新世代 cycle / 旧世代四档），不是四档生效阶段：这一列是池化表的维度。
+        "regime": cell_label_payload(row["regime"]),
         "source": source_payload(row["source"]),
         "state": state_payload(row["state"]),
         "reason": reason_payload(row["reason"]),
@@ -640,12 +659,14 @@ def cell_key(strategy_id: Any, regime: str) -> str:
     return f"{strategy_id}|{regime}"
 
 
-#: 矩阵的固定列序（`quant.PRIORITY` 的顺序：高波动 → 下行 → 上行 → 箱体）。
+#: 矩阵的列序：**cycle 三格**（上行 → 下行 → 横盘，#66）。
 #:
 #: 列顺序由后端给，不由前端猜：前端按数组顺序排，才不会出现两处各有一份顺序、而两份都
-#: 「看起来对」。`PRIORITY` 是**判定**优先级，拿它当列序是借用它的稳定性，不是声称列序
-#: 有判定含义——四档都列出来，没有优先级之分。
-ORDERED_REGIMES: tuple[str, ...] = tuple(regime.value for regime in PRIORITY)
+#: 「看起来对」。三格互斥且平等，这个顺序**没有判定含义**，只是稳定。
+#:
+#: 旧世代（第 5 代之前）的格子键是四档，那些列由 `columns_for()` 按**实际存在**的键补上
+#: ——列序只描述当前口径，不替历史世代决定它该有哪些列。
+ORDERED_REGIMES: tuple[str, ...] = tuple(cell.value for cell in CYCLE_CELLS)
 
 #: 阶段取值 → 列序下标。`ordered_cell_keys` 用它排同一策略内的四格。
 _REGIME_ORDER: dict[str, int] = {

@@ -320,10 +320,18 @@ class RegimeEvidence:
 
     #: 当前**生效**的行情阶段（`apps.regime.quant.BaseRegime` 的取值）；
     #: `None` = 冷启动，当前没有生效判定。
+    #:
+    #: **只服务保命档判据与展示**（`admission` 的第一个参数读它）：四档里那一档
+    #: 是不是 `high_vol`，与「往哪走」是两个问题（#66）。
     regime: str | None = None
+    #: 当前**格子键**（cycle 三格）：这一格是池化表的维度，也是豁免的键。
+    #:
+    #: `None` = 判不出方向（`unclear` / 旧判定行没有 `cycle`）。与 `regime is None`
+    #: 不是同一件事：后者是「连阶段都没有」，前者是「有阶段、但没有方向」。
+    cell_key: str | None = None
     #: 当前生效判定的生效时刻。与 `regime` 一起从停机链同一个读口出来，不另查。
     effective_at: datetime | None = None
-    #: 当代池化表里这一格（本策略 × `regime`）的结论摘录；
+    #: 当代池化表里这一格（本策略 × `cell_key`）的结论摘录；
     #: `None` = 当代没有这一格（未覆盖），**不是**「结论是中性」。
     cell: RegimePoolCellEvidence | None = None
     #: 在期人工豁免：`{(策略 id, 阶段): 豁免 id}`，形状照 `in_force_exemptions` 的返回。
@@ -726,6 +734,8 @@ def regime_verdict(
     cell: RegimePoolCellEvidence | None,
     exemptions: Mapping[tuple[Any, str], Any],
     resume: StrategyCandidateStatus = StrategyCandidateStatus.PAPER_PENDING,
+    *,
+    cell_key: str | None = None,
 ) -> Verdict | None:
     """行情闸门：这条候选现在能不能往前推一步（spec #30 D1 / D4）。
 
@@ -830,11 +840,17 @@ def regime_verdict(
     # 直接 `exemptions.get((candidate_id, regime_state))` 也行，但那样豁免 id 会被
     # 拿来做一次「有没有」的判断后丢掉。这里要留痕（把命中的那一对写进依据栏），
     # 所以走一遍、把命中的挑出来，命中与否是同一趟的结果。
+    # 豁免的键是**格子键**（#66）：四档是生效阶段、描述的是「此刻要不要保命」，而豁免
+    # 登记的是「这个方向上放我跑」。用 `regime_state` 去撞会让换轴之后的每一条豁免都
+    # 匹配不上——表现是「我明明豁免了，它还是被停」，而日志里没有任何异常。
+    # `cell_key` 不传（测试 / 旧调用点）时退回 `regime_state`：那时两者同值，行为不变。
+    exemption_key = cell_key if cell_key is not None else regime_state
     exempted = [
         (strategy_id, regime)
         for strategy_id, regime in exemptions
-        if strategy_id == candidate_id and regime == regime_state
+        if strategy_id == candidate_id and regime == exemption_key
     ]
+    # **第一个参数仍是四档**（`admission` 读它判保命档），第二个是这一格的结论。
     verdict = admission(
         regime_state,
         None if cell is None else cell.state,
@@ -892,11 +908,14 @@ def _regime_exempt_verdict(
     组合里。
     """
     detail: dict[str, Any] = {
+        # `regime` 是**生效阶段**（四档）；`exempt` 里那一对是**格子键**。#66 之后这两个
+        # 不是一个东西，所以不能并成一句 `regime=…` 就完事——读依据栏的人会以为豁免
+        # 覆盖的是那个四档阶段。
         "regime": regime_state,
         # 命中的那一对单独点出来（不是把整个在期集合抄一遍）：读记录的人要能一眼
         # 看出「谁被豁免了」；而整个集合里可能有别的策略在别的阶段上的豁免。
         "exempt": [
-            {"strategy_id": str(strategy_id), "regime": regime}
+            {"strategy_id": str(strategy_id), "cell": regime}
             for strategy_id, regime in exempted
         ],
     }

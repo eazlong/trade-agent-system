@@ -104,8 +104,13 @@ from uuid import UUID
 from django.utils import timezone
 
 from apps.regime import config, deactivation, judgement, pool_rebuild
-from apps.regime.models import DeactivationDecision, DeactivationExemption
-from apps.regime.quant import BaseRegime
+from apps.regime.models import (
+    DeactivationDecision,
+    DeactivationExemption,
+    cell_display,
+    legacy_cell_regime,
+)
+from apps.regime.quant import CYCLE_CELLS, CYCLE_CELL_VALUES, BaseRegime
 from apps.regime.slice import REASON_DISPLAY, REASON_HIGH_VOL_BLANKET
 from apps.trading.models import LiveSession, Strategy
 
@@ -283,14 +288,18 @@ def close_left_regime_exemptions(
     volatility: str | None = None,
     now: datetime | None = None,
 ) -> tuple[int, ...]:
-    """阶段离开该阶段 → 豁免自然失效（CONTEXT.md 第 120 条）。返回被关掉的豁免 id。
+    """离开该格子 → 豁免自然失效（CONTEXT.md 第 120 条）。返回被关掉的豁免 id。
 
     写成一条记录而不是纯查询派生，理由见 `DeactivationExemption` 的 docstring：阶段当天
     离开又回来时，纯按 `now < expires_at` 判断会让它复活，而那句话是「自然失效」不是
     「暂停」。
 
-    冷启动（`regime is None`）时**一条都不关**：说不清「离开了没有」，而误关的代价是
-    一条本来在期的豁免无声消失。
+    `regime` 这个参数名是历史遗留，**它收的是格子键**（cycle 三格，#66）：豁免行自迁移
+    0019 起存的就是格子键，调用方必须传 `state.cell`。传四档会让 `.exclude(regime=…)`
+    把每一条在期豁免都判成「离开」并关掉，而 `closed_at` 写下去没有复活路径。
+
+    冷启动 / 判不出方向（`regime is None`）时**一条都不关**：说不清「离开了没有」，而
+    误关的代价是一条本来在期的豁免无声消失。
 
     **保命档期间同样一条都不关**，原因一模一样：高波动是**叠加层**（CONTEXT.md 第 115
     条），不是「离开」。豁免登记的永远是**基础阶段**，而高波动抬升期间传进来的这个
@@ -458,8 +467,11 @@ def run_deactivation(
         return summary
 
     summary["exemptions_closed"] = len(
-        # 波动维一起传：保命档的判据是它，不是 slug（#65）。
-        close_left_regime_exemptions(state.regime, volatility=state.volatility, now=now)
+        # **传格子键，不是四档生效阶段**（#66）：豁免行自迁移 0019 起存的是 `bear` 这类
+        # 格子键，拿 `downtrend` 去比会让每一条在期豁免都被判成「阶段离开」关掉——
+        # 而 `closed_at` 写下去没有复活路径。保命档那一条由 `volatility` 单独兜（#65），
+        # 两个判据取或，方向只会多认保命档。
+        close_left_regime_exemptions(state.cell, volatility=state.volatility, now=now)
     )
     for outcome in derivation.writable:
         row = cells.get((outcome.strategy_id, outcome.regime))
@@ -564,24 +576,27 @@ def state_of(exemption: DeactivationExemption, *, now: datetime) -> str:
 
 
 def regime_display(value: str) -> str:
-    """阶段取值 → 中文。**认不出来就原样返回**，不回落成某一档。
+    """格子/阶段取值 → 中文。实现收在 `models.cell_display`（**只有一处兜底**）。
 
-    模型上的 `choices` 只在表单校验里管用，手工写进去的行绕得过它。一条脏行不该让整个
-    清单炸掉；但它也绝不能被显示成「下行趋势」——那会让人以为豁免覆盖的是另一档。
+    这个函数留在本模块是因为两个入口（管理命令、聊天渠道）都按这个名字读它；语义与
+    `models.cell_display` 逐字相同，只是把「两套词表都认」这条纪律收在一处，免得
+    四份拷贝各自演化——换轴时漏掉其中一处，那一条路径就会把每条新决策印成
+    「bear（认不出的阶段）」。
     """
-    try:
-        return BaseRegime(value).display
-    except ValueError:
-        return f"{value}（认不出的阶段）"
+    return cell_display(value)
 
 
 def regime_options_text() -> str:
-    """四个阶段的中文名与 slug（`上行趋势（uptrend）、…`）。
+    """可登记豁免的格子中文名与 slug（`上行周期（bull）、…`）。
 
     **两个入口的「可选：…」共用这一句**：分叉的话，人在 Telegram 上看到的可选项与在
     终端上看到的对不上，而两个列表都没错、只是不全——这种分叉没人会报。
+
+    **列的是 cycle 三格**（#66）：豁免落库的键、读侧匹配的键都是它。四档仍然收
+    （`resolve_regime` 会换算），但它不再是「可选值」——把四档列在前面会让人以为那才是
+    正常口径，而落库的会是 `bear` 这类格子键。
     """
-    return "、".join(f"{m.display}（{m.value}）" for m in BaseRegime)
+    return "、".join(f"{c.display}（{c.value}）" for c in CYCLE_CELLS)
 
 
 # --------------------------------------------------------------------------- #
@@ -694,28 +709,52 @@ def resolve_regime(regime: str = "", *, now: datetime | None = None) -> RegimeCh
     """
     text = (regime or "").strip()
     if text:
+        # **两套键都收，但存进去的必须是格子键**（#66）。
+        #
+        # 豁免的读侧全部按 `state.cell`（cycle 三格）匹配（`deactivation.derive` /
+        # `gate_run._refs` / `effects.read_regime`）。写侧只认四档的话有两处坏法：
+        #
+        # 1. `--regime bear` 直接被判成「认不出的阶段」——新口径的键压根发不出去；
+        # 2. 走默认路径（不给 `--regime`）时取的是四档 `state.regime`，落一条 `downtrend`，
+        #    而读侧找的是 `bear` ⇒ **这条豁免永远不生效**；更糟的是每轮
+        #    `close_left_regime_exemptions` 都用 `.exclude(regime=state.cell)` 比对，
+        #    它永远满足「不等于」，于是被判「阶段离开」写 `closed_at`——而那个字段
+        #    没有复活路径。用户看到的是「我明明豁免了，它还是被停，而且清单上写着已关闭」。
+        #
+        # 所以这里**先按 cycle 认，再按四档认并换算**：人打成 `downtrend` 也照收（那是
+        # 换轴之前的手感），但落库的是 `bear`。`high_vol` 换算不出来（`legacy_cell_regime`
+        # 对它返回 `None`），仍然照原值落——「显式就是知情」，由调用方补警告。
+        if text in CYCLE_CELL_VALUES:
+            return RegimeChoice(regime=text)
         try:
             BaseRegime(text)
         except ValueError:
             raise ExemptionError(
-                f"认不出的阶段 {text!r}，可选：{regime_options_text()}"
+                f"认不出的格子 {text!r}，可选：{regime_options_text()}"
             )
-        return RegimeChoice(regime=text)
+        return RegimeChoice(regime=legacy_cell_regime(text) or text)
 
     state = current_regime_state(now=now)
     if state.regime is None:
         raise ExemptionError(
-            "当前没有生效中的阶段判定（冷启动），推断不出该登记哪个阶段，"
+            "当前没有生效中的阶段判定（冷启动），推断不出该登记哪一格，"
             f"可选：{regime_options_text()}"
         )
     if state.blanket:
         raise ExemptionError(
-            "当前生效阶段是保命档（高波动），它不是可以登记豁免的基础阶段："
+            "当前生效阶段是保命档（事件波动），它不是可以登记豁免的格子："
             "此刻登记会得到一条不计入豁免、也拦不住任何东西的记录，"
             f"可选：{regime_options_text()}"
         )
+    if state.cell is None:
+        # 有阶段但判不出方向（`unclear`）：没有可问的那一格，登记一条豁免无处安放。
+        raise ExemptionError(
+            "当前判定判不出周期方向，没有可登记豁免的格子，"
+            f"可选：{regime_options_text()}"
+        )
     return RegimeChoice(
-        regime=state.regime,
+        # **格子键，不是四档**：读侧按 `state.cell` 匹配（见上面那一段）。
+        regime=state.cell,
         effective_at=state.effective_at,
         taken_from_current=True,
     )

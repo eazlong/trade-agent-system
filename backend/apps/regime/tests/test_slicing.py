@@ -43,10 +43,13 @@ from apps.regime import config, pool_rebuild, slicing, tasks
 from apps.regime import slice as sl
 from apps.regime.judgement import SYMBOL
 from apps.regime.models import ActorKind, RebuildStatus, RegimePoolRebuild
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import Cycle
 
-RANGE = BaseRegime.RANGE
-DOWNTREND = BaseRegime.DOWNTREND
+#: 格子键（cycle 三格）：切片标签与载荷 `cells` 的键读它（#66）。
+#: `range`/`downtrend` 是四档时代的数据语言——继续沿用会让「标签是四档还是三格」
+#: 在断言里看不出来，而切片会把四档值静默当成「没有结论」。
+SIDEWAYS = Cycle.SIDEWAYS
+BEAR = Cycle.BEAR
 
 #: 12 天窗口，端点 d0 / d11。与 `test_slice.py` 的 `SPLIT_WINDOW` 同形，便于对照。
 DAY0 = date(2026, 1, 1)
@@ -65,9 +68,12 @@ def at(n: int, hour: int = 12, tz=timezone.utc) -> datetime:
     return datetime(2026, 1, 1, hour, tzinfo=tz) + timedelta(days=n)
 
 
-def all_range_tags() -> dict[date, BaseRegime]:
-    """窗口内全是箱体震荡。用「单阶段」标签，好让断言的注意力留在适配层。"""
-    return {d(i): RANGE for i in range(12)}
+def all_sideways_tags() -> dict[date, Cycle]:
+    """窗口内全是横盘周期（cycle 的 sideways 一格）。
+
+    用「单格」标签，好让断言的注意力留在适配层。
+    """
+    return {d(i): SIDEWAYS for i in range(12)}
 
 
 def row(
@@ -184,10 +190,10 @@ class TestFingerprint(SimpleTestCase):
     """窗口内的哈希：窗口外的标签变了不算变。"""
 
     def test_labels_outside_the_window_do_not_move_the_fingerprint(self):
-        inside = {d(i): RANGE for i in range(12)}
+        inside = {d(i): SIDEWAYS for i in range(12)}
         with_outside = dict(inside)
-        with_outside[d(-5)] = DOWNTREND
-        with_outside[d(40)] = DOWNTREND
+        with_outside[d(-5)] = BEAR
+        with_outside[d(40)] = BEAR
 
         self.assertEqual(
             slicing.tag_fingerprint(inside, WINDOW),
@@ -195,9 +201,9 @@ class TestFingerprint(SimpleTestCase):
         )
 
     def test_a_label_inside_the_window_does_move_it(self):
-        before = {d(i): RANGE for i in range(12)}
+        before = {d(i): SIDEWAYS for i in range(12)}
         after = dict(before)
-        after[d(4)] = DOWNTREND
+        after[d(4)] = BEAR
 
         self.assertNotEqual(
             slicing.tag_fingerprint(before, WINDOW),
@@ -205,8 +211,8 @@ class TestFingerprint(SimpleTestCase):
         )
 
     def test_the_fingerprint_does_not_depend_on_construction_order(self):
-        forward = {d(i): RANGE for i in range(12)}
-        backward = {d(i): RANGE for i in range(11, -1, -1)}
+        forward = {d(i): SIDEWAYS for i in range(12)}
+        backward = {d(i): SIDEWAYS for i in range(11, -1, -1)}
 
         self.assertEqual(
             slicing.tag_fingerprint(forward, WINDOW),
@@ -219,11 +225,11 @@ class TestFingerprint(SimpleTestCase):
 
         self.assertEqual(len(empty), slicing.FINGERPRINT_LENGTH)
         self.assertEqual(empty, slicing.tag_fingerprint({}, WINDOW))
-        self.assertNotEqual(empty, slicing.tag_fingerprint({d(0): RANGE}, WINDOW))
+        self.assertNotEqual(empty, slicing.tag_fingerprint({d(0): SIDEWAYS}, WINDOW))
 
     def test_the_window_actually_narrows_the_hash(self):
         """同一份标签、两个不同的窗口 = 两个指纹（否则窗口边界就没被看着）。"""
-        tags = {d(i): RANGE for i in range(12)}
+        tags = {d(i): SIDEWAYS for i in range(12)}
 
         self.assertNotEqual(
             slicing.tag_fingerprint(tags, (DAY0, DAY0 + timedelta(days=5))),
@@ -247,7 +253,7 @@ class TestStaleness(SimpleTestCase):
             "config_snapshot": {},
             "tags": {
                 "symbol": SYMBOL,
-                "fingerprint": slicing.tag_fingerprint(all_range_tags(), WINDOW),
+                "fingerprint": slicing.tag_fingerprint(all_sideways_tags(), WINDOW),
             },
         }
         payload.update(overrides)
@@ -255,30 +261,30 @@ class TestStaleness(SimpleTestCase):
 
     def test_no_slice_at_all_is_stale(self):
         self.assertTrue(
-            slicing.is_stale(result_stub(metrics={}), all_range_tags(), SMALL)
+            slicing.is_stale(result_stub(metrics={}), all_sideways_tags(), SMALL)
         )
 
     def test_a_missing_metrics_field_is_not_an_error(self):
         self.assertTrue(
-            slicing.is_stale(result_stub(metrics=None), all_range_tags(), SMALL)
+            slicing.is_stale(result_stub(metrics=None), all_sideways_tags(), SMALL)
         )
 
     def test_a_matching_slice_is_not_stale(self):
         stored = self._stored()
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
 
-        self.assertFalse(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertFalse(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
     def test_a_version_bump_makes_everything_stale(self):
         stored = self._stored(version=sl.SLICE_VERSION + 1)
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
 
-        self.assertTrue(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertTrue(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
     def test_a_label_change_inside_the_window_makes_it_stale(self):
         stored = self._stored()
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
-        moved = all_range_tags() | {d(3): DOWNTREND}
+        moved = all_sideways_tags() | {d(3): BEAR}
 
         self.assertTrue(slicing.is_stale(result, moved, SMALL))
 
@@ -286,7 +292,7 @@ class TestStaleness(SimpleTestCase):
         """存量切片不该因为窗口之外的历史被重算而集体作废。"""
         stored = self._stored()
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
-        moved = all_range_tags() | {d(-30): DOWNTREND, d(300): DOWNTREND}
+        moved = all_sideways_tags() | {d(-30): BEAR, d(300): BEAR}
 
         self.assertFalse(slicing.is_stale(result, moved, SMALL))
 
@@ -295,7 +301,7 @@ class TestStaleness(SimpleTestCase):
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
         stricter = config.EvidenceConfig(min_trades=30, min_months=3)
 
-        self.assertTrue(slicing.is_stale(result, all_range_tags(), stricter))
+        self.assertTrue(slicing.is_stale(result, all_sideways_tags(), stricter))
 
     def test_only_min_months_changing_is_enough(self):
         stored = self._stored()
@@ -304,7 +310,7 @@ class TestStaleness(SimpleTestCase):
         self.assertTrue(
             slicing.is_stale(
                 result,
-                all_range_tags(),
+                all_sideways_tags(),
                 config.EvidenceConfig(min_trades=3, min_months=3),
             )
         )
@@ -315,20 +321,20 @@ class TestStaleness(SimpleTestCase):
         del stored["evidence_threshold"]
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
 
-        self.assertTrue(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertTrue(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
     def test_computed_at_alone_does_not_make_it_stale(self):
         """**这一条是重算入口存在的理由**：算得早不是陈旧，否则每次都是全表重写。"""
         stored = self._stored(computed_at="1999-01-01T00:00:00+00:00")
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
 
-        self.assertFalse(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertFalse(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
     def test_the_config_snapshot_alone_does_not_make_it_stale(self):
         stored = self._stored(config_snapshot={"judgement": {"warmup_days": 999}})
         result = result_stub(metrics={slicing.SLICE_KEY: stored})
 
-        self.assertFalse(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertFalse(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
 
 # --------------------------------------------------------------------------- #
@@ -344,7 +350,7 @@ class TestPayloadEnvelope(SimpleTestCase):
             rows=rows if rows is not None else [close_row(1, Decimal("100.00"))],
             window=WINDOW,
             initial_capital=CAP,
-            tags=tags if tags is not None else all_range_tags(),
+            tags=tags if tags is not None else all_sideways_tags(),
             params=params,
             now=datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc),
         )
@@ -393,7 +399,7 @@ class TestPayloadEnvelope(SimpleTestCase):
         self.assertEqual(block["first"], DAY0.isoformat())
         self.assertEqual(block["last"], WINDOW[1].isoformat())
         self.assertEqual(
-            block["fingerprint"], slicing.tag_fingerprint(all_range_tags(), WINDOW)
+            block["fingerprint"], slicing.tag_fingerprint(all_sideways_tags(), WINDOW)
         )
 
     def test_the_tags_block_survives_an_empty_label_set(self):
@@ -579,17 +585,17 @@ class TestMaterialisation(TestCase):
     def test_compute_slice_writes_the_payload_it_returns(self):
         result = self.make_result()
 
-        payload = slicing.compute_slice(result, all_range_tags(), params=SMALL)
+        payload = slicing.compute_slice(result, all_sideways_tags(), params=SMALL)
 
         result.refresh_from_db()
         self.assertEqual(slicing.stored_slice(result), payload)
-        self.assertEqual(payload["cells"]["range"]["trades"], 2)
+        self.assertEqual(payload["cells"]["sideways"]["trades"], 2)
 
     def test_compute_slice_skips_the_open_rows_of_an_unclosed_position(self):
         result = self.make_result(trades=1)
         self.add_trade(result, day=5, pnl=None, trade_type="open")
 
-        payload = slicing.compute_slice(result, all_range_tags(), params=SMALL)
+        payload = slicing.compute_slice(result, all_sideways_tags(), params=SMALL)
 
         self.assertEqual(payload["attribution"]["closed_trades"], 1)
         self.assertEqual(payload["attribution"]["open_trades_excluded"], 1)
@@ -597,10 +603,10 @@ class TestMaterialisation(TestCase):
     def test_a_second_compute_is_not_stale_and_so_is_skipped(self):
         result = self.make_result()
 
-        slicing.compute_slice(result, all_range_tags(), params=SMALL)
+        slicing.compute_slice(result, all_sideways_tags(), params=SMALL)
         result.refresh_from_db()
 
-        self.assertFalse(slicing.is_stale(result, all_range_tags(), SMALL))
+        self.assertFalse(slicing.is_stale(result, all_sideways_tags(), SMALL))
 
 
 class TestSliceTask(_StubbedConnectionReset, TestCase):

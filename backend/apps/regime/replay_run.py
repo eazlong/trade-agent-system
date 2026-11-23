@@ -223,6 +223,9 @@ def run_replay(
         ),
         cells,
         previous=previous,
+        # 那一代的口径：换轴窗口里决策行与格子可能各用一套键，按代给候选键才不会
+        # 把一条仍成立的决策报成「那一格没了」。
+        generation_pool_version=generation.pool_version,
     )
 
     by_id = {d.id: d for d in pending}

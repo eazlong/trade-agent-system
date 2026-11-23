@@ -38,9 +38,9 @@ CONTEXT.md 把池化定为**加权合并**——把多份切片的成交合起�
 
 ## 与单元 6 的判定顺序逐条对齐
 
-`_pooled_state` 的四步与 `slice._cell` 完全同序（未出现 → 保命档 → 门槛 → 比对），
-理由不是对称美学：日报要能用同一句话解释「为什么这一格是中性」。两层成因不同的话，
-读的人得先判断自己在看哪一层才知道那句话成不成立。
+`_pooled_state` 的三步与 `slice._cell` 完全同序（未出现 → 门槛 → 比对），理由不是
+对称美学：日报要能用同一句话解释「为什么这一格是中性」。两层成因不同的话，读的人得
+先判断自己在看哪一层才知道那句话成不成立。
 
 ## 冲突：阻塞建议，不阻塞结论
 
@@ -67,13 +67,11 @@ from datetime import date
 from typing import Any, Iterable, Mapping, Sequence
 
 from apps.regime import config
-from apps.regime.quant import PRIORITY, BaseRegime
+from apps.regime.quant import CYCLE_CELLS, Cycle
 from apps.regime.slice import (
     REASON_ARCHETYPE_NOT_FIT,
-    REASON_HIGH_VOL_BLANKET,
     REASON_INSUFFICIENT,
     REASON_NO_REGIME_DAYS,
-    STATE_BLANKET,
     STATE_FIT,
     STATE_NEUTRAL,
     STATE_UNFIT,
@@ -103,7 +101,13 @@ from apps.regime.slice import (
 #: 所以改完判据重算会得到同一个指纹、命中复用分支、返回旧代——而日志还会说"输入指纹
 #: 未变"，看起来一切正常。2026-10-22 实际踩到了这一幕：改完绝对门跑去重算，池化直接
 #: 复用了第 2 代。算法版本是继指纹之后第二根必须自己进位的轴。
-POOL_VERSION = 4
+#:
+#: 5：**合并口径换成 cycle 三格**（#66）。格子键从四档换成 `bull/bear/sideways`，格数
+#: 从「策略数 × 4」变成「策略数 × 3」。这一位与 `SLICE_VERSION` 进位**必须分开**：前者
+#: 是「输入样本长什么样」（切片重算了才变），后者是「合并口径怎么算」（只重算池化就能变）。
+#: 合成一个版本号会让「重算了切片」与「改了合并口径」在库里长得一样，而两者要跑的动作
+#: 不同——前者得重跑切片，后者只需要重建池化。
+POOL_VERSION = 5
 
 #: 一份切片被排除在池化之外的原因。**按原因分开计数**，不记一个「跳过了几个」：
 #: 「三个是本金为 0」与「三个是版本太旧」需要两个完全不同的动作（前者要人去查回测
@@ -359,7 +363,11 @@ def load_sample(
     cell_regime_days: dict[str, int] = {}
     full_daily: dict[date, float] = defaultdict(float)
 
-    for regime in PRIORITY:
+    # **格子键集恒为 `CYCLE_CELLS`**（#66）。三格缺一即排除整份：旧版本载荷的
+    # `cells` 里根本没有 `bull` 这个键，按「缺一个就当没有交易」读下去会得到一份笔数
+    # 看起来完整、实际整格成交都丢了的样本——那种错比少用一份回测难发现得多。
+    # `SLICE_VERSION` 进位保证这些旧载荷先被 `is_stale` 判成陈旧、由重算入口刷新一遍。
+    for regime in CYCLE_CELLS:
         cell = cells.get(regime.value)
         if not isinstance(cell, Mapping) or "merge_inputs" not in cell:
             return SampleLoad(excluded=EXCLUDED_NO_MERGE_INPUTS)
@@ -502,26 +510,30 @@ def _summarise(sample: SliceSample) -> dict:
     }
 
 
-def _pooled_state(merged: _Merged, regime: BaseRegime) -> tuple[str, str]:
+def _pooled_state(merged: _Merged) -> tuple[str, str]:
     """合并样本的状态。与 `slice._cell` 的判定顺序**逐条对齐**，只有门槛那一步不同
     （缩放 vs 不缩放，见模块 docstring）。
 
-    顺序不是巧合：该阶段没出现先于保命档（`regime_days == 0` 时再多样本也回答不了），
-    保命档先于门槛（保命与证据无关），门槛先于 `_fitness`（样本不够时两指标的比较
-    没有意义）。两层同序，日报才能用同一句话解释「为什么这一格是中性」。
+    顺序不是巧合：该方向没出现先于门槛（`regime_days == 0` 时再多样本也回答不了），
+    门槛先于 `_fitness`（样本不够时两指标的比较没有意义）。两层同序，日报才能用同一句
+    话解释「为什么这一格是中性」。
+
+    **#66 起没有保命档那一步**：格子轴是 cycle，三格里没有高波动，所以「保命档不做
+    适用性判断」这条语义不可能再从这条路径上产出。它整体在 halt 层
+    （`deactivation.is_blanket` 读波动维），而 `DeactivationDerivation` 在保命档期间
+    显式早退——那条闸是它的唯一出处，这里不再判第二遍。
     """
     if merged.regime_days == 0:
         return STATE_UNKNOWN, REASON_NO_REGIME_DAYS
-    if regime is BaseRegime.HIGH_VOL:
-        return STATE_BLANKET, REASON_HIGH_VOL_BLANKET
     if not merged.enough:
         return STATE_NEUTRAL, REASON_INSUFFICIENT
     return _fitness(merged.metrics, merged.full_metrics)
 
 
 def _direction(state: str) -> int:
-    """结论的方向，只用于判「明显冲突」。中性/未知/保命档都是 0：它们不指向任何
-    一边，与它们冲突无从谈起（「中性」本来就不构成停用理由，没有可冲突的动作）。"""
+    """结论的方向，只用于判「明显冲突」。中性/未知（以及旧载荷里的保命档）都是 0：
+    它们不指向任何一边，与它们冲突无从谈起（「中性」本来就不构成停用理由，没有可冲突
+    的动作）。"""
     if state == STATE_FIT:
         return 1
     if state == STATE_UNFIT:
@@ -667,7 +679,9 @@ def build_pool(
     grouped = _by_strategy(samples)
 
     for strategy_id in sorted(grouped):
-        for regime in PRIORITY:
+        # **三格，按 cycle**（#66）：格数 = 策略数 × 3。用 `CYCLE_CELLS` 而不是 `PRIORITY`
+        # 是这一票的全部内容——后者把高波动单独当一格，而它本就不该做适用性判断。
+        for regime in CYCLE_CELLS:
             result.cells[(strategy_id, regime.value)] = _pool_cell(
                 strategy_id=strategy_id,
                 regime=regime,
@@ -683,7 +697,7 @@ def build_pool(
 def _pool_cell(
     *,
     strategy_id: int,
-    regime: BaseRegime,
+    regime: Cycle,
     own: Sequence[SliceSample],
     pool: Mapping[int, Sequence[SliceSample]],
     matches: Mapping[int, ArchetypeMatch],
@@ -695,14 +709,13 @@ def _pool_cell(
     **两条路径都只经过 `_pooled_state`，没有第二处改写。** 「原型也样本不足 → 中性」
     （Q4：不引入第三层）已经落在 `_pooled_state` 的门槛那一步；在这里再写一遍不会
     改变任何结果，却会把 `unknown`（该阶段窗口里就没出现）改写成 `neutral`——
-    那是句被证据推翻的话：样本再多也回答不了「没出现过的阶段适不适用」。同理，
-    保命档的状态与证据无关，也不该被门槛改写。判定的**唯一**入口是 `_pooled_state`，
-    顺序的理据都在它那里。
+    那是句被证据推翻的话：样本再多也回答不了「没出现过的方向适不适用」。判定的**唯一**
+    入口是 `_pooled_state`，顺序的理据都在它那里。
     """
     merged = _merge(own, regime.value, params)
 
     if merged.enough:
-        state, reason = _pooled_state(merged, regime)
+        state, reason = _pooled_state(merged)
         # 冲突判定问的是**相对**方向：合并结论与某个品种自己的结论是否相反。绝对水平
         # 门（`_fitness` 里那道）与它无关——一条策略在所有品种上都亏钱时，它「不比
         # 全样本差」仍然成立，而那不构成冲突。传 `state` 会让绝对门静默关掉冲突判定。
@@ -734,7 +747,7 @@ def _pool_cell(
         result.unclassified.add(strategy_id)
 
     fallback = _merge(siblings, regime.value, params)
-    state, reason = _pooled_state(fallback, regime)
+    state, reason = _pooled_state(fallback)
 
     # 兜底路径**不出「适用」结论**（2026-10-22）。借来的样本能说明「这一类策略在这个
     # 阶段行不行」，说明不了「这一条行不行」——而 `fit` 是会被拿去做放行依据的那个值。

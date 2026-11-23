@@ -505,6 +505,8 @@ def _regime_checks(candidate: Any | None) -> list[Check]:
         evidence.cell,
         evidence.exemptions,
         StrategyCandidateStatus.AWAITING_LIVE_APPROVAL,
+        # 豁免的键是格子键（#66）；不传会让「我明明豁免了」在换轴之后失效。
+        cell_key=evidence.cell_key,
     )
     cell_state = None if evidence.cell is None else evidence.cell.state
     if verdict is None:

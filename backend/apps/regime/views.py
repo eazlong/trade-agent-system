@@ -90,6 +90,7 @@ from apps.regime import serializers as ser
 from apps.regime import strategy_lifecycle
 from apps.regime import truth
 from apps.regime.models import (
+    LEGACY_CELL_REGIMES,
     ActorKind,
     MechanismKind,
     MechanismMode,
@@ -485,7 +486,7 @@ def _diff(generation: RegimePoolRebuild) -> dict[str, Any]:
             {
                 "key": ser.cell_key(*key),
                 "strategy": {"id": str(key[0]), "name": names.get(key[0], "")},
-                "regime": ser.regime_payload(key[1]),
+                "regime": ser.cell_label_payload(key[1]),
                 "kind": kind,
                 "before": ser.triple_payload(was),
                 "after": ser.triple_payload(now),
@@ -647,6 +648,24 @@ def pool(request: Request) -> Response:
     # 最近一次启停流水，那一份由 `cell_payload` 挂到格子的 `strategy` 上。
     names = {strategy_id: row["name"] for strategy_id, row in info.items()}
     ordered = ser.ordered_cell_keys(cells, names)
+    # 列 = **这一代实际发生的键集**，顺序按后端给的固定口径补。
+    #
+    # 两个方向都试过，各有一个坏法：
+    #
+    # - 只给三格：**旧世代**（第 5 代之前）的键是四档，按三格取列一格也取不到，而数据
+    #   明明在那一代的库里——页面读成「这一代什么都没算出来」。
+    # - 三格再加旧键：新世代会凭空多出四档那几列（它们在这一代里一格都没有），矩阵宽
+    #   一倍且全是「无此格」。
+    #
+    # 所以按**实际键集**给列，顺序用「先三格、后四档」的固定口径：这样同一代两次请求的
+    # 列序一致（`ordered_cell_keys` 已经按同一口径排过），而新旧两代的列各是它们自己的
+    # 维度。空前代（冷启动 / 这一代没有格子）退回三格，否则前端拿到 0 列会自己补一份。
+    present = {regime for _, regime in ordered}
+    columns: list[str] = [
+        regime
+        for regime in (*ser.ORDERED_REGIMES, *sorted(LEGACY_CELL_REGIMES))
+        if regime in present
+    ] or list(ser.ORDERED_REGIMES)
 
     # **两级去重，两张表**（2026-10-23）。理由见 `ser.evidence_dedupe` 与
     # `TestPoolDoesNotRepeatEvidence`：重复的**不是**整份 evidence（`metrics` /
@@ -670,8 +689,10 @@ def pool(request: Request) -> Response:
     return Response(
         {
             **_pool_state(generation),
-            # 矩阵的列序由后端给（`serializers.ORDERED_REGIMES`），前端按数组排。
-            "regimes": [ser.regime_payload(regime) for regime in ser.ORDERED_REGIMES],
+            # 列序由后端给（`serializers.ORDERED_REGIMES` = cycle 三格），前端按数组排。
+            # 旧世代的格子键是四档：`columns` 按「这一代实际出现的键」给列，
+            # 于是看历史世代时不会出现「三列全空、数据在第四列找不到位置」。
+            "regimes": [ser.cell_label_payload(regime) for regime in columns],
             "evidence": evidence,
             "results": results,
             "cells": [
@@ -707,10 +728,12 @@ def pool_cell(request: Request) -> Response:
     ## 参数
 
     - `strategy`（必填）：策略 id（与池化表格子 `strategy.id` 同一个值）；
-    - `regime`（必填）：阶段 slug；
+    - `regime`（必填）：格子 slug。新世代是 cycle 三格（bull / bear / sideways），
+      旧世代是四档（high_vol / downtrend / uptrend / range）——两套都收，因为看历史
+      世代时那一代的键就是四档，拒掉它会让「查上一代的依据」这条唯一的诊断路径不通；
     - `generation`（选填）：哪一代，缺省是当前代——与 `pool/` 的判据一致。
 
-    阶段不合法（不在 `ORDERED_REGIMES` 里）→ **400**：那是请求拼错，不是「这一格不在」。
+    格子键两套都不认 → **400**：那是请求拼错，不是「这一格不在」。
     格子不存在 → **404**：策略没错、阶段没错，但这一代里没有这一格（样本不足、或策略
     不在这一代里）。两者不混。
 
@@ -724,9 +747,13 @@ def pool_cell(request: Request) -> Response:
     regime = request.query_params.get("regime")
     if not strategy_id or not regime:
         return _bad_request("strategy 与 regime 都必填")
-    if regime not in ser.ORDERED_REGIMES:
-        allowed = " / ".join(ser.ORDERED_REGIMES)
-        return _bad_request(f"未知的 regime：{regime!r}（可选：{allowed}）")
+    # **两套格子键都收**（#66）：看历史世代时那一代的键是四档，而这条端点是「查上一代的
+    # 依据」唯一的路径——只认三格会让旧世代的那一格永远打不开（400，理由还是一句错话）。
+    allowed_regimes = (*ser.ORDERED_REGIMES, *sorted(LEGACY_CELL_REGIMES))
+    if regime not in allowed_regimes:
+        return _bad_request(
+            f"未知的 regime：{regime!r}（可选：{' / '.join(allowed_regimes)}）"
+        )
 
     try:
         generation_id = _int_param(request, "generation")

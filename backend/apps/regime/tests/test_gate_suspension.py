@@ -11,8 +11,9 @@
 
 1. **只放行 `fit`**：`unfit` / `neutral` / `unknown` / 无格 / 无生效阶段一律产出暂停声明。
    「判不了」不是「放它过去」——这是本票的裁决，也是它与候选漏斗侧同源的那一条。
-2. **保命档与冷启动什么都不动**（`blocked`）：说不清阶段时不动，说得清而这一层不该动手
-   （高波动）时同样不动。理由与停用路逐条同构。
+2. **保命档、冷启动、判不出方向都什么都不动**（`blocked`）：说不清阶段时不动，说得清而
+   这一层不该动手（高波动）时同样不动，说得清但没有可问的那一列（`cell is None`，#66）
+   时也不动。理由与停用路逐条同构。
 3. **Shadow 档不声明、但要解除**：回到 Shadow 的意义就是不再拦，留一条活行会让「重新打开
    开关」那一刻的期望集与现状之间出现一段没人解释的空档（与停用路同款）。
 4. **豁免是放行 + 一个说法**：人工按住的格子不该被这条路拦住；解除原因必须写 `exempted`，
@@ -31,9 +32,10 @@ from datetime import datetime, timedelta, timezone
 
 from django.test import SimpleTestCase
 
+from apps.regime import deactivation as dea
 from apps.regime import gate as g
 from apps.regime.models import HaltTrigger
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 from apps.regime.slice import (
     REASON_INSUFFICIENT,
     REASON_NO_REGIME_DAYS,
@@ -44,8 +46,12 @@ from apps.regime.slice import (
     STATE_UNKNOWN,
 )
 
+#: 四档生效阶段：`Situation.regime` 与保命档判据读它。
 RANGE = BaseRegime.RANGE.value
 HIGH_VOL = BaseRegime.HIGH_VOL.value
+
+#: 格子键（cycle 三格）：`Situation.cell` 读它。
+SIDEWAYS = Cycle.SIDEWAYS.value
 
 DAY0 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 
@@ -76,6 +82,7 @@ def situation(
     *,
     gate_open: bool = True,
     regime: str | None = RANGE,
+    cell: str | None = SIDEWAYS,
     blocked: str = "",
     exemptions: dict | None = None,
     switch_at: datetime | None = at(),
@@ -83,11 +90,15 @@ def situation(
     generation_at: datetime | None = at(),
 ) -> g.Situation:
     """与 `test_gate.py` 的同名 helper 同款：默认是一轮最普通的——开关开着、阶段是箱体
-    震荡、三个时刻都落在 `DAY0`（于是 `opened_at` 的期望值一眼可读）。"""
+    震荡（`sideways` 那一格）、三个时刻都落在 `DAY0`（于是 `opened_at` 的期望值一眼可读）。
+
+    `regime`（四档）与 `cell`（cycle 格子键）是两个轴，理由见 `test_gate.py` 的同名 helper。
+    """
     return g.Situation(
         gate_open=gate_open,
         switch_at=switch_at,
         regime=regime,
+        cell=cell,
         regime_effective_at=regime_effective_at,
         generation_at=generation_at,
         exemptions=exemptions or {},
@@ -293,10 +304,10 @@ class TestARetiredStrategyDoesNotJoinTheValuation(SimpleTestCase):
 # --------------------------------------------------------------------------- #
 
 
-class TestTheTwoBlockedOutcomes(SimpleTestCase):
+class TestTheBlockedOutcomes(SimpleTestCase):
     def test_a_blanket_stage_does_neither_declare_nor_release(self):
-        """高波动期间声明与解除都不做。**不能**让它落进逐行判定：这一段里「按阶段比较」
-        本身没有意义（阶段没离开，只是被叠了一层），而解除是不可逆的。"""
+        """高波动期间声明与解除都不做。**不能**让它落进逐行判定：这一段里「按格子比较」
+        本身没有意义（格子可能是一个正常方向键，而这一层此刻不该动手），而解除是不可逆的。"""
         result = plan([ref(1, cell_state=STATE_UNFIT)], regime=HIGH_VOL)
         self.assertEqual(result.blocked, g.BLOCKED_BLANKET)
         self.assertEqual(result.declarations, ())
@@ -304,12 +315,26 @@ class TestTheTwoBlockedOutcomes(SimpleTestCase):
         self.assertTrue(result.note)
 
     def test_a_blanket_cell_without_a_blanket_stage_does_not_suspend(self):
-        """格子是 `blanket` 而阶段不是高波动（池化窗口里的高波日落在别处）时，**不发表
-        意见**——保命档有它自己那条全场停机链，把它读成 `unfit` 会让这两条路的回边互不
-        相遇（保命档会自己解除，而这一路要等格子回 `fit`）。"""
+        """格子是 `blanket`（旧载荷）而阶段不是高波动时，**不发表意见**——保命档有它自己
+        那条全场停机链，把它读成 `unfit` 会让这两条路的回边互不相遇（保命档会自己解除，
+        而这一路要等格子回 `fit`）。#66 之后池化不再产出 `blanket`，这一格只剩存量数据。"""
         result = plan([ref(1, cell_state=STATE_BLANKET)], regime=RANGE)
         self.assertEqual(result.declarations, ())
         self.assertEqual(result.close_reasons, {1: g.CLOSE_BECAME_FIT})
+
+    def test_a_direction_gap_moves_nothing(self):
+        """判不出方向（`Situation.cell is None`）：有阶段、但没有可问的那一列，什么都不动。
+
+        与冷启动分开：冷启动连阶段都没有，这里是「判过了、没判出方向」。两者的说明
+        文案不同（`BLOCKED_NO_CELL` vs `BLOCKED_COLD_START`），页面据此说不同的话。
+        """
+        result = plan(
+            [ref(1, cell_state=STATE_UNFIT), ref(2, cell_state=STATE_FIT)], cell=None
+        )
+        self.assertEqual(result.blocked, dea.BLOCKED_NO_CELL)
+        self.assertEqual(result.declarations, ())
+        self.assertEqual(result.close_reasons, {})
+        self.assertIn(dea.BLOCKED_DISPLAY[dea.BLOCKED_NO_CELL], result.note)
 
     def test_a_cold_start_moves_nothing(self):
         result = plan([ref(1, cell_state=STATE_UNFIT)], regime=None)

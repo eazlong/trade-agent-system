@@ -6,11 +6,13 @@
 
 八条性质，每一条坏了都不报警、只出错的数：
 
-1. **三种「什么都不动」各自说得出理由**：冷启动（`cold_start`）、状态过期
-   （`stale_state`）、阶段有了却一代池化表都没有（`no_generation`——那不是「没有
-   建议」，是**没法问**）。三者都落成 `skipped` 并带一句给人看的话：**不静默**是这条
+1. **四种「什么都不动」各自说得出理由**：冷启动（`cold_start`）、状态过期
+   （`stale_state`）、阶段有了却判不出周期格子（`no_cell`——旧结构日把周期吃掉了，
+   与两列存在之前的旧行同形）、以及一代池化表都没有（`no_generation`——那不是「没有
+   建议」，是**没法问**）。四者都落成 `skipped` 并带一句给人看的话：**不静默**是这条
    纪律的一半，「日志不算被看见」是另一半，所以那句话必须在返回值里，由任务与日报
-   接着往上传。
+   接着往上传。`no_cell` 与 `no_generation` 分开报数是刻意的：前者是「这一行没有方向
+   结论」，后者是「还没有池化表可问」，两件事的修法完全不同。
 2. **`skipped` 键恒存在**（没事时是 `None`）。一个会因为缺键而变成「没事」的字段，
    迟早会被当成没事——所以这里与判定的「有问题才给 `skipped`」刻意不同。
 3. **决策冻的是它自己那一刻的依据**：`evidence["cell"]` 是池化那一格依据摘要的**副本**，
@@ -27,8 +29,9 @@
    也不产出建议**，只在 `unresolved`/`unmanaged` 里报数；判据二只标记，且 `mode` 只认
    `live`、`status` 只认 `LiveSession.ACTIVE_STATUSES`（不在这里手抄状态字面量）。
 7. **豁免的「在期」是三条一起**（未关闭 / 已生效 / 未到期），而「阶段离开」的一次性
-   关闭**不可逆**——所以三种「说不清当前阶段」的收场下关闭一律停手，**保命档期间也停手**
-   （高波动是叠加层，不是「离开」）。两个方向不对称，就往不会造成不可逆损失的那边倒。
+   关闭**不可逆**——所以三种「说不清当前阶段」的收场（冷启动 / 过期 / 判不出格子）
+   下关闭一律停手，**保命档期间也停手**（高波动是叠加层，不是「离开」）。两个方向
+   不对称，就往不会造成不可逆损失的那边倒。
 8. **返回值可 JSON 序列化且键集恒定**：它进 Celery 结果与日报，键集随路径漂移会让
    「今天和昨天有什么不同」多出一堆假差异。
 
@@ -64,10 +67,16 @@ from apps.regime.models import (
     RegimePoolRebuild,
 )
 from apps.regime.pool import POOL_SOURCE_STRATEGY
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 
+#: 四档生效阶段：`RegimeJudgement` 的 `base_regime` / `effective_regime` 读它。
 DOWNTREND = BaseRegime.DOWNTREND
 UPTREND = BaseRegime.UPTREND
+
+#: 格子键（cycle 三格）：池化格、决策行、豁免行上的 `regime` 字段读它（#66）。
+BULL = Cycle.BULL
+BEAR = Cycle.BEAR
+SIDEWAYS = Cycle.SIDEWAYS
 
 #: 生命周期参数：过期门槛 3 天（默认值）。待机天数不参与本模块，但参数是同一个配置类，
 #: 这里一并给上默认值——传半份配置会让「用错了哪一组参数」看不出来。
@@ -199,8 +208,9 @@ class _Fixture(TestCase):
     def judged(
         self,
         *,
-        regime: str = DOWNTREND,
+        regime: str = DOWNTREND.value,
         effective_regime: str | None = None,
+        cycle: str | None = BEAR.value,
         effective_at: datetime | None = None,
     ):
         """一条生效中的判定。`attribute_date` 比生效日早两天（今天的映射如此），但模型
@@ -209,6 +219,9 @@ class _Fixture(TestCase):
         `effective_regime` 与 `regime` 分开是给保命档用的：高波动是**被资讯抬上来的**，
         那一行的基础阶段仍是它原本那一档（`base_regime` 是纯量化口径，`effective_regime`
         是抬升后的值）。默认两者相同——多数用例问的不是这个分岔。
+
+        `cycle` 是格子轴（#66）：默认 `bear`。传 `None` 表达「这一行没有周期结论」——
+        那是 `high_vol` 那种旧结构日（波动吃掉了周期）与两列存在之前的旧行共同的形状。
         """
         moment = effective_at or NOW
         return RegimeJudgement.objects.create(
@@ -217,12 +230,13 @@ class _Fixture(TestCase):
             effective_at=moment,
             base_regime=regime,
             effective_regime=effective_regime or regime,
+            cycle=cycle,
         )
 
     def exempt(
         self,
         strategy,
-        regime: str = DOWNTREND,
+        regime: str = BEAR.value,
         *,
         granted_at: datetime | None = None,
         expires_at: datetime | None = None,
@@ -369,7 +383,7 @@ class TestNothingIsWrittenWhenThereIsNothingToAskAbout(_Fixture):
     """性质 1 + 2：不产出，但要说出来，且每条收场各有各的理由。"""
 
     def test_cold_start_produces_nothing_and_says_so(self):
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         summary = self.decide()
         self.assertEqual(summary["skipped"], dea.BLOCKED_COLD_START)
         self.assertTrue(summary["note"])
@@ -379,7 +393,7 @@ class TestNothingIsWrittenWhenThereIsNothingToAskAbout(_Fixture):
 
     def test_a_stale_state_produces_nothing_and_says_so(self):
         self.judged(effective_at=days(-4))
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         summary = self.decide()
         self.assertEqual(summary["skipped"], dea.BLOCKED_STALE_STATE)
         self.assertFalse(DeactivationDecision.objects.exists())
@@ -398,7 +412,7 @@ class TestNothingIsWrittenWhenThereIsNothingToAskAbout(_Fixture):
 
     def test_skipped_is_present_and_none_on_the_normal_path(self):
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
         summary = self.decide()
         self.assertIn("skipped", summary)
         self.assertIsNone(summary["skipped"])
@@ -408,7 +422,7 @@ class TestNothingIsWrittenWhenThereIsNothingToAskAbout(_Fixture):
         """过期不是「算不出来」：日报要能说「若状态仍有效则会有 N 条」——那正是让人
         知道该去查判定任务的数字。"""
         self.judged(effective_at=days(-4))
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         summary = self.decide()
         self.assertEqual(summary["targets"], 1)
         self.assertEqual(summary["written"], 0)
@@ -431,7 +445,7 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {
                         "state": sl.STATE_UNFIT,
                         "reason": sl.REASON_INSUFFICIENT,
@@ -443,7 +457,7 @@ class TestTheSuggestionWritten(_Fixture):
         summary = self.decide()
         row = DeactivationDecision.objects.get()
         self.assertEqual(row.strategy_id, self.alpha.id)
-        self.assertEqual(row.regime, DOWNTREND)
+        self.assertEqual(row.regime, BEAR.value)
         self.assertEqual(row.status, DecisionStatus.SUGGESTED.value)
         self.assertEqual(row.pool_rebuild_id, generation.id)
         self.assertEqual(row.evidence["pool_rebuild_id"], generation.id)
@@ -451,7 +465,7 @@ class TestTheSuggestionWritten(_Fixture):
         self.assertEqual(row.evidence["cell"], {"trades": 7})
         self.assertEqual(row.evidence["state"], sl.STATE_UNFIT)
         self.assertEqual(row.evidence["reason"], sl.REASON_INSUFFICIENT)
-        self.assertEqual(row.evidence["regime"], DOWNTREND)
+        self.assertEqual(row.evidence["regime"], BEAR.value)
         self.assertEqual(row.evidence["regime_effective_at"], NOW.isoformat())
         self.assertIs(row.evidence["needs_review"], False)
         self.assertEqual(row.first_decided_at, NOW)
@@ -470,7 +484,7 @@ class TestTheSuggestionWritten(_Fixture):
         把 `status` 顺手放回 `defaults`，表现会是「一轮推导悄悄把一条正在拦人的决策标回
         `suggested`」：日报与 gate 的 `_untouched` 都读这一列，而两边看起来都正常。
         """
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         self.decide()
         for flipped in (DecisionStatus.APPLIED, DecisionStatus.RELEASED):
             DeactivationDecision.objects.update(status=flipped.value)
@@ -491,7 +505,7 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {
                         "state": sl.STATE_UNFIT,
                         "reason": sl.REASON_DIRECTION_CONFLICT,
@@ -506,7 +520,7 @@ class TestTheSuggestionWritten(_Fixture):
         self.assertEqual(summary["written"], 0)
 
     def test_a_strategy_without_a_cell_is_counted_not_suggested(self):
-        make_generation(cells=((self.beta, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.beta, BEAR, {"state": sl.STATE_FIT}),))
         summary = self.decide()
         self.assertEqual(summary["missing_cells"], 1)
         self.assertEqual(summary["targets"], 0)
@@ -516,8 +530,8 @@ class TestTheSuggestionWritten(_Fixture):
         """幽灵策略行有格子也不产出建议——对它产出建议是给幽灵加动作。"""
         make_generation(
             cells=(
-                (self.gamma, DOWNTREND, {"state": sl.STATE_UNFIT}),
-                (self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),
+                (self.gamma, BEAR, {"state": sl.STATE_UNFIT}),
+                (self.alpha, BEAR, {"state": sl.STATE_FIT}),
             )
         )
         summary = self.decide()
@@ -530,7 +544,7 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "evidence": {"trades": 7}},
                 ),
             )
@@ -555,12 +569,12 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "evidence": {"trades": 1}},
                 ),
                 (
                     self.beta,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "evidence": {"trades": 2}},
                 ),
             )
@@ -582,7 +596,7 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "evidence": {"trades": 1}},
                 ),
             ),
@@ -592,7 +606,7 @@ class TestTheSuggestionWritten(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "evidence": {"trades": 2}},
                 ),
             ),
@@ -609,12 +623,12 @@ class TestTheSuggestionWritten(_Fixture):
         make_generation(
             fingerprint="old",
             finished_at=days(-1),
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),),
         )
         make_generation(
             fingerprint="new",
             finished_at=NOW,
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),),
         )
         summary = self.decide()
         self.assertEqual(summary["targets"], 0)
@@ -624,7 +638,7 @@ class TestTheSuggestionWritten(_Fixture):
         make_generation(
             status=RebuildStatus.BUILDING.value,
             finished_at=None,
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),),
         )
         summary = self.decide()
         self.assertEqual(summary["skipped"], dru.SKIPPED_NO_GENERATION)
@@ -642,7 +656,7 @@ class TestExemptionIsAReadBack(_Fixture):
     def setUp(self):
         super().setUp()
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
 
     def test_an_in_force_exemption_is_carried_as_a_pointer(self):
         """豁免抑制的是**动作**（第③段的 gate 施加之前要查在期豁免），不是结论：
@@ -670,7 +684,7 @@ class TestExemptionIsAReadBack(_Fixture):
 
     def test_an_exemption_for_another_regime_does_not_apply(self):
         """豁免键是（策略 × 阶段）：在别的阶段被豁免过，不构成这个阶段的挡箭牌。"""
-        self.exempt(self.alpha, regime=UPTREND)
+        self.exempt(self.alpha, regime=BULL)
         self.decide()
         self.assertIsNone(DeactivationDecision.objects.get().exemption_id)
 
@@ -695,22 +709,28 @@ class TestExemptionIsAReadBack(_Fixture):
 
 
 class TestExemptionClosing(_Fixture):
-    """性质 7 的后一半：阶段离开时一次性关闭，且不可逆。"""
+    """性质 7 的后一半：格子离开时一次性关闭，且不可逆。"""
 
-    def test_an_exemption_for_a_regime_we_have_left_is_closed(self):
+    def test_an_exemption_for_a_cell_we_have_left_is_closed(self):
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
-        exemption = self.exempt(self.alpha, regime=UPTREND)
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=BULL)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertEqual(exemption.closed_at, NOW)
         self.assertEqual(exemption.closed_reason, dru.CLOSE_REASON_REGIME_LEFT)
         self.assertEqual(summary["exemptions_closed"], 1)
 
-    def test_an_exemption_for_the_current_regime_survives(self):
+    def test_an_exemption_for_the_current_cell_survives(self):
+        """当前格子与豁免登记的那一格相同 ⇒ 没有「离开」，一条都不关。
+
+        比对的是**格子键**（`bear`），不是四档生效阶段（`downtrend`）（#66）：豁免行在
+        迁移 0019 之后存的就是格子键，拿四档去比会让每一条在期豁免都在换轴当天被当成
+        「离开」关掉——而 `closed_at` 写下去没有复活路径。
+        """
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
-        exemption = self.exempt(self.alpha)
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=BEAR.value)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
@@ -720,9 +740,9 @@ class TestExemptionClosing(_Fixture):
         """到期与「阶段离开」是两条独立的失效条件：已经过了期的既不重关，也不该被
         写成「阶段离开」——那会把一条正常到期的记录说成一次观测。"""
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
         exemption = self.exempt(
-            self.alpha, regime=UPTREND, granted_at=days(-20), expires_at=days(-1)
+            self.alpha, regime=BULL, granted_at=days(-20), expires_at=days(-1)
         )
         summary = self.decide()
         exemption.refresh_from_db()
@@ -732,9 +752,9 @@ class TestExemptionClosing(_Fixture):
     def test_an_already_closed_one_keeps_its_own_reason(self):
         """两次读之间可能有别人（管理命令）关掉了同一条，那时以先到者为准。"""
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
         exemption = self.exempt(
-            self.alpha, regime=UPTREND, closed_at=days(-1), closed_reason="manual"
+            self.alpha, regime=BULL, closed_at=days(-1), closed_reason="manual"
         )
         summary = self.decide()
         exemption.refresh_from_db()
@@ -746,14 +766,14 @@ class TestExemptionClosing(_Fixture):
         """误关一条在期豁免**不可逆**（`closed_at` 写下去没有复活路径），而豁免本身
         还有「到期」兜底——两个方向不对称，就往不会造成不可逆损失的那边倒。"""
         self.judged(effective_at=days(-4))
-        exemption = self.exempt(self.alpha, regime=UPTREND)
+        exemption = self.exempt(self.alpha, regime=BULL)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
         self.assertEqual(summary["exemptions_closed"], 0)
 
     def test_the_close_is_suspended_on_cold_start(self):
-        exemption = self.exempt(self.alpha, regime=UPTREND)
+        exemption = self.exempt(self.alpha, regime=BULL)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
@@ -761,7 +781,7 @@ class TestExemptionClosing(_Fixture):
 
     def test_the_close_is_suspended_when_there_is_no_generation(self):
         self.judged()
-        exemption = self.exempt(self.alpha, regime=UPTREND)
+        exemption = self.exempt(self.alpha, regime=BULL)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
@@ -776,26 +796,27 @@ class TestExemptionClosing(_Fixture):
         那条策略直接进停用。这条路径是活的：高波动本身不 blocked，判定照跑。
         """
         self.judged(regime=DOWNTREND, effective_regime=BaseRegime.HIGH_VOL)
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
-        exemption = self.exempt(self.alpha, regime=DOWNTREND)
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=BEAR.value)
         summary = self.decide()
         exemption.refresh_from_db()
         self.assertIsNone(exemption.closed_at)
         self.assertEqual(summary["exemptions_closed"], 0)
 
     def test_the_close_resumes_once_the_blanket_has_passed(self):
-        """高波动只是**延后**了「阶段离开」的判定，不是取消它。
+        """高波动只是**延后**了「格子离开」的判定，不是取消它。
 
-        保命档过去后生效阶段回落到基础阶段；它若已经换了（下行趋势 → 上行趋势），旧豁免
-        照常按「阶段离开」关闭。没有这一条，一个「高波动一来就再也不关了」的实现也能让
+        保命档过去后生效阶段回落到基础阶段；它若已经换了方向（`bear` → `bull`），旧豁免
+        照常按「格子离开」关闭。没有这一条，一个「高波动一来就再也不关了」的实现也能让
         上面那条用例全绿。
         """
         self.judged(regime=DOWNTREND, effective_regime=BaseRegime.HIGH_VOL)
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
-        exemption = self.exempt(self.alpha, regime=DOWNTREND)
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
+        exemption = self.exempt(self.alpha, regime=BEAR.value)
         self.decide()
 
-        self.judged(regime=UPTREND, effective_at=days(1))
+        # 方向换了：四档从下行变上行，格子从 `bear` 变 `bull`。
+        self.judged(regime=UPTREND, cycle=BULL.value, effective_at=days(1))
         summary = self.decide(now=days(1))
 
         exemption.refresh_from_db()
@@ -812,8 +833,8 @@ class TestTheSummaryShape(_Fixture):
     """性质 2 + 8：键集恒定，且能直接进 Celery 结果与日报。"""
 
     def summaries(self) -> dict[str, dict]:
-        """三条收场各来一份，外加正常路径一份。"""
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        """四条收场各来一份，外加正常路径一份。"""
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         cold = self.decide()
         DeactivationDecision.objects.all().delete()
 
@@ -823,12 +844,17 @@ class TestTheSummaryShape(_Fixture):
         self.judged()
         dry = self.decide()  # 这一代还是那条 unfit 格子，正常产出
 
+        # 有阶段、有池化表，但这一行判不出周期格子：旧结构日的形状。
+        self.judged(cycle=None, effective_at=days(1))
+        no_cell = self.decide(now=days(1))
+
         RegimePoolRebuild.objects.all().delete()
         no_generation = self.decide()
         return {
             "cold": cold,
             "stale": stale,
             "normal": dry,
+            "no_cell": no_cell,
             "no_generation": no_generation,
         }
 
@@ -854,7 +880,7 @@ class TestTheSummaryShape(_Fixture):
                 else:
                     self.assertTrue(summary["note"])
 
-    def test_the_three_skipped_paths_are_distinguishable(self):
+    def test_the_four_skipped_paths_are_distinguishable(self):
         summaries = self.summaries()
         self.assertEqual(
             {name: s["skipped"] for name, s in summaries.items()},
@@ -862,6 +888,7 @@ class TestTheSummaryShape(_Fixture):
                 "cold": dea.BLOCKED_COLD_START,
                 "stale": dea.BLOCKED_STALE_STATE,
                 "normal": None,
+                "no_cell": dea.BLOCKED_NO_CELL,
                 "no_generation": dru.SKIPPED_NO_GENERATION,
             },
         )

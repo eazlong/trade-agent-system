@@ -11,7 +11,9 @@
    恰好把凌晨的开仓归到一根尚未开盘的日线上。
 4. **门槛是刹车**：稀有阶段按天数占比缩放笔数门槛，但 `min_months` 不缩放，所以
    缩放在任何情况下都不能让一个样本稀薄的格子「过门槛」。
-5. **高波动档不做适用性判断**（`blanket`），且**门槛在这一档失效**——它与证据无关。
+5. **格子轴是 cycle 三格**（#66）：`bull` / `bear` / `sideways`。判不出方向的日子
+   （`unclear`、判据未就绪）**不进任何一格**，其持仓份额落 `pnl_unattributed`——
+   三格之外没有「第三个方向」，也没有「高波动档」那种单独的格子。
 6. **四态各有各的成因**：`unknown`（该阶段没出现过）/ `neutral`（证据不足或方向矛盾）
    / `fit` / `unfit`。缺一格会在日报里变成「这一行没有」，而它有好几种意思。
 
@@ -21,7 +23,7 @@
 
 **判定表（`_fitness`）直接测**：它是纯函数、参数是两本字典，构造出来比走一遍
 `slice_backtest` 清楚得多。端到端只覆盖「表以外的部分确实接上了」——适用、不适用、
-门槛拦下、高波动、未知各一条。
+门槛拦下、判不出方向、未知各一条。
 """
 
 from __future__ import annotations
@@ -34,12 +36,13 @@ from django.test import SimpleTestCase
 
 from apps.regime import slice as sl
 from apps.regime.config import EVIDENCE, JUDGEMENT, EvidenceConfig
-from apps.regime.quant import BaseRegime, label_series, latest_label
+from apps.regime.quant import Cycle, label_series, latest_label
 
-HIGH_VOL = BaseRegime.HIGH_VOL
-DOWNTREND = BaseRegime.DOWNTREND
-UPTREND = BaseRegime.UPTREND
-RANGE = BaseRegime.RANGE
+
+#: 格子轴的三个键（#66）。切片不再按四档分格——高波动是叠加层，`unclear` 不进格子。
+BULL = Cycle.BULL
+BEAR = Cycle.BEAR
+SIDEWAYS = Cycle.SIDEWAYS
 
 #: 缩小后的证据门槛。见模块 docstring。
 SMALL = EvidenceConfig(min_trades=3, min_months=1)
@@ -51,8 +54,8 @@ STRICT = EvidenceConfig(min_trades=3, min_months=3)
 DAY0 = date(2026, 1, 1)
 CAP = 10000.0
 
-#: 小窗口用的日线标签：前 6 天（1/1~1/6）下行趋势，后 6 天（1/7~1/12）箱体震荡。
-#: 12 天且对半分，所以每档的 `day_share` 是 0.5、缩放后门槛是 round(3×0.5)=2。
+#: 小窗口用的日线标签：前 6 天（1/1~1/6）下行周期，后 6 天（1/7~1/12）横盘周期。
+#: 12 天且对半分，所以每格的 `day_share` 是 0.5、缩放后门槛是 round(3×0.5)=2。
 SPLIT_WINDOW = (DAY0, DAY0 + timedelta(days=11))
 
 
@@ -64,15 +67,13 @@ def at(n: int, hour: int = 12, tz=timezone.utc) -> datetime:
     return datetime(2026, 1, 1, hour, tzinfo=tz) + timedelta(days=n)
 
 
-def tags_of(mapping: dict[int, BaseRegime]) -> dict[date, BaseRegime]:
-    return {d(offset): regime for offset, regime in mapping.items()}
+def tags_of(mapping: dict[int, Cycle]) -> dict[date, Cycle]:
+    return {d(offset): cycle for offset, cycle in mapping.items()}
 
 
-def split_tags() -> dict[date, BaseRegime]:
-    """`SPLIT_WINDOW` 的标签：`d0~d5` 下行趋势，`d6~d11` 箱体震荡。"""
-    return tags_of(
-        {i: DOWNTREND for i in range(0, 6)} | {i: RANGE for i in range(6, 12)}
-    )
+def split_tags() -> dict[date, Cycle]:
+    """`SPLIT_WINDOW` 的标签：`d0~d5` 下行周期，`d6~d11` 横盘周期。"""
+    return tags_of({i: BEAR for i in range(0, 6)} | {i: SIDEWAYS for i in range(6, 12)})
 
 
 def trade(entry_offset: int, exit_offset: int, pnl: float, **kwargs) -> sl.SliceTrade:
@@ -104,30 +105,30 @@ class TestAttributionByEntryTime(SimpleTestCase):
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        cell = out["cells"]["range"]
+        cell = out["cells"]["sideways"]
         self.assertEqual(cell["trades"], 1)
         self.assertAlmostEqual(cell["total_pnl"], 250.0)
-        self.assertEqual(out["cells"]["downtrend"]["trades"], 0)
-        self.assertAlmostEqual(out["cells"]["downtrend"]["total_pnl"], 0.0)
+        self.assertEqual(out["cells"]["bear"]["trades"], 0)
+        self.assertAlmostEqual(out["cells"]["bear"]["total_pnl"], 0.0)
 
     def test_a_cross_regime_trade_splits_pnl_but_counts_once_at_the_entry(self):
         """**本单元的核心规则**：钱按天分，笔数只归开仓段。"""
         out = sl.slice_backtest(
-            [trade(5, 7, 300.0)],  # 开在 d5（下行趋势）→ 平在 d7（箱体震荡）
+            [trade(5, 7, 300.0)],  # 开在 d5（下行周期）→ 平在 d7（横盘周期）
             split_tags(),
             initial_capital=CAP,
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        down, rng = out["cells"]["downtrend"], out["cells"]["range"]
+        bear, side = out["cells"]["bear"], out["cells"]["sideways"]
 
         # 3 个自然日（d5/d6/d7）→ 每天 100
-        self.assertAlmostEqual(down["total_pnl"], 100.0)
-        self.assertAlmostEqual(rng["total_pnl"], 200.0)
+        self.assertAlmostEqual(bear["total_pnl"], 100.0)
+        self.assertAlmostEqual(side["total_pnl"], 200.0)
 
         # 笔数只算 1 笔，且只算在开仓段
-        self.assertEqual(down["trades"], 1)
-        self.assertEqual(rng["trades"], 0)
+        self.assertEqual(bear["trades"], 1)
+        self.assertEqual(side["trades"], 0)
 
     def test_the_exit_regime_gets_the_money_but_never_the_count(self):
         """对照面：给了钱的格子**仍然**一笔都不计。混起来就是「在哪开仓」被判成了
@@ -139,11 +140,11 @@ class TestAttributionByEntryTime(SimpleTestCase):
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        rng = out["cells"]["range"]
-        self.assertGreater(rng["total_pnl"], 0.0)
-        self.assertEqual(rng["trades"], 0)
+        side = out["cells"]["sideways"]
+        self.assertGreater(side["total_pnl"], 0.0)
+        self.assertEqual(side["trades"], 0)
         # 一笔都不算 ⇒ 胜率无从谈起。报 0.0 会读成「全亏」。
-        self.assertIsNone(rng["win_rate"])
+        self.assertIsNone(side["win_rate"])
 
     def test_the_count_regime_keeps_the_whole_trade_in_its_win_rate(self):
         """胜率与单笔均值走**整笔**口径（交易集合的统计量），不是分摊份额。"""
@@ -154,9 +155,9 @@ class TestAttributionByEntryTime(SimpleTestCase):
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        down = out["cells"]["downtrend"]
-        self.assertEqual(down["trades"], 1)
-        self.assertAlmostEqual(down["win_rate"], 1.0)
+        bear = out["cells"]["bear"]
+        self.assertEqual(bear["trades"], 1)
+        self.assertAlmostEqual(bear["win_rate"], 1.0)
 
     def test_pnl_is_conserved_across_the_cells(self):
         trades = same_day_trades([1, 3, 7, 9], 100.0) + [trade(5, 7, 300.0)]
@@ -174,8 +175,8 @@ class TestAttributionByEntryTime(SimpleTestCase):
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        self.assertAlmostEqual(out["cells"]["range"]["total_pnl"], 50.0)
-        self.assertEqual(out["cells"]["range"]["span_days"], 1)
+        self.assertAlmostEqual(out["cells"]["sideways"]["total_pnl"], 50.0)
+        self.assertEqual(out["cells"]["sideways"]["span_days"], 1)
 
     def test_an_inverted_window_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -201,15 +202,15 @@ class TestUnattributableSharesAreAccounted(SimpleTestCase):
 
     def test_a_share_landing_on_an_unjudged_day_is_reported_not_dropped(self):
         out = sl.slice_backtest(
-            [trade(5, 7, 300.0)],  # d5(下行) / d6(缺) / d7(箱体)
+            [trade(5, 7, 300.0)],  # d5(下行) / d6(缺) / d7(横盘)
             self._holed_tags(),
             initial_capital=CAP,
             window=SPLIT_WINDOW,
             params=SMALL,
         )
         self.assertAlmostEqual(out["attribution"]["pnl_unattributed"], 100.0)
-        self.assertAlmostEqual(out["cells"]["downtrend"]["total_pnl"], 100.0)
-        self.assertAlmostEqual(out["cells"]["range"]["total_pnl"], 100.0)
+        self.assertAlmostEqual(out["cells"]["bear"]["total_pnl"], 100.0)
+        self.assertAlmostEqual(out["cells"]["sideways"]["total_pnl"], 100.0)
 
     def test_unattributable_shares_are_never_redistributed(self):
         """落空的份额不许摊给别的阶段——那会让每一格都说「我这里有这些钱」。"""
@@ -236,7 +237,7 @@ class TestUnattributableSharesAreAccounted(SimpleTestCase):
             window=SPLIT_WINDOW,
             params=SMALL,
         )
-        rng = out["cells"]["range"]
+        rng = out["cells"]["sideways"]
         self.assertAlmostEqual(rng["total_pnl"], 100.0)
         self.assertEqual(rng["trades"], 0)
         self.assertEqual(out["attribution"]["unjudged"], 1)
@@ -282,18 +283,18 @@ class TestTheDayIsUtcNotBusinessDay(SimpleTestCase):
                     pnl=300.0,
                 )
             ],
-            tags_of({3: RANGE, 4: DOWNTREND}),
+            tags_of({3: SIDEWAYS, 4: BEAR}),
             initial_capital=CAP,
             window=(d(3), d(4)),
             params=SMALL,
         )
-        self.assertEqual(out["cells"]["range"]["trades"], 1)
-        self.assertEqual(out["cells"]["downtrend"]["trades"], 0)
-        self.assertAlmostEqual(out["cells"]["range"]["total_pnl"], 150.0)
-        self.assertAlmostEqual(out["cells"]["downtrend"]["total_pnl"], 150.0)
+        self.assertEqual(out["cells"]["sideways"]["trades"], 1)
+        self.assertEqual(out["cells"]["bear"]["trades"], 0)
+        self.assertAlmostEqual(out["cells"]["sideways"]["total_pnl"], 150.0)
+        self.assertAlmostEqual(out["cells"]["bear"]["total_pnl"], 150.0)
 
     def test_utc_midnight_is_the_boundary(self):
-        tags = tags_of({2: RANGE, 3: DOWNTREND})
+        tags = tags_of({2: SIDEWAYS, 3: BEAR})
         before = sl.slice_backtest(
             [trade(3, 3, 10.0, hour=0)],
             tags,
@@ -302,7 +303,7 @@ class TestTheDayIsUtcNotBusinessDay(SimpleTestCase):
             params=SMALL,
         )
         # datetime(2026,1,1,0) + 3 天 = 2026-01-04 00:00 UTC ⇒ d3
-        self.assertEqual(before["cells"]["downtrend"]["trades"], 1)
+        self.assertEqual(before["cells"]["bear"]["trades"], 1)
 
         after = sl.slice_backtest(
             [sl.SliceTrade(at(3, 0) - timedelta(minutes=1), at(3, 0), 10.0)],
@@ -311,7 +312,7 @@ class TestTheDayIsUtcNotBusinessDay(SimpleTestCase):
             window=(d(2), d(3)),
             params=SMALL,
         )
-        self.assertEqual(after["cells"]["range"]["trades"], 1)
+        self.assertEqual(after["cells"]["sideways"]["trades"], 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -438,9 +439,9 @@ class TestScalingCannotRescueAThinSample(SimpleTestCase):
 
     def test_a_regime_that_appeared_for_two_days_stays_neutral(self):
         # 120 天的窗口里只出现 2 天 ⇒ 占比 1/60 ⇒ 笔数门槛缩到 1
-        tags = {d(i): RANGE for i in range(120)}
-        tags[d(0)] = UPTREND
-        tags[d(60)] = UPTREND
+        tags = {d(i): SIDEWAYS for i in range(120)}
+        tags[d(0)] = BULL
+        tags[d(60)] = BULL
         out = sl.slice_backtest(
             [trade(0, 0, 100.0)],
             tags,
@@ -448,7 +449,7 @@ class TestScalingCannotRescueAThinSample(SimpleTestCase):
             window=(d(0), d(119)),
             params=EVIDENCE,
         )
-        cell = out["cells"]["uptrend"]
+        cell = out["cells"]["bull"]
         self.assertEqual(cell["threshold"]["min_trades"], 1)
         self.assertTrue(cell["threshold"]["scaled"])
         self.assertEqual(cell["trades"], 1)
@@ -462,24 +463,24 @@ class TestScalingCannotRescueAThinSample(SimpleTestCase):
         这里必须用 `min_months=3` 的门槛：`SMALL` 的 `min_months=1` 会让「挤在一个月」
         也过门槛，测出来的就不是「覆盖月数」这条规则了。
         """
-        tags = {d(i): RANGE for i in range(60)}
+        tags = {d(i): SIDEWAYS for i in range(60)}
 
         crowded = same_day_trades([0, 3, 6, 9, 11], 100.0)
         out = sl.slice_backtest(
             crowded, tags, initial_capital=CAP, window=(d(0), d(59)), params=STRICT
         )
-        self.assertEqual(out["cells"]["range"]["trades"], 5)
-        self.assertEqual(out["cells"]["range"]["months"], 1)
-        self.assertTrue(out["cells"]["range"]["threshold"]["met"] is False)
-        self.assertEqual(out["cells"]["range"]["state"], sl.STATE_NEUTRAL)
+        self.assertEqual(out["cells"]["sideways"]["trades"], 5)
+        self.assertEqual(out["cells"]["sideways"]["months"], 1)
+        self.assertTrue(out["cells"]["sideways"]["threshold"]["met"] is False)
+        self.assertEqual(out["cells"]["sideways"]["state"], sl.STATE_NEUTRAL)
 
         spread = same_day_trades([0, 22, 30, 45, 59], 100.0)
         out = sl.slice_backtest(
             spread, tags, initial_capital=CAP, window=(d(0), d(59)), params=STRICT
         )
-        self.assertEqual(out["cells"]["range"]["months"], 3)
-        self.assertTrue(out["cells"]["range"]["threshold"]["met"])
-        self.assertEqual(out["cells"]["range"]["state"], sl.STATE_FIT)
+        self.assertEqual(out["cells"]["sideways"]["months"], 3)
+        self.assertTrue(out["cells"]["sideways"]["threshold"]["met"])
+        self.assertEqual(out["cells"]["sideways"]["state"], sl.STATE_FIT)
 
 
 # --------------------------------------------------------------------------- #
@@ -616,7 +617,7 @@ class TestAbsoluteProfitFloor(SimpleTestCase):
 
 
 class TestEndToEndStates(SimpleTestCase):
-    """一条覆盖 fit / unfit / 门槛拦下 / 高波动 / 未知的端到端。判定表本身见上一节。"""
+    """一条覆盖 fit / unfit / 门槛拦下 / 判不出方向 / 未知的端到端。判定表本身见上一节。"""
 
     def _run(self, trades, tags, params=SMALL, window=SPLIT_WINDOW):
         return sl.slice_backtest(
@@ -628,22 +629,22 @@ class TestEndToEndStates(SimpleTestCase):
             same_day_trades([0, 2, 4], 100.0) + same_day_trades([6, 8, 10], 100.0),
             split_tags(),
         )
-        self.assertEqual(out["cells"]["range"]["state"], sl.STATE_FIT)
-        self.assertEqual(out["cells"]["range"]["reason"], "")
+        self.assertEqual(out["cells"]["sideways"]["state"], sl.STATE_FIT)
+        self.assertEqual(out["cells"]["sideways"]["reason"], "")
 
     def test_a_losing_regime_is_unfit(self):
-        """箱体里连亏 3 笔，每笔 −400。该格回撤 12%，而全样本因为前段赚过钱（峰值
+        """横盘里连亏 3 笔，每笔 −400。该格回撤 12%，而全样本因为前段赚过钱（峰值
         10300）只有 11.65% —— 两个指标一致更差 ⇒ 不适用。
 
         亏得比前段赚得多是**构造上的必要**：全样本的峰值被前段的 +300 抬高了，若这
-        三笔只亏 −300，全样本的峰值 10300 与谷底 9400 给出的回撤反而比箱体格更大，
+        三笔只亏 −300，全样本的峰值 10300 与谷底 9400 给出的回撤反而比横盘格更大，
         两个指标就会一好一坏——那测的是 `direction_conflict` 那条支路，不是这一条。
         """
         out = self._run(
             same_day_trades([0, 2, 4], 100.0) + same_day_trades([6, 8, 10], -400.0),
             split_tags(),
         )
-        rng = out["cells"]["range"]
+        rng = out["cells"]["sideways"]
         self.assertAlmostEqual(rng["max_drawdown_pct"], 12.0)
         self.assertAlmostEqual(rng["calmar"], -73.0)
         self.assertAlmostEqual(
@@ -655,38 +656,54 @@ class TestEndToEndStates(SimpleTestCase):
     def test_a_regime_below_the_threshold_is_neutral_and_its_numbers_survive(self):
         """中性 ≠ 没有数字。日报要能用数字回答「为什么这一格没结论」。"""
         out = self._run(same_day_trades([6], -500.0), split_tags())
-        rng = out["cells"]["range"]
+        rng = out["cells"]["sideways"]
         self.assertEqual(rng["state"], sl.STATE_NEUTRAL)
         self.assertEqual(rng["reason"], sl.REASON_INSUFFICIENT)
         self.assertAlmostEqual(rng["total_pnl"], -500.0)
         self.assertAlmostEqual(rng["win_rate"], 0.0)
         self.assertEqual(rng["trades"], 1)
 
-    def test_high_vol_is_a_blanket_halt_not_an_applicability_verdict(self):
+    def test_days_without_a_direction_form_no_cell_and_their_pnl_is_unattributed(self):
+        """判不出方向的日子（`unclear` / 未就绪）**不进任何一格**（#66）。
+
+        它们既不构成第四个「方向」，也不像旧世代那样单独占一个高波动格。代价是那几天
+        持仓的份额落进 `pnl_unattributed`——记账而不是重分配，见 `slice_backtest`。
+        """
+        # 整段窗口都判不出方向：三格全空，钱全部落进未归属。
+        out = self._run(same_day_trades([6, 8, 10], -300.0), tags_of({}))
+        self.assertEqual(set(out["cells"]), {"bull", "bear", "sideways"})
+        self.assertNotIn("high_vol", out["cells"])
+        self.assertNotIn("unclear", out["cells"])
+        self.assertAlmostEqual(out["attribution"]["pnl_unattributed"], -900.0)
+        for name, cell in out["cells"].items():
+            self.assertEqual(cell["state"], sl.STATE_UNKNOWN, name)
+            self.assertEqual(cell["trades"], 0, name)
+
+    def test_the_blanket_tier_is_legacy_and_never_produced(self):
+        """`blanket` 自 #66 起只是旧载荷的读侧词——切片再也不产出它。
+
+        高波动退出格子轴，保命档改由 halt 层按波动维承担（`deactivation.is_blanket`）。
+        所以这里钉两件事：`STATE_BLANKET` 只留在 `LEGACY_STATES`、不在 `STATE_VALUES`；
+        正常切片里每一格的状态都在新词表内，且没有一格带着旧的高波动原因。
+        """
+        self.assertIn(sl.STATE_BLANKET, sl.LEGACY_STATES)
+        self.assertNotIn(sl.STATE_BLANKET, sl.STATE_VALUES)
+        self.assertEqual(
+            sl.STATE_VALUES,
+            {sl.STATE_FIT, sl.STATE_UNFIT, sl.STATE_NEUTRAL, sl.STATE_UNKNOWN},
+        )
+
         out = self._run(
             same_day_trades([6, 8, 10], -300.0),
-            tags_of({i: HIGH_VOL for i in range(12)}),
+            split_tags(),
         )
-        cell = out["cells"]["high_vol"]
-        self.assertEqual(cell["state"], sl.STATE_BLANKET)
-        self.assertEqual(cell["reason"], sl.REASON_HIGH_VOL_BLANKET)
-        # 数字照留：它们仍然说明这段行情里发生了什么
-        self.assertAlmostEqual(cell["total_pnl"], -900.0)
-        self.assertEqual(cell["trades"], 3)
-
-    def test_the_evidence_threshold_is_void_in_the_high_vol_tier(self):
-        """1 笔、1 个月，远在门槛之下——但高波动档与证据无关，仍是 blanket 而非中性。
-        否则资讯抬升到高波动之后什么都停不掉（CONTEXT.md）。"""
-        out = self._run(
-            same_day_trades([6], -300.0), tags_of({i: HIGH_VOL for i in range(12)})
-        )
-        cell = out["cells"]["high_vol"]
-        self.assertFalse(cell["threshold"]["met"])
-        self.assertEqual(cell["state"], sl.STATE_BLANKET)
+        for name, cell in out["cells"].items():
+            self.assertIn(cell["state"], sl.STATE_VALUES, name)
+            self.assertNotEqual(cell["reason"], sl.REASON_HIGH_VOL_BLANKET, name)
 
     def test_a_regime_absent_from_the_window_is_unknown(self):
         out = self._run(same_day_trades([6, 8, 10], 100.0), split_tags())
-        cell = out["cells"]["uptrend"]
+        cell = out["cells"]["bull"]
         self.assertEqual(cell["state"], sl.STATE_UNKNOWN)
         self.assertEqual(cell["reason"], sl.REASON_NO_REGIME_DAYS)
         self.assertEqual(cell["trades"], 0)
@@ -696,10 +713,10 @@ class TestEndToEndStates(SimpleTestCase):
         out = self._run(
             same_day_trades([0, 2, 4], 100.0),
             tags_of(
-                {**{i: DOWNTREND for i in range(6)}, **{i: RANGE for i in range(6, 12)}}
+                {**{i: BEAR for i in range(6)}, **{i: SIDEWAYS for i in range(6, 12)}}
             ),
         )
-        rng = out["cells"]["range"]
+        rng = out["cells"]["sideways"]
         self.assertEqual(rng["state"], sl.STATE_NEUTRAL)
         self.assertEqual(rng["reason"], sl.REASON_INSUFFICIENT)
         self.assertEqual(rng["threshold"]["regime_days"], 6)
@@ -707,14 +724,12 @@ class TestEndToEndStates(SimpleTestCase):
     def test_unknown_and_neutral_are_distinguishable(self):
         out = self._run(same_day_trades([0, 2, 4], 100.0), split_tags())
         self.assertNotEqual(sl.STATE_UNKNOWN, sl.STATE_NEUTRAL)
-        self.assertEqual(out["cells"]["uptrend"]["state"], sl.STATE_UNKNOWN)
-        self.assertEqual(out["cells"]["range"]["state"], sl.STATE_NEUTRAL)
+        self.assertEqual(out["cells"]["bull"]["state"], sl.STATE_UNKNOWN)
+        self.assertEqual(out["cells"]["sideways"]["state"], sl.STATE_NEUTRAL)
 
-    def test_every_regime_always_gets_a_cell(self):
+    def test_every_cycle_cell_always_gets_a_cell(self):
         out = self._run([], split_tags())
-        self.assertEqual(
-            set(out["cells"]), {"high_vol", "downtrend", "uptrend", "range"}
-        )
+        self.assertEqual(set(out["cells"]), {"bull", "bear", "sideways"})
 
 
 # --------------------------------------------------------------------------- #
@@ -750,11 +765,30 @@ class TestPayloadShape(SimpleTestCase):
             self._payload()["evidence_threshold"], {"min_trades": 3, "min_months": 1}
         )
 
-    def test_regime_days_add_up_to_the_window(self):
-        attribution = self._payload()["attribution"]
-        self.assertEqual(
+    def test_regime_days_never_exceed_the_window(self):
+        """三格天数之和 **≤** 窗口天数：判不出方向（`unclear`）的日子不进任何一格。
+
+        这里刻意挖掉 d5（模拟一个 `unclear` 日）：它不属于三格，也不计入任何一格的
+        `regime_days`。旧世代是「四档之和恰好等于窗口」；换轴之后那条等式不再成立，
+        因为三格之外还有「判不出来」这种日子，把它的天数摊进某一格就是伪造方向。
+        """
+        tags = {day: cycle for day, cycle in split_tags().items() if day != d(5)}
+        out = sl.slice_backtest(
+            same_day_trades([6, 8, 10], 100.0),
+            tags,
+            initial_capital=CAP,
+            window=SPLIT_WINDOW,
+            params=SMALL,
+        )
+        attribution = out["attribution"]
+        self.assertEqual(set(attribution["regime_days"]), {"bull", "bear", "sideways"})
+        self.assertLessEqual(
             sum(attribution["regime_days"].values()), attribution["window_days"]
         )
+        # 被挖掉的那天不算进任何一格，日历长度（12 天）严格大于三格之和（11 天）。
+        self.assertEqual(attribution["regime_days"]["bear"], 5)  # d0~d4
+        self.assertEqual(attribution["regime_days"]["sideways"], 6)  # d6~d11
+        self.assertLess(sum(attribution["regime_days"].values()), 12)
 
     def test_the_payload_is_json_serialisable(self):
         """它要进 `BacktestResult.metrics`（JSONField）。"""
@@ -797,7 +831,7 @@ class TestMergeInputs(SimpleTestCase):
             )
 
     def test_an_empty_cell_carries_empty_sample_not_none(self):
-        cell = self._payload()["cells"]["uptrend"]  # 窗口内这个阶段没出现过
+        cell = self._payload()["cells"]["bull"]  # 窗口内这个阶段没出现过
         self.assertEqual(cell["merge_inputs"]["daily_return"], {})
         self.assertEqual(cell["merge_inputs"]["trades"], [])
 
@@ -822,14 +856,14 @@ class TestMergeInputs(SimpleTestCase):
                 )
                 for name, cell in out["cells"].items():
                     self.assertIsNone(cell["merge_inputs"], name)
-                    # 结论与数字照旧：四态照给，笔数照数（这三笔全在 `range` 那格）。
+                    # 结论与数字照旧：四态照给，笔数照数（这三笔全在 `sideways` 那格）。
                     self.assertIn("state", cell)
-                self.assertEqual(out["cells"]["range"]["trades"], 3)
+                self.assertEqual(out["cells"]["sideways"]["trades"], 3)
                 self.assertEqual(out["full_sample"]["total_pnl"], 300.0)
 
     def test_the_daily_series_sums_to_the_cells_own_total_pnl(self):
         """样本是收益率，所以对账要先乘回本金。"""
-        cell = self._payload()["cells"]["range"]
+        cell = self._payload()["cells"]["sideways"]
         self.assertAlmostEqual(
             sum(cell["merge_inputs"]["daily_return"].values()),
             cell["total_pnl"] / CAP,
@@ -838,7 +872,7 @@ class TestMergeInputs(SimpleTestCase):
 
     def test_the_per_trade_samples_are_that_cells_trades(self):
         """胜率必须能从逐笔样本重算出来——它自己是个四舍五入过的比例，反推是近似。"""
-        cell = self._payload()["cells"]["range"]
+        cell = self._payload()["cells"]["sideways"]
         samples = cell["merge_inputs"]["trades"]
         self.assertEqual(len(samples), cell["trades"])
         wins = sum(1 for _, pnl in samples if pnl > 0)
@@ -853,16 +887,16 @@ class TestMergeInputs(SimpleTestCase):
         """
         out = self._payload(
             [trade(0, 0, 10.0), trade(35, 35, 20.0)],
-            tags_of({**{i: RANGE for i in range(2)}, 35: RANGE}),
+            tags_of({**{i: SIDEWAYS for i in range(2)}, 35: SIDEWAYS}),
             window=(d(0), d(35)),
         )
-        cell = out["cells"]["range"]["merge_inputs"]
+        cell = out["cells"]["sideways"]["merge_inputs"]
         self.assertEqual(
             [iso for iso, _ in cell["trades"]], ["2026-01-01", "2026-02-05"]
         )
         self.assertEqual(
             len({iso[:7] for iso, _ in cell["trades"]}),
-            out["cells"]["range"]["months"],
+            out["cells"]["sideways"]["months"],
         )
 
     def test_a_trade_held_across_two_regimes_splits_its_amount_in_the_series(self):
@@ -873,16 +907,17 @@ class TestMergeInputs(SimpleTestCase):
         """
         out = self._payload([trade(5, 6, 200.0)])
         self.assertEqual(
-            out["cells"]["downtrend"]["merge_inputs"]["daily_return"],
+            out["cells"]["bear"]["merge_inputs"]["daily_return"],
             {"2026-01-06": 0.01},
         )
         self.assertEqual(
-            out["cells"]["range"]["merge_inputs"]["daily_return"], {"2026-01-07": 0.01}
+            out["cells"]["sideways"]["merge_inputs"]["daily_return"],
+            {"2026-01-07": 0.01},
         )
         self.assertEqual(
-            out["cells"]["downtrend"]["merge_inputs"]["trades"], [["2026-01-06", 0.02]]
+            out["cells"]["bear"]["merge_inputs"]["trades"], [["2026-01-06", 0.02]]
         )
-        self.assertEqual(out["cells"]["range"]["merge_inputs"]["trades"], [])
+        self.assertEqual(out["cells"]["sideways"]["merge_inputs"]["trades"], [])
 
     def test_the_full_sample_curve_is_the_sum_of_the_cells_daily_series(self):
         """全样本不单独存，因为它是一条恒等式而不是一个近似——存第二份就会漂。
@@ -986,3 +1021,42 @@ class TestBuildTags(SimpleTestCase):
         self.assertEqual(
             sl.build_tags(floats, QUANT_PARAMS), sl.build_tags(decimals, QUANT_PARAMS)
         )
+
+
+class TestBuildCycleTags(SimpleTestCase):
+    """`build_cycle_tags` 是切片的**格子轴入口**（#66）：只收 `CYCLE_CELLS` 里的日子。
+
+    `build_tags`（四档）留着只服务真值比对，切片必须走这一条。这一节钉住三件事：
+    键集恰好三格、判不出方向的日子（`unclear` / 未就绪）不进映射、以及它与
+    `label_series` 的周期维逐日一致——两处各算一遍就会让同一天出现两个方向。
+    """
+
+    def test_only_the_three_cycle_cells_survive(self):
+        tags = sl.build_cycle_tags(candles(RAMP), QUANT_PARAMS)
+        self.assertTrue(tags)
+        for day, cycle in tags.items():
+            self.assertIsInstance(cycle, Cycle, day)
+            self.assertIn(cycle, (Cycle.BULL, Cycle.BEAR, Cycle.SIDEWAYS), day)
+
+    def test_unready_days_are_absent_instead_of_defaulted(self):
+        """预热没走完的日子**不进映射**——与 `build_tags` 同一条纪律。"""
+        tags = sl.build_cycle_tags(candles(RAMP), QUANT_PARAMS)
+        self.assertNotIn(DAY0, tags)
+        self.assertLess(len(tags), len(RAMP))
+        self.assertGreater(len(tags), 0)
+
+    def test_cycle_tags_agree_with_the_series_cycle(self):
+        """标签是 `label_series` 周期维的投影——只有一处实现。"""
+        rows = candles(RAMP)
+        tags = sl.build_cycle_tags(rows, QUANT_PARAMS)
+        labels = {label.date: label for label in label_series(rows, QUANT_PARAMS)}
+        self.assertEqual(
+            set(tags),
+            {
+                day
+                for day, label in labels.items()
+                if label.cycle in (Cycle.BULL, Cycle.BEAR, Cycle.SIDEWAYS)
+            },
+        )
+        for day, cycle in tags.items():
+            self.assertIs(labels[day].cycle, cycle)

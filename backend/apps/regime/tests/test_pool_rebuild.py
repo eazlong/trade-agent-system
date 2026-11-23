@@ -59,10 +59,13 @@ from apps.regime.pool import (
     POOL_SOURCE_ARCHETYPE,
     POOL_SOURCE_STRATEGY,
 )
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_CELLS, Cycle
 
-RANGE = BaseRegime.RANGE
-DOWNTREND = BaseRegime.DOWNTREND
+#: 格子键（cycle 三格）：切片标签、池化格的 `regime` 字段读它（#66）。
+#: `range`/`downtrend` 是四档时代的数据语言，这里换到 cycle 之后再沿用那两个名字
+#: 只会让「这一格是四档还是三格」在断言里看不出来。
+SIDEWAYS = Cycle.SIDEWAYS
+BEAR = Cycle.BEAR
 
 #: 12 天窗口（端点 d0 / d11），与 `test_pool.py` / `test_slicing.py` 同形。
 DAY0 = date(2026, 1, 1)
@@ -79,10 +82,10 @@ TWO_MONTHS = EvidenceConfig(min_trades=3, min_months=2)
 #: 「同一微秒」上（那会让「按完成时刻取最近」的用例变成靠 id 兜底）。
 T0 = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
 
-#: `down-trend 那三笔平稳盈利把全样本曲线的峰抬起来，箱体那三笔连亏从峰上下来`——
-#: 与 `test_pool.downtrend_profit_then_range_loss` 同一份数据，于是「下行趋势适用、
-#: 箱体不适用」这个结论在两个文件里是同一个（本文件另有一处直接钉住它）。
-DOWNTREND_TRADES = (
+#: `下行周期那三笔平稳盈利把全样本曲线的峰抬起来，横盘那三笔连亏从峰上下来`——
+#: 与 `test_pool.downtrend_profit_then_range_loss` 同一份数据，于是「下行周期适用、
+#: 横盘不适用」这个结论在两个文件里是同一个（本文件另有一处直接钉住它）。
+BEAR_TRADES = (
     (0, 1000.0),
     (1, 1000.0),
     (2, 1000.0),
@@ -105,19 +108,19 @@ def same_day(n: int, pnl: float) -> sl.SliceTrade:
     return sl.SliceTrade(entry_time=at(n), exit_time=at(n), pnl=pnl)
 
 
-def all_range_tags() -> dict[date, BaseRegime]:
-    return {d(i): RANGE for i in range(12)}
+def all_sideways_tags() -> dict[date, Cycle]:
+    return {d(i): SIDEWAYS for i in range(12)}
 
 
-def downtrend_tags() -> dict[date, BaseRegime]:
-    """前六天是下行趋势、其余是箱体震荡，与 `DOWNTREND_TRADES` 的分段对齐。"""
-    tags = all_range_tags()
-    tags.update({d(i): DOWNTREND for i in range(6)})
+def bear_tags() -> dict[date, Cycle]:
+    """前六天是下行周期、其余是横盘，与 `BEAR_TRADES` 的分段对齐。"""
+    tags = all_sideways_tags()
+    tags.update({d(i): BEAR for i in range(6)})
     return tags
 
 
-def tags_span(span: int, overrides: dict[int, BaseRegime] | None = None) -> dict:
-    tags = {d(i): RANGE for i in range(span)}
+def tags_span(span: int, overrides: dict[int, Cycle] | None = None) -> dict:
+    tags = {d(i): SIDEWAYS for i in range(span)}
     tags.update({d(offset): regime for offset, regime in (overrides or {}).items()})
     return tags
 
@@ -183,7 +186,7 @@ def probe_class(stem: str, archetype: str) -> type:
 def cell(
     strategy_id: int = 1,
     *,
-    regime: str = RANGE.value,
+    regime: str = SIDEWAYS.value,
     state: str = "fit",
     reason: str = "",
     source: str = POOL_SOURCE_STRATEGY,
@@ -268,7 +271,7 @@ class TestInputFingerprint(SimpleTestCase):
 
     def setUp(self):
         span = 12
-        tags = tags_span(span, {i: DOWNTREND for i in range(6)})
+        tags = tags_span(span, {i: BEAR for i in range(6)})
         self.samples = [
             pure_sample(
                 [same_day(0, 1000.0), same_day(1, 1000.0), same_day(2, 1000.0)],
@@ -483,13 +486,13 @@ class TestArchetypeFingerprintScope(SimpleTestCase):
 
         # 够格的 1 号自己不受影响（它压根不查原型）。
         self.assertEqual(
-            with_sibling.cells[(1, RANGE.value)].state,
-            without_sibling.cells[(1, RANGE.value)].state,
+            with_sibling.cells[(1, SIDEWAYS.value)].state,
+            without_sibling.cells[(1, SIDEWAYS.value)].state,
         )
         # 而 2 号兜底那一格**变了**——这就是「够格策略的原型也进指纹」的理由。
         self.assertNotEqual(
-            with_sibling.cells[(2, RANGE.value)].evidence["trades"],
-            without_sibling.cells[(2, RANGE.value)].evidence["trades"],
+            with_sibling.cells[(2, SIDEWAYS.value)].evidence["trades"],
+            without_sibling.cells[(2, SIDEWAYS.value)].evidence["trades"],
             "同原型兜底应当借到 1 号那三笔；若这里相等，说明本用例没有真的造出"
             "「够格策略的原型影响别人」这个前提",
         )
@@ -606,7 +609,7 @@ class _Fixture(TestCase):
         return result
 
     def sliced(
-        self, strategy, *, trades=DOWNTREND_TRADES, tags=None, params=SMALL, **kwargs
+        self, strategy, *, trades=BEAR_TRADES, tags=None, params=SMALL, **kwargs
     ):
         """造一个结果并把切片落库（真走 `slice_result`，不手写载荷）。
 
@@ -615,7 +618,7 @@ class _Fixture(TestCase):
         夹具的账，不该让用例去记得重新取一次。
         """
         result = self.add_result(strategy, trades=trades, **kwargs)
-        slicing.compute_slice(result, tags or downtrend_tags(), params=params)
+        slicing.compute_slice(result, tags or bear_tags(), params=params)
         result.refresh_from_db(fields=["metrics"])
         return result
 
@@ -657,28 +660,28 @@ class TestCurrentGeneration(_Fixture):
 
     def test_cells_are_keyed_by_strategy_and_regime(self):
         generation = make_generation(finished_at=T0)
-        add_cell(generation, self.alpha, RANGE, state="fit")
-        add_cell(generation, self.beta, DOWNTREND, state="unfit")
+        add_cell(generation, self.alpha, SIDEWAYS, state="fit")
+        add_cell(generation, self.beta, BEAR, state="unfit")
 
         cells = pool_rebuild.current_cells()
 
         self.assertEqual(
-            set(cells), {(self.alpha.id, RANGE.value), (self.beta.id, DOWNTREND.value)}
+            set(cells), {(self.alpha.id, SIDEWAYS.value), (self.beta.id, BEAR.value)}
         )
-        self.assertEqual(cells[(self.alpha.id, RANGE.value)]["state"], "fit")
-        self.assertEqual(cells[(self.beta.id, DOWNTREND.value)]["reason"], "")
+        self.assertEqual(cells[(self.alpha.id, SIDEWAYS.value)]["state"], "fit")
+        self.assertEqual(cells[(self.beta.id, BEAR.value)]["reason"], "")
 
     def test_cells_of_an_older_generation_are_not_current(self):
         old = make_generation(fingerprint="old", started_at=T0, finished_at=T0)
-        add_cell(old, self.alpha, RANGE, state="unfit")
+        add_cell(old, self.alpha, SIDEWAYS, state="unfit")
         fresh = make_generation(
             fingerprint="new", started_at=T0, finished_at=T0 + timedelta(hours=1)
         )
-        add_cell(fresh, self.alpha, RANGE, state="fit")
+        add_cell(fresh, self.alpha, SIDEWAYS, state="fit")
 
         cells = pool_rebuild.current_cells()
 
-        self.assertEqual(cells[(self.alpha.id, RANGE.value)]["state"], "fit")
+        self.assertEqual(cells[(self.alpha.id, SIDEWAYS.value)]["state"], "fit")
 
     def test_the_finished_at_tie_falls_back_to_the_id(self):
         """同一时刻的两代（测试里的常见形状）按 id 取后落的那一代，不是随机的。"""
@@ -794,15 +797,15 @@ class TestCollectSamples(_Fixture):
         samples, _, _ = pool_rebuild.collect_samples()
 
         self.assertEqual(len(samples), 1)
-        self.assertEqual(samples[0].cell_regime_days[DOWNTREND.value], 6)
+        self.assertEqual(samples[0].cell_regime_days[BEAR.value], 6)
 
     def test_the_regime_days_travel_with_the_sample(self):
         self.sliced(self.alpha)
 
         samples, _, _ = pool_rebuild.collect_samples()
 
-        self.assertEqual(samples[0].cell_regime_days[RANGE.value], 6)
-        self.assertEqual(samples[0].cell_regime_days[DOWNTREND.value], 6)
+        self.assertEqual(samples[0].cell_regime_days[SIDEWAYS.value], 6)
+        self.assertEqual(samples[0].cell_regime_days[BEAR.value], 6)
 
 
 class TestStrategyRawTexts(_Fixture):
@@ -920,24 +923,28 @@ class TestRebuildPool(_Fixture):
         generation = RegimePoolRebuild.objects.get(pk=summary["rebuild_id"])
         self.assertEqual(summary["candidates"], 2)
         self.assertEqual(summary["results_used"], 2)
-        self.assertEqual(summary["cells_total"], 8)
+        self.assertEqual(summary["cells_total"], 6)
         self.assertEqual(generation.candidates, 2)
         self.assertEqual(generation.results_used, 2)
-        self.assertEqual(generation.cells_total, 8)
+        self.assertEqual(generation.cells_total, 6)
         self.assertEqual(
             RegimePoolCell.objects.filter(rebuild=generation).count(),
             generation.cells_total,
         )
 
-    def test_every_sample_bearing_strategy_gets_all_four_regimes(self):
-        """缺失的格子在日报里表现为「这一行没有」，而它有两种意思——所以不留空格。"""
+    def test_every_sample_bearing_strategy_gets_all_three_cells(self):
+        """缺失的格子在日报里表现为「这一行没有」，而它有两种意思——所以不留空格。
+
+        #66 之后格子轴是 cycle 三格（`CYCLE_CELLS`）：两条策略 × 三格 = 6。写死「四条
+        策略 × 四档」那个数的话，换轴之后这条会红在一个与「不留空格」无关的算术上。
+        """
         pool_rebuild.rebuild_pool()
 
         cells = pool_rebuild.current_cells()
 
-        self.assertEqual(len(cells), 8)
+        self.assertEqual(len(cells), len(CYCLE_CELLS) * 2)
         for strategy in (self.alpha, self.beta):
-            for regime in BaseRegime:
+            for regime in CYCLE_CELLS:
                 with self.subTest(strategy=strategy.name, regime=regime.value):
                     self.assertIn((strategy.id, regime.value), cells)
 
@@ -972,15 +979,17 @@ class TestRebuildPool(_Fixture):
 
         cells = pool_rebuild.current_cells()
 
-        self.assertEqual(cells[(self.alpha.id, DOWNTREND.value)]["state"], sl.STATE_FIT)
-        self.assertEqual(cells[(self.alpha.id, RANGE.value)]["state"], sl.STATE_UNFIT)
+        self.assertEqual(cells[(self.alpha.id, BEAR.value)]["state"], sl.STATE_FIT)
+        self.assertEqual(
+            cells[(self.alpha.id, SIDEWAYS.value)]["state"], sl.STATE_UNFIT
+        )
 
     def test_the_evidence_is_persisted_with_the_cell(self):
         """依据不进差异计数，但它必须落下来——它是「凭什么这么判」的唯一答案。"""
         pool_rebuild.rebuild_pool(params=SMALL)
 
         cells = pool_rebuild.current_cells()
-        evidence = cells[(self.alpha.id, RANGE.value)]["evidence"]
+        evidence = cells[(self.alpha.id, SIDEWAYS.value)]["evidence"]
 
         # 逐条带 id、品种、窗口：只有这样，池化表上那一格才能在没有原始回测行的情况下
         # 回答「是哪些回测算出来的」。
@@ -997,7 +1006,7 @@ class TestRebuildPool(_Fixture):
 
         self.assertEqual(summary["unclassified"], [self.gamma.id])
         cells = pool_rebuild.current_cells()
-        for regime in BaseRegime:
+        for regime in CYCLE_CELLS:
             with self.subTest(regime=regime.value):
                 row = cells[(self.gamma.id, regime.value)]
                 self.assertEqual(row["source"], POOL_SOURCE_ARCHETYPE)
@@ -1116,7 +1125,7 @@ class TestRebuildPool(_Fixture):
         """从「什么都没有」变成一整代结论，那确实每一格都变了。"""
         summary = pool_rebuild.rebuild_pool()
 
-        self.assertEqual(summary["cells_changed"], 8)
+        self.assertEqual(summary["cells_changed"], 6)
 
     def test_new_cells_count_as_changes(self):
         pool_rebuild.rebuild_pool()
@@ -1124,9 +1133,9 @@ class TestRebuildPool(_Fixture):
 
         summary = pool_rebuild.rebuild_pool()
 
-        self.assertEqual(summary["cells_changed"], 4)
+        self.assertEqual(summary["cells_changed"], 3)
         generation = RegimePoolRebuild.objects.get(pk=summary["rebuild_id"])
-        self.assertEqual(generation.cells_changed, 4)
+        self.assertEqual(generation.cells_changed, 3)
 
     def test_an_exclusion_only_round_changes_nothing(self):
         """新增一个没切过片的回测会换指纹、会重算，但一个格子都不该动。"""
@@ -1162,7 +1171,7 @@ class TestRebuildPool(_Fixture):
                 pool_rebuild.rebuild_pool()
 
         generation = RegimePoolRebuild.objects.get()
-        self.assertEqual(RegimePoolCell.objects.filter(rebuild=generation).count(), 8)
+        self.assertEqual(RegimePoolCell.objects.filter(rebuild=generation).count(), 6)
 
     def test_a_failed_generation_never_becomes_current(self):
         with patch.object(
@@ -1214,7 +1223,7 @@ class TestRebuildPool(_Fixture):
             summary = pool_rebuild.rebuild_pool()
 
         self.assertEqual(
-            RegimePoolCell.objects.filter(rebuild_id=summary["rebuild_id"]).count(), 8
+            RegimePoolCell.objects.filter(rebuild_id=summary["rebuild_id"]).count(), 6
         )
         self.assertEqual(len(pool_rebuild.current_cells()), 0)
 

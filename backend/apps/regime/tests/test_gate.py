@@ -24,14 +24,23 @@
    `halt_sync._rewrite` 每 300 秒看见一次变化，于是 `opened_notified_at` 被反复清空、
    用户被反复通知同一条窗口开启（Q4）。
 5. **Shadow 档不声明、也不写 status**，但活行照样解除（Q3）。
-6. **三种「什么都不动」各有各的理由**：冷启动与状态过期（`deactivation.BLOCKED_*`）是
+6. **四种「什么都不动」各有各的理由**：冷启动与状态过期（`deactivation.BLOCKED_*`）是
    「说不清现在是什么阶段」；保命档（高波动）是**说得清、而这一层不该动手**——它要是落进
    逐行判定，每一行都会被判成「阶段离开」而解除，而那是假话（高波动是叠加层，不是离开了
-   原阶段，CONTEXT.md 第 115 条）。三者共同的一点：**都不是「按空集解除」**。
+   原阶段，CONTEXT.md 第 115 条）；判不出方向（`situation.cell is None`，`unclear` 或
+   旧行没有 `cycle`）是**说得清、但没有可问的那一列**（#66）。四者共同的一点：
+   **都不是「按空集解除」**。
 7. **五个解除原因码**互不重复、取值不飘，且有一处**故意的短码重名**（`regime_left`）：
    它只有在 `halt_notify` 按触发源路由时才是安全的。
 8. **给用户看的那两句话自带主语**：`label` 进下单拒绝理由与 `query_halt`，`reason` 进
    通知正文；正文里没有 `label`，所以策略名必须出现在 `reason` 里（Q10）。
+
+## 两个键，不是一个
+
+决策行上的 `regime`、以及 `Situation.cell`，自 #66 起都是 **cycle 格子键**
+（`bull`/`bear`/`sideways`）。`Situation.regime` 仍是四档**生效阶段**——保命档判据与
+展示口径读它。拿四档去比格子（或反过来）的后果是**每一行都不相等**，于是所有声明被解除：
+一次换轴变成一次静默放开。
 """
 
 from __future__ import annotations
@@ -44,10 +53,14 @@ from apps.regime import deactivation as dea
 from apps.regime import gate as g
 from apps.regime import halt_sync
 from apps.regime.models import DecisionStatus, HaltTrigger
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_DISPLAY, BaseRegime, Cycle
 
+#: 四档生效阶段：`Situation.regime` 与保命档判据读它。
 DOWNTREND = BaseRegime.DOWNTREND.value
-UPTREND = BaseRegime.UPTREND.value
+
+#: 格子键（cycle 三格）：决策行上、以及 `Situation.cell` 读它。
+BULL = Cycle.BULL.value
+BEAR = Cycle.BEAR.value
 
 DAY0 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 
@@ -64,13 +77,16 @@ def at(days: int = 0, hours: int = 0) -> datetime:
 def row(
     strategy_id: int,
     *,
-    regime: str = DOWNTREND,
+    regime: str = BEAR,
     status: str = g.STATUS_SUGGESTED,
     warrant: str = g.STILL_TARGET,
     name: str = "",
     cell_reason: str = "",
 ) -> g.DecisionRef:
-    """一条决策行的字面量。`decision_id` 只为回写定位，用可读的假值就够了。"""
+    """一条决策行的字面量。`decision_id` 只为回写定位，用可读的假值就够了。
+
+    `regime` 是**格子键**（cycle 三格）：自 #66 起决策行存的就是它。
+    """
     return g.DecisionRef(
         decision_id=f"d-{strategy_id}",
         strategy_id=strategy_id,
@@ -86,14 +102,18 @@ def situation(
     *,
     gate_open: bool = True,
     regime: str | None = DOWNTREND,
+    cell: str | None = BEAR,
     blocked: str = "",
     exemptions: dict | None = None,
     switch_at: datetime | None = at(),
     regime_effective_at: datetime | None = at(),
     generation_at: datetime | None = at(),
 ) -> g.Situation:
-    """这一轮的世界状态。默认是一轮**最普通**的：开关开着、阶段是下行趋势、
+    """这一轮的世界状态。默认是一轮**最普通**的：开关开着、阶段是下行趋势（`bear` 那一格）、
     三个时刻都落在 `DAY0`（于是 `opened_at` 的期望值一眼可读）。
+
+    `regime` 与 `cell` 是**两个轴**：前者是四档生效阶段（保命档判据读它），后者是 cycle
+    格子键（逐行比较读它）。默认组合 `downtrend + bear` 是最常见的正常状态。
 
     默认值是 `at()` 而**不是** `None`：`None` 在 `Situation` 里是有意义的值
     （「这一项取不到」），所以这里不能拿它当「没传」。要表达「取不到」就显式传 `None`。
@@ -102,6 +122,7 @@ def situation(
         gate_open=gate_open,
         switch_at=switch_at,
         regime=regime,
+        cell=cell,
         regime_effective_at=regime_effective_at,
         generation_at=generation_at,
         exemptions=exemptions or {},
@@ -215,8 +236,9 @@ class TestWhatEarnsADeclaration(SimpleTestCase):
             [(g.STATUS_APPLIED, g.STATUS_RELEASED)],
         )
 
-    def test_a_row_from_another_regime_is_not_declared(self):
-        plan = derive([row(1, regime=UPTREND, status=g.STATUS_APPLIED)])
+    def test_a_row_from_another_cell_is_not_declared(self):
+        """行上的格子不是当前那一格 → 它还算不算建议都没意义了，按 `regime_left` 收回。"""
+        plan = derive([row(1, regime=BULL, status=g.STATUS_APPLIED)])
 
         self.assertEqual(plan.declarations, ())
         self.assertEqual(plan.close_reasons, {1: g.CLOSE_REGIME_LEFT})
@@ -275,13 +297,13 @@ class TestWhatEarnsADeclaration(SimpleTestCase):
 
 
 class TestWhichReasonWins(SimpleTestCase):
-    """顺序不是随手排的：阶段 → 豁免 → 判据/归属。混在一处比对会让用户看到
-    「重新适配」而其实是阶段换了。"""
+    """顺序不是随手排的：格子 → 豁免 → 判据/归属。混在一处比对会让用户看到
+    「重新适配」而其实是格子换了。"""
 
-    def test_the_regime_beats_everything(self):
+    def test_the_cell_beats_everything(self):
         豁免 = {1: g.Exemption(in_force=True, ends_at=at(days=3))}
         plan = derive(
-            [row(1, regime=UPTREND, warrant=g.GONE, status=g.STATUS_APPLIED)],
+            [row(1, regime=BULL, warrant=g.GONE, status=g.STATUS_APPLIED)],
             exemptions=豁免,
         )
 
@@ -304,20 +326,20 @@ class TestWhichReasonWins(SimpleTestCase):
 
 
 class TestNeverTouchedRowsKeepTheirStatus(SimpleTestCase):
-    def test_a_suggested_row_in_another_regime_is_not_marked_released(self):
+    def test_a_suggested_row_in_another_cell_is_not_marked_released(self):
         """它只能来自机制没写 status 的那段时间（Shadow 档），而「机制解除过它」是
         假话。它同时还在 `replay_run` 的重放集合里（`exclude(status=RELEASED)`），
         那是它该待的地方：一条没人认领的**建议**值得复核。
         """
-        plan = derive([row(1, regime=UPTREND, status=g.STATUS_SUGGESTED)])
+        plan = derive([row(1, regime=BULL, status=g.STATUS_SUGGESTED)])
 
         self.assertEqual(plan.close_reasons, {1: g.CLOSE_REGIME_LEFT})
         self.assertEqual(plan.statuses, ())
 
-    def test_an_applied_row_in_another_regime_is_marked_released(self):
+    def test_an_applied_row_in_another_cell_is_marked_released(self):
         """机制**碰过**的那一条（`applied`）必须收回——那正是「它当时在拦」这条
         记录的正确收场。"""
-        plan = derive([row(1, regime=UPTREND, status=g.STATUS_APPLIED)])
+        plan = derive([row(1, regime=BULL, status=g.STATUS_APPLIED)])
 
         self.assertEqual(
             [(w.status, w.old_status) for w in plan.statuses],
@@ -329,18 +351,18 @@ class TestNeverTouchedRowsKeepTheirStatus(SimpleTestCase):
         「不写」是这一格的默认，任何一条别的判据都不该把它翻过来。"""
         exemptions = {1: g.Exemption(in_force=True, ends_at=at(days=3))}
         plan = derive(
-            [row(1, regime=UPTREND, status=g.STATUS_SUGGESTED)], exemptions=exemptions
+            [row(1, regime=BULL, status=g.STATUS_SUGGESTED)], exemptions=exemptions
         )
 
         self.assertEqual(plan.statuses, ())
 
-    def test_a_suggested_row_in_the_current_regime_is_also_left_alone(self):
-        """**同一格里最省事的那条路**：阶段对上、判据仍成立，只有豁免在期把它按住。
+    def test_a_suggested_row_in_the_current_cell_is_also_left_alone(self):
+        """**同一格里最省事的那条路**：格子对上、判据仍成立，只有豁免在期把它按住。
 
-        它比上一条更容易写成假历史——「阶段对不上」那半个条件在上一条里顺手替我们挡住
+        它比上一条更容易写成假历史——「格子对不上」那半个条件在上一条里顺手替我们挡住
         了写回，这里没有东西挡：`_close_reason` 给的是 `exempted`，目标值是 `released`，
         而这一行从没被机制施加过（`applied` 是机制写的，它还是 `suggested`）。于是判据
-        必须是「目标值是 `released` 且旧值是 `suggested`」**而不是**「阶段对不上」——
+        必须是「目标值是 `released` 且旧值是 `suggested`」**而不是**「格子对不上」——
         否则用户一按豁免，那条从没生效过的建议就被记成「机制解除过它」。
         """
         exemptions = {1: g.Exemption(in_force=True, ends_at=at(days=3))}
@@ -437,7 +459,7 @@ class TestTheShadowBranch(SimpleTestCase):
     def test_scenario_produces_reasons_but_no_declarations_and_no_status_writes(self):
         rows = [
             row(1, status=g.STATUS_APPLIED),
-            row(2, regime=UPTREND, status=g.STATUS_APPLIED),
+            row(2, regime=BULL, status=g.STATUS_APPLIED),
             row(3, status=g.STATUS_SUGGESTED),
         ]
         plan = derive(rows, gate_open=False)
@@ -475,7 +497,7 @@ class TestBlockedAndColdStartTouchNothing(SimpleTestCase):
 
     def test_a_cold_start_derives_nothing_at_all(self):
         plan = derive(
-            [row(1), row(2, regime=UPTREND, status=g.STATUS_APPLIED)], regime=None
+            [row(1), row(2, regime=BULL, status=g.STATUS_APPLIED)], regime=None
         )
 
         self.assertEqual(plan.declarations, ())
@@ -510,17 +532,17 @@ class TestBlockedAndColdStartTouchNothing(SimpleTestCase):
 class TestTheBlanketTier(SimpleTestCase):
     """保命档（高波动）期间声明与解除**两样都不做**。
 
-    高波动是**叠加层**而不是「离开了原阶段」，而逐行判定的尺子是 `regime == 当前阶段`
-    ——高波动一抬上来，每一行都会被判成「阶段离开」：活行被解除、决策行被翻成 `released`。
-    那是假话，而解除不可逆（`CONTEXT.md` 第 115 条；取向与 `deactivation_run
-    .close_left_regime_exemptions` 的第三条停手同构）。保命档那一层自己有全场作用域的
-    声明，所以这一层无事可做。
+    高波动是**叠加层**而不是「离开了原阶段」，而逐行判定的尺子是 `row.regime ==
+    situation.cell`——保命档期间 `cell` 仍可能是一个正常方向键，逐行判下去会按那个方向
+    声明或解除：活行被解除、决策行被翻成 `released`。那是假话，而解除不可逆
+    （`CONTEXT.md` 第 115 条；取向与 `deactivation_run.close_left_regime_exemptions` 的
+    第三条停手同构）。保命档那一层自己有全场作用域的声明，所以这一层无事可做。
     """
 
     def test_a_blanket_regime_touches_nothing_at_all(self):
         rows = [
             row(1, status=g.STATUS_APPLIED),
-            row(2, regime=UPTREND, status=g.STATUS_APPLIED),
+            row(2, regime=BULL, status=g.STATUS_APPLIED),
             row(3, status=g.STATUS_SUGGESTED),
         ]
         plan = derive(rows, regime=BaseRegime.HIGH_VOL.value)
@@ -572,12 +594,57 @@ class TestTheBlanketTier(SimpleTestCase):
         self.assertIn(dea.BLOCKED_DISPLAY[dea.BLOCKED_STALE_STATE], plan.note)
 
     def test_the_blanket_code_is_not_one_of_the_cannot_tell_codes(self):
-        """四个码共用 `Confirmation.skipped` 那一格，而页面按码分岔说不同的话：
+        """几个码共用 `Confirmation.skipped` 那一格，而页面按码分岔说不同的话：
         重字的表现是「保命档被报成一次取数故障」，用户会去查一个不存在的故障。
+
+        `BLOCKED_NO_CELL` 也必须与保命档分开：前者是「这一列不存在」，后者是「这一层
+        不该动手」，两者的用户动作不同（等下一轮判定 vs 什么都不用做）。
         """
         self.assertNotIn(
-            g.BLOCKED_BLANKET, (dea.BLOCKED_COLD_START, dea.BLOCKED_STALE_STATE)
+            g.BLOCKED_BLANKET,
+            (
+                dea.BLOCKED_COLD_START,
+                dea.BLOCKED_STALE_STATE,
+                dea.BLOCKED_NO_CELL,
+            ),
         )
+
+
+class TestADirectionGap(SimpleTestCase):
+    """判不出方向（`situation.cell is None`）：有阶段、但没有可问的那一列。
+
+    这是 #66 才出现的第四种「什么都不动」。它与冷启动（`regime is None`）是两件事：
+    冷启动连阶段都没有，这里「有阶段、但这一列没有方向」（`unclear` / 旧行 `cycle` 为空）。
+    收场相同（什么都不动），写给人看的那句话不同。
+    """
+
+    def test_a_state_without_a_direction_touches_nothing_at_all(self):
+        rows = [
+            row(1, status=g.STATUS_APPLIED),
+            # 与「当前格子」对不上的行：若逐行判下去，它会按 `regime_left` 被解除。
+            row(2, regime=BULL, status=g.STATUS_APPLIED),
+            row(3, status=g.STATUS_SUGGESTED),
+        ]
+        plan = derive(rows, cell=None)
+
+        self.assertEqual(plan.declarations, ())
+        self.assertEqual(plan.statuses, ())
+        self.assertEqual(plan.close_reasons, {})
+        self.assertEqual(plan.blocked, dea.BLOCKED_NO_CELL)
+        self.assertIn(dea.BLOCKED_DISPLAY[dea.BLOCKED_NO_CELL], plan.note)
+
+    def test_the_direction_gap_beats_the_row_by_row_verdict(self):
+        """一行「格子对、判据仍成立」本该被声明——没有格子可比时它原样留着。"""
+        plan = derive([row(1, status=g.STATUS_APPLIED)], cell=None)
+
+        self.assertNotEqual(plan.blocked, "")
+        self.assertEqual(plan.declarations, ())
+
+    def test_a_cold_start_still_reports_cold_start_not_a_direction_gap(self):
+        """两者都为 `None` 时先报冷启动：连阶段都没有，谈不上「判不出方向」。"""
+        plan = g.derive(situation(regime=None, cell=None), [row(1)])
+
+        self.assertEqual(plan.blocked, dea.BLOCKED_COLD_START)
 
 
 # --------------------------------------------------------------------------- #
@@ -600,12 +667,16 @@ class TestWhatTheUserSees(SimpleTestCase):
 
     def test_the_reason_carries_the_subject_because_the_body_does_not(self):
         """通知正文只打触发源、作用域与 `reason`（Q10 的核查），读的人手上只有一行
-        「作用域 策略 <uuid>」——所以策略名与阶段名只能出现在这句话里。"""
+        「作用域 策略 <uuid>」——所以策略名与**方向名**只能出现在这句话里。
+
+        方向名取的是**格子那一格**（`bear` → 下行周期），不是生效阶段（#66）：这句话
+        回答的是「它在哪个方向上不适用」，而那是格子的维度。
+        """
         plan = derive([row(1, name="趋势跟踪", cell_reason="下行趋势表现不佳")])
         reason = plan.declarations[0].reason
 
         self.assertIn("趋势跟踪", reason)
-        self.assertIn("下行趋势", reason)
+        self.assertIn(CYCLE_DISPLAY[BEAR], reason)
         self.assertIn("下行趋势表现不佳", reason)
         self.assertIn("减仓放行", reason)
 
@@ -615,6 +686,13 @@ class TestWhatTheUserSees(SimpleTestCase):
         self.assertEqual(g._regime_display("meltdown"), "meltdown")
         self.assertEqual(g._regime_display(None), "（无）")
         self.assertEqual(g._regime_display(DOWNTREND), "下行趋势")
+
+    def test_a_cell_is_shown_by_its_cycle_name_not_parsed_as_a_four_tier_regime(self):
+        """格子键与四档不是同一个词表：`bear` 若走 `BaseRegime(...)` 会抛，而它其实
+        是一个完全正常的格子键。取不到时也不猜，原样说出来。"""
+        self.assertEqual(g._cell_display(BEAR), CYCLE_DISPLAY[BEAR])
+        self.assertEqual(g._cell_display("meltdown"), "meltdown")
+        self.assertEqual(g._cell_display(None), "（无方向）")
 
     def test_the_shadow_note_says_both_halves(self):
         """Shadow 的一轮要说清两件事：不拦了，而且决策行的状态一个字没写——

@@ -165,7 +165,7 @@ from apps.regime import (
     truth_run,
 )
 from apps.regime.models import ActorKind, MechanismMode
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_CELLS, BaseRegime
 
 from .base import AgentMessage, AgentResult
 
@@ -480,12 +480,18 @@ def _exempt_usage() -> str:
 
 
 def _regime_of(text: str) -> str:
-    """阶段那一项：认 slug，也认中文名（`/regime exempt grant 甲策略 下行趋势`）。
+    """格子那一项：认 slug，也认中文名（`/regime exempt grant 甲策略 下行周期`）。
 
     中文名**只在这一层**翻成 slug（`resolve_regime` 收的是 slug，认不出的会拒绝）：在共享
-    层再加一张中文表，就是给「阶段叫什么」造第二套答案，而终端那边只认 slug。
+    层再加一张中文表，就是给「格子叫什么」造第二套答案，而终端那边只认 slug。
+
+    **两套词表都认**（#66）：新口径是 cycle 三格（`下行周期`），换轴之前的手感是四档
+    （`下行趋势`）。只认四档会让用户按页面上的新词打命令时被当成「认不出的格子」。
     """
     wanted = (text or "").strip()
+    for cell in CYCLE_CELLS:
+        if wanted == cell.display:
+            return cell.value
     for member in BaseRegime:
         if wanted == member.display:
             return member.value
@@ -533,7 +539,7 @@ def _exempt_grant(args: list[str], actor: str, now: datetime) -> str:
     if choice.taken_from_current:
         # 「取的是当前生效阶段」必须打出来，否则一条取来的阶段会被当成人的决定。
         lines.append(
-            f"未给阶段，取当前生效阶段：{deactivation_run.regime_display(choice.regime)}"
+            f"未给格子，取当前格子：{deactivation_run.regime_display(choice.regime)}"
             f"（自 {choice.effective_at:%Y-%m-%d %H:%M} 生效）"
         )
     lines.append(deactivation_run.grant_summary(outcome))

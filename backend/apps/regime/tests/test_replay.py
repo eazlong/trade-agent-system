@@ -5,20 +5,20 @@
 
 九条性质，每一条坏了都不报警、只出错的话：
 
-1. **收敛是三档，不是五档**：池化的五个状态落进 `ReviewVerdict` 的三档，靠的是
+1. **收敛是三档，不是四档**：池化的四个状态落进 `ReviewVerdict` 的三档，靠的是
    `deactivation.VERDICT_OF_STATE` 这一份现成的表——不在这里另抄一份状态字面量表，
    两处迟早会漂。
-2. **`fit` 是唯一会惊动人的那一档**，其余（中性 / 没结论 / 保命档 / **那一格没了**）
-   一律落到「没事」。反过来把「说不出来」落成「依据失效」，会让一次全表重算之后的
-   每一格都变成告警。
+2. **`fit` 是唯一会惊动人的那一档**，其余（中性 / 没结论 / **那一格没了**，以及旧载荷
+   里那个已经不再产出的 `blanket`）一律落到「没事」。反过来把「说不出来」落成「依据
+   失效」，会让一次全表重算之后的每一格都变成告警。
 3. **认不出来的状态取值走 `UNKNOWN`**，绝不可能是 `FIT`——与 `deactivation._verdict`
    同一个 fail-safe 方向：认不出来就什么都不说，既不说该停、也不说可以跑。
-4. **词表恰好盖满，且 `unfit` 是被特殊照顾的那一格**：`VERDICT_OF_STATE` 只有四个键，
+4. **词表恰好盖满，且 `unfit` 是被特殊照顾的那一格**：`VERDICT_OF_STATE` 只有三个键，
    **`unfit` 不在里面**——在 `deactivation._verdict` 里它走的是另一条路（`TARGET`／
    `NEEDS_REVIEW`，取决于冲突标记），所以它压根不是「一个状态对应一个结论」。
    `replay.review_verdict` 因此必须把 `unfit` 分支排在查表**之前**。两侧合起来
-   （`set(VERDICT_OF_STATE) | {STATE_UNFIT}`）才等于 `slice` 的五个 `STATE_*`，
-   测试把这条并集关系钉住，于是词表漂移在编译期之外还有一道拦截。
+   （`set(VERDICT_OF_STATE) | {STATE_UNFIT}`）才等于 `slice` 的**新**状态集合
+   `STATE_VALUES`，测试把这条并集关系钉住，于是词表漂移在编译期之外还有一道拦截。
 5. **`needs_review` 不改结论**：方向冲突的格子说的是「依据要人看一眼」，不是「变成
    适用了」。它如实记进证据、如实带进日报，但**不是第四档结论**。
 6. **顺序稳定**：结论要进日报与告警，顺序不稳会让「今天和昨天有什么不同」多出一堆
@@ -28,6 +28,11 @@
 8. **三档的计数键恒存在**（0 也留着），与 `pool_rebuild.EXCLUSION_KEYS` 同一条纪律。
 9. **告警只描述、不含动作**：CONTEXT.md 明令不自动恢复，所以那句话里必须出现「不会
    自动恢复」，并把出口（人工豁免）指出来——否则收到告警的人唯一能做的就是来问。
+
+#66 之后决策行上的键是**两种世代并存**的：存量行还写着四档（`downtrend` 之类），新
+写入的是 cycle 格子键。换算是 `models.legacy_cell_regime` 的职责，本文件钉住的是
+「查格子之前必须先换算」——不换算的话那批决策会一律落成「那一格没了」→ `STILL_NEUTRAL`，
+而它们在新口径下可能仍然成立。
 
 纯逻辑，一律 `SimpleTestCase`。`strategy_id` 在这里只用小整数：这一层把它当**不透明的
 键**（比较、原样带出去），不解析也不拼接——与 `deactivation.py` 同一条约定。
@@ -44,10 +49,16 @@ from apps.regime import replay
 from apps.regime import slice as sl
 from apps.regime.models import ReviewVerdict
 from apps.regime.pool import POOL_SOURCE_ARCHETYPE, POOL_SOURCE_STRATEGY
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_DISPLAY, BaseRegime, Cycle
 
+#: 四档生效阶段：决策行上的**旧**键。存量行仍在用，也让告警的展示名有源可查。
 DOWNTREND = BaseRegime.DOWNTREND.value
 UPTREND = BaseRegime.UPTREND.value
+HIGH_VOL = BaseRegime.HIGH_VOL.value
+
+#: 格子键（cycle 三格）：新代池化表与决策行上的**新**键。
+BULL = Cycle.BULL.value
+BEAR = Cycle.BEAR.value
 
 #: `slice` 的四个状态取值。词表覆盖全靠它，所以从这里取而不是从 `pool` 抄一遍。
 ALL_STATES = (
@@ -55,7 +66,6 @@ ALL_STATES = (
     sl.STATE_UNFIT,
     sl.STATE_NEUTRAL,
     sl.STATE_UNKNOWN,
-    sl.STATE_BLANKET,
 )
 
 
@@ -70,7 +80,7 @@ def row(
     """`pool_rebuild.current_cells()` 里那一行的形状。"""
     return {
         "strategy_id": 1,
-        "regime": DOWNTREND,
+        "regime": BEAR,
         "source": source,
         "state": state,
         "reason": reason,
@@ -80,7 +90,7 @@ def row(
 
 
 def ref(
-    decision_id: int, strategy_id: int = 1, regime: str = DOWNTREND
+    decision_id: int, strategy_id: int = 1, regime: str = BEAR
 ) -> replay.DecisionRef:
     return replay.DecisionRef(id=decision_id, strategy_id=strategy_id, regime=regime)
 
@@ -99,7 +109,12 @@ class TestReviewVerdict(SimpleTestCase):
             replay.review_verdict(row(sl.STATE_FIT)), ReviewVerdict.BECAME_FIT.value
         )
 
-    def test_neutral_unknown_and_blanket_are_all_still_neutral(self):
+    def test_neutral_unknown_and_a_legacy_blanket_are_all_still_neutral(self):
+        """`blanket` 是旧载荷里的取值（#66 之后池化不再产出它），但存量行仍在。
+
+        它不在 `VERDICT_OF_STATE` 里，于是走 `.get(state, UNKNOWN)` 兜底 → 中性。方向
+        是对的：一条「保命档」的字面量不构成「依据失效」，不该惊动人。
+        """
         for state in (sl.STATE_NEUTRAL, sl.STATE_UNKNOWN, sl.STATE_BLANKET):
             with self.subTest(state=state):
                 self.assertEqual(
@@ -138,13 +153,14 @@ class TestReviewVerdict(SimpleTestCase):
         self.assertEqual(from_unfit, {dea.TARGET, dea.NEEDS_REVIEW})
 
     def test_table_plus_unfit_covers_every_slice_state(self):
-        """性质 4b：两侧合起来才盖满 `slice` 的五个状态。少一个键，那个状态就会走
-        fail-safe（`UNKNOWN`）而不是被判定——安静地少判一格，而不是报错。"""
+        """性质 4b：两侧合起来才盖满 `slice` 的**新**状态集合。少一个键，那个状态就会
+        走 fail-safe（`UNKNOWN`）而不是被判定——安静地少判一格，而不是报错。"""
+        self.assertEqual(set(ALL_STATES), set(sl.STATE_VALUES))
         self.assertEqual(set(dea.VERDICT_OF_STATE) | {sl.STATE_UNFIT}, set(ALL_STATES))
         self.assertFalse(set(dea.VERDICT_OF_STATE) & {sl.STATE_UNFIT})
 
     def test_every_state_lands_in_the_three_tier_table(self):
-        """五个状态逐个走一遍：都必须落进三档，且只有 `fit` 会惊动人。"""
+        """四个状态逐个走一遍：都必须落进三档，且只有 `fit` 会惊动人。"""
         for state in ALL_STATES:
             with self.subTest(state=state):
                 verdict = replay.review_verdict(row(state))
@@ -181,7 +197,7 @@ class TestPlanReviews(SimpleTestCase):
     def test_carries_the_cell_values_verbatim(self):
         """报告要照抄池化的话，所以 `state`/`reason`/`source`/`cell` 都必须原样带出来。"""
         cells = {
-            (1, DOWNTREND): row(
+            (1, BEAR): row(
                 sl.STATE_UNFIT,
                 reason="archetype_fallback",
                 source=POOL_SOURCE_ARCHETYPE,
@@ -206,25 +222,49 @@ class TestPlanReviews(SimpleTestCase):
         self.assertFalse(review.needs_review)
         self.assertEqual(dict(review.cell), {})
 
-    def test_reads_the_cell_of_the_decisions_own_regime(self):
-        """重放问的是**那条决策记的那个阶段**那一格，与传入的其它列无关。"""
+    def test_reads_the_cell_of_the_decisions_own_cell(self):
+        """重放问的是**那条决策记的那个格子**，与传入的其它格无关。"""
         cells = {
-            (1, DOWNTREND): row(sl.STATE_UNFIT),
-            (1, UPTREND): {**row(sl.STATE_FIT), "regime": UPTREND},
+            (1, BEAR): row(sl.STATE_UNFIT),
+            (1, BULL): {**row(sl.STATE_FIT), "regime": BULL},
         }
-        (review,) = replay.plan_reviews([ref(11, regime=DOWNTREND)], cells)
-        # 若错取了上涨段那一格，结论会变成 `BECAME_FIT`——那正是这条要拦住的错。
+        (review,) = replay.plan_reviews([ref(11, regime=BEAR)], cells)
+        # 若错取了上涨周期那一格，结论会变成 `BECAME_FIT`——那正是这条要拦住的错。
         self.assertEqual(review.verdict, ReviewVerdict.STILL_UNFIT.value)
+
+    def test_a_legacy_four_tier_decision_is_converted_before_the_lookup(self):
+        """存量决策行上写的是四档（`downtrend`）：查格子前必须先换算成 `bear`。
+
+        直接拿 `downtrend` 去新代里查会落「那一格没了」→ `STILL_NEUTRAL`，而这条决策
+        在新口径下其实**仍然成立**。这是本次换轴最容易被忽略、后果又最安静的一处：
+        结论从「仍不适用」变成了「没事」，且没有任何报错。
+        """
+        cells = {(1, BEAR): row(sl.STATE_UNFIT)}
+        (review,) = replay.plan_reviews([ref(11, regime=DOWNTREND)], cells)
+        self.assertEqual(review.verdict, ReviewVerdict.STILL_UNFIT.value)
+        # 记录上留的是**决策原本**的键，不是换算后的：那条决策记的是什么要可查。
+        self.assertEqual(review.regime, DOWNTREND)
+
+    def test_a_high_vol_decision_has_no_cell_to_read(self):
+        """`high_vol` 刻意不映射：那天没有任何方向结论，它不构成任何一个格子。
+
+        即使当下 `bear` 那一格判为适用，也不能把「保命档那天」的决策读成「依据失效」——
+        那是把两件不相干的事接上了。
+        """
+        cells = {(1, BEAR): row(sl.STATE_FIT)}
+        (review,) = replay.plan_reviews([ref(11, regime=HIGH_VOL)], cells)
+        self.assertEqual(review.verdict, ReviewVerdict.STILL_NEUTRAL.value)
+        self.assertFalse(review.invalidated)
 
     def test_order_is_stable_and_independent_of_input_order(self):
         """性质 6：同一批输入换一个传入顺序，产出顺序必须逐条相同。"""
         cells = {
-            (1, DOWNTREND): row(sl.STATE_FIT),
-            (2, DOWNTREND): row(sl.STATE_UNFIT),
-            (2, UPTREND): row(sl.STATE_NEUTRAL),
+            (1, BEAR): row(sl.STATE_FIT),
+            (2, BEAR): row(sl.STATE_UNFIT),
+            (2, BULL): row(sl.STATE_NEUTRAL),
         }
         decisions = [
-            ref(3, strategy_id=2, regime=UPTREND),
+            ref(3, strategy_id=2, regime=BULL),
             ref(1, strategy_id=1),
             ref(2, strategy_id=2),
         ]
@@ -233,18 +273,18 @@ class TestPlanReviews(SimpleTestCase):
         self.assertEqual(forward, backward)
         self.assertEqual(
             [(r.strategy_id, r.regime) for r in forward],
-            [(1, DOWNTREND), (2, DOWNTREND), (2, UPTREND)],
+            [(1, BEAR), (2, BEAR), (2, BULL)],
         )
 
     def test_first_replay_counts_as_changed(self):
         """性质 7：从没重放过（`None`）→ 说了话，就是一条新信息。"""
-        cells = {(1, DOWNTREND): row(sl.STATE_UNFIT)}
+        cells = {(1, BEAR): row(sl.STATE_UNFIT)}
         (review,) = replay.plan_reviews([ref(11)], cells)
         self.assertIsNone(review.previous_verdict)
         self.assertTrue(review.changed)
 
     def test_unchanged_verdict_is_not_changed(self):
-        cells = {(1, DOWNTREND): row(sl.STATE_UNFIT)}
+        cells = {(1, BEAR): row(sl.STATE_UNFIT)}
         (review,) = replay.plan_reviews(
             [ref(11)], cells, previous={11: ReviewVerdict.STILL_UNFIT.value}
         )
@@ -252,12 +292,10 @@ class TestPlanReviews(SimpleTestCase):
         self.assertFalse(review.changed)
 
     def test_invalidated_is_exactly_the_became_fit_tier(self):
-        cells = {(1, DOWNTREND): row(sl.STATE_FIT)}
+        cells = {(1, BEAR): row(sl.STATE_FIT)}
         (review,) = replay.plan_reviews([ref(11)], cells)
         self.assertTrue(review.invalidated)
-        unchanged = replay.plan_reviews(
-            [ref(11)], {(1, DOWNTREND): row(sl.STATE_UNFIT)}
-        )
+        unchanged = replay.plan_reviews([ref(11)], {(1, BEAR): row(sl.STATE_UNFIT)})
         self.assertFalse(unchanged[0].invalidated)
 
 
@@ -277,9 +315,9 @@ class TestCountVerdicts(SimpleTestCase):
 
     def test_counts_each_tier(self):
         cells = {
-            (1, DOWNTREND): row(sl.STATE_FIT),
-            (2, DOWNTREND): row(sl.STATE_UNFIT),
-            (3, DOWNTREND): row(sl.STATE_NEUTRAL),
+            (1, BEAR): row(sl.STATE_FIT),
+            (2, BEAR): row(sl.STATE_UNFIT),
+            (3, BEAR): row(sl.STATE_NEUTRAL),
         }
         decisions = [ref(1, 1), ref(2, 2), ref(3, 3)]
         counts = replay.count_verdicts(replay.plan_reviews(decisions, cells))
@@ -310,6 +348,17 @@ class TestFormatAlert(SimpleTestCase):
         self.assertIn(BaseRegime(DOWNTREND).display, message)
         self.assertNotIn(DOWNTREND, message)
 
+    def test_a_cell_key_is_rendered_in_chinese_too(self):
+        """告警里的格子也可能是 cycle 键——#66 之后写下的决策存的就是它。
+
+        `Review.regime` 原样带决策行存的那个值：存量行是四档，新行是格子键，于是
+        展示层必须两个词表都读得懂。只认四档时，一条新决策的告警会在投递那一刻抛
+        `ValueError`，而命令只会把它记成「投递异常」——人以为没告警，实际是坏告警。
+        """
+        message = replay.format_alert([{"strategy_id": "a", "regime": BEAR}])
+        self.assertIn(CYCLE_DISPLAY[BEAR], message)
+        self.assertNotIn(BEAR, message)
+
     def test_falls_back_to_the_id_when_there_is_no_name(self):
         message = replay.format_alert([{"strategy_id": "abc", "regime": DOWNTREND}])
         self.assertIn("abc", message)
@@ -329,7 +378,7 @@ class TestSerialisable(SimpleTestCase):
     """`plan_reviews` 的产出原样进日报，所以它必须能被当成普通数据搬运。"""
 
     def test_reviews_are_json_serialisable(self):
-        cells = {(1, DOWNTREND): row(sl.STATE_FIT, evidence={"trades": 3})}
+        cells = {(1, BEAR): row(sl.STATE_FIT, evidence={"trades": 3})}
         planned = replay.plan_reviews([ref(11)], cells)
         import dataclasses
 

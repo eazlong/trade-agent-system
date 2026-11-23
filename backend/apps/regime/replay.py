@@ -21,13 +21,18 @@ CONTEXT.md 第 118 条把这件事的两头都钉死了：**重算不自动恢�
 
 ## 三值词表：先收敛，再判
 
-`ReviewVerdict` 只有三档，池化的状态有五档，所以这里先收敛再判：
+`ReviewVerdict` 只有三档，池化的状态有四态（#66），所以这里先收敛再判：
 
-- `unfit` → `STILL_UNFIT`。新表仍判这条策略在这个阶段不适用，这条决策照样成立。
+- `unfit` → `STILL_UNFIT`。新表仍判这条策略在这个格子不适用，这条决策照样成立。
   `needs_review`（方向冲突）**不改变结论**：冲突说的是「依据要人看一眼」，不是「变成
   适用了」。它是如实记进证据、也如实带进日报的一个标记，不是第四档结论。
 - `fit` → `BECAME_FIT`。**唯一**会触发告知的那一档。
-- 其余（`neutral` / `unknown` / `blanket` / 那一格没了）→ `STILL_NEUTRAL`。
+- 其余（`neutral` / `unknown` / 那一格没了，以及旧载荷里的 `blanket`）→ `STILL_NEUTRAL`。
+
+**决策行上的键可能是旧四档**：换轴之前写下的决策存 `downtrend` 之类，迁移 0019 会映射
+一部分，但 `high_vol` 刻意不映射。查格子前先换算（`models.legacy_cell_regime`），与
+`gate_run._warrant` 用同一个函数——两处各写一份的话，一次换轴会让「重放说没事、gate
+说该停」同时出现在同一条决策上。
 
 收敛用的是 `deactivation.VERDICT_OF_STATE`（池化状态 → 逐策略结论的唯一出处），不在这里
 另抄一份状态字面量表。于是**认不出来的状态取值走的是 `UNKNOWN`**，落成 `STILL_NEUTRAL`，
@@ -48,8 +53,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from uuid import UUID
 
 from apps.regime import deactivation
-from apps.regime.models import ReviewVerdict
-from apps.regime.quant import BaseRegime
+from apps.regime.models import ReviewVerdict, cell_display, cell_keys_for
 from apps.regime.slice import STATE_UNFIT
 
 
@@ -101,6 +105,16 @@ class Review:
         return self.previous_verdict != self.verdict
 
 
+def _cell_name(cell: str) -> str:
+    """格子键 → 中文。**两套词表都认**（#66），实现收在 `models.cell_display`。
+
+    这里原本是 `BaseRegime(item["regime"]).display`，而决策行的 `regime` 自 #66 起存的是
+    **格子键**（`bear` 等）——`BaseRegime("bear")` 会抛 `ValueError`，于是一次「有建议
+    依据失效」的重算会让告警格式化本身炸掉，而告警恰恰是这个机制唯一会主动叫人的出口。
+    """
+    return cell_display(cell)
+
+
 def review_verdict(row: Mapping[str, Any] | None) -> str:
     """新表的一格 → 这次重放的结论。取不到那一格（`None`）算 `STILL_NEUTRAL`。
 
@@ -126,6 +140,7 @@ def plan_reviews(
     cells: Mapping[tuple[UUID, str], Mapping[str, Any]],
     *,
     previous: Mapping[int, str] | None = None,
+    generation_pool_version: int | None = None,
 ) -> tuple[Review, ...]:
     """逐条决策算出它的重放结论。**纯函数**：不读库、不写库、不看时钟。
 
@@ -140,7 +155,19 @@ def plan_reviews(
     previous = previous or {}
     planned: list[Review] = []
     for decision in sorted(decisions, key=lambda d: (str(d.strategy_id), d.regime)):
-        row = cells.get((decision.strategy_id, decision.regime))
+        # **决策行上的键可能仍是旧四档**（迁移 0019 之前写下的行，或 `high_vol` 那种刻意
+        # 不映射的）。直接拿它去新代里查会落「那一格没了」，重放于是判 STILL_NEUTRAL——
+        # 而那条决策在新口径下其实可能还成立。先换算成格子键再查，与 `gate_run._warrant`
+        # 用同一个换算函数：两处各写一份的话，「重放说没事、gate 说该停」会同时出现。
+        # 按**那一代的口径**给候选键（`cell_keys_for`）：换轴窗口里决策行与格子可能各用
+        # 一套键，只试一种会让重放把一条仍成立的决策报成「那一格没了」。与
+        # `gate_run._warrant` 用同一个函数——两处各写一份，「重放说没事、gate 说该停」
+        # 会同时出现在同一条决策上。
+        row = None
+        for cell_key in cell_keys_for(generation_pool_version, decision.regime):
+            row = cells.get((decision.strategy_id, cell_key))
+            if row is not None:
+                break
         planned.append(
             Review(
                 decision_id=decision.id,
@@ -186,7 +213,6 @@ def format_alert(
     lines = [head]
     for item in invalidated:
         who = item.get("name") or item.get("strategy_id")
-        regime = BaseRegime(item["regime"]).display
-        lines.append(f"· {who} @ {regime}")
+        lines.append(f"· {who} @ {_cell_name(item['regime'])}")
     lines.append("**不会自动恢复**：确认要放它跑，请用人工豁免命令。")
     return "\n".join(lines)

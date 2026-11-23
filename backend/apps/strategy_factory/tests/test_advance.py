@@ -1569,23 +1569,25 @@ class TestRegimeInjection:
         assert f"mechanism_mode={MechanismMode.SHADOW.value}" in text
 
     def test_exemptions_land_in_the_detail_as_readable_pairs(self, _oos_candidate):
-        """豁免的键是 (策略 id, 阶段)，落进 JSONField 前换成可读的字符串对。
+        """豁免的键是 (策略 id, 格子)，落进 JSONField 前换成可读的字符串对。
 
         原样落会把一对元组写成 Python repr，事后审计只能靠反推当初豁免了谁。
+        #66 之后那一维是**格子键**（cycle 三格），不是四档生效阶段。
         """
         strategy_id = _oos_candidate.strategy_id
         deps = self._deps(
             regime=lambda candidate: RegimeEvidence(
                 regime="downtrend",
+                cell_key="bear",
                 cell=RegimePoolCellEvidence(state="unfit"),
-                exemptions={(strategy_id, "downtrend"): "ex-1"},
+                exemptions={(strategy_id, "bear"): "ex-1"},
             )
         )
 
         out = advance(_oos_candidate, deps=deps)
 
         assert out.detail["exempt"] == [
-            {"strategy_id": str(strategy_id), "regime": "downtrend"}
+            {"strategy_id": str(strategy_id), "cell": "bear"}
         ]
 
     def test_real_orchestrator_clock_reaches_the_reader(self, _oos_candidate):
@@ -1823,8 +1825,9 @@ class TestTheSecondPromotionPointIsAlsoGated:
         deps = self._paper_deps(
             regime=lambda candidate: RegimeEvidence(
                 regime="downtrend",
+                cell_key="bear",
                 cell=RegimePoolCellEvidence(state="unfit"),
-                exemptions={(strategy_id, "downtrend"): 7},
+                exemptions={(strategy_id, "bear"): 7},
             )
         )
 
@@ -1833,9 +1836,9 @@ class TestTheSecondPromotionPointIsAlsoGated:
         assert out.to_status is StrategyCandidateStatus.AWAITING_LIVE_APPROVAL
         assert out.reason_code is ReasonCode.REGIME_EXEMPT
         # 留痕落在依据栏那一对上（T2 的 `_regime_detail` 把它压成可读的字符串对），
-        # 于是审计面答得出「这条是被人放过去的，放的是策略×阶段的哪一格」。
+        # 于是审计面答得出「这条是被人放过去的，放的是策略×格子的哪一格」。
         assert out.detail["exempt"] == [
-            {"strategy_id": str(strategy_id), "regime": "downtrend"}
+            {"strategy_id": str(strategy_id), "cell": "bear"}
         ]
 
 

@@ -82,7 +82,7 @@ from apps.regime.deactivation_run import (
     roster_report,
     supersede_warnings,
 )
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import CYCLE_CELLS, BaseRegime
 from apps.trading.models import Strategy
 
 
@@ -121,8 +121,15 @@ class Command(BaseCommand):
         parser.add_argument(
             "--regime",
             default="",
-            choices=["", *(m.value for m in BaseRegime)],
-            help="阶段。--grant 时不给则取**当前生效阶段**，并把取到的值打出来",
+            # **两套键都收**（#66）：新口径是 cycle 三格，四档仍收（`resolve_regime` 会换算
+            # 成格子键再落库）。只列四档会让 `--regime bear` 在 argparse 这一层就被拒，
+            # 而只列三格会让照着旧文档打 `downtrend` 的人得到一个看不懂的报错。
+            choices=[
+                "",
+                *(c.value for c in CYCLE_CELLS),
+                *(m.value for m in BaseRegime),
+            ],
+            help="格子。--grant 时不给则取**当前格子**，并把取到的值打出来",
         )
         parser.add_argument(
             "--note",

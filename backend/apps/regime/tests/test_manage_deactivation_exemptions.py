@@ -44,12 +44,13 @@ from django.utils import timezone as django_timezone
 
 from apps.regime import config, deactivation_run, judgement
 from apps.regime.management.commands import manage_deactivation_exemptions as manage
+from apps.regime import models as models_module
 from apps.regime.models import (
     DeactivationDecision,
     DeactivationExemption,
     RegimeJudgement,
 )
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 from apps.trading.models import Strategy
 
 #: 夹具的时间锚点，**取真实时钟**而不是写死一个过去时刻。
@@ -79,7 +80,9 @@ class _Fixture(TestCase):
         self,
         strategy=None,
         *,
-        regime=BaseRegime.UPTREND.value,
+        # 默认用**格子键**（#66）：豁免行存的是 cycle 三格，夹具跟着走才不会让
+        # 「同一格再发一条」这类用例退化成「两条落在不同格子上」。
+        regime=Cycle.BULL.value,
         granted_at: datetime | None = None,
         days: int = 10,
         closed_at: datetime | None = None,
@@ -100,7 +103,12 @@ class _Fixture(TestCase):
         )
 
     def judge(self, regime=BaseRegime.UPTREND.value, *, days_ago=1) -> RegimeJudgement:
-        """一条**生效中**的判定：`effective_at` 在真实时钟之前，命令才认它。"""
+        """一条**生效中**的判定：`effective_at` 在真实时钟之前，命令才认它。
+
+        **`cycle` 必须跟着填**（#66）：豁免登记的是**格子键**（cycle 三格），不给 `cycle`
+        时 `RegimeState.cell` 是 `None`，`--regime` 省略那一支会拒绝推断——那不是缺陷，
+        而是「判不出方向就没有可登记的那一格」这条纪律。所以夹具按四档 → 格子的映射填。
+        """
         effective_at = django_timezone.now() - timedelta(days=days_ago)
         return RegimeJudgement.objects.create(
             symbol=judgement.SYMBOL,
@@ -109,6 +117,8 @@ class _Fixture(TestCase):
             base_regime=regime,
             escalation="",
             effective_regime=regime,
+            cycle=models_module.legacy_cell_regime(regime),
+            volatility="normal",
             evidence={},
             config_snapshot={},
         )
@@ -233,7 +243,7 @@ class TestRegimeDisplay(_Fixture):
         模型上的 `choices` 只在表单校验里管用，手工写进去的行绕得过它。一条脏行不该让
         清单命令炸掉，但也绝不能被显示成「下行趋势」——那会让人以为豁免覆盖的是另一档。
         """
-        self.assertEqual(manage.regime_display("moon"), "moon（认不出的阶段）")
+        self.assertEqual(manage.regime_display("moon"), "moon（认不出的格子）")
 
 
 # --------------------------------------------------------------------------- #
@@ -247,7 +257,9 @@ class TestGrantExpiry(_Fixture):
             "--grant", "--strategy", "AlphaStem", "--regime", BaseRegime.RANGE.value
         )
         row = DeactivationExemption.objects.get()
-        self.assertEqual(row.regime, BaseRegime.RANGE.value)
+        # 落库的是**格子键**（#66）：`--regime range` 照收，但存成 `sideways`——
+        # 读侧（`derive` / `gate_run` / `read_regime`）全都按格子键匹配。
+        self.assertEqual(row.regime, "sideways")
         self.assertEqual(
             row.expires_at - row.granted_at,
             timedelta(days=config.DEACTIVATION.exemption_days),
@@ -283,8 +295,9 @@ class TestGrantExpiry(_Fixture):
         self.manage(
             "--grant", "--strategy", "AlphaStem", "--regime", BaseRegime.RANGE.value
         )
+        # 读侧按格子键取（#66）。
         self.assertIn(
-            (self.alpha.id, BaseRegime.RANGE.value),
+            (self.alpha.id, "sideways"),
             deactivation_run.in_force_exemptions(),
         )
 
@@ -299,8 +312,41 @@ class TestGrantRegime(_Fixture):
         self.judge(BaseRegime.DOWNTREND.value)
         out, _ = self.manage("--grant", "--strategy", "AlphaStem")
         row = DeactivationExemption.objects.get()
-        self.assertEqual(row.regime, BaseRegime.DOWNTREND.value)
-        self.assertIn(BaseRegime.DOWNTREND.display, out)
+        # 「取当前」取的是**格子键**（#66）：`downtrend` 的四档判定在这一维上是 `bear`。
+        self.assertEqual(row.regime, "bear")
+        self.assertIn(Cycle.BEAR.display, out)
+
+    def test_a_cycle_key_can_be_granted_directly(self):
+        """`--regime bear` 能发出去，且**落库就是 `bear`**（#66）。
+
+        这一条挡的是一个真实发生过的缺陷形状：写入侧只认四档时，`--regime bear` 在
+        argparse 或 `resolve_regime` 那一层就被拒（「认不出的阶段」），于是新口径的键
+        根本发不出去；而走默认路径发出来的又是四档键，**读侧按 `state.cell` 匹配，
+        永远撞不上**——用户看到的是「我明明豁免了，它还是被停」。
+        """
+        self.judge(BaseRegime.DOWNTREND.value)
+        out, _ = self.manage("--grant", "--strategy", "AlphaStem", "--regime", "bear")
+        row = DeactivationExemption.objects.get()
+        self.assertEqual(row.regime, "bear")
+        self.assertIn("下行周期", out)
+        # 推导读得到它（读侧也按格子键）
+        self.assertIn((self.alpha.id, "bear"), deactivation_run.in_force_exemptions())
+
+    def test_a_four_tier_key_is_translated_before_it_is_stored(self):
+        """四档键仍然收，但**落库前换算成格子键**：库里只该有一种口径。
+
+        留着四档落库的坏法不是「显示难看」，而是它会被 `close_left_regime_exemptions`
+        的 `.exclude(regime=state.cell)` 判成「离开」并写 `closed_at`——而那个字段
+        没有复活路径，一条刚发出的豁免在下一轮就永久失效。
+        """
+        self.judge(BaseRegime.DOWNTREND.value)
+        self.manage("--grant", "--strategy", "AlphaStem", "--regime", "downtrend")
+        row = DeactivationExemption.objects.get()
+        self.assertEqual(row.regime, "bear")
+        self.assertFalse(
+            DeactivationExemption.objects.filter(regime="downtrend").exists(),
+            "库里不该再出现四档键的豁免行",
+        )
 
     def test_a_pending_judgement_is_not_taken(self):
         """待生效的那条不算「当前生效阶段」——它明天才咬人。
@@ -654,7 +700,7 @@ class TestListing(_Fixture):
     def test_a_dirty_regime_row_does_not_break_the_listing(self):
         self.exemption(regime="moon")
         out, _ = self.manage()
-        self.assertIn("moon（认不出的阶段）", out)
+        self.assertIn("moon（认不出的格子）", out)
 
     def test_the_listing_runs_after_a_grant(self):
         """发完立刻把清单打出来：发出人要在同一屏里看见「现在在期的是什么」，

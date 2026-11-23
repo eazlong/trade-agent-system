@@ -73,9 +73,8 @@ from typing import Any, Iterable, Mapping
 from django.utils import timezone
 
 from apps.regime import config
-from apps.regime.quant import BaseRegime, Volatility
+from apps.regime.quant import CYCLE_CELL_VALUES, BaseRegime, Volatility
 from apps.regime.slice import (
-    STATE_BLANKET,
     STATE_FIT,
     STATE_NEUTRAL,
     STATE_UNFIT,
@@ -111,11 +110,17 @@ VERDICT_DISPLAY = {
 
 #: 池化状态 → 逐策略结论。`unfit` 的两种分岔由 `needs_review` 决定，不在这张表里。
 #: 单独拎出来是为了让「池化的词表被覆盖全了」可以逐项断言（测试钉住键集）。
+#:
+#: **#66 起键集缩到三键**（`fit` / `neutral` / `unknown`）：格子轴换成 cycle 之后，
+#: 池化不再产出 `blanket`——三格里根本没有高波动。加上 `unfit` 恰好等于 `slice` 的
+#: **新**状态集合 `STATE_VALUES`，这是本票的验收判据之一。
+#:
+#: `BLANKET` 这个取值本身留着：它仍是「保命档期间逐策略结论」的正确措辞，由
+#: `derive` 在保命档期间显式早退时产生（`Outcome.verdict`），不再由查表推出来。
 VERDICT_OF_STATE = {
     STATE_FIT: FIT,
     STATE_NEUTRAL: NEUTRAL,
     STATE_UNKNOWN: UNKNOWN,
-    STATE_BLANKET: BLANKET,
 }
 
 # --------------------------------------------------------------------------- #
@@ -126,11 +131,18 @@ VERDICT_OF_STATE = {
 BLOCKED_COLD_START = "cold_start"
 #: 上一有效判定距今超过 `stale_after_days` 个自然日。
 BLOCKED_STALE_STATE = "stale_state"
+#: 当前是保命档（事件波动）。#66 起它是**显式**闸，见 `derive` 里那一段。
+BLOCKED_BLANKET = "blanket"
+#: 当前判定判不出周期方向（`unclear`，或旧行没有 `cycle`）。格子轴是 cycle，没有方向
+#: 就没有可问的那一列——与冷启动同形：一条 `blocked`，什么都不写。
+BLOCKED_NO_CELL = "no_cell"
 
 BLOCKED_DISPLAY = {
     "": "",
     BLOCKED_COLD_START: "冷启动：还没有过生效判定，本轮不产出停用建议",
     BLOCKED_STALE_STATE: "状态过期：本轮不产出停用建议，请先查判定任务",
+    BLOCKED_BLANKET: "保命档：全场停用由保命档那一层负责，本轮不产出停用建议",
+    BLOCKED_NO_CELL: "当前判定判不出周期方向：没有可问的那一格，本轮不产出停用建议",
 }
 
 
@@ -206,6 +218,28 @@ class RegimeState:
     @property
     def cold(self) -> bool:
         return self.regime is None
+
+    @property
+    def cell(self) -> str | None:
+        """**当前该读哪一格**（#66）：周期三格的键，取不到时 `None`。
+
+        这是格子轴唯一的一处换算：池化表的键是 cycle（`bull`/`bear`/`sideways`），而
+        `regime` 是四档的生效阶段（保命档判据、展示、日报快照都仍在读它）。两者不是
+        同一个东西，这个属性把它们的关系写在一处——散在 `gate_run` / `deactivation_run`
+        / `strategy_factory.effects` 各写一遍，迟早有一处按 `downtrend` 去新代找格子，
+        而那必然落 `no_cell`（fail-closed 拦人，且理由是错的）。
+
+        **`unclear` 与 `None` 都返回 `None`**：三格里没有这两者，它们说的是「判不出方向」，
+        不是第三个方向。调用方拿它去查格子，查不到就是「这一代对这些日子没有结论」——
+        与池化对「该方向没出现过」给 `unknown` 是同一条口径。
+
+        旧判定行（两列存在之前写的）在这里读出 `None`，那是如实：它的 `cycle` 确实是 NULL。
+        迁移回填只处理了 `uptrend` / `downtrend` / `range`，`high_vol` 那批刻意留空
+        （那天的周期信息在旧判据里根本不存在）。
+        """
+        if self.cycle in CYCLE_CELL_VALUES:
+            return self.cycle
+        return None
 
     @property
     def blanket(self) -> bool:
@@ -397,20 +431,52 @@ def derive(
             stale_after_days=params.stale_after_days,
         )
 
+    # **保命档：一条都不产出**（#66 起必须显式判）。
+    #
+    # 换轴之前这条是**结构性**的：池化对 `high_vol` 那一格恒返回 `blanket`，而 `blanket`
+    # 不是 `TARGET`，所以没有任何代码路径能让保命档产出建议。格子轴换成 cycle 之后那个
+    # 结构保证**不存在了**——保命档期间 `state.cell` 仍然是一个有效的方向键，照走就会按
+    # 那个方向给出 `unfit` 建议，于是「此刻谁都不该开新仓」变成了「这几条策略在这个方向
+    # 上不适用」：动作一样，理由完全不同，而后者要人工恢复。所以这条闸只能显式写出来，
+    # 与 `gate.derive` 的 `BLOCKED_BLANKET` 同源同措辞。
+    if state.blanket:
+        return Derivation(
+            regime=state.regime,
+            blocked=BLOCKED_BLANKET,
+            age_days=age_days,
+            outcomes=(),
+            unmanaged=unmanaged,
+            stale_after_days=params.stale_after_days,
+        )
+
+    # 格子键：三格之一，取不到（`unclear` / 旧行无 cycle）就没有可问的那一列。
+    cell = state.cell
+    if cell is None:
+        # 没有方向结论时逐策略落 `NO_CELL` 是一句真的废话，而且会把一次「判不出方向」
+        # 摊成几十条噪声。收场与冷启动同形：一条 `blocked`，什么都不写。
+        return Derivation(
+            regime=state.regime,
+            blocked=BLOCKED_NO_CELL,
+            age_days=age_days,
+            outcomes=(),
+            unmanaged=unmanaged,
+            stale_after_days=params.stale_after_days,
+        )
+
     outcomes = []
     for strategy_id in managed:
-        row = cells.get((strategy_id, state.regime))
+        row = cells.get((strategy_id, cell))
         verdict, cell_state, reason, source = _verdict(row)
         outcomes.append(
             Outcome(
                 strategy_id=strategy_id,
-                regime=state.regime,
+                regime=cell,
                 verdict=verdict,
                 state=cell_state,
                 reason=reason,
                 source=source,
                 running=strategy_id in running,
-                exempt_id=exemptions.get((strategy_id, state.regime)),
+                exempt_id=exemptions.get((strategy_id, cell)),
                 evidence=dict(row.get("evidence") or {}) if row else {},
             )
         )

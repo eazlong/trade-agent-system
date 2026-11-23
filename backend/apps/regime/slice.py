@@ -130,20 +130,32 @@ UTC 开盘日）。不用业务日（`to_business(...).date()`）：两者只在
 「曲线的数」的和，而不是「各格 `total_pnl`」的和——两者差在 1e-6 的量级上。留下这句
 是为了将来有人对不上账时能一眼看到差异的来源，而不是去怀疑公式。
 
-## 高波动档不参与适用性判断
+## 格子轴是 cycle，三格（#66）
 
-CONTEXT.md：高波动是**保命档**，不做适用性判断，一律停开新仓；**证据门槛在高波动档
-失效**，切片对高波动阶段无实际作用。所以这一格照样算数字（不是特例跳过、不该假装
-没算），但状态是 `blanket` 而不是 `fit`/`unfit`——**它不是「适用性四态」里的第五态，
-而是「此格没有适用性结论」**：在这里推不出停用决策，因为停用决策本来就与证据无关。
-消费者（单元 7、日报）必须把 `blanket` 与 `中性` 分开读：中性说「证据不够，先别动」，
-`blanket` 说「与证据无关，此刻谁都不该开新仓」。
+切片分的是 **策略 × 周期方向**：`bull` / `bear` / `sideways`（`quant.CYCLE_CELLS`）。
+这不是把四档换了个名字，是换了**问的问题**：四档问「这段行情整体算哪一档」，其中高波动
+排在第一位、把当天的周期信息整个吃掉；三格问「往哪走」，与高波动这一维并存。
+
+两条边界，写在这里省得后人以为是漏了：
+
+- **高波动不进格子。** 它是叠加层（ADR 0007），不是「这条策略在高波动阶段表现如何」
+  的一格。让它独占地让那一格的样本极稀，而那一格本就不该做适用性判断。**保命档不做
+  适用性判断这条语义没有消失**，它整体搬到了 halt 层（`deactivation.is_blanket` 读
+  波动维），不在这里留第二份。
+- **`unclear` 不进格子。** 它说的是「判不出方向」，不是第三个方向。把它当第四格会让
+  「判不出来」暴露成一种可比较的适用性结论，而 #64 已经把它定为「按没有结论计」。
+  代价是这些天持仓的 PnL 落 `pnl_unattributed`（记账，不重分配）。
+
+于是 `STATE_BLANKET` 从**产出**里消失了，只剩读侧兼容：库里第 5 代之前的池化格与版本 3
+的载荷里还有它，删掉常量会让那些行在页面上变成「认不出的状态」，而认不出来走 fail-safe
+——不拦也不放，静默失语。所以它留在词表里、标成 legacy，并由 `STATE_VALUES` 把它排除
+在新代的状态集合之外。
 
 ## 「未知」与「中性」的分别
 
-- `unknown`：该阶段在回测窗口内**一天都没有出现过**（已判定天数为 0）。这是
+- `unknown`：该方向在回测窗口内**一天都没有出现过**（已判定天数为 0）。这是
   「无历史数据」，与样本厚薄无关，再多样本也回答不了。
-- `neutral`：阶段出现过，但这一格的样本没过门槛，或两个排序指标相对全样本
+- `neutral`：方向出现过，但这一格的样本没过门槛，或两个排序指标相对全样本
   给了**互相矛盾的方向**（视为样本噪声，见 `_fitness`）。
 - 两者都不构成停用理由（CONTEXT.md：中性不构成停用理由），但原因不同，日报与
   单元 7 需要分开显示。
@@ -159,7 +171,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
 from apps.regime import config
-from apps.regime.quant import PRIORITY, BaseRegime, label_series
+from apps.regime.quant import CYCLE_CELLS, BaseRegime, Cycle, label_series
 
 #: 载荷版本。`metrics` 里的切片结论带它，形状变了才分得清新旧。
 #:
@@ -173,7 +185,13 @@ from apps.regime.quant import PRIORITY, BaseRegime, label_series
 #: 往每份载荷里写 `state`，所以存量载荷里那些 `fit` 是按旧判据算的。不升这一位，
 #: `is_stale` 会说「不陈旧」、切片不重算，池化读到的仍是旧的 `state`，而池化那边的
 #: 绝对门只能改它自己算出来的结论、改不了已经落进载荷的这一份。
-SLICE_VERSION = 3
+#:
+#: 4：**格子轴从四档换成 cycle 三格**（#66）。输入样本的形状变了——`cells` 的键集从
+#: `high_vol/downtrend/uptrend/range` 变成 `bull/bear/sideways`，`regime_days` 跟着换键。
+#: 这是**形状**变了，不只是数值变了：旧载荷的 `cells` 里没有 `bull` 这个键，池化按新
+#: 键集去读会一个字都读不到，然后按「这一格没有样本」静默产出一整代表。不升这一位，
+#: `is_stale` 会说「不陈旧」，于是新旧两种键集的载荷混在同一批池化输入里。
+SLICE_VERSION = 4
 
 #: 年化换算用的天数。**自然日而非交易日**：24/7 市场没有收盘、没有交易日边界，
 #: 与 CONTEXT.md 给成功率定的「分母是自然日」同一条口径。365 是个约定值（不追
@@ -183,14 +201,35 @@ DAYS_PER_YEAR = 365.0
 #: 置信区间的 z 值（95%）。两处区间共用。
 Z95 = 1.96
 
-#: 四态 + `blanket`。取值即落库契约，改名等于让新旧 metrics 出现两套键。
+#: 状态取值。**取值即落库契约**，改名等于让新旧 metrics 出现两套键。
+#:
+#: 自 #66 起只有四态：格子轴换成 cycle 之后，保命档不再是「格子的一种状态」——三格里
+#: 根本没有高波动，它由 halt 层按波动维单独承担（`deactivation.is_blanket`）。
 STATE_FIT = "fit"  # 适用
 STATE_UNFIT = "unfit"  # 不适用
 STATE_NEUTRAL = "neutral"  # 中性（证据不足 / 样本噪声）——不构成停用理由
 STATE_UNKNOWN = "unknown"  # 未知（该阶段在本窗口内没出现过）
-STATE_BLANKET = "blanket"  # 保命档：不做适用性判断，与证据无关
+#: **保护区（legacy）：不再由任何路径产出，只为读得懂旧载荷与旧世代的格子。**
+#:
+#: 存量 `regime_pool_cells` 里有第 5 代之前的 `blanket` 行（那时高波动自己占一格），
+#: `slice` 版本 3 的载荷里也有。把它从常量表里删掉会让这些行在读面上变成「认不出的
+#: 状态」，而认不出来走的是 fail-safe——不拦也不放，静默失语。留着它、并从产出侧彻底
+#: 断开，才是「旧数据读得懂、新数据产不出」。
+STATE_BLANKET = "blanket"  # （legacy）保命档：旧世代高波动那一格
 
-#: `reason` 的取值。与状态分开：状态只有五个，原因要能说清「为什么落到这个状态」。
+#: **新代的状态集合**：四态。`VERDICT_OF_STATE` 与它对齐（`unfit` 另走一条路），
+#: 这是 #66 的验收判据之一——词表与产出一致，而不是「词表里有、产出里没有」。
+STATE_VALUES: frozenset[str] = frozenset(
+    {STATE_FIT, STATE_UNFIT, STATE_NEUTRAL, STATE_UNKNOWN}
+)
+
+#: 只在旧数据里出现的状态取值。读侧必须容忍，产出侧一个字都不写。
+LEGACY_STATES: frozenset[str] = frozenset({STATE_BLANKET})
+
+#: `reason` 的取值。与状态分开：状态只有四个，原因要能说清「为什么落到这个状态」。
+#:
+#: 与状态同一条处置：`REASON_HIGH_VOL_BLANKET` 自 #66 起**不再由切片产出**，只留给旧载荷
+#: 与 halt 层的措辞复用（那边的话术仍要能引用「高波动保命档」这个词）。
 REASON_INSUFFICIENT = "insufficient_evidence"
 REASON_DIRECTION_CONFLICT = "direction_conflict"
 REASON_INCOMPARABLE = "incomparable"
@@ -214,7 +253,7 @@ STATE_DISPLAY = {
     STATE_UNFIT: "不适用",
     STATE_NEUTRAL: "中性",
     STATE_UNKNOWN: "未知",
-    STATE_BLANKET: "保命档",
+    STATE_BLANKET: "保命档（旧世代）",
 }
 
 REASON_DISPLAY = {
@@ -265,7 +304,13 @@ class SliceTrade:
 def build_tags(
     candles: Sequence[Mapping], params: config.JudgementConfig = config.JUDGEMENT
 ) -> dict[date, BaseRegime]:
-    """「日期 → 阶段」映射：`label_series` 的投影，只留判得出的那些日子。
+    """「日期 → 四档」映射：`label_series` 的投影，只留判得出的那些日子。
+
+    **#66 之后它不再是切片的格子轴**（那是 `build_cycle_tags`）。留着它是因为**真值
+    比对**那条读面仍然按四档问（`truth.tally` 的人工区间就是四档），而 ADR 0007 的
+    一致率口径也是四档的。两条读面问的是两个问题：「这条策略在这个方向上适不适用」
+    用 cycle，「机制判的档与人工标的档一致吗」用四档——把后者换成 cycle 是在改口径，
+    那是 #67 的范围，不是本票。
 
     判不出的日子**不进映射**（不是塞一个默认档位）：调用方用 `tags.get(day)` 取，
     取不到就是「那天没有阶段结论」，与「那天是箱体震荡」在字典里必须长得不一样。
@@ -277,6 +322,32 @@ def build_tags(
         label.date: label.regime
         for label in label_series(candles, params)
         if label.judged
+    }
+
+
+def build_cycle_tags(
+    candles: Sequence[Mapping], params: config.JudgementConfig = config.JUDGEMENT
+) -> dict[date, Cycle]:
+    """「日期 → 周期维」映射：切片的**格子轴**（#66）。
+
+    只收 `label.cycle in CYCLE_CELLS` 的日子，两种日子都不进映射，而它们是两件不同的事：
+
+    - **`cycle is None`**：那一天判据还没就绪（`classify_day` 的三个就绪条件缺一）。
+    - **`cycle is Cycle.UNCLEAR`**：判了，但两条路径都没能证明方向。
+
+    两者都不进格子，理由与「判不出来就说判不出来」同一条：`unclear` 不是「第三个方向」，
+    把它当第四格会让「判不出来」暴露成一种可比较的适用性结论。代价是这些日子里持仓的
+    那部分 PnL 落 `pnl_unattributed`（`slice_backtest` 记账，不重分配），而落进那里的
+    原因在 `attribution` 里能数出来。
+
+    **波动不进格子**（ADR 0007）：高波动是叠加层，按 `CYCLE_CELLS` 分格才不会让
+    `bull + event_spike` 那种牛市暴跌日被读成「高波动阶段的一格」——那一格样本极稀，
+    而它本就不该做适用性判断。
+    """
+    return {
+        label.date: label.cycle
+        for label in label_series(candles, params)
+        if label.cycle in CYCLE_CELLS
     }
 
 
@@ -627,7 +698,7 @@ def _merge_inputs(
 
 
 def _cell(
-    regime: BaseRegime,
+    regime: Cycle,
     daily: Mapping[date, float],
     entry_dates: Sequence[date],
     pnls: Sequence[float],
@@ -637,11 +708,11 @@ def _cell(
     initial_capital: float,
     params: config.EvidenceConfig,
 ) -> dict:
-    """一格（策略 × 阶段）的全部证据。**每一格都产出**，包括空的那几格。
+    """一格（策略 × 周期方向）的全部证据。**每一格都产出**，包括空的那几格。
 
     空格子必须存在，理由与「判不出来就说判不出来」是同一条：缺失的格子在日报里
-    会表现为「这一行没有」，而它有两种完全不同的意思（这个阶段没出现过 / 这个阶段
-    出现了但没交易）。四格齐全 + `state` + `reason` 让两种意思各自可读。
+    会表现为「这一行没有」，而它有两种完全不同的意思（这个方向没出现过 / 这个方向
+    出现了但没交易）。三格齐全（`CYCLE_CELLS`）+ `state` + `reason` 让两种意思各自可读。
 
     每格除了结论与门槛，还带一份 `merge_inputs`（池化要用的样本，见模块 docstring）
     ——**空格子也带**（空的那份），这样「这一格没交易」在池化那里与「这份载荷是旧版本、
@@ -654,6 +725,10 @@ def _cell(
     metrics = _segment_metrics(daily, initial_capital)
     months = covered_months(entry_dates)
     wins = sum(1 for pnl in pnls if pnl > 0)
+    # 分母是**判得出周期方向的天数之和**（三格之和），不是窗口长度：#66 之后`unclear`
+    # 与未就绪的日子不进任何一格，拿窗口长度当分母会让每一格的 `day_share` 系统性偏小
+    # ——门槛被缩小，稀薄样本反而更容易过。三格之和是一个诚实的分母：它回答「在能判出
+    # 方向的天里，这一个方向占多少」。
     day_share = (regime_days / total_days) if total_days else 0.0
     threshold = scaled_min_trades(day_share, params)
     enough = len(entry_dates) >= threshold and months >= params.min_months
@@ -687,15 +762,13 @@ def _cell(
         cell["pnl_mean_ci95"] = mean_pnl_interval(pnls)
 
     if regime_days == 0:
-        # 该阶段在本窗口内一天都没出现过。再多样本也回答不了，与门槛无关。
+        # 该方向在本窗口内一天都没出现过。再多样本也回答不了，与门槛无关。
         return cell
 
-    if regime is BaseRegime.HIGH_VOL:
-        # 保命档：不做适用性判断。数字照留（它们仍然说明这段行情里发生了什么），
-        # 但状态不是 fit/unfit——停用与证据无关，在这里推不出停用决策。
-        cell["state"] = STATE_BLANKET
-        cell["reason"] = REASON_HIGH_VOL_BLANKET
-        return cell
+    # **#66 起这里不再有保命档分支**：格子轴是 cycle，三格里没有高波动。高波动日按它
+    # 当天的方向落进 bull/bear/sideways——那正是 ADR 0007 要的「两维并存、互不覆盖」。
+    # 「保命档不做适用性判断」这条语义原样保留在 halt 层（`deactivation.is_blanket` 读
+    # 波动维），不在这里再判一次：同一件事两个出处，迟早有一处先漂。
 
     if not enough:
         cell["state"] = STATE_NEUTRAL
@@ -710,19 +783,25 @@ def _cell(
 
 def slice_backtest(
     trades: Sequence[SliceTrade],
-    tags: Mapping[date, BaseRegime],
+    tags: Mapping[date, Cycle],
     *,
     initial_capital: float,
     window: tuple[date, date],
     params: config.EvidenceConfig = config.EVIDENCE,
 ) -> dict:
-    """把一次回测的已平仓成交切成「策略 × 阶段」的证据。
+    """把一次回测的已平仓成交切成「策略 × 周期方向」的证据（#66）。
+
+    **格子轴是 cycle，不是四档**：三格 = 上行 / 下行 / 横盘。高波动不进格子（它是叠加层，
+    ADR 0007），`unclear` 也不进格子（它说的是「判不出方向」，不是第三个方向）。两者
+    共同的效果是：那几天持仓的 PnL 落 `pnl_unattributed`，并在 `attribution` 里数得出来。
 
     Args:
         trades: **只含已平仓的**成交（见 `SliceTrade`）。未平仓的行由适配层挡掉并
             计数，本函数看不到它们，所以 `attribution.open_trades_excluded` 由调用
             方补进去。
-        tags: 「日期 → 阶段」映射（`build_tags`），须覆盖到窗口起点**之前**的预热。
+        tags: 「日期 → 周期方向」映射（`build_cycle_tags`），须覆盖到窗口起点**之前**
+            的预热。传四档映射（`build_tags`）是调用方写错：三格里不含 `high_vol`，
+            那样每个高波日都会被当成「没有结论」并静默落进 `pnl_unattributed`。
         initial_capital: 回测初始资金，全部分段共用同一个分母（见 `_annualized_pct`）。
         window: 回测的起止自然日，用来数「该阶段占了几天」。
         params: 证据门槛，默认取统一配置面的当前值。
@@ -750,19 +829,21 @@ def slice_backtest(
     if end < start:
         raise ValueError(f"回测窗口倒置：{start} → {end}")
 
-    # 窗口内已判定的天数：分母（`day_share`）与「该阶段出现过没有」都从这里来。
-    window_tags = {d: regime for d, regime in tags.items() if start <= d <= end}
+    # 窗口内判得出方向的天：分母（`day_share`）与「这个方向出现过没有」都从这里来。
+    # **分母只算判得出方向的天**：`unclear` 与未就绪的日子不进三格，拿窗口长度当分母
+    # 会让每一格的 `day_share` 系统性偏小、门槛被缩小——稀薄样本反而更容易过。
+    window_tags = {d: cycle for d, cycle in tags.items() if start <= d <= end}
     total_days = len(window_tags)
-    regime_days: dict[BaseRegime, int] = defaultdict(int)
-    for regime in window_tags.values():
-        regime_days[regime] += 1
+    regime_days: dict[Cycle, int] = defaultdict(int)
+    for cycle in window_tags.values():
+        regime_days[cycle] += 1
 
     daily: dict[date, float] = defaultdict(float)
-    per_regime_daily: dict[BaseRegime, dict[date, float]] = defaultdict(
+    per_regime_daily: dict[Cycle, dict[date, float]] = defaultdict(
         lambda: defaultdict(float)
     )
-    per_regime_entries: dict[BaseRegime, list[date]] = defaultdict(list)
-    per_regime_pnls: dict[BaseRegime, list[float]] = defaultdict(list)
+    per_regime_entries: dict[Cycle, list[date]] = defaultdict(list)
+    per_regime_pnls: dict[Cycle, list[float]] = defaultdict(list)
     pnl_unattributed = 0.0
     attributed = 0
     unjudged = 0
@@ -773,40 +854,40 @@ def slice_backtest(
         share = trade.pnl / len(segments)
 
         for day in segments:
-            regime = tags.get(day)
-            if regime is None:
-                # 那一天的阶段判不出来（或压根没有日线）。它的份额无处可归——
-                # 记账而不是静默丢弃，见本函数的 docstring。
+            cycle = tags.get(day)
+            if cycle is None:
+                # 那一天判不出周期方向（`unclear`、未就绪、或压根没有日线）。它的份额
+                # 无处可归——记账而不是静默丢弃，见本函数的 docstring。
                 pnl_unattributed += share
                 continue
             daily[day] += share
-            per_regime_daily[regime][day] += share
+            per_regime_daily[cycle][day] += share
 
-        entry_regime = tags.get(entry_day)
-        if entry_regime is None:
+        entry_cycle = tags.get(entry_day)
+        if entry_cycle is None:
             # **笔数不入任何一格**，但它的 PnL 已经按上面那一段分给了持仓期内的
-            # 各阶段。这正是「求准 / 求保守」不对称的落点：算钱要准，算笔数要保守
-            # ——一笔连开仓时是什么行情都说不出的交易，不足以支撑任何一格的结论。
+            # 各方向。这正是「求准 / 求保守」不对称的落点：算钱要准，算笔数要保守
+            # ——一笔连开仓时是什么方向都说不出的交易，不足以支撑任何一格的结论。
             unjudged += 1
         else:
             attributed += 1
-            per_regime_entries[entry_regime].append(entry_day)
-            per_regime_pnls[entry_regime].append(trade.pnl)
+            per_regime_entries[entry_cycle].append(entry_day)
+            per_regime_pnls[entry_cycle].append(trade.pnl)
 
     full = _segment_metrics(daily, initial_capital)
     cells = {
-        regime.value: _cell(
-            regime=regime,
-            daily=per_regime_daily.get(regime, {}),
-            entry_dates=per_regime_entries.get(regime, ()),
-            pnls=per_regime_pnls.get(regime, ()),
-            regime_days=regime_days.get(regime, 0),
+        cycle.value: _cell(
+            regime=cycle,
+            daily=per_regime_daily.get(cycle, {}),
+            entry_dates=per_regime_entries.get(cycle, ()),
+            pnls=per_regime_pnls.get(cycle, ()),
+            regime_days=regime_days.get(cycle, 0),
             total_days=total_days,
             full=full,
             initial_capital=initial_capital,
             params=params,
         )
-        for regime in PRIORITY
+        for cycle in CYCLE_CELLS
     }
 
     return {
@@ -823,8 +904,10 @@ def slice_backtest(
             "attributed": attributed,
             "unjudged": unjudged,
             "pnl_unattributed": round(pnl_unattributed, _ROUND),
+            # 三格各自的天数。**键集是 `CYCLE_CELLS`**（恒三键，0 也留着）——池化与
+            # 前端都靠这个恒定键集区分「这个方向没出现过」与「这一版没有这个键」。
             "regime_days": {
-                regime.value: regime_days.get(regime, 0) for regime in PRIORITY
+                cycle.value: regime_days.get(cycle, 0) for cycle in CYCLE_CELLS
             },
             "window_days": total_days,
             # 由适配层补：本函数拿不到未平仓的行，见 `SliceTrade` 的 docstring。

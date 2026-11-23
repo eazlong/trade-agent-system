@@ -6,13 +6,14 @@
 
 九条性质，每一条坏了都不报警、只出错的数：
 
-1. **四种「什么都不动」各自说得出理由**：`no_generation`（阶段有了却一代池化表都没有
+1. **五种「什么都不动」各自说得出理由**：`no_generation`（阶段有了却一代池化表都没有
    ——那不是「没有该停的」，是**没法问**）、冷启动（`cold_start`）、状态过期
-   （`stale_state`）、保命档（`gate.BLOCKED_BLANKET`——前三个是「说不清」，这一个是
-   **说得清、而判定层不该动手**，理由见 `test_gate.TestTheBlanketTier`）。四种都落成
+   （`stale_state`）、判不出周期格子（`no_cell`——旧结构日把周期吃掉了，本轮连「该问
+   哪一列」都答不出）、保命档（`gate.BLOCKED_BLANKET`——前四个是「说不清」，这一个是
+   **说得清、而判定层不该动手**，理由见 `test_gate.TestTheBlanketTier`）。五种都落成
    `skipped` + 一句给人看的话，且**都不发起对账**：期望集算不出来的时候，活行原样继续拦
    是唯一诚实的动作。
-2. **`skipped` 键恒存在，键集在五条路径上一致**，返回值可 JSON 序列化（它进 Celery
+2. **`skipped` 键恒存在，键集在六条路径上一致**，返回值可 JSON 序列化（它进 Celery
    结果与日报）。
 3. **声明先写、记录后写**：一次失败的 `status` 回写不该留下「机制声明过它」而声明表里
    空无一物的假历史——反过来才是不可收拾的那一半。
@@ -76,10 +77,14 @@ from apps.regime.models import (
     RegimePoolRebuild,
 )
 from apps.regime.pool import POOL_SOURCE_STRATEGY
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 
+#: 四档生效阶段：`RegimeJudgement` 的 `base_regime` / `effective_regime` 读它。
 DOWNTREND = BaseRegime.DOWNTREND
-UPTREND = BaseRegime.UPTREND
+
+#: 格子键（cycle 三格）：池化格、决策行、豁免行上的 `regime` 字段读它（#66）。
+BULL = Cycle.BULL.value
+BEAR = Cycle.BEAR.value
 
 #: 生命周期参数（与 `test_deactivation_run` 同一份）：过期门槛 3 天。本模块自己不用它
 #: 算任何东西，但 `deactivation.derive` 会——传半份配置会让「用错了哪一组参数」看不出来。
@@ -146,6 +151,7 @@ def make_generation(
     fingerprint: str | None = None,
     finished_at: datetime | None = None,
     cells: tuple = (),
+    pool_version: int | None = None,
 ) -> RegimePoolRebuild:
     """人工造一代。绕过 `rebuild_pool`，好让用例只问它真正在问的那一件事。
 
@@ -158,7 +164,8 @@ def make_generation(
         status=status,
         actor_kind="task",
         actor_name="任务",
-        pool_version=pool.POOL_VERSION,
+        # 换代轴窗口用（`pool_version` 4 = 旧四档键的那一代）：默认仍是当前版本。
+        pool_version=pool.POOL_VERSION if pool_version is None else pool_version,
         input_fingerprint=fingerprint or f"f{next(_fingerprints)}",
         started_at=finished_at or NOW,
         finished_at=finished_at or NOW,
@@ -252,9 +259,11 @@ class _Fixture(TestCase):
         *,
         regime: str = DOWNTREND,
         effective_regime: str | None = None,
+        cycle: str | None = BEAR,
         effective_at: datetime | None = None,
     ):
-        """一条生效中的判定（`gate_run` 只读它的 `effective_regime` 与 `effective_at`）。"""
+        """一条生效中的判定。`gate_run` 读它的 `effective_regime`（四档，判保命档）与
+        `cycle`（格子键，问「这一列」），两个轴缺一不可。"""
         moment = effective_at or NOW
         return RegimeJudgement.objects.create(
             symbol=judgement.SYMBOL,
@@ -262,6 +271,7 @@ class _Fixture(TestCase):
             effective_at=moment,
             base_regime=_slug(regime),
             effective_regime=_slug(effective_regime or regime),
+            cycle=cycle,
         )
 
     def switch(
@@ -285,7 +295,7 @@ class _Fixture(TestCase):
     def exemption(
         self,
         strategy,
-        regime: str = DOWNTREND,
+        regime: str = BEAR,
         *,
         granted_at: datetime | None = None,
         expires_at: datetime | None = None,
@@ -305,7 +315,7 @@ class _Fixture(TestCase):
     def decision(
         self,
         strategy,
-        regime: str = DOWNTREND,
+        regime: str = BEAR,
         *,
         status: str = DecisionStatus.SUGGESTED.value,
         evidence: dict | None = None,
@@ -364,7 +374,7 @@ class _Fixture(TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 性质 1 + 2：三种「什么都不动」
+# 性质 1 + 2：四种「说不清」什么都不动
 # --------------------------------------------------------------------------- #
 
 
@@ -388,7 +398,7 @@ class TestTheEarlyExits(_Fixture):
         self.assertIsNone(row.closed_at)
 
     def test_a_cold_start_leaves_the_live_row_blocking(self):
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
         row = self.live_row(self.alpha)
 
@@ -404,7 +414,7 @@ class TestTheEarlyExits(_Fixture):
         )
 
     def test_a_stale_state_leaves_the_live_row_blocking(self):
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         self.judged(effective_at=days(-4))
         row = self.live_row(self.alpha)
 
@@ -414,6 +424,30 @@ class TestTheEarlyExits(_Fixture):
         self.assertIsNone(summary["halt"])
         row.refresh_from_db()
         self.assertIsNone(row.closed_at)
+
+    def test_a_judgement_without_a_cycle_cell_leaves_the_live_row_blocking(self):
+        """有阶段、有池化表，但这一行判不出周期格子（旧结构日）：本轮连「该问哪一列」
+        都答不出来，所以与冷启动同一收场——一条都不动。
+
+        `no_cell` 单独成一档而不是并进冷启动/过期：那两档说的是「有没有一条生效中的
+        判定」，这一档说的是「有判定、但它没有方向结论」，修法完全不同。
+        """
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
+        self.judged(cycle=None)
+        self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
+        row = self.live_row(self.alpha)
+
+        summary = self.gate_round()
+
+        self.assertEqual(summary["skipped"], dea.BLOCKED_NO_CELL)
+        self.assertIsNone(summary["halt"])
+        self.assertEqual(summary["declarations"], [])
+        self.assertEqual(summary["statuses"], [])
+        row.refresh_from_db()
+        self.assertIsNone(row.closed_at)
+        self.assertEqual(
+            DeactivationDecision.objects.get().status, DecisionStatus.APPLIED.value
+        )
 
     def test_no_generation_is_asked_before_anything_else_is_read(self):
         """一代池化表都没有时，连开关与豁免都不必问——那两问的答案无处可用。"""
@@ -435,7 +469,7 @@ class TestTheShadowTier(_Fixture):
     def setUp(self):
         super().setUp()
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
 
     def test_the_live_row_is_closed_with_gate_closed(self):
         self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
@@ -494,7 +528,7 @@ class TestTheLiveRound(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "reason": "本阶段样本偏少"},
                 ),
             )
@@ -553,7 +587,7 @@ class TestTheLiveRound(_Fixture):
         add_cell(
             pool_rebuild.current_generation(),
             self.beta,
-            DOWNTREND,
+            BEAR,
             state=sl.STATE_FIT,
         )
 
@@ -685,19 +719,40 @@ class TestWhatTheWarrantSays(_Fixture):
 
     def test_the_warrant_reads_the_rows_own_cell_not_the_current_regime_column(self):
         """判据查的是**这一行自己的**那一格，不是当前阶段那一列。"""
-        make_generation(cells=((self.alpha, UPTREND, {"state": sl.STATE_UNFIT}),))
-        decision = self.decision(self.alpha, regime=UPTREND)
+        make_generation(cells=((self.alpha, BULL, {"state": sl.STATE_UNFIT}),))
+        decision = self.decision(self.alpha, regime=BULL)
         self.assertEqual(self._warrant(decision), gate.STILL_TARGET)
 
     def test_a_fit_cell_on_another_regime_does_not_rescue_the_row(self):
         """别的阶段那一列写着 `fit`，与这一行无关：它自己那一格没有了 ⇒ `lapsed`。"""
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
-        decision = self.decision(self.alpha, regime=UPTREND)
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
+        decision = self.decision(self.alpha, regime=BULL)
+        self.assertEqual(self._warrant(decision), gate.LAPSED)
+
+    def test_a_legacy_four_tier_row_is_converted_before_the_lookup(self):
+        """存量决策行上写的是四档（`downtrend`）：查格子前必须先换算成 `bear`。
+
+        直接拿四档去新代里查必然落空 ⇒ `LAPSED` ⇒ 解除 ⇒ 静默放开一条仍然成立的
+        停用。迁移 0019 之后的存量行仍可能带着旧键（以及 `high_vol` 那种刻意不映射
+        的值），所以换算这件事发生在**读**这一侧，而不是指望库里全是新键。
+        """
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
+        decision = self.decision(self.alpha, regime=DOWNTREND)
+        self.assertEqual(self._warrant(decision), gate.STILL_TARGET)
+
+    def test_a_high_vol_row_has_no_cell_to_read(self):
+        """`high_vol` 刻意不映射：那一天没有方向结论，不构成任何一个格子。
+
+        即使当下 `bear` 判着不适用，也不能把「保命档那天」的决策读成「仍然成立」——
+        换不出来就如实落 `LAPSED`（可追溯的解除），而不是猜一个格子。
+        """
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
+        decision = self.decision(self.alpha, regime=BaseRegime.HIGH_VOL)
         self.assertEqual(self._warrant(decision), gate.LAPSED)
 
     def test_a_strategy_outside_the_managed_set_departs_before_any_cell_is_read(self):
         """归属先于判据：格子还在、还判着不适用，但策略已经不归这套机制管了。"""
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         decision = self.decision(self.alpha)
         self.assertEqual(self._warrant(decision, managed=frozenset()), gate.GONE)
 
@@ -711,7 +766,7 @@ class TestWhatTheWarrantSays(_Fixture):
             cells=(
                 (
                     self.alpha,
-                    DOWNTREND,
+                    BEAR,
                     {"state": sl.STATE_UNFIT, "needs_review": True},
                 ),
             )
@@ -756,7 +811,7 @@ class TestWhatTheWarrantSays(_Fixture):
         self.judged()
         row = self.live_row(self.alpha)
         self.decision(self.alpha)
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         # 用 `update` 而不是改内存里那一个：`_warrant` 那一侧走的是 `select_related`
         # 现查出来的行，改内存实例不会影响它。
         self.alpha.__class__.objects.filter(pk=self.alpha.pk).update(is_active=False)
@@ -776,7 +831,7 @@ class TestWhatTheWarrantSays(_Fixture):
         self.judged()
         row = self.live_row(self.gamma)
         self.decision(self.gamma)
-        make_generation(cells=((self.gamma, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.gamma, BEAR, {"state": sl.STATE_UNFIT}),))
 
         summary = self.gate_round()
 
@@ -794,8 +849,8 @@ class TestWhatTheWarrantSays(_Fixture):
         对不上了——写 `strategy_gone` 会把一次阶段离开说成一次策略离场。"""
         self.judged()
         row = self.live_row(self.alpha)
-        self.decision(self.alpha, regime=UPTREND)
-        make_generation(cells=((self.alpha, UPTREND, {"state": sl.STATE_UNFIT}),))
+        self.decision(self.alpha, regime=BULL)
+        make_generation(cells=((self.alpha, BULL, {"state": sl.STATE_UNFIT}),))
 
         summary = self.gate_round()
 
@@ -811,14 +866,14 @@ class TestWhatTheWarrantSays(_Fixture):
     ):
         self.judged()
         decision = self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         first = self.gate_round()
         # issue #51：第一轮两路各一条（alpha 停用 + beta 暂停，beta 无格 ⇒ 悬置）。
         self.assertEqual(first["halt"]["created"], 2)
 
         make_generation(
             finished_at=days(1),
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),),
         )
         second = self.gate_round(now=days(1))
 
@@ -867,7 +922,7 @@ class TestTheWindowStart(_Fixture):
         self.decision(self.alpha)
         make_generation(
             finished_at=days(-5),
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),),
         )
         self.gate_round()
         return HaltDeclaration.objects.get(
@@ -901,7 +956,7 @@ class TestTheWindowStart(_Fixture):
         """「当前阶段」是这一层唯一关心的口径：别的阶段上的豁免与本轮无关。"""
         row = self._declare(
             exemption={
-                "regime": UPTREND,
+                "regime": BULL,
                 "granted_at": days(-10),
                 "expires_at": days(50),
                 "closed_at": days(-1),
@@ -918,7 +973,7 @@ class TestTheWindowStart(_Fixture):
         decision = self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
         make_generation(
             finished_at=days(-5),
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),),
         )
 
         summary = self.gate_round()
@@ -976,7 +1031,7 @@ class TestTheStatusWrite(_Fixture):
             evidence={"cell": {"trades": 3}, "frozen": True},
         )
         make_generation(
-            cells=((self.alpha, DOWNTREND, dict({"state": sl.STATE_UNFIT}, **cell)),)
+            cells=((self.alpha, BEAR, dict({"state": sl.STATE_UNFIT}, **cell)),)
         )
         return decision
 
@@ -988,7 +1043,7 @@ class TestTheStatusWrite(_Fixture):
         self.gate_round()
         make_generation(
             finished_at=days(1),
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),),
         )
         self.gate_round(now=days(1))
 
@@ -1001,7 +1056,7 @@ class TestTheStatusWrite(_Fixture):
         """`suggested` 是只有 `deactivation_run` 写过的值 = 机制从没碰过它。给它写
         `released` 等于往表里记一条「它当时在拦」的假历史（Q3 的同一条理由）。"""
         decision = self.decision(self.alpha)  # suggested
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
 
         summary = self.gate_round()
 
@@ -1021,12 +1076,16 @@ class TestTheStatusWrite(_Fixture):
         decision = self._applied_world()
         real = grun._refs
 
-        def stale(*, managed, cells):
+        def stale(*, managed, cells, generation_pool_version=None):
             return tuple(
                 replace(ref, status=gate.STATUS_RELEASED)
                 if ref.strategy_id == self.alpha.id
                 else ref
-                for ref in real(managed=managed, cells=cells)
+                for ref in real(
+                    managed=managed,
+                    cells=cells,
+                    generation_pool_version=generation_pool_version,
+                )
             )
 
         with patch.object(grun, "_refs", side_effect=stale):
@@ -1065,7 +1124,7 @@ class TestTheStatusWrite(_Fixture):
             status=DecisionStatus.RELEASED.value,
             evidence={"cell": {"trades": 3}, "frozen": True},
         )
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
 
         summary = self.gate_round()
 
@@ -1091,18 +1150,18 @@ class TestTheStatusWrite(_Fixture):
     def test_the_write_is_matched_on_the_row_not_on_the_pair(self):
         """同一个策略的两行（不同阶段）各写各的目标：按 `strategy_id` 一把写的实现会把
         两行都写成同一个值。"""
-        first = self.decision(self.alpha, regime=DOWNTREND)
+        first = self.decision(self.alpha, regime=BEAR)
         # 第二行是**被机制领过**的（`applied`）：只有这样它才既进得了回写集合
         # （`_untouched` 会把「没人认领的建议」挡在外面），又能与本轮的目标值不同。
         second = self.decision(
-            self.alpha, regime=UPTREND, status=DecisionStatus.APPLIED.value
+            self.alpha, regime=BULL, status=DecisionStatus.APPLIED.value
         )
         # 判定不另建：`setUp` 已经落了一条 `downtrend` 的（`uniq_regime_judgement_symbol_effective_at`
         # 钉着「同一品种同一生效时刻只有一条」）。
         make_generation(
             cells=(
-                (self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),
-                (self.alpha, UPTREND, {"state": sl.STATE_UNFIT}),
+                (self.alpha, BEAR, {"state": sl.STATE_UNFIT}),
+                (self.alpha, BULL, {"state": sl.STATE_UNFIT}),
             )
         )
 
@@ -1140,7 +1199,7 @@ class TestTheScopeOfATurn(_Fixture):
         super().setUp()
         self.switch()
         self.judged()
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
 
     def test_the_event_and_blanket_rows_are_left_alone(self):
         for trigger in (HaltTrigger.EVENT, HaltTrigger.BLANKET):
@@ -1213,8 +1272,8 @@ class TestTheSummaryShape(_Fixture):
     """键集恒定，且能直接进 Celery 结果与日报。"""
 
     def summaries(self) -> dict[str, dict]:
-        """五条路径各来一份：三种「什么都不动」、Shadow、正常一轮。"""
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        """六条路径各来一份：四种「说不清」、Shadow、正常一轮。"""
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         cold = self.gate_round()
 
         self.judged(effective_at=days(-4))
@@ -1227,6 +1286,10 @@ class TestTheSummaryShape(_Fixture):
         self.switch()
         live = self.gate_round()
 
+        # 有阶段、有池化表，但这一行判不出周期格子：旧结构日的形状。
+        self.judged(cycle=None, effective_at=days(1))
+        no_cell = self.gate_round(now=days(1))
+
         RegimePoolRebuild.objects.all().delete()
         no_generation = self.gate_round()
         return {
@@ -1234,6 +1297,7 @@ class TestTheSummaryShape(_Fixture):
             "stale": stale,
             "shadow": shadow,
             "live": live,
+            "no_cell": no_cell,
             "no_generation": no_generation,
         }
 
@@ -1275,6 +1339,7 @@ class TestTheSummaryShape(_Fixture):
                 "stale": dea.BLOCKED_STALE_STATE,
                 "shadow": None,
                 "live": None,
+                "no_cell": dea.BLOCKED_NO_CELL,
                 "no_generation": dru.SKIPPED_NO_GENERATION,
             },
         )
@@ -1293,3 +1358,59 @@ class TestTheSummaryShape(_Fixture):
                 str(self.beta.id): gate.CLOSE_GATE_CLOSED,
             },
         )
+
+
+class TestTheCellAxisWindow(_Fixture):
+    """换轴窗口：决策行与池化格各用一套键的那段时间。
+
+    两道闸都要开到位：开关打到 `executing`（否则整轮 `gate_closed`），判定也要在生效态
+    （否则 `cold_start`）——两条早退都会掩盖真正要问的那件事。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.switch()
+        self.judged()
+
+    def test_a_decision_migrated_ahead_of_the_pool_rebuild_is_not_released(self):
+        """**换轴窗口**：迁移 0019 已把决策行的键改成 `bear`，而当前代还是旧四档键的那一代。
+
+        这是本票最贵的一处：`_warrant` 拿 `bear` 去旧代里查会落空 ⇒ LAPSED ⇒
+        `close_reason = became_fit` ⇒ 活声明被解除。**解除的方向是放开开仓**，于是一次
+        换轴成为一次静默放开，而页面上只显示「已解除」。
+
+        按代挑键（`cell_keys_for`）之后：旧代用 `downtrend` 那一格，判据照旧成立。
+        """
+        # 旧代：格子键是四档（`pool_version=4`），决策行已经被迁移成 cycle 键。
+        make_generation(
+            pool_version=4,
+            cells=((self.alpha, DOWNTREND.value, {"state": sl.STATE_UNFIT}),),
+        )
+        row = self.decision(self.alpha, regime=BEAR)
+
+        summary = self.gate_round()
+
+        self.assertNotIn(
+            str(self.alpha.id),
+            summary["close_reasons"],
+            "旧代里那一格仍然判着不适用，这条决策不该被解除",
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.status, DecisionStatus.APPLIED.value)
+
+    def test_a_legacy_four_tier_row_is_still_matched_in_a_legacy_generation(self):
+        """反向：决策行还是四档键、而那一代也是旧代 —— 也要对得上。
+
+        混部期间两种形状都会出现，只认一个方向就会漏掉另一批行。
+        """
+        make_generation(
+            pool_version=4,
+            cells=((self.alpha, DOWNTREND.value, {"state": sl.STATE_UNFIT}),),
+        )
+        row = self.decision(self.alpha, regime=DOWNTREND.value)
+
+        summary = self.gate_round()
+
+        self.assertNotIn(str(self.alpha.id), summary["close_reasons"])
+        row.refresh_from_db()
+        self.assertEqual(row.status, DecisionStatus.APPLIED.value)

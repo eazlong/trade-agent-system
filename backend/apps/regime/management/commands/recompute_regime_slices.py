@@ -159,9 +159,10 @@ class Command(BaseCommand):
         if limit > 0:
             queryset = queryset[:limit]
 
-        # 标签算一次，全批共用。空标签（日线还没回填）不是错误：切片会照落、四格全
+        # 标签算一次，全批共用。空标签（日线还没回填）不是错误：切片会照落、三格全
         # unknown，那是可读的结论；但要吼一声，否则「全 unknown」看起来像算法坏了。
-        tags = slicing.load_tags()
+        # **取周期维**（#66）：切片的格子轴是 cycle 三格，不是四档。
+        tags = slicing.load_cycle_tags()
         if not tags:
             self.stderr.write(
                 self.style.WARNING("当前没有任何已判定日线，切片将全部为 unknown")

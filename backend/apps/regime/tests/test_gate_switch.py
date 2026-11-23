@@ -51,7 +51,7 @@ from apps.regime.models import (
     MechanismMode,
     RegimeMechanismSwitch,
 )
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle
 from apps.regime.tests.test_gate_run import (
     NOW,
     _Fixture as _GateRunFixture,
@@ -60,7 +60,11 @@ from apps.regime.tests.test_gate_run import (
     make_generation,
 )
 
+#: 四档生效阶段：判定的 `base_regime` / `effective_regime` 读它（保命档判据与展示）。
 DOWNTREND = BaseRegime.DOWNTREND
+
+#: 格子键（cycle 三格）：池化格、决策行、豁免行上的 `regime` 字段读它（#66）。
+BEAR = Cycle.BEAR.value
 
 #: 三种「这一轮算不出该停谁」的码。**从各层自己那里取，不在用例里写字符串字面量**：
 #: 这一层要钉的是「页面把它原样报出来了吗」，不是「那个码拼成什么字」——钉字面量的话，
@@ -86,6 +90,8 @@ class _Fixture(_GateRunFixture):
         self,
         *,
         regime: str = DOWNTREND,
+        cell: str = BEAR,
+        cycle: str | None = None,
         strategy=None,
         state: str = sl.STATE_UNFIT,
         reason: str = "本阶段样本偏少",
@@ -94,6 +100,12 @@ class _Fixture(_GateRunFixture):
         extra_cells: tuple = (),
     ):
         """造一个**正常一轮**的世界：当前代里那一格判着不适配，于是这一行该停。
+
+        `regime` 是四档生效阶段（判定的两列、保命档判据），`cell` 是格子键（池化格与
+        决策行）。两个轴不能互相顶替（#66）：喂同一个值会让「拿 `bear` 问保命档」永远
+        为假，而「拿 `downtrend` 找格子」永远落空。`cycle` 默认跟随 `cell`；保命档那几条
+        用例传 `unclear`，因为那一天本就没有方向结论（`RegimeState.cell` 对 non-cell
+        取值一律返回 `None`）。
 
         `switch=True` 时预先落一条开关流水（档位=执行态）。确认页与 `flip` 的用例都不该
         用它——页面上那些「假设此刻打开」的数只有在档位真是 Shadow 时才是那个意思，而
@@ -109,14 +121,14 @@ class _Fixture(_GateRunFixture):
         if switch:
             self.switch()
         if judgement:
-            self.judged(regime=regime)
+            self.judged(regime=regime, cycle=cell if cycle is None else cycle)
         make_generation(
             cells=(
-                (strategy, regime, {"state": state, "reason": reason}),
+                (strategy, cell, {"state": state, "reason": reason}),
                 *extra_cells,
             )
         )
-        return self.decision(strategy, regime=regime)
+        return self.decision(strategy, regime=cell)
 
     # --- 两个出口 ---------------------------------------------------------- #
 
@@ -217,7 +229,7 @@ class TestTheWordList(_Fixture):
         readopted = self.live_row(self.alpha)
         self.decision(self.gamma)
         self.decision(self.alpha, status=DecisionStatus.APPLIED.value)
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),))
 
         data = gsw.confirmation(now=NOW)
 
@@ -395,7 +407,7 @@ class TestTheRenderedPage(_Fixture):
 class TestWhatThePageSaysWhenItWouldNotBlock(_Fixture):
     def test_a_cold_start_says_the_round_will_do_nothing(self):
         """先跑 recompute 的那种「没法问」在这里也是一句话，而不是一次静默的空转动。"""
-        make_generation(cells=((self.alpha, DOWNTREND, {"state": sl.STATE_UNFIT}),))
+        make_generation(cells=((self.alpha, BEAR, {"state": sl.STATE_UNFIT}),))
         self.decision(self.alpha)
 
         data = self.preview().data
@@ -446,7 +458,7 @@ class TestWhatThePageSaysWhenItWouldNotBlock(_Fixture):
         """
         self.live_world(
             state=sl.STATE_FIT,
-            extra_cells=((self.beta, DOWNTREND, {"state": sl.STATE_FIT}),),
+            extra_cells=((self.beta, BEAR, {"state": sl.STATE_FIT}),),
         )
 
         data = self.preview().data
@@ -490,7 +502,7 @@ class TestWhatThePageSaysWhenItWouldNotBlock(_Fixture):
         就成了一句漏掉了一半事实的话。
         """
         self.exemption(self.alpha)
-        self.live_world(extra_cells=((self.beta, DOWNTREND, {"state": sl.STATE_FIT}),))
+        self.live_world(extra_cells=((self.beta, BEAR, {"state": sl.STATE_FIT}),))
 
         data = self.preview().data
 
@@ -505,11 +517,16 @@ class TestWhatThePageSaysWhenItWouldNotBlock(_Fixture):
         """保命档（高波动）期间「该停 0 个」不是「没什么可拦」：那一层的全场停用由保命档
         自己负责，而它没有开关。两句话混用是要命的误读。
 
-        格子落 `blanket` 这一档（保命档下池化层不做适用性判断），于是「该停 0 个」是
-        **判据真的算出 0**；拿一个 `unfit` 格子被别的什么挡掉凑出的 0 会让这条用例去钉
-        一个与保命档无关的巧合。
+        #66 之后格子轴是 cycle，而保命档期间池化层**照样**会按某个方向给结论——所以
+        「该停 0 个」不能靠「那一格判不了」凑出来，它必须来自 `derive` 的**显式**保命档
+        闸（`BLOCKED_BLANKET`）。这里让那一格落在 `unknown`：即便它有一个方向，早退的
+        保命档也不会让任何一条策略成为「该停」。
         """
-        self.live_world(regime=BaseRegime.HIGH_VOL, state=sl.STATE_BLANKET)
+        self.live_world(
+            regime=BaseRegime.HIGH_VOL,
+            cycle=Cycle.UNCLEAR.value,
+            state=sl.STATE_UNKNOWN,
+        )
 
         data = self.preview().data
         body = self.preview().body
@@ -529,7 +546,11 @@ class TestWhatThePageSaysWhenItWouldNotBlock(_Fixture):
         个字，但它解释的是「为什么该停是 0」，不是「关掉之后会怎样」。那句话为真，钉错了
         却会让一条只该在关闭方向出现的警告被别处的巧合顶替掉。
         """
-        self.live_world(regime=BaseRegime.HIGH_VOL, state=sl.STATE_BLANKET)
+        self.live_world(
+            regime=BaseRegime.HIGH_VOL,
+            cycle=Cycle.UNCLEAR.value,
+            state=sl.STATE_UNKNOWN,
+        )
 
         closing = self.preview(closing=True)
 
@@ -593,7 +614,7 @@ class TestFlipRegimeGate(_Fixture):
         # 判据翻面：新的一代里这一格重新适配。代与代之间判定不会翻面，所以「翻回来」必然
         # 落在一代新的表上——这正是 `attitude_since` 拿 `generation_at` 当候选的理由。
         make_generation(
-            cells=((self.alpha, DOWNTREND, {"state": sl.STATE_FIT}),),
+            cells=((self.alpha, BEAR, {"state": sl.STATE_FIT}),),
             finished_at=NOW + timedelta(minutes=1),
         )
 
