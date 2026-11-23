@@ -37,11 +37,17 @@ const labelled = (value: string, display?: string): Labelled => ({
 const ACTIVE_LIFECYCLE = labelled("active", "在册（机制会管它）");
 const RETIRED_LIFECYCLE = labelled("retired", "已退役（机制不再管它）");
 
+/**
+ * 矩阵列：**三格，按 cycle**（issue #66）。
+ *
+ * 格子轴从四档换成周期方向，高波动是叠加层、不进格子。夹具跟着走，否则「列序由后端
+ * 给」这条用例测的还是旧口径的列，而组件里的 `FALLBACK_REGIME_ORDER` 已经换成三格了——
+ * 两份夹具不一致，用例就会在「后端给了 regimes」与「没给」两条路径上给出相反的期望。
+ */
 const REGIMES = [
-  labelled("high_vol", "高波动"),
-  labelled("downtrend", "下行趋势"),
-  labelled("uptrend", "上行趋势"),
-  labelled("range", "箱体"),
+  labelled("bull", "上行周期"),
+  labelled("bear", "下行周期"),
+  labelled("sideways", "横盘"),
 ];
 
 const generation: RegimeGeneration = {
@@ -220,7 +226,10 @@ const archetypeCell = cell("9", "mean_revert", REGIMES[2], labelled("neutral"), 
   evidenceName: "archetype",
 });
 
-const unknownCell = cell("10", "newborn", REGIMES[3], labelled("unknown"));
+// **三格**（issue #66）：旧夹具里的第四格（`range`）没有了，映射到 `sideways` 那一格——
+// 它测的是「同一策略的第二格可各自展开」，与那一格是哪一维无关。
+const unknownCell = cell("10", "newborn", REGIMES[2], labelled("unknown"));
+// `blanket` 状态读侧仍要能显示（旧世代的格子里有它），但它不再由任何路径产出。
 const blanketCell = cell("11", "blanket_guard", REGIMES[0], labelled("blanket"));
 
 const poolCells: RegimePoolCell[] = [
@@ -230,7 +239,7 @@ const poolCells: RegimePoolCell[] = [
   unknownCell,
   blanketCell,
   // 同一策略的第二格：验证同一行里多格可各自展开
-  cell("7", "rsi_cross", REGIMES[3], labelled("neutral")),
+  cell("7", "rsi_cross", REGIMES[2], labelled("neutral")),
 ];
 
 const poolTables = dedupeTables(poolCells.map((c) => c.evidence_key));
@@ -255,7 +264,7 @@ describe("矩阵", () => {
     const headers = within(table)
       .getAllByRole("columnheader")
       .map((node) => node.textContent ?? "");
-    expect(headers).toEqual(["策略", "高波动", "下行趋势", "上行趋势", "箱体"]);
+    expect(headers).toEqual(["策略", "上行周期", "下行周期", "横盘"]);
   });
 
   it("五种状态各一色，认不出来的不落成绿色", () => {
@@ -384,12 +393,12 @@ describe("行内展开", () => {
     render(
       <PoolTable
         pool={pool}
-        initialExpanded={new Set([fitCell.key, "7|range"])}
+        initialExpanded={new Set([fitCell.key, "7|sideways"])}
       />
     );
 
     expect(screen.getByTestId(`pool-cell-detail-${fitCell.key}`)).toBeTruthy();
-    expect(screen.getByTestId("pool-cell-detail-7|range")).toBeTruthy();
+    expect(screen.getByTestId("pool-cell-detail-7|sideways")).toBeTruthy();
   });
 
   it("原始证据整份摊开，认不出来的键也不吞掉", () => {
@@ -403,7 +412,7 @@ describe("行内展开", () => {
     // 线上最常见的形状：同一份证据（同原型兜底）落在同一条策略的 4 个阶段上。
     // 后端只发一份、格子各带同一个 `evidence_key` / `results_key`——两格展开都必须
     // 拿到原文，**包括那个被抽到 `results` 表里的 `results`**。
-    const shared = cell("7", "rsi_cross", REGIMES[3], labelled("neutral"), {
+    const shared = cell("7", "rsi_cross", REGIMES[2], labelled("neutral"), {
       evidenceName: "fit",
     });
     const tables = dedupeTables([fitCell.evidence_key]);
@@ -612,7 +621,7 @@ describe("操作列", () => {
     const headers = within(screen.getByTestId("pool-table"))
       .getAllByRole("columnheader")
       .map((node) => node.textContent ?? "");
-    expect(headers).toEqual(["策略", "高波动", "下行趋势", "上行趋势", "箱体"]);
+    expect(headers).toEqual(["策略", "上行周期", "下行周期", "横盘"]);
     expect(screen.queryByTestId("pool-row-action-7")).toBeNull();
   });
 
@@ -629,7 +638,7 @@ describe("操作列", () => {
     const headers = within(screen.getByTestId("pool-table"))
       .getAllByRole("columnheader")
       .map((node) => node.textContent ?? "");
-    expect(headers).toEqual(["策略", "高波动", "下行趋势", "上行趋势", "箱体", "操作"]);
+    expect(headers).toEqual(["策略", "上行周期", "下行周期", "横盘", "操作"]);
 
     // 5 个策略行各一个（`rowsOf` 按策略归并）
     expect(screen.getByTestId("fake-action-7")).toBeTruthy();
@@ -649,6 +658,7 @@ describe("操作列", () => {
 
     const detail = screen.getByTestId(`pool-cell-detail-${fitCell.key}`);
     const cellNode = detail.querySelector("td");
-    expect(cellNode?.getAttribute("colspan")).toBe("6"); // 1 策略 + 4 阶段 + 1 操作
+    // 1 策略 + **3 阶段**（issue #66：三格）+ 1 操作
+    expect(cellNode?.getAttribute("colspan")).toBe("5");
   });
 });

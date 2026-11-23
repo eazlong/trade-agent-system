@@ -58,8 +58,14 @@ const TONE_CLASS: Record<Tone, string> = {
   blue: "bg-blue-dim text-blue border-blue/40",
 };
 
-/** 矩阵列的后备顺序（后端 `regimes` 缺失时才用；显示名仍取格子自己的 `regime.display`）。 */
-const FALLBACK_REGIME_ORDER = ["high_vol", "downtrend", "uptrend", "range"];
+/**
+ * 矩阵列的后备顺序（后端 `regimes` 缺失时才用；显示名仍取格子自己的 `regime.display`）。
+ *
+ * **三格，按 cycle**（issue #66）：格子轴从四档换成了周期方向，高波动是叠加层、
+ * 不进格子。留着旧四档会让后端偶发没给 `regimes` 时，前端把三格的列按四档的顺序排
+ * ——而那正是「同一件事的第二处真相」，两份都不报错，只是看起来不对。
+ */
+const FALLBACK_REGIME_ORDER = ["bull", "bear", "sideways"];
 
 function columnsOf(pool: RegimePool): Labelled[] {
   if (pool.regimes.length > 0) return pool.regimes;
