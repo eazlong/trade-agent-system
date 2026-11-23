@@ -222,6 +222,12 @@ class JudgementConfig:
     # 跨四年变化几十倍，绝对间距门槛必然周期性失效（与「阈值按分位自校准」同一理由）。
     trend_separation_min_atr: float = 0.5
 
+    # 放量倍数的分母窗口。**本阶段只用于算「放量倍数」这个中间量，不参与定档**——
+    # 进配置面而不是写成模块常量，是因为它一旦参与判定就是阈值的一部分，而阈值必须
+    # 随判定记录一起落快照才谈得上「事后能解释当时为什么这么判」；等它真的开始参与
+    # 判定再补进来，历史记录就已经缺了这一格。
+    volume_ma_period: int = 20
+
     @property
     def warmup_days(self) -> int:
         """历史标注要在回测窗口起点前多取多少天。
@@ -257,6 +263,10 @@ class JudgementConfig:
         if self.trend_separation_min_atr <= 0:
             raise ValueError(
                 f"trend_separation_min_atr 必须为正，当前 {self.trend_separation_min_atr}"
+            )
+        if self.volume_ma_period < 2:
+            raise ValueError(
+                f"volume_ma_period 必须 >= 2，当前 {self.volume_ma_period}"
             )
 
 

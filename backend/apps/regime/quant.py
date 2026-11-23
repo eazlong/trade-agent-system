@@ -23,6 +23,24 @@
 口径（下单、盈亏、滑点）必须用 Decimal，但那不是这一层的职责。落库的 `DailyCandle`
 仍是 Decimal，转 float 只发生在本文件内部。
 
+## 两段：算数（`metrics_series`）与定档（`_classify`）
+
+逐日判定被刻意拆成两步，因为「周期」与「波动」两个维度的分类器要共用同一批中间量：
+
+1. `metrics_series` **只算数**：ATR、ATR%、ATR% 分位、快慢 EMA、斜率、间距，连同波动
+   代理要用的跳空 / 放量倍数 / ATR 环比，逐日产出一个 `DayMetrics`。它不含任何档位，
+   也不替调用方判断「能不能定档」——算不出来就是 `None`，理由与下面「数据不足」一节相同。
+2. `_classify` **只定档**：吃一个 `DayMetrics`，先验「三个条件齐了吗」，再按优先级给
+   `BaseRegime`。它不看 K 线，也不自己算数。
+
+`label_series` 是这两步的串联，仍然是对外唯一入口（实时判定与历史标注共用）。拆开的
+收益在下一步：加一个分类器只需再写一个吃 `DayMetrics` 的函数，不必复制一遍算数——复制
+出来的第二份算数迟早会和第一份漂开，而两边的结论都会看着很正常。
+
+波动代理的三个量（`gap` / `volume_ratio` / `atr_jump`）当前**只算不用**：它们进结构体
+是为了让波动维的分类器直接可取，本阶段不参与定档。K 线行里没有 `open` / `volume`
+时它们就是 `None`——「说不出来就说说不出来」，不是 0。
+
 ## 四档与优先级
 
 高波动 > 下行趋势 > 上行趋势 > 箱体震荡，互斥且固定（`PRIORITY`）。**箱体震荡是兜底**，
@@ -52,6 +70,7 @@ import numpy as np
 from apps.regime.config import JUDGEMENT, JudgementConfig
 from apps.strategy_engine.indicators import atr as _atr
 from apps.strategy_engine.indicators import ema as _ema
+from apps.strategy_engine.indicators import sma as _sma
 
 
 class BaseRegime(str, Enum):
@@ -89,6 +108,48 @@ PRIORITY: tuple[BaseRegime, ...] = (
 
 
 @dataclass(frozen=True)
+class DayMetrics:
+    """某一日的**中间量**：定档所需要的一切数字，一个档位都不含。
+
+    这个结构体存在的唯一理由是「两个维度的分类器要共用同一批算数」。它因此必须是
+    **纯算数**的：不判断够不够、不给默认值、不暗示某个量是「好」还是「坏」。可算的
+    算出来，算不出来的留 `None`（不是 0，也不是 NaN——NaN 会往判定里漏水，
+    `None` 才是「这个统计量今天不存在」的显式形态）。
+
+    `quantile_sample` 是**样本数**而不是判定结论：它等于窗口里有限的 ATR% 个数。
+    「窗口够不够满」这个判断体现在 `atr_pct_rank` 上——窗口没满它就没有值（`None`），
+    而不是填一个基于残缺样本的分位。`quantile_sample` 留在结构里是为了让事后能回答
+    「那天为什么判不出来」，不参与就绪判断。
+
+    ## 波动代理的三个量（本阶段只算不用）
+
+    `gap` / `volume_ratio` / `atr_jump` 属于下一步的 volatility 维，本阶段**不参与**
+    定档，进结构体只是为了让那个分类器不必再算一遍。它们依赖 K 线行里的 `open` /
+    `volume`；调用方没给（或给了不可解析的值）时为 `None`——行情源缺量能数据是常态，
+    编一个 1.0 会让「没有量能」与「量能平稳」长得一模一样。
+    """
+
+    date: date
+
+    # 波动轴
+    atr: float | None
+    atr_pct: float | None
+    atr_pct_rank: float | None
+    quantile_sample: int
+
+    # 趋势轴
+    ema_fast: float | None
+    ema_slow: float | None
+    ema_slope: float | None
+    separation: float | None
+
+    # 波动代理（事件驱动判定用；本阶段不参与定档）
+    gap: float | None
+    volume_ratio: float | None
+    atr_jump: float | None
+
+
+@dataclass(frozen=True)
 class DayLabel:
     """某一天的基础阶段，连同**决定它的那几个数字**。
 
@@ -98,10 +159,14 @@ class DayLabel:
 
     未判定日（`regime is None`）不填任何推断值：可算的算（`atr_pct` 等），不可算的留
     `None`（`atr_pct_rank` 需要满窗口，`None` 表示「这个统计量今天不存在」，而不是 0）。
+
+    `metrics` 是那批中间量本身，与逐字段属性指向同一个对象。两处并存不是冗余：
+    落库 / 序列化侧要的是扁平字段（旧键一个都不能少），分类器要的是一个整体。
     """
 
     date: date
     regime: BaseRegime | None
+    metrics: DayMetrics
 
     # 波动轴
     atr: float | None
@@ -156,22 +221,46 @@ def _require_date(row: Mapping[str, Any], index: int) -> date:
 
 
 def _normalize(candles: Sequence[Mapping[str, Any]]) -> tuple[list[date], list[dict]]:
-    """把任意数值类型（Decimal / float / str）的行统一成 float 行，供指标库消费。"""
+    """把任意数值类型（Decimal / float / str）的行统一成 float 行，供指标库消费。
+
+    `high`/`low`/`close` 是**必需**的（缺了它什么档都定不出来，静默补一个值只会
+    产出一条看着正常的假标签）。`open`/`volume` 是**可选**的：行情源不给量能是常态，
+    而它们现在只喂波动代理、不参与定档。缺或不认识就留 `None`，让下游的
+    `volume_ratio`/`gap` 变成 `None`——不能编成 0 或 1.0，那样「没有数据」与「量能
+    平稳」会长得一模一样。
+    """
     dates: list[date] = []
     rows: list[dict] = []
     for index, row in enumerate(candles):
         dates.append(_require_date(row, index))
         try:
-            rows.append(
-                {
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                }
-            )
+            normalized = {
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"第 {index} 根 kline 的 high/low/close 无法解析") from exc
+        for name in ("open", "volume"):
+            normalized[name] = _optional_float(row.get(name))
+        rows.append(normalized)
     return dates, rows
+
+
+def _optional_float(value: Any) -> float | None:
+    """可选数值列的宽松解析：读不出来就是 `None`，不抛。
+
+    只用于 `open`/`volume` 这类**不参与定档**的列。它们读不出来的后果只是某个代理量
+    算不出来（`None`），而不是一条错误标签——为此让整条标注序列失败是把可选项当成了
+    必选项。
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if np.isfinite(parsed) else None
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -192,24 +281,18 @@ def _pad_to(array: np.ndarray, size: int) -> np.ndarray:
     return padded
 
 
-def label_series(
+def metrics_series(
     candles: Sequence[Mapping[str, Any]],
     params: JudgementConfig = JUDGEMENT,
-) -> list[DayLabel]:
-    """逐日判定基础阶段。输出与输入**等长同序**，一天一条。
+) -> list[DayMetrics]:
+    """逐日算出**中间量**。输出与输入**等长同序**，一天一条；一个档位都不含。
 
-    只使用 `candles[i]` 及其之前的数据——没有任何前视。这是历史标注能拿去切片的前提：
-    若某天的标签用到了它之后的价格，切片就会「预知」那段行情。
+    这是「算数」那一段的全部：ATR、ATR%、ATR% 分位、快慢 EMA、斜率、间距，外加波动
+    代理要用的跳空 / 放量倍数 / ATR 环比。定档在 `_classify` 里，两者分开的理由见
+    模块 docstring：两个维度的分类器要共用这一批算数，复制一遍迟早会漂。
 
-    判定的三个条件全在**收盘后**才成立（ATR/EMA 都用到当日 close），与「北京 08:00 出
-    结论、次日 08:00 生效」的时序自洽：D-1 那根日线在 UTC 00:00 收盘，判定跑在 UTC 00:00。
-
-    Args:
-        candles: 按时间**升序**排列的日线，每行需含 `date`/`high`/`low`/`close`。
-        params: 判定参数；默认取统一配置面的当前值。
-
-    Returns:
-        与 `candles` 等长的 `DayLabel` 列表。数据不足以判定的日子 `regime is None`。
+    只使用 `candles[i]` 及其之前的数据——没有任何前视，与 `label_series` 同一条约束。
+    算不出来的量一律 `None`（不是 0、不是 NaN），由分类器决定这够不够定档。
     """
     if not candles:
         return []
@@ -239,13 +322,18 @@ def label_series(
     finite_pct = np.isfinite(atr_pct).astype(np.int64)
     prefix = np.concatenate([[0], np.cumsum(finite_pct)])
 
-    labels: list[DayLabel] = []
+    opens = np.array([r["open"] if r["open"] is not None else np.nan for r in rows])
+    volumes = np.array(
+        [r["volume"] if r["volume"] is not None else np.nan for r in rows]
+    )
+    volume_ma = _pad_to(_sma(volumes, params.volume_ma_period), n)
+
+    series: list[DayMetrics] = []
     for i in range(n):
         start = max(0, i + 1 - qw)
         sample = int(prefix[i + 1] - prefix[start])
 
         available = dict(
-            date=dates[i],
             atr=_finite_or_none(atr[i]),
             atr_pct=_finite_or_none(atr_pct[i]),
             ema_fast=_finite_or_none(ema_fast[i]),
@@ -281,32 +369,126 @@ def label_series(
         ):
             rank = percentile_rank(atr_pct[start : i + 1], atr_pct[i])
 
-        # 三个条件缺一不可：分位够长、斜率可算、间距可算。缺任何一项都落到未判定，
-        # 绝不退化成某个档位——说不出来就说说不出来。
-        regime = (
-            _classify(rank, slope, separation, params)
-            if rank is not None and slope is not None and separation is not None
-            else None
-        )
-
-        labels.append(
-            DayLabel(
-                regime=regime,
+        series.append(
+            DayMetrics(
+                date=dates[i],
                 atr_pct_rank=rank,
                 quantile_sample=sample,
                 ema_slope=slope,
                 separation=separation,
+                gap=_gap_ratio(opens[i], closes[i - 1]) if i >= 1 else None,
+                volume_ratio=_volume_ratio(volumes[i], volume_ma[i]),
+                atr_jump=_atr_jump(atr[i], atr[i - 1]) if i >= 1 else None,
                 **available,
             )
         )
 
-    return labels
+    return series
 
 
-def _classify(
-    rank: float, slope: float, separation: float, params: JudgementConfig
-) -> BaseRegime:
-    """按固定优先级定档。顺序即 `PRIORITY`：先问「该不该保命」，再问「往哪走」。"""
+def _gap_ratio(open_: float, previous_close: float) -> float | None:
+    """跳空幅度：`|open_t / close_{t-1} - 1|`。
+
+    取绝对值而不是带符号：波动代理问的是「有没有跳」，不是「往哪跳」——方向由周期维
+    回答，两个维度各自只答自己的问题。
+    """
+    if not (np.isfinite(open_) and np.isfinite(previous_close)):
+        return None
+    if previous_close <= 0:
+        # 前一日收盘非正只能来自坏数据；除下去会得到 inf 再被吞成 nan，看起来像「没跳空」。
+        return None
+    return float(abs(open_ / previous_close - 1.0))
+
+
+def _volume_ratio(volume: float, volume_ma: float) -> float | None:
+    """放量倍数：当日量能 / 均量。均量为 0 或算不出来时是 `None`。"""
+    if not (np.isfinite(volume) and np.isfinite(volume_ma)):
+        return None
+    if volume_ma <= 0:
+        return None
+    return float(volume / volume_ma)
+
+
+def _atr_jump(atr: float, previous_atr: float) -> float | None:
+    """ATR 环比：`ATR_t / ATR_{t-1}`。前一日 ATR 为 0（停牌、重复 K 线）时是 `None`。"""
+    if not (np.isfinite(atr) and np.isfinite(previous_atr)):
+        return None
+    if previous_atr <= 0:
+        return None
+    return float(atr / previous_atr)
+
+
+def label_series(
+    candles: Sequence[Mapping[str, Any]],
+    params: JudgementConfig = JUDGEMENT,
+) -> list[DayLabel]:
+    """逐日判定基础阶段。输出与输入**等长同序**，一天一条。
+
+    这是「算数 + 定档」两段的串联：`metrics_series` 出中间量，`_classify` 出档位。
+    本函数保留为对外唯一入口——实时判定（`latest_label`）与历史标注（切片）都走它，
+    因此量化口径仍然只有一处实现。
+
+    只使用 `candles[i]` 及其之前的数据——没有任何前视。这是历史标注能拿去切片的前提：
+    若某天的标签用到了它之后的价格，切片就会「预知」那段行情。
+
+    判定的三个条件全在**收盘后**才成立（ATR/EMA 都用到当日 close），与「北京 08:00 出
+    结论、次日 08:00 生效」的时序自洽：D-1 那根日线在 UTC 00:00 收盘，判定跑在 UTC 00:00。
+
+    Args:
+        candles: 按时间**升序**排列的日线，每行需含 `date`/`high`/`low`/`close`。
+        params: 判定参数；默认取统一配置面的当前值。
+
+    Returns:
+        与 `candles` 等长的 `DayLabel` 列表。数据不足以判定的日子 `regime is None`。
+    """
+    return [classify_day(m, params) for m in metrics_series(candles, params)]
+
+
+def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> DayLabel:
+    """把一天的中间量定成档位，连同那批中间量一起返回。
+
+    定不出来（三个条件缺一）时 `regime is None`，**绝不退化成某个档位**——说不出来
+    就说说不出来。这里的判断刻意放在分类侧而不是算数侧：中间量只回答「这个数是多少」，
+    「够不够下结论」是分类器的事，两个维度可以有不同的门槛。
+    """
+    ready = (
+        metrics.atr_pct_rank is not None
+        and metrics.ema_slope is not None
+        and metrics.separation is not None
+    )
+    return DayLabel(
+        date=metrics.date,
+        regime=_classify(metrics, params) if ready else None,
+        metrics=metrics,
+        atr=metrics.atr,
+        atr_pct=metrics.atr_pct,
+        atr_pct_rank=metrics.atr_pct_rank,
+        quantile_sample=metrics.quantile_sample,
+        ema_fast=metrics.ema_fast,
+        ema_slow=metrics.ema_slow,
+        ema_slope=metrics.ema_slope,
+        separation=metrics.separation,
+    )
+
+
+def _classify(metrics: DayMetrics, params: JudgementConfig) -> BaseRegime:
+    """按固定优先级定档。顺序即 `PRIORITY`：先问「该不该保命」，再问「往哪走」。
+
+    只吃中间量结构体，不碰 K 线：这是 prefactor 的核心——算数与定档分开之后，加第二个
+    维度的分类器不必复制一遍算数。
+
+    调用前提是三个条件都齐（`classify_day` 已验）。半截数据在这里**抛**而不是退回箱体
+    震荡：箱体震荡是兜底档，拿它去接「算不出来」正是本模块反复在防的那类失败——一条
+    安静的假标签，切片会当真。
+    """
+    rank = metrics.atr_pct_rank
+    slope = metrics.ema_slope
+    separation = metrics.separation
+    if rank is None or slope is None or separation is None:
+        raise ValueError(
+            "中间量不足以定档（需要 atr_pct_rank / ema_slope / separation），"
+            f"当前 {metrics.date}: rank={rank}, slope={slope}, separation={separation}"
+        )
     if rank > params.high_vol_quantile:
         return BaseRegime.HIGH_VOL
     threshold = params.trend_separation_min_atr

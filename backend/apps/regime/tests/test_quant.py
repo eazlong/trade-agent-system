@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -134,11 +135,38 @@ class TestFourTiersAreFixed(SimpleTestCase):
         )
 
 
+def metrics(rank=0.5, slope=1.0, separation=1.0, **overrides):
+    """造一条只用于定档的中间量。其余字段填「能算出来」的正常值。
+
+    刻意不从 `label_series` 反推：这一节测的是**规则**，直接喂结构体才不必先让真实
+    指标走到某个恰好满足条件的日子（那种夹具一改参数就散）。
+    """
+    fields = dict(
+        date=DAY0,
+        atr=1.0,
+        atr_pct=0.01,
+        atr_pct_rank=rank,
+        quantile_sample=PARAMS.quantile_window_days,
+        ema_fast=100.0,
+        ema_slow=99.0,
+        ema_slope=slope,
+        separation=separation,
+        gap=None,
+        volume_ratio=None,
+        atr_jump=None,
+    )
+    fields.update(overrides)
+    return quant.DayMetrics(**fields)
+
+
 class TestDecisionTable(SimpleTestCase):
     """规则本身。
 
     `_classify` 是这条规则的唯一一处陈述，所以直接测它：端到端用例（下一节）证明
     它接到了真实指标上，这一节证明规则在四个方向上都对，包括「符号与间距打架」那格。
+
+    它吃的是**中间量结构体**，不碰 K 线——这正是 prefactor 的形状：算数与定档分开之后，
+    规则可以脱离行情直接被测，而行情夹具那份成本留给端到端那一节。
     """
 
     def test_high_vol_beats_both_trends(self):
@@ -146,28 +174,30 @@ class TestDecisionTable(SimpleTestCase):
         for slope, separation in ((1.0, 2.0), (-1.0, -2.0), (0.0, 0.0)):
             with self.subTest(slope=slope, separation=separation):
                 self.assertIs(
-                    quant._classify(0.95, slope, separation, PARAMS),
+                    quant._classify(metrics(0.95, slope, separation), PARAMS),
                     BaseRegime.HIGH_VOL,
                 )
 
     def test_threshold_is_strictly_exceeded(self):
         """分位**恰好**等于阈值不算高波动：「超过第 80 百分位」不等于「达到」。"""
         self.assertIs(
-            quant._classify(PARAMS.high_vol_quantile, 0.0, 0.0, PARAMS),
+            quant._classify(metrics(PARAMS.high_vol_quantile, 0.0, 0.0), PARAMS),
             BaseRegime.RANGE,
         )
         self.assertIs(
-            quant._classify(PARAMS.high_vol_quantile + 0.01, 0.0, 0.0, PARAMS),
+            quant._classify(metrics(PARAMS.high_vol_quantile + 0.01, 0.0, 0.0), PARAMS),
             BaseRegime.HIGH_VOL,
         )
 
     def test_trend_needs_sign_and_separation_to_agree(self):
         threshold = PARAMS.trend_separation_min_atr
         self.assertIs(
-            quant._classify(0.5, +1.0, +(threshold + 0.1), PARAMS), BaseRegime.UPTREND
+            quant._classify(metrics(0.5, +1.0, +(threshold + 0.1)), PARAMS),
+            BaseRegime.UPTREND,
         )
         self.assertIs(
-            quant._classify(0.5, -1.0, -(threshold + 0.1), PARAMS), BaseRegime.DOWNTREND
+            quant._classify(metrics(0.5, -1.0, -(threshold + 0.1)), PARAMS),
+            BaseRegime.DOWNTREND,
         )
 
     def test_disagreeing_sign_and_separation_is_not_a_trend(self):
@@ -178,16 +208,20 @@ class TestDecisionTable(SimpleTestCase):
         """
         threshold = PARAMS.trend_separation_min_atr
         self.assertIs(
-            quant._classify(0.5, +1.0, -(threshold + 0.1), PARAMS), BaseRegime.RANGE
+            quant._classify(metrics(0.5, +1.0, -(threshold + 0.1)), PARAMS),
+            BaseRegime.RANGE,
         )
         self.assertIs(
-            quant._classify(0.5, -1.0, +(threshold + 0.1), PARAMS), BaseRegime.RANGE
+            quant._classify(metrics(0.5, -1.0, +(threshold + 0.1)), PARAMS),
+            BaseRegime.RANGE,
         )
 
     def test_separation_exactly_at_the_threshold_is_not_a_trend(self):
         """符号对但幅度只有刚好一个门槛：噪声喊了一声方向，不算趋势。"""
         self.assertIs(
-            quant._classify(0.5, +1.0, +PARAMS.trend_separation_min_atr, PARAMS),
+            quant._classify(
+                metrics(0.5, +1.0, +PARAMS.trend_separation_min_atr), PARAMS
+            ),
             BaseRegime.RANGE,
         )
 
@@ -198,6 +232,210 @@ class TestDecisionTable(SimpleTestCase):
         枚举、互斥」直接冲突。它的用途只是给日报写依据，等单元 8 需要时才引入。
         """
         self.assertFalse(hasattr(quant, "detect_box_range"))
+
+
+class TestArithmeticIsSeparateFromClassification(SimpleTestCase):
+    """prefactor 的形状：**算数**与**定档**是两段，不是一回事。
+
+    这条性质不是「代码组织偏好」：两个维度（周期 / 波动）的分类器要共用同一批中间量。
+    不拆开，每加一个分类器就得复制一遍算数，而复制出来的第二份迟早会和第一份漂开——
+    两边的结论都会看着很正常，这正是本设计反复在防的那类失败。
+
+    用例钉三件事：中间量序列不含档位、定档只吃中间量、两段串起来就是对外入口。
+    """
+
+    def test_metrics_series_carries_no_verdict(self):
+        """中间量结构体里**没有** `regime`：它只回答「这个数是多少」。
+
+        有 `regime` 就意味着算数与定档又缝回了一起——那正是这次要拆开的东西。
+        """
+        fields = {f.name for f in dataclasses.fields(quant.DayMetrics)}
+        self.assertNotIn("regime", fields)
+
+    def test_metrics_series_is_one_row_per_candle_in_order(self):
+        series = candles(RAMP)
+        metrics = quant.metrics_series(series, PARAMS)
+
+        self.assertEqual([m.date for m in metrics], [row["date"] for row in series])
+        self.assertEqual(quant.metrics_series([], PARAMS), [])
+
+    def test_the_same_metrics_under_different_history_give_the_same_regime(self):
+        """同一份中间量，来自完全不同的两段行情 ⇒ 同一个档位。
+
+        这是「定档不看行情」的**可失败**形式：若哪天有人把 K 线重新塞进分类器
+        （比如「顺便看一眼原始收盘价」），两段不同行情的同日中间量就会被判出不同档位，
+        这条会红。只断言 `_classify(m) == classify_day(m)` 是没有约束力的——后者本来
+        就是前者的直接委托。
+        """
+        up = {m.date: m for m in quant.metrics_series(candles(RAMP), PARAMS)}
+        down = {m.date: m for m in quant.metrics_series(candles(STEADY_DOWN), PARAMS)}
+        shared = sorted(set(up) & set(down))[-1]
+
+        # 两段行情的中间量本来不同，档位也就理应不同；把其中一份的「就绪三项」
+        # 搬到另一份上，档位必须跟着这三项走，而不是跟着它来自哪段行情走。
+        transplanted = dataclasses.replace(
+            down[shared],
+            atr_pct_rank=up[shared].atr_pct_rank,
+            ema_slope=up[shared].ema_slope,
+            separation=up[shared].separation,
+        )
+        self.assertNotEqual(up[shared].atr_pct_rank, down[shared].atr_pct_rank)
+        self.assertIs(
+            quant.classify_day(transplanted, PARAMS).regime,
+            quant.classify_day(up[shared], PARAMS).regime,
+        )
+
+    def test_label_series_is_the_two_stages_joined(self):
+        """`label_series` 不是第三份实现，而是 `metrics_series` + `classify_day`。
+
+        逐日断言而不是只比长度：两段各自独立算一遍时，任何一处差异都只会表现成
+        「某些天的档位不同」，而不是报错。
+        """
+        series = candles(DOWN_CALMING)
+        joined = [
+            quant.classify_day(m, PARAMS) for m in quant.metrics_series(series, PARAMS)
+        ]
+
+        self.assertEqual(label_series(series, PARAMS), joined)
+
+    def test_each_label_carries_the_metrics_object_it_was_built_from(self):
+        """落库要扁平字段，分类器要整体对象，两者指向同一批数字。"""
+        label = label_series(candles(RAMP), PARAMS)[EXPECTED_ONSET]
+
+        self.assertIsInstance(label.metrics, quant.DayMetrics)
+        self.assertEqual(label.metrics.date, label.date)
+        self.assertEqual(label.metrics.atr_pct_rank, label.atr_pct_rank)
+        self.assertEqual(label.metrics.ema_slope, label.ema_slope)
+        self.assertEqual(label.metrics.separation, label.separation)
+
+    def test_an_unready_metrics_struct_is_unjudged_not_range(self):
+        """三个条件缺一 → 未判定。分类侧也把这一条守住，不只在串联处守。"""
+        for missing in ("atr_pct_rank", "ema_slope", "separation"):
+            with self.subTest(missing=missing):
+                label = quant.classify_day(metrics(**{missing: None}), PARAMS)
+                self.assertIsNone(label.regime)
+
+    def test_classify_refuses_half_data_instead_of_defaulting_to_range(self):
+        """`_classify` 自己拿到半截数据时**抛**，不退回兜底档。
+
+        `classify_day` 已经先验过，所以这条路正常不会走到；但它要是静默返回箱体震荡，
+        「算不出来」就会变成一条安静的假标签——而箱体震荡是兜底档，切片会当真。
+        抛异常是把「调用方漏了校验」变成一个立刻看得见的事故。
+        """
+        with self.assertRaises(ValueError):
+            quant._classify(metrics(atr_pct_rank=None), PARAMS)
+        with self.assertRaises(ValueError):
+            quant._classify(metrics(ema_slope=None), PARAMS)
+        with self.assertRaises(ValueError):
+            quant._classify(metrics(separation=None), PARAMS)
+
+
+class TestVolatilityProxyMetrics(SimpleTestCase):
+    """波动代理的三个中间量：**本阶段只算不用**。
+
+    它们进结构体是为了让波动维的分类器直接可取，现在一个都不参与定档。这条用例同时
+    钉住两件容易走偏的事：缺数据时必须是 `None`（不是 0 / 1.0），以及它们确实**没有**
+    影响档位。
+    """
+
+    def test_the_three_proxy_fields_are_in_the_struct_but_not_in_the_verdict(self):
+        fields = {f.name for f in dataclasses.fields(quant.DayMetrics)}
+        for name in ("gap", "volume_ratio", "atr_jump"):
+            self.assertIn(name, fields)
+
+        params = replace(PARAMS, volume_ma_period=3)
+        # 代理量刻意取极端值（不是「温和地有点跳空」）：若哪天它们被接进了定档，
+        # 极端值必然翻档位。温和值只能证明「这个夹具碰巧没触发阈值」，那种断言会
+        # 随着阈值调整静默变成空转。
+        with_proxy = [
+            {**row, "open": row["close"] * 1.9, "volume": 100_000.0 * (i + 1)}
+            for i, row in enumerate(candles(RAMP))
+        ]
+        bare = label_series(candles(RAMP), params)
+        enriched = label_series(with_proxy, params)
+
+        # 只算不用：档位逐日相等。
+        self.assertEqual([lb.regime for lb in bare], [lb.regime for lb in enriched])
+        # 但中间量确实算出来了。
+        last = enriched[-1].metrics
+        self.assertIsNotNone(last.gap)
+        self.assertIsNotNone(last.volume_ratio)
+        self.assertIsNotNone(last.atr_jump)
+
+    def test_missing_open_and_volume_yield_none_not_a_default(self):
+        """行情源不给量能是常态；编成 0 或 1.0 会让「没有数据」与「量能平稳」长得一样。
+
+        `atr_jump` 是例外：它只依赖 ATR，与量能无关，所以这里照样有值——把它也一起
+        断言成 `None` 会让「ATR 环比」这个量在缺量能行情里凭空消失，而它本来是
+        可算的。
+        """
+        params = replace(PARAMS, volume_ma_period=3)
+        label = label_series(candles(RAMP), params)[-1]
+
+        self.assertIsNone(label.metrics.gap)
+        self.assertIsNone(label.metrics.volume_ratio)
+        self.assertIsNotNone(label.metrics.atr_jump)
+
+    def test_the_first_day_has_no_proxy_metrics(self):
+        """跳空与 ATR 环比都要前一日的数，第一天无从谈起。"""
+        rows = [{**row, "open": row["close"], "volume": 100.0} for row in candles(RAMP)]
+        first = quant.metrics_series(rows, PARAMS)[0]
+
+        self.assertIsNone(first.gap)
+        self.assertIsNone(first.atr_jump)
+
+    def test_gap_is_an_absolute_ratio(self):
+        """跳空取绝对值：方向由周期维回答，波动维只回答「有没有跳」。"""
+        rows = [
+            {
+                "date": DAY0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "open": 100.0,
+                "volume": 100.0,
+            },
+            {
+                "date": DAY0 + timedelta(days=1),
+                "high": 103.0,
+                "low": 97.0,
+                "close": 100.0,
+                "open": 97.0,
+                "volume": 100.0,
+            },
+        ]
+        second = quant.metrics_series(rows, PARAMS)[1]
+
+        self.assertAlmostEqual(second.gap, 0.03, places=9)
+
+    def test_an_unparseable_optional_column_is_tolerated(self):
+        """`open`/`volume` 读不出来只让代理量变成 `None`，不该让整条标注序列失败。
+
+        `high`/`low`/`close` 相反：缺了它什么档都定不出来，必须报错（见
+        `TestInputHandling`）。
+        """
+        rows = [{**row, "open": "n/a", "volume": None} for row in candles(RAMP)]
+        labels = label_series(rows, PARAMS)
+
+        self.assertEqual(len(labels), len(RAMP))
+        # 两个字段的解析失败路径各断言一次：只断 volume 等于放过了 open 那一支。
+        self.assertIsNone(labels[-1].metrics.gap)
+        self.assertIsNone(labels[-1].metrics.volume_ratio)
+
+    def test_volume_ratio_is_unavailable_during_its_own_warmup(self):
+        """量能在、但均量还没攒够 `volume_ma_period` 天：`volume_ratio` 是 `None`。
+
+        这是它最容易被"顺手"改成 0 或 1.0 的边界。改成 1.0 会让上线头几天看起来像
+        「量能一直平稳」，而不是「还看不出来」。
+        """
+        params = replace(PARAMS, volume_ma_period=3)
+        rows = [{**row, "open": row["close"], "volume": 100.0} for row in candles(RAMP)]
+        series = quant.metrics_series(rows, params)
+
+        # 均量是 3 日窗，所以下标 0、1 两天还没有分母。
+        self.assertIsNone(series[0].volume_ratio)
+        self.assertIsNone(series[1].volume_ratio)
+        self.assertIsNotNone(series[2].volume_ratio)
 
 
 class TestClassificationEndToEnd(SimpleTestCase):

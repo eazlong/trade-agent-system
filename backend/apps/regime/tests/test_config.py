@@ -98,6 +98,10 @@ class TestSnapshot(SimpleTestCase):
                 "high_vol_quantile",
                 "ema_slope_lookback_days",
                 "trend_separation_min_atr",
+                # 2026-11-23 起：放量倍数的分母窗口。它现在只喂一个**不参与定档**的
+                # 中间量（波动代理），但仍然进快照——等它真的开始参与判定那天再补，
+                # 历史记录就已经缺了这一格，而「当时用的哪个窗口」再也答不上来。
+                "volume_ma_period",
                 "warmup_days",
             ),
             # `judgement_hour` / `judgement_minute` 是「业务日 D 的判定时刻」，
@@ -271,6 +275,10 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         # 钉在这里是为了让将来在 Shadow 里调它们时留下一次可见的改动。
         self.assertEqual(config.JUDGEMENT.ema_slope_lookback_days, 5)
         self.assertEqual(config.JUDGEMENT.trend_separation_min_atr, 0.5)
+        # 放量倍数的分母窗口（2026-11-23）。它目前只喂一个**不参与定档**的代理量，
+        # 但仍然钉在这里：等它真的开始参与判定，这个数就是阈值本身，钉住的时点不该
+        # 等到那天。
+        self.assertEqual(config.JUDGEMENT.volume_ma_period, 20)
 
     def test_lifecycle_defaults(self):
         self.assertEqual(
@@ -484,6 +492,12 @@ class TestSelfValidation(SimpleTestCase):
             with self.subTest(threshold=bad):
                 with self.assertRaises(ValueError):
                     config.JudgementConfig(trend_separation_min_atr=bad)
+
+    def test_volume_ma_period_must_be_at_least_two(self):
+        """1 天均量 = 当日自己，放量倍数恒为 1.0——「有没有放量」这个量就不再回答任何事。"""
+        with self.assertRaises(ValueError) as ctx:
+            config.JudgementConfig(volume_ma_period=1)
+        self.assertIn("volume_ma_period", str(ctx.exception))
 
     def test_negative_lifecycle_is_rejected(self):
         with self.assertRaises(ValueError):
