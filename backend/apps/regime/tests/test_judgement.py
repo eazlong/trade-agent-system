@@ -853,6 +853,8 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             ema_slow = 100.0
             ema_slope = 1.0
             separation = 3.0
+            slope_strength = 2.0
+            slope_consistency = 1.0
 
         evidence = build_evidence(Label(), {"action": "adopted", "reason": ""})
         self.assertEqual(
@@ -882,6 +884,8 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             ema_slow = 100.0
             ema_slope = -1.0
             separation = -3.0
+            slope_strength = 2.0
+            slope_consistency = 1.0
 
         quant_block = build_evidence(Label(), {"action": "adopted", "reason": ""})[
             "quant"
@@ -903,6 +907,8 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             ema_slow = None
             ema_slope = None
             separation = None
+            slope_strength = None
+            slope_consistency = None
 
         evidence = build_evidence(Label(), {"action": "adopted", "reason": ""})
         self.assertIsNone(evidence["quant"]["regime"])
@@ -953,8 +959,17 @@ class TestTwoAxesReachTheRecord(TestCase):
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
         self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROJECTION)
 
-    def test_a_high_vol_day_stores_a_null_cycle(self):
-        """`high_vol` → `cycle` 落 NULL。这是 issue #63 点名的规则，不是遗漏。"""
+    def test_a_high_vol_day_still_records_the_cycle(self):
+        """`high_vol` 那天 `cycle` **不再落 NULL**——#64 要结束的正是这个状态。
+
+        #63 时两维是四档的投影，`high_vol` 只能给空 cycle：旧结构里波动排在 `PRIORITY`
+        第一位，那天的周期信息在判据里根本不存在。现在周期维有自己的两条路径，于是
+        同一条记录里可以既 `base_regime=high_vol`（该保命）又 `cycle=...`（方向看得见）。
+
+        这条同时钉住写入路径：`cycle` 取自 `label.cycle`（独立判定），**不是**
+        `project_to_axes(base)`——后者会把那天重新变回 `None`，等于在写入这一层把
+        本票的改动悄悄装回去。
+        """
         # 末段从 320 起恢复宽幅（`end_band` 只在给了 `end_from` 时生效），
         # ATR% 分位跳到 1.0 → 高波动。
         persist(series(end_from=320, end_band=0.06), SIGNED_DAY)
@@ -962,8 +977,11 @@ class TestTwoAxesReachTheRecord(TestCase):
 
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
         self.assertEqual(record.base_regime, BaseRegime.HIGH_VOL.value)
-        self.assertIsNone(record.cycle)
         self.assertEqual(record.volatility, Volatility.EVENT_SPIKE.value)
+        self.assertIsNotNone(
+            record.cycle,
+            "高波动不再吞掉周期：这天必须有方向，而不是空值",
+        )
 
     def test_the_axes_are_projected_from_the_written_base_not_from_the_label(self):
         """两维的**唯一来源**是写进记录的 `base_regime`，不是量化标签。

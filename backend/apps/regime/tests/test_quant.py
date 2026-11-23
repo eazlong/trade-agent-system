@@ -151,6 +151,11 @@ def metrics(rank=0.5, slope=1.0, separation=1.0, **overrides):
         ema_slow=99.0,
         ema_slope=slope,
         separation=separation,
+        # 周期维那两条通道（#64）。默认值刻意取「够强且一致」：这样构造出来的中间量
+        # 在四档规则里与改动前完全等价，只有显式覆盖它们时才进入 `unclear` 那些分支。
+        # ATR=1.0，所以 strength 就等于 |slope|。
+        slope_strength=abs(slope),
+        slope_consistency=1.0,
         gap=None,
         volume_ratio=None,
         atr_jump=None,
@@ -232,6 +237,175 @@ class TestDecisionTable(SimpleTestCase):
         枚举、互斥」直接冲突。它的用途只是给日报写依据，等单元 8 需要时才引入。
         """
         self.assertFalse(hasattr(quant, "detect_box_range"))
+
+
+class TestCycleDecisionTable(SimpleTestCase):
+    """周期维的**真判定**（#64）：两条独立路径 + 显式横盘 + `unclear`。
+
+    这一组是本票的核心。它解决两个已量化的缺陷：
+
+    1. **箱体当兜底吞掉缓慢趋势** —— 旧结构里 `RANGE` 是「其余」。实测 2254 个可比日里
+       人工标「下行」而算法判「箱体」的有 207 天，其中 125 天（60%）EMA 斜率方向其实
+       是对的，只是 `|separation| <= 0.5` 卡住。
+    2. **间距阈值是唯一判据** —— 缓慢阴跌时 EMA20 与 EMA60 靠得近，间距到不了半个 ATR。
+
+    所以这里逐个钉死：两条路径各自都能单独成立、横盘必须**同时**证明「无间距且无强度」、
+    以及判不出来时落 `unclear` 而不是任何一档。
+    """
+
+    def cycle(self, **overrides):
+        """只喂中间量的构造器。默认是「两条路径都不成立」的中性位置。"""
+        return quant._classify_cycle(metrics(**overrides), PARAMS)
+
+    # ---- 路径一：斜率与间距同向且过阈值 ----
+
+    def test_path_one_needs_sign_and_separation_to_agree(self):
+        """间距与斜率同向、且过 `cycle_separation_min_atr` ⇒ 趋势。
+
+        这是旧结构那一支，但门槛从 0.5 松到 0.15——松是安全的，因为路径二与显式横盘
+        会各自兜住松下来的那部分。
+        """
+        sep = PARAMS.cycle_separation_min_atr
+        self.assertIs(
+            self.cycle(ema_slope=+1.0, separation=+(sep + 0.05)), quant.Cycle.BULL
+        )
+        self.assertIs(
+            self.cycle(ema_slope=-1.0, separation=-(sep + 0.05)), quant.Cycle.BEAR
+        )
+
+    def test_path_one_alone_works_even_without_strength(self):
+        """间距够就是趋势，**不要求**强度也够——两条路径是「或」，不是「且」。
+
+        把两者串成且会让「拉得很开但走得慢」的日子落进 `unclear`，而它明明是个
+        清晰的方向。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr + 0.05),
+                slope_strength=0.0,
+                slope_consistency=0.0,
+            ),
+            quant.Cycle.BULL,
+        )
+
+    # ---- 路径二：强度 × 一致性（缓慢趋势的救回通道）----
+
+    def test_path_two_rescues_a_slow_trend_with_a_narrow_separation(self):
+        """**这就是缓慢阴跌那一天**：间距不够，但强度够且方向一致 ⇒ 下行。
+
+        旧结构在这格里判箱体——125 天错向的主体。新结构必须判 `bear`，且这条用例
+        同时证明路径二**不依赖**路径一（间距刻意取得远小于门槛）。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=-1.0,
+                separation=-(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=PARAMS.cycle_strength_min + 0.05,
+                slope_consistency=PARAMS.cycle_consistency_min + 0.05,
+            ),
+            quant.Cycle.BEAR,
+        )
+
+    def test_path_two_requires_both_strength_and_consistency(self):
+        """强度够但一致性不够 ⇒ **不是**趋势，也**不是**横盘，是 `unclear`。
+
+        这种日子（有动能无共识）被旧结构判成箱体，正是「把要动的行情说成平静」。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=PARAMS.cycle_strength_min + 0.05,
+                slope_consistency=PARAMS.cycle_consistency_min - 0.05,
+            ),
+            quant.Cycle.UNCLEAR,
+        )
+
+    def test_missing_consistency_falls_back_to_unclear_not_sideways(self):
+        """一致性算不出来（窗口没满）时不许当「一致」。
+
+        `None` 是「还看不出来」，填 1.0 会让预热期整段看起来方向极其一致。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=PARAMS.cycle_strength_min + 0.05,
+                slope_consistency=None,
+            ),
+            quant.Cycle.UNCLEAR,
+        )
+
+    # ---- 显式横盘：必须同时证明「无间距」与「无强度」----
+
+    def test_sideways_requires_both_no_separation_and_no_strength(self):
+        """横盘是**主动证明**出来的，不是「其余」。
+
+        三个格逐个断言：两条都弱 ⇒ 横盘；只有一条弱 ⇒ `unclear`。把后者判成横盘，
+        就是旧结构那 207 天系统性错向的形态。
+        """
+        sep_min = PARAMS.cycle_separation_min_atr
+        str_min = PARAMS.cycle_strength_min
+        cases = [
+            # (separation 弱?, strength 弱?, 期望)
+            (True, True, quant.Cycle.SIDEWAYS),
+            (False, True, quant.Cycle.UNCLEAR),
+            (True, False, quant.Cycle.UNCLEAR),
+        ]
+        for weak_sep, weak_str, expected in cases:
+            with self.subTest(weak_sep=weak_sep, weak_str=weak_str):
+                self.assertIs(
+                    self.cycle(
+                        ema_slope=+1.0,
+                        separation=(sep_min / 3) if weak_sep else -(sep_min + 0.05),
+                        slope_strength=(str_min / 2) if weak_str else (str_min + 0.05),
+                        slope_consistency=0.0,
+                    ),
+                    expected,
+                )
+
+    def test_missing_strength_counts_as_weak_for_sideways(self):
+        """强度算不出来（ATR 为 0 等）时按「弱」处理，仍可判横盘。
+
+        与一致性那条相反：横盘要的是「证明不了有强度」，而 `None` 恰恰就是证明不了。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=None,
+                slope_consistency=None,
+            ),
+            quant.Cycle.SIDEWAYS,
+        )
+
+    def test_the_slope_sign_decides_the_direction_not_the_separation_sign(self):
+        """方向由**斜率**决定；间距只是「拉开没拉开」的旁证。
+
+        间距说下行而斜率说上行（刚拐头）时，两条路径都不成立——落 `unclear`，
+        既不判 bull（斜率对但间距反向）也不判 bear（间距对但方向刚变）。
+        """
+        self.assertIs(
+            self.cycle(
+                ema_slope=+1.0,
+                separation=-(PARAMS.cycle_separation_min_atr + 0.05),
+                slope_strength=0.0,
+                slope_consistency=0.0,
+            ),
+            quant.Cycle.UNCLEAR,
+        )
+
+    def test_half_data_raises_instead_of_defaulting(self):
+        """`_classify_cycle` 拿到半截数据时**抛**，不退回横盘。
+
+        与 `_classify` 同一纪律：静默返回 `sideways` 会把「算不出来」变成一条安静的
+        假标签，而横盘正是最容易看起来正常的那个假标签。
+        """
+        for missing in ("ema_slope", "separation"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(ValueError):
+                    quant._classify_cycle(metrics(**{missing: None}), PARAMS)
 
 
 class TestArithmeticIsSeparateFromClassification(SimpleTestCase):
@@ -494,6 +668,83 @@ class TestClassificationEndToEnd(SimpleTestCase):
         self.assertEqual(labels[-1].atr_pct_rank, 1.0)
 
 
+class TestSlowTrendIsNotSwallowedBySideways(SimpleTestCase):
+    """本票要解决的第一个缺陷：**缓慢趋势不再落进箱体**（端到端）。
+
+    上一组钉的是规则本身；这一组钉「规则接到真实指标上之后，缓慢阴跌确实被判成
+    `bear`」。两者的区别很实际：规则对了但指标算错、或窗口取错，端到端那条才会红。
+    """
+
+    def test_a_slow_bleed_is_bear_not_sideways(self):
+        """温和阴跌（每天 −0.6、振幅 1.0）：间距走不满门槛，但仍是一条下行。
+
+        这是旧结构最典型的失败形态——`|separation|` 到不了 0.5，于是落箱体。
+        用例先在真实指标上确认「间距确实不够」（否则它证明不了任何事），再断言
+        周期维没有因此判横盘。
+        """
+        # 每天 −0.2、振幅 1.0：实测 separation ≈ −0.25、strength ≈ 0.10、consistency = 1.0。
+        # 这组数正好落在两个判据之间——间距没走满 0.5，强度刚够 0.10。旧结构在这格
+        # 判箱体（207 天错向的主体），新结构必须判 bear，这正是路径二的全部意义。
+        slow_bleed = [200 - 0.2 * i for i in range(30)]
+        label = label_series(candles(slow_bleed), PARAMS)[-1]
+
+        self.assertLess(label.ema_slope, 0, "方向确实是下行")
+        self.assertGreater(
+            label.separation,
+            -PARAMS.trend_separation_min_atr,
+            "间距确实没走满兼容层那道 0.5 的门槛——这正是它过去被判箱体的原因",
+        )
+        self.assertIs(label.cycle, quant.Cycle.BEAR, "路径二把它救回成下行")
+
+    def test_a_flat_market_is_sideways_explicitly(self):
+        """真正不动的行情仍判横盘——显式判定不等于把横盘取消。
+
+            没有这条，把 `sideways` 整个删掉也能让上一条通过；而 ADR 0007 要的是
+        `sideways` 从 33.5% 降到 2% 量级，不是降到 0。
+        """
+        label = label_series(candles(TINY_DRIFT), PARAMS)[-1]
+
+        self.assertIs(label.cycle, quant.Cycle.SIDEWAYS)
+
+
+class TestUnclearIsProduced(SimpleTestCase):
+    """`unclear` 是**会被产出**的取值，不是枚举里摆着的装饰。
+
+    #63 时它还被明确标注为「本版不产出」；本票落地后必须真的出现，否则「判不出来」
+    这条语义就只活在 docstring 里。
+    """
+
+    def test_unclear_appears_on_a_conflicting_market(self):
+        """先横后动：强度够但窗口内方向来回翻 ⇒ `unclear`。
+
+        构造一段「来回震荡」再接一段单边，使一致性占比落在门槛之下。
+        """
+        zigzag = [100.0, 103.0, 99.0, 104.0, 98.0, 105.0, 97.0, 106.0, 96.0, 107.0]
+        saw = zigzag + [107.0 + 2.0 * i for i in range(1, 11)]
+        labels = label_series(candles(saw), PARAMS)
+        produced = {lb.cycle for lb in labels if lb.judged}
+
+        self.assertIn(quant.Cycle.UNCLEAR, produced)
+
+    def test_unclear_is_not_sideways(self):
+        """两者是不同的事实：`unclear` = 判了但方向证不出来；`sideways` = 证出了没方向。
+
+        混同的代价已经量过——旧结构把前者当后者，207 天系统性错向。
+        """
+        self.assertIsNot(quant.Cycle.UNCLEAR, quant.Cycle.SIDEWAYS)
+        self.assertNotEqual(quant.Cycle.UNCLEAR.value, quant.Cycle.SIDEWAYS.value)
+
+    def test_unclear_projects_to_nothing_in_the_legacy_layer(self):
+        """`unclear + normal` 还原不回四档——旧结构里没有这一格，必须抛。
+
+        这一点决定了「`unclear` 与 `missing` 同待遇」的落地位置：它不是在投影里
+        折叠成 range，而是在统计口径里按「没有结论」计（见 `truth` 的 missing 语义）。
+        """
+        self.assertIsNone(
+            quant.project_to_base_axes(quant.Cycle.UNCLEAR, quant.Volatility.NORMAL)
+        )
+
+
 class TestUndecidableDaysAreNotRange(SimpleTestCase):
     """数据不足是「还没有资格判定」，不是某一种阶段。
 
@@ -603,6 +854,46 @@ class TestNoLookahead(SimpleTestCase):
         self.assertNotEqual(original[-1].regime, mutated[-1].regime)
 
 
+class TestCycleHasNoLookahead(SimpleTestCase):
+    """周期维的新判据同样**不许前视**——这是历史切片能重算的前提。
+
+    `TestNoLookahead` 钉的是四档；本组钉的是 #64 新增的两条通道。一致性那条尤其
+    容易踩：它要回看 20 天，实现里若把窗口写成 `[i - window, i + window]` 或在
+    `metrics_series` 里预先算一遍全序列再取尾，就会用到未来数据，而结果看起来
+    完全正常。
+    """
+
+    def test_truncating_the_history_does_not_change_earlier_cycles(self):
+        """前缀不变：只喂前 N 天算出来的周期，必须与全量算出来的前 N 天逐日相等。"""
+        series = candles(DOWN_CALMING * 3)
+        full = label_series(series, PARAMS)
+
+        for cut in (8, 12, 20, len(series) - 1):
+            with self.subTest(cut=cut):
+                self.assertEqual(label_series(series[:cut], PARAMS), full[:cut])
+
+    def test_mutating_the_tail_does_not_change_earlier_cycles(self):
+        """改后缀：把后半段换成反向行情，前半段的分类必须一个都不动。"""
+        head = DOWN_CALMING
+        original = label_series(candles(head + list(range(100, 130))), PARAMS)
+        flipped = label_series(candles(head + list(range(200, 170, -1))), PARAMS)
+
+        self.assertEqual(original[: len(head)], flipped[: len(head)])
+        self.assertNotEqual(original[len(head) :], flipped[len(head) :])
+
+    def test_consistency_only_reads_backwards(self):
+        """一致性的窗口是 `[i - window + 1, i]`：第 i 天只由 `[0, i]` 决定。
+
+        直接对中间量断言比分档更敏感——即使某天档位碰巧没变，两个通道的数字也会变。
+        """
+        series = candles(DOWN_CALMING * 3)
+        short = quant.metrics_series(series[:20], PARAMS)[-1]
+        long = quant.metrics_series(series, PARAMS)[19]
+
+        self.assertEqual(short.slope_consistency, long.slope_consistency)
+        self.assertEqual(short.slope_strength, long.slope_strength)
+
+
 class TestSeriesShape(SimpleTestCase):
     def test_output_is_one_label_per_candle_in_order(self):
         series = candles(RAMP)
@@ -679,37 +970,38 @@ class TestTwoAxesAreProjectedFromOneVerdict(SimpleTestCase):
                 self.assertIsNone(label.volatility)
 
     def test_the_projection_round_trips_to_the_four_tiers(self):
-        """本票的核心断言：投影回四档必须逐日等于 `label_series` 的输出。
+        """**兼容投影**（`project_to_axes`）仍是四档到两维的唯一逆表。
 
-        覆盖全部五组夹具——四档里除了 uptrend / downtrend / range，还有 high_vol，
-        而 high_vol 恰恰是「cycle 留空」的那一支，只测其中三档会漏掉它。
+        #64 之后 `cycle` 有独立判据，所以「两维投影回四档 == regime」这条**不再成立**：
+        `base=high_vol` 那天 cycle 可以是 `bear`（波动吃掉周期，但周期维自己看得见方向），
+        而 `bear + event_spike` 正是设计上无法还原的合法组合。这里因此只钉逆表本身
+        （三档一一对应 + high_vol 的 cycle 留空），真正的端到端等价由下面那组按新结构
+        重写的用例负责。
         """
-        fixtures = {
-            "ramp": candles(RAMP),
-            "down_calming": candles(DOWN_CALMING),
-            "steady_down": candles(STEADY_DOWN),
-            "tiny_drift": candles(TINY_DRIFT),
-            "quiet_then_spike": candles(QUIET_THEN_SPIKE, bands=[1.0] * 15 + [30.0]),
-        }
-        for name, rows in fixtures.items():
-            with self.subTest(fixture=name):
-                labels = label_series(rows, PARAMS)
-                projected = [quant.project_to_base(label) for label in labels]
-                self.assertEqual(projected, [label.regime for label in labels])
+        for regime, (cycle, volatility) in quant._TO_AXES.items():
+            with self.subTest(regime=regime.value):
+                self.assertEqual(quant.project_to_axes(regime), (cycle, volatility))
+                if regime is not BaseRegime.HIGH_VOL:
+                    self.assertIs(quant.project_to_base_axes(cycle, volatility), regime)
 
-    def test_high_vol_leaves_the_cycle_axis_empty(self):
-        """旧结构里波动吃掉了周期，所以那天的周期**真的没有**结论。
+    def test_high_vol_no_longer_erases_the_cycle_axis(self):
+        """#64 之后「高波动」不再吞掉周期：那是本票要结束的状态。
 
-        从价格再猜一个 `bull`/`bear` 会让「那天是牛市暴跌」变成一句编出来的话：
-        本版没有独立的周期判据，猜出来的那个数与 `regime` 出自同一个判据，等于
-        把一趟结论说成两趟。
+        #63 时两维是四档的投影，`high_vol` 的 cycle 只能留空——因为旧结构里波动排在
+        `PRIORITY` 第一位，那天的周期信息在判据里**根本不存在**。现在周期维有自己的
+        两条路径，它与四档互不覆盖，于是同一天可以既是 `high_vol`（该保命）又是
+        `bear`（方向是下行）。这正是 ADR 0007 要的「两维并存」。
+
+        这也解释了为什么 `project_to_base` 在这里必须**抛**：`bear + event_spike`
+        是旧四档表达不了的组合，静默丢掉方向比报错更坏。
         """
         label = label_series(candles(STEADY_DOWN), PARAMS)[-1]
 
         self.assertIs(label.regime, BaseRegime.HIGH_VOL)
-        self.assertIsNone(label.cycle)
         self.assertIs(label.volatility, quant.Volatility.EVENT_SPIKE)
-        self.assertIs(quant.project_to_base(label), BaseRegime.HIGH_VOL)
+        self.assertIs(label.cycle, quant.Cycle.BEAR, "周期维独立看见了下行方向")
+        with self.assertRaises(ValueError):
+            quant.project_to_base(label)
 
     def test_the_other_three_tiers_map_one_to_one(self):
         expected = {
@@ -757,18 +1049,23 @@ class TestProjectionEquivalenceOnBulkHistory(SimpleTestCase):
     两者证的是同一件事。
     """
 
-    def _round_trip_every_day(self, rows, params):
+    def _axes_are_present_on_judged_days(self, rows, params):
+        """判得出的日子两维**必有值**；判不出的日子两维**同时为空**。
+
+        #64 之后不再断言「投影回四档相等」——cycle 有独立判据，它与四档允许不一致，
+        且不一致正是本票要的结果。这里钉的是同进退这条更强也更本质的性质：
+        不许出现「有一维、没另一维」的半截结论。
+        """
         labels = label_series(rows, params)
-        projected = [quant.project_to_base(label) for label in labels]
-        self.assertEqual(
-            projected,
-            [label.regime for label in labels],
-            f"{len(rows)} 根日线里出现了一天投影不回原档",
-        )
-        # 同时钉两维与四档的**同进退**：判得出的日子波动维必有值。
         for label in labels:
-            if label.judged:
+            if not label.judged:
+                with self.subTest(day=label.date):
+                    self.assertIsNone(label.cycle)
+                    self.assertIsNone(label.volatility)
+                continue
+            with self.subTest(day=label.date):
                 self.assertIsNotNone(label.volatility)
+                self.assertIsNotNone(label.cycle)
 
     def test_a_long_random_walk_round_trips_every_day(self):
         rng = np.random.default_rng(20261123)
@@ -777,7 +1074,7 @@ class TestProjectionEquivalenceOnBulkHistory(SimpleTestCase):
             closes.append(max(1.0, closes[-1] * (1.0 + rng.normal(0, 0.03))))
         # 振幅随价格漂移：让 ATR% 分位真的动起来，四档都会出现。
         bands = [abs(rng.normal(0.02, 0.02)) + 0.001 for _ in closes]
-        self._round_trip_every_day(candles(closes, bands), PARAMS)
+        self._axes_are_present_on_judged_days(candles(closes, bands), PARAMS)
 
     def test_every_tier_appears_in_that_history(self):
         """前提检查：上面那条随机游走必须**真的产生四档**。
@@ -820,12 +1117,12 @@ class TestProjectionEquivalenceOnBulkHistory(SimpleTestCase):
         for params in variants:
             for name, rows in fixtures.items():
                 with self.subTest(params=params, fixture=name):
-                    self._round_trip_every_day(rows, params)
+                    self._axes_are_present_on_judged_days(rows, params)
 
-    def test_empty_and_single_row_inputs_round_trip(self):
+    def test_empty_and_single_row_inputs_have_no_axes(self):
         for rows in ([], candles([100.0])):
             with self.subTest(n=len(rows)):
-                self._round_trip_every_day(rows, PARAMS)
+                self._axes_are_present_on_judged_days(rows, PARAMS)
 
 
 class TestProjectionBoundaries(SimpleTestCase):

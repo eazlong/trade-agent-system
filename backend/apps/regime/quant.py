@@ -41,9 +41,26 @@
 是为了让波动维的分类器直接可取，本阶段不参与定档。K 线行里没有 `open` / `volume`
 时它们就是 `None`——「说不出来就说说不出来」，不是 0。
 
+## 周期维自成一体（#64）
+
+`_classify` 出的是 `BaseRegime`（四档兼容层），`_classify_cycle` 出的是 `Cycle`。
+**两者已经不是同一件事了**，这是 #64 之后本模块最重要的结构变化：
+
+- `_classify` 仍按固定优先级走，高波动排第一——它回答「此刻该不该保命」，服务的是
+  停机链、池化与切片。这一层本票**刻意不动**，那是 #65 / #66 的范围。
+- `_classify_cycle` 回答「往哪走」，两条独立路径（间距 / 强度×一致性），横盘要显式
+  证明，判不出来落 `unclear`。
+
+于是在高风险日会出现 `regime=high_vol` 而 `cycle=bear` 这类组合——**那不是矛盾**，
+正是 ADR 0007 要的「两维并存、互不覆盖」。反过来，`project_to_axes` 那套兼容投影
+仍然存在且仍然正确（四档 → 两维），只是它不再是 `cycle` 的来源：拿投影去顶替独立
+判定，会在写入路径上把「缓慢趋势兜底成横盘」这个缺陷悄悄装回来。
+
 ## 四档与优先级
 
-高波动 > 下行趋势 > 上行趋势 > 箱体震荡，互斥且固定（`PRIORITY`）。**箱体震荡是兜底**，
+高波动 > 下行趋势 > 上行趋势 > 箱体震荡，互斥且固定（`PRIORITY`）。**箱体震荡是兜底**
+（这一句只描述 `BaseRegime` 这个**兼容层**——周期维 `cycle` 自 #64 起已不再兜底，
+见下节），
 所以它不是一个「检出了箱体」的结论，而是「既非高波动、也无趋势」的剩余。这一点有直接
 后果：箱体判定（`detect_box_range`）**不参与**档位归属——检不检出都落到箱体震荡。它的
 用途是给日报写依据（「判为箱体，且确实检出 [a, b]」vs「判为箱体，但未见成形箱体」），
@@ -283,6 +300,19 @@ class DayMetrics:
     ema_slope: float | None
     separation: float | None
 
+    # 周期维的两条独立通道（#64）。它们与上面那几个量是**同一批算数**的产物，
+    # 进结构体是为了让 `_classify_cycle` 不必重算——重算出来的第二份迟早会和第一份
+    # 漂开，而两边的结论都会看着很正常。
+    #
+    # `slope_strength` = |ema_slope| / ATR，量「单位波动走了多远」；它与 `separation`
+    # 的分工是路径二与路径一：间距说「两条均线拉开了吗」，强度说「快线自己走得快不快」。
+    #
+    # `slope_consistency` = 回看窗口内斜率符号与当日同向的占比（0~1）。它回答的是
+    # 「这个方向是持续的，还是今天才翻的」——单独看强度分辨不了这两件事，而那正是
+    # 「有动能无共识」的日子被判成趋势的来源。
+    slope_strength: float | None
+    slope_consistency: float | None
+
     # 波动代理（事件驱动判定用；本阶段不参与定档）
     gap: float | None
     volume_ratio: float | None
@@ -325,6 +355,11 @@ class DayLabel:
     ema_slow: float | None
     ema_slope: float | None
     separation: float | None
+
+    #: 周期维那两条通道的中间量（#64）。落库要的扁平字段与 `metrics` 指向同一批数，
+    #: 所以这里也各留一格——事后要解释「那天为什么判 unclear」，答案必须在这一行里。
+    slope_strength: float | None
+    slope_consistency: float | None
 
     @property
     def judged(self) -> bool:
@@ -506,6 +541,16 @@ def metrics_series(
                 (available["ema_fast"] - available["ema_slow"]) / available["atr"]
             )
 
+        # 周期维的两条通道（#64）。都从上面已经算好的 `slope` / `atr` / `ema_fast`
+        # 派生，不再重算指标——这正是 `metrics_series` 只算数、不算档的意义。
+        strength = None
+        if slope is not None and available["atr"] is not None and available["atr"] > 0:
+            strength = float(abs(slope) / available["atr"])
+
+        consistency = _slope_consistency(
+            ema_fast, i, lookback, params.cycle_consistency_window
+        )
+
         window_full = i + 1 >= qw and sample == qw
         rank = None
         if (
@@ -522,6 +567,8 @@ def metrics_series(
                 quantile_sample=sample,
                 ema_slope=slope,
                 separation=separation,
+                slope_strength=strength,
+                slope_consistency=consistency,
                 gap=_gap_ratio(opens[i], closes[i - 1]) if i >= 1 else None,
                 volume_ratio=_volume_ratio(volumes[i], volume_ma[i]),
                 atr_jump=_atr_jump(atr[i], atr[i - 1]) if i >= 1 else None,
@@ -564,6 +611,62 @@ def _atr_jump(atr: float, previous_atr: float) -> float | None:
     return float(atr / previous_atr)
 
 
+def _slope_consistency(
+    ema_fast: np.ndarray,
+    index: int,
+    lookback: int,
+    window: int,
+) -> float | None:
+    """回看窗口内「斜率符号与当日同向」的占比；窗口不够满时是 `None`。
+
+    这是周期维路径二的第二道门，回答的是**方向是不是持续的**。没有它，单看
+    `|slope| / ATR` 会把「今天猛地动一下、之前一直横着」也算成趋势；有了它，那种
+    日子落 `unclear`——不是箱体，因为强度明明够。把「有动能无共识」判成横盘，正是
+    旧结构那 207 天系统性错向的主要形态之一。
+
+    ## 只用 `[i - window + 1, i]` 这一段
+
+    窗口内每个 j 的斜率都由 `ema_fast[j]` 与 `ema_fast[j - lookback]` 决定，两者都
+    不晚于 j，因此**没有前视**。这一点与 `label_series` 的同一条约束一致：某天的
+    标签只能用那天及之前的数据，否则切片会「预知」那段行情。
+
+    ## 窗口不满就是 `None`，不是 1.0
+
+    返 `None` 让调用方落 `unclear`。填 1.0 会把「还看不出方向有没有持续性」与
+    「方向一直很一致」写成同一个数，而前者本来该说「判不出来」。
+
+    ## 分母是**实际采到的样本数**而不是 `window`
+
+    窗口头部有一段 `j - lookback < 0`，那些位置没有斜率。把它们当「不同向」计入
+    分母会系统性地压低早期的一致性，让刚上线那段日子凭空显得反复无常。
+    """
+    if window < 2 or index < window - 1:
+        return None
+    current = ema_fast[index]
+    base = ema_fast[index - lookback] if index - lookback >= 0 else np.nan
+    if not (np.isfinite(current) and np.isfinite(base)):
+        return None
+    want = 1.0 if current > base else -1.0
+
+    start = index - window + 1
+    same = 0
+    total = 0
+    for j in range(start, index + 1):
+        k = j - lookback
+        if k < 0:
+            continue
+        fast_now = ema_fast[j]
+        fast_then = ema_fast[k]
+        if not (np.isfinite(fast_now) and np.isfinite(fast_then)):
+            continue
+        total += 1
+        if (1.0 if fast_now > fast_then else -1.0) == want:
+            same += 1
+    if total == 0:
+        return None
+    return same / total
+
+
 def label_series(
     candles: Sequence[Mapping[str, Any]],
     params: JudgementConfig = JUDGEMENT,
@@ -603,7 +706,15 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
         and metrics.separation is not None
     )
     regime = _classify(metrics, params) if ready else None
-    cycle, volatility = project_to_axes(regime)
+
+    # 周期维（#64）**不再由四档投影**：它有了自己的判据（两条独立路径 + 显式横盘），
+    # 投影只在 `volatility` 那一条上还成立。这条分开是本票的全部内容——只要 cycle
+    # 还是 `project_to_axes` 的产物，`sideways` 就永远是「其余」，缓慢阴跌必然落进箱体。
+    #
+    # `regime is None` 的日子 cycle 也必须是 `None`：判不出来就是判不出来，给一个
+    # `sideways` 等于拿安静的假结论去喂切片。
+    cycle = _classify_cycle(metrics, params) if ready else None
+    volatility = project_to_axes(regime)[1] if regime is not None else None
     return DayLabel(
         date=metrics.date,
         regime=regime,
@@ -618,7 +729,77 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
         ema_slow=metrics.ema_slow,
         ema_slope=metrics.ema_slope,
         separation=metrics.separation,
+        slope_strength=metrics.slope_strength,
+        slope_consistency=metrics.slope_consistency,
     )
+
+
+def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle | None:
+    """周期维的**真判定**（#64）：两条独立通道 + 显式横盘，判不出来就是 `unclear`。
+
+    ## 它解决的两个已量化缺陷
+
+    1. **箱体当兜底吞掉缓慢趋势。** 旧结构里 `RANGE` 是「其余」——既非高波动、也无
+       趋势就落它。2254 个可比日里人工标「下行」而算法判「箱体」的有 207 天，其中
+       125 天（60%）EMA 斜率方向其实是对的，只是 `|separation| <= 0.5` 卡住。
+    2. **间距阈值是唯一判据。** 缓慢阴跌时 EMA20 与 EMA60 靠得近，间距到不了半个 ATR。
+
+    ## 趋势的两条独立路径
+
+    - **路径一（间距）**：`slope` 与 `separation` 同向，且 `|separation| > sep_min`。
+      这是旧结构那一支，但门槛从 0.5 松到 0.15——因为下面那个显式横盘会承担
+      「松下来的部分」：间距不足**且**强度不足才算横盘。
+    - **路径二（强度 × 一致性）**：`|slope| / ATR >= strength_min` **且**回看窗口内
+      斜率同向占比 `>= consistency_min`。缓慢趋势可能间距不够，但它走得稳、方向一致，
+      这一支就是为它开的。
+
+    ## 横盘是**显式证明**，不是兜底
+
+    必须同时满足「无间距」与「无强度」才判 `sideways`；只有一条不够就落 `unclear`。
+    这条区分是本函数的全部要点：旧结构把「证明不了是趋势」直接当成「就是横盘」，
+    而两者是不同的事实——前者是判不出来，后者是判出来了。混同的代价已经量过：
+    207 天系统性错向。
+
+    ## 返回 `None` 而不是 `Cycle.UNCLEAR`
+
+    `None` = 这一行的周期维**不存在**（`classify_day` 在三个就绪条件缺一时的情形，
+    与 `regime is None` 同进退）。`unclear` = 就绪了、判了、但方向证明不出来。
+    上游要能分开这两件事，所以这里不替调用方折叠。
+
+    ## 只吃中间量，不碰 K 线
+
+    与 `_classify` 同一纪律：规则可以脱离行情直接被测。
+    """
+    slope = metrics.ema_slope
+    separation = metrics.separation
+    if slope is None or separation is None:
+        raise ValueError(
+            "周期维的中间量不全（需要 ema_slope / separation），"
+            f"当前 {metrics.date}: slope={slope}, separation={separation}"
+        )
+
+    strong_direction = (
+        metrics.slope_strength is not None
+        and metrics.slope_strength >= params.cycle_strength_min
+        and metrics.slope_consistency is not None
+        and metrics.slope_consistency >= params.cycle_consistency_min
+    )
+    sep_min = params.cycle_separation_min_atr
+
+    if slope > 0 and (separation > sep_min or strong_direction):
+        return Cycle.BULL
+    if slope < 0 and (separation < -sep_min or strong_direction):
+        return Cycle.BEAR
+
+    # 走到这里说明两条路径都没走通。**只有「间距不足」与「强度不足」同时成立**
+    # 才是横盘；任何一边够（甚至只是强度够而一致性不够）都不是横盘，是判不出来。
+    weak_strength = (
+        metrics.slope_strength is None
+        or metrics.slope_strength < params.cycle_strength_min
+    )
+    if abs(separation) < sep_min and weak_strength:
+        return Cycle.SIDEWAYS
+    return Cycle.UNCLEAR
 
 
 def _classify(metrics: DayMetrics, params: JudgementConfig) -> BaseRegime:

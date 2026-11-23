@@ -98,6 +98,13 @@ class TestSnapshot(SimpleTestCase):
                 "high_vol_quantile",
                 "ema_slope_lookback_days",
                 "trend_separation_min_atr",
+                # 2026-11-23（#64）：周期维的两条独立通道。它们是**真正的阈值**——
+                # 判 `bull`/`bear`/`sideways`/`unclear` 全靠这四个数，所以必须随
+                # 判定记录落快照，否则「那天为什么判 unclear」事后无从解释。
+                "cycle_separation_min_atr",
+                "cycle_strength_min",
+                "cycle_consistency_window",
+                "cycle_consistency_min",
                 # 2026-11-23 起：放量倍数的分母窗口。它现在只喂一个**不参与定档**的
                 # 中间量（波动代理），但仍然进快照——等它真的开始参与判定那天再补，
                 # 历史记录就已经缺了这一格，而「当时用的哪个窗口」再也答不上来。
@@ -279,6 +286,13 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         # 但仍然钉在这里：等它真的开始参与判定，这个数就是阈值本身，钉住的时点不该
         # 等到那天。
         self.assertEqual(config.JUDGEMENT.volume_ma_period, 20)
+        # 周期维判据（#64）：ADR 0007 的帕累托前沿，字面钉死。
+        # 这四个数一起决定「趋势 / 横盘 / 判不出来」，改了就等于改了机制对缓慢趋势的
+        # 识别能力——正是旧结构 207 天系统性错向的根源所在，所以不留隐式漂移的空间。
+        self.assertEqual(config.JUDGEMENT.cycle_separation_min_atr, 0.15)
+        self.assertEqual(config.JUDGEMENT.cycle_strength_min, 0.10)
+        self.assertEqual(config.JUDGEMENT.cycle_consistency_window, 20)
+        self.assertEqual(config.JUDGEMENT.cycle_consistency_min, 0.60)
 
     def test_lifecycle_defaults(self):
         self.assertEqual(
@@ -492,6 +506,36 @@ class TestSelfValidation(SimpleTestCase):
             with self.subTest(threshold=bad):
                 with self.assertRaises(ValueError):
                     config.JudgementConfig(trend_separation_min_atr=bad)
+
+    def test_cycle_separation_threshold_must_be_positive(self):
+        """取 0 时任何一点均线间距都算「有间距」→ 显式横盘永远不成立。
+
+        后果不是报错，而是 `sideways` 重新退化成事实上的空集——一种看起来完全正常
+        的静默退化。负值更糟：路径一的符号判据被直接架空。
+        """
+        for bad in (0, -0.15):
+            with self.subTest(threshold=bad):
+                with self.assertRaises(ValueError):
+                    config.JudgementConfig(cycle_separation_min_atr=bad)
+
+    def test_cycle_strength_min_must_be_positive(self):
+        """强度通道的门槛取 0 ⇒ 该通道恒成立，缓慢趋势那条独立路径被噪声接管。"""
+        for bad in (0, -0.1):
+            with self.subTest(strength=bad):
+                with self.assertRaises(ValueError):
+                    config.JudgementConfig(cycle_strength_min=bad)
+
+    def test_cycle_consistency_window_must_be_at_least_two(self):
+        """窗口 1 天时「同向占比」只能是 0 或 1，一致性判据退化成只看今天。"""
+        with self.assertRaises(ValueError):
+            config.JudgementConfig(cycle_consistency_window=1)
+
+    def test_cycle_consistency_min_must_be_a_fraction_above_zero(self):
+        """0 等于取消这条门；> 1 则它永远不可能成立（判不出任何趋势）。"""
+        for bad in (0, -0.1, 1.5):
+            with self.subTest(consistency=bad):
+                with self.assertRaises(ValueError):
+                    config.JudgementConfig(cycle_consistency_min=bad)
 
     def test_volume_ma_period_must_be_at_least_two(self):
         """1 天均量 = 当日自己，放量倍数恒为 1.0——「有没有放量」这个量就不再回答任何事。"""

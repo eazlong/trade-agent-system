@@ -220,7 +220,38 @@ class JudgementConfig:
 
     # 快慢均线间距至少要走满 0.5 个 ATR。用 ATR 归一化而非绝对价格：币圈价格量级
     # 跨四年变化几十倍，绝对间距门槛必然周期性失效（与「阈值按分位自校准」同一理由）。
+    #
+    # **2026-11-23（#64）起它不再是趋势的唯一判据，也不再是箱体的唯一门槛。** 周期维的
+    # 判定改为两条独立路径（见 cycle_* 那组），这里保留原值只服务于四档兼容层：
+    # BaseRegime 仍按「斜率符号 + 该间距」定档，#65 才会把它彻底让位给两维。
     trend_separation_min_atr: float = 0.5
+
+    # ---- 周期维（cycle）判据：ADR 0007 的帕累托前沿（#64）----
+    #
+    # 三个数回答的是同一个问题「这天是不是在走出一个方向」，而不是「间距有多大」。
+    # 旧结构只有间距一道门，于是 207 天系统性错向里的 125 天（60%）明明斜率方向是
+    # 对的，仅因为 |separation| <= 0.5 就被判成箱体——缓慢阴跌时 EMA20 与 EMA60 靠
+    # 得近，间距到不了半个 ATR。这就是本组参数存在的全部理由。
+    #
+    # cycle_separation_min_atr = 0.15：路径一的门槛，比兼容层的 0.5 松得多。松是
+    # 安全的，因为路径一还要求斜率符号同向；而**松下来的那部分由显式横盘承担**——
+    # 只有当间距与强度**同时**不够时才算横盘，缺一就落 unclear，不再默认兜底。
+    cycle_separation_min_atr: float = 0.15
+
+    # cycle_strength_min = 0.10：路径二的门槛之一，|slope| / ATR。它量的是「单位
+    # 波动走了多远」——用 ATR 归一化，所以不随价格量级漂移。它是间距之外的第二条
+    # 独立通道：缓慢趋势可能间距不够，但只要强度够、且下面那条一致性也够，仍然算趋势。
+    cycle_strength_min: float = 0.10
+
+    # cycle_consistency_window = 20：路径二回看的自然日数，约一个交易月。它要回答
+    # 的是「方向是不是持续的」，而不是「今天有没有动」——所以必须长到能跨过一次噪声，
+    # 又短到跟得上已经开始的趋势。20 是 ADR 扫出来的前沿点。
+    cycle_consistency_window: int = 20
+
+    # cycle_consistency_min = 0.60：窗口内斜率符号**与当前同向**的占比下限。
+    # 这一条是路径二里防「有动能无共识」的门：强度够但方向来回翻的日子不算趋势，
+    # 而是 unclear——不是箱体。把这种日子判成横盘正是旧结构的主要失败形态。
+    cycle_consistency_min: float = 0.60
 
     # 放量倍数的分母窗口。**本阶段只用于算「放量倍数」这个中间量，不参与定档**——
     # 进配置面而不是写成模块常量，是因为它一旦参与判定就是阈值的一部分，而阈值必须
@@ -267,6 +298,34 @@ class JudgementConfig:
         if self.volume_ma_period < 2:
             raise ValueError(
                 f"volume_ma_period 必须 >= 2，当前 {self.volume_ma_period}"
+            )
+        # ---- 周期维判据（#64）----
+        # 四个数一起决定「趋势 / 横盘 / 判不出来」这条三岔口，所以逐个在校验里点名。
+        # 它们错法不同，但后果同一种：静默地把一整类行情判成某个看着正常的档位。
+        if self.cycle_separation_min_atr <= 0:
+            raise ValueError(
+                "cycle_separation_min_atr 必须为正，当前 "
+                f"{self.cycle_separation_min_atr}"
+                "——取 0 时任何一点均线间距都算「有间距」，显式横盘永远不成立，"
+                "sideways 会重新退化成事实上的空集"
+            )
+        if self.cycle_strength_min <= 0:
+            raise ValueError(
+                "cycle_strength_min 必须为正，当前 "
+                f"{self.cycle_strength_min}"
+                "——取 0 时强度通道恒成立，缓慢趋势那条独立路径会被噪声全面接管"
+            )
+        if self.cycle_consistency_window < 2:
+            raise ValueError(
+                "cycle_consistency_window 必须 >= 2，当前 "
+                f"{self.cycle_consistency_window}"
+                "——窗口 1 天时「同向占比」只能是 0 或 1，一致性判据退化成只看今天"
+            )
+        if not 0.0 < self.cycle_consistency_min <= 1.0:
+            raise ValueError(
+                "cycle_consistency_min 必须落在 (0, 1]，当前 "
+                f"{self.cycle_consistency_min}"
+                "——取 0 等于取消这条门；取 > 1 则它永远不可能成立"
             )
 
 

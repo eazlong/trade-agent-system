@@ -475,6 +475,10 @@ def build_evidence(label, decision: dict) -> dict:
             "ema_slow": label.ema_slow,
             "ema_slope": label.ema_slope,
             "separation": label.separation,
+            # 周期维那两条通道的中间量（#64）。判 `unclear` 的日子要能回答
+            # 「为什么判不出来」，答案就在这两个数上——是强度不够、还是一致性不够。
+            "slope_strength": label.slope_strength,
+            "slope_consistency": label.slope_consistency,
         },
         "decision": decision,
     }
@@ -608,11 +612,23 @@ def run_daily_judgement(
     )
     effective_regime = apply_escalation(base, escalation)
 
-    # 三列从**采纳后的基础阶段**派生，不是从量化原始结论：持续期会把今天量化判的档
-    # 换掉（沿用昨天的），而记录说的是「这一天机制最终的基础阶段是什么」，两维必须与
-    # `base_regime` 同源，否则同一条记录里两维说 uptrend、四档说 downtrend。
-    # 量化原始投影另记在 `evidence["quant"]` 里（见 `build_evidence`），两者都可查。
-    axes_cycle, axes_volatility = project_to_axes(base)
+    # 两维的来源在 #64 之后**分开了**，这是本票与 #63 最大的一处不同：
+    #
+    # - `volatility` 仍是**投影**：它由 `base_regime` 派生（#65 才会改成独立判定）。
+    # - `cycle` 现在是**判出来的**：`label.cycle` 走自己的两条路径，与四档无关。
+    #   拿 `project_to_axes(base)` 去顶替它，等于把「缓慢阴跌」重新按四档兜底成
+    #   sideways——那正是本票要解决的缺陷，会在写入路径上被悄悄装回去。
+    #
+    # `base_regime` 与 `cycle` 因此**允许不一致**，且不一致是有意义的：
+    #   base=high_vol（波动吃掉了周期）+ cycle=bear（周期维独立看见了方向）。
+    # 这正是 ADR 0007 要的「两维并存、互不覆盖」，也是 #65 落地后唯一正确的形状。
+    #
+    # 但 `cycle` 仍跟随**采纳后的** `base` 走持续期语义吗？不：只要今天判定就绪，
+    # `label.cycle` 就是今天的事实。持续期约束的是「四档要不要改口」（保命档与机制
+    # 停用看的是它），而周期维是描述性的，它不需要防抖——把它也冻住只会让周期的
+    # 描述比行情慢一拍，且没有任何调用方依赖那份滞后。
+    axes_cycle = label.cycle
+    axes_volatility = project_to_axes(base)[1]
     record, created = _record_once(
         symbol=symbol,
         attribute_date=attribute_date,
