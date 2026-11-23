@@ -51,7 +51,7 @@ from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 
 from apps.agent import event_commands
-from apps.common.time_utils import business_tz, format_business
+from apps.common.time_utils import business_day, business_tz, format_business
 from apps.regime import config, deactivation, deactivation_run, halt, judgement, report
 from apps.regime.models import (
     CANDIDATE_DISCARD_EXPIRED,
@@ -69,6 +69,7 @@ from apps.regime.models import (
     RegimeJudgement,
     RegimeMechanismSwitch,
     business_midnight,
+    judgement_moment,
 )
 from apps.regime.quant import BaseRegime
 from apps.regime.tests.test_shadow import (
@@ -84,8 +85,8 @@ from apps.trading.models import LiveSession, Strategy
 #: 判定机制的名义时刻：北京 2026-09-22 08:00（= UTC 00:00），日界刚过、判定刚落库。
 NOW = datetime.combine(RUN_DAY, time(8, 0), tzinfo=business_tz())
 #: 截止时刻（`ReportConfig.watchdog_hour:watchdog_minute` = 09:00）之前 / 之后。
-BEFORE_DEADLINE = datetime.combine(RUN_DAY, time(8, 30), tzinfo=business_tz())
-AFTER_DEADLINE = datetime.combine(RUN_DAY, time(10, 0), tzinfo=business_tz())
+BEFORE_DEADLINE = datetime.combine(RUN_DAY, time(23, 40), tzinfo=business_tz())
+AFTER_DEADLINE = datetime.combine(RUN_DAY, time(23, 55), tzinfo=business_tz())
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +169,12 @@ class TestContract(SimpleTestCase):
         # 而它只存在于判定层的私有名里。两处必须一起改，所以钉住。
         self.assertEqual(report.ACTION_CARRIED, judgement._DECISION_CARRIED)
 
+    def test_dwell_exempt_flag_matches_the_judgement_layer(self):
+        # 第①段还要认出「保命档没走持续期」这一种收场。它同样只存在于判定层的私有名
+        # 里，而漏认的后果与 `carried` 漏认不同：不是报错，是那一天的日报看起来像一次
+        # 普通的阶段切换，「今天就该保命」这个事实消失。
+        self.assertEqual(report.DWELL_EXEMPT_HIGH_VOL, judgement._EXEMPT_HIGH_VOL)
+
     def test_the_blanket_predicate_comes_from_the_deactivation_layer(self):
         # 「哪一档是保命档」只能有一处判据（`deactivation.is_blanket`），日报这边不自己写
         # `regime == "high_vol"`。判错了不会报错，只会把抬升日渲染成一片「将解除」——
@@ -191,6 +198,37 @@ class TestContract(SimpleTestCase):
             {field.name for field in dataclasses.fields(config.REPORT)},
         )
 
+    def test_the_deadline_is_after_the_judgement_moment(self):
+        """日报截止时刻必须**晚于**判定时刻——这是两组配置之间唯一的一条硬耦合。
+
+        排反了的后果不是「晚一点」，是那天**永久**没有正确的日报：截止先到 ⇒ `_ready`
+        放行 ⇒ 当天第一份日报写成「今日判定缺失」，而日报一天一条（`(symbol, run_day)`
+        唯一），等到当晚判定真出结论也没有第二条可以发。所以这条关系按契约钉死，不靠
+        两处默认值恰好配合得好。
+        """
+        deadline = report._deadline(RUN_DAY)
+        moment = judgement_moment(RUN_DAY)
+        self.assertGreater(
+            deadline,
+            moment,
+            f"日报截止 {deadline} 必须晚于判定时刻 {moment}",
+        )
+        # 也要留够「判定落库 → 心跳写日报 → 投递」的余量，不能只晚一分钟。
+        self.assertGreaterEqual(deadline - moment, timedelta(minutes=5))
+
+    def test_the_judgement_moment_is_not_the_business_day_boundary(self):
+        """判定时刻与业务日界是**两个**概念，这是本次改动的全部要点。
+
+        日界必须留在北京 08:00（= UTC 00:00 = 日线换线），判定时刻只是「日界之后等到
+        几点才判」。两者合成一个常量的话，挪判定时刻就必然连带挪动日线对齐。
+        """
+        boundary = business_midnight(RUN_DAY)
+        moment = judgement_moment(RUN_DAY)
+        self.assertEqual(boundary.hour, 8)
+        self.assertGreater(moment, boundary)
+        # 同一天、同一个业务日：判定时刻挪动不会让 run_day 翻天。
+        self.assertEqual(business_day(moment), RUN_DAY)
+
     def test_the_five_sections_are_a_fixed_contract(self):
         # `sections` 是落库的 JSON，8v 的只读工具与审计会按键取段。
         self.assertEqual(
@@ -203,11 +241,20 @@ class TestContract(SimpleTestCase):
         self.assertIn("{horizon}", report._SECTION_TITLES[report.SECTION_EVENTS])
 
     def test_skip_display_covers_every_shape_the_judgement_returns(self):
-        # `run_daily_judgement` 的四种「没结论」收场。缺一种，第①段就会把 slug 原样丢给
-        # 用户（「今日判定缺失（stale_candles）」）——能读，但那不是给人看的字。
+        # `run_daily_judgement` 的**每一种**「没结论」收场。缺一种，第①段就会把 slug 原样
+        # 丢给用户（「今日判定缺失（stale_candles）」）——能读，但那不是给人看的字。
+        #
+        # 第五种（`before_judgement_moment`）正常到不了日报：截止时刻排在判定时刻之后。
+        # 它留在这里是为了「判定的每一种收场都有话可说」这条契约不在改动里破掉。
         self.assertEqual(
             set(report._SKIP_DISPLAY),
-            {"no_candles", "stale_candles", "empty_series", "undecidable"},
+            {
+                "no_candles",
+                "stale_candles",
+                "empty_series",
+                "undecidable",
+                "before_judgement_moment",
+            },
         )
         for slug in report._SKIP_DISPLAY:
             self.assertEqual(
@@ -295,6 +342,67 @@ class TestPureRendering(TestCase):
         self.assertIn("生效时刻：", body)
         self.assertIn("本条要到生效时刻才咬人", body)
         self.assertIn("基础阶段：箱体震荡", body)
+
+    def test_the_dwell_exemption_note_reads_right_when_the_days_are_short(self):
+        """保命档豁免的第一种成因：天数确实不够，豁免是它得以采纳的原因。
+
+        这一句必须出现天数对照——没有它，读者看到的就是一次普通切换（`adopted` +
+        `reason` 为空），而「今天就该保命」与「机制在防抖」两种情形从此分不出来。
+        """
+        result = concluded_payload(regime="high_vol", with_record=False)
+        record = SimpleNamespace(
+            evidence={
+                "quant": {"regime": "high_vol"},
+                "decision": {
+                    "action": "adopted",
+                    "reason": "",
+                    "in_force_days": 1,
+                    "dwell_exempt": "high_vol",
+                },
+            }
+        )
+        body = report._section_today(result, record, SYMBOL)
+        self.assertIn("保命档", body)
+        self.assertIn("不适用", body)
+        self.assertIn("只站了 1 个自然日", body)
+        self.assertIn(f"通常要满 {config.JUDGEMENT_LIFECYCLE.min_dwell_days} 天", body)
+
+    def test_the_dwell_exemption_note_does_not_contradict_itself_when_the_days_are_long(
+        self,
+    ):
+        """保命档豁免的第二种成因：天数本来就够，豁免与「等不等得到」无关。
+
+        **这是 2026-11-17 生产日报暴露出来的原句缺陷**：那一天 `in_force_days=36`、
+        持续期是 3，而文案统一写成「只站了 {days} 个自然日（通常要满 {min} 天）」——
+        36 >= 3，这句话在读者眼里只能是「36 小于 3」或者「机制算错了」。豁免是**无条件**
+        的，天数够不够都会被采纳，所以两种成因必须两句话。
+
+        断言不写死具体措辞，而是钉住**不出现自相矛盾**：天数与门槛都要在句子之外
+        对得上。用 `assertNotIn("只站了", ...)` 而不是比对整句，是为了让将来改标点时
+        这条用例仍然只在真的矛盾时才红。
+        """
+        result = concluded_payload(regime="high_vol", with_record=False)
+        min_days = config.JUDGEMENT_LIFECYCLE.min_dwell_days
+        record = SimpleNamespace(
+            evidence={
+                "quant": {"regime": "high_vol"},
+                "decision": {
+                    "action": "adopted",
+                    "reason": "",
+                    "in_force_days": min_days + 33,
+                    "dwell_exempt": "high_vol",
+                },
+            }
+        )
+        body = report._section_today(result, record, SYMBOL)
+        self.assertIn("保命档", body)
+        self.assertIn(f"已站 {min_days + 33} 个自然日", body)
+        self.assertNotIn(
+            "只站了",
+            body,
+            "天数够的时候不许说「只站了」——那与「通常要满 M 天」直接矛盾，"
+            "而矛盾的文案比没有文案更坏：读者会以为机制算错了",
+        )
 
     def test_today_section_calls_out_an_escalation(self):
         result = concluded_payload(

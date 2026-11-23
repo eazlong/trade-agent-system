@@ -69,9 +69,9 @@ from apps.regime.quant import BaseRegime
 DOWNTREND = BaseRegime.DOWNTREND
 UPTREND = BaseRegime.UPTREND
 
-#: 生命周期参数：过期门槛 3 天（默认值）。默认的 5 天待机不参与本模块，但参数是同一个
-#: 配置类，这里一并给上——传半份配置会让「用错了哪一组参数」看不出来。
-LIFE = JudgementLifecycleConfig(min_dwell_days=5, stale_after_days=3)
+#: 生命周期参数：过期门槛 3 天（默认值）。待机天数不参与本模块，但参数是同一个配置类，
+#: 这里一并给上默认值——传半份配置会让「用错了哪一组参数」看不出来。
+LIFE = JudgementLifecycleConfig(min_dwell_days=3, stale_after_days=3)
 
 NOW = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
 

@@ -117,6 +117,10 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+# 业务日界的钟点（默认 08:00）。只取这一个常量：`judgement_hour` 必须不早于它，而那
+# 一条约束不能写成字面量 8——日界一改，两处就会静默错开，错开的表现是「闸永远开着」。
+from apps.common.time_utils import BUSINESS_DAY_START_HOUR
+
 # --------------------------------------------------------------------------- #
 # 分组定义
 # --------------------------------------------------------------------------- #
@@ -207,8 +211,11 @@ class JudgementConfig:
     # 只要符号、不要间距幅度，噪声喊一声就算趋势；只要间距、不要符号，(EMA20−EMA60)
     # 是带符号的，负间距会变成「下行」——符号那一项其实在防的就是这个误读。
     #
-    # 斜率回看 5 个自然日：短于「最小持续期 5 天」的斜率是在测噪声（机制自己都规定
-    # 阶段至少站 5 天才算数），长于它的斜率则追不上已经在走的趋势。
+    # 斜率回看 5 个自然日：这是个**独立于持续期**的选择，别拿 `min_dwell_days` 推它。
+    # 它要回答的是「趋势有没有在走」，一个 5 日窗口正好覆盖一个完整的交易周、滤掉日内
+    # 与隔夜的噪声；短于它量到的基本是噪声，长于它则追不上已经在走的趋势。持续期
+    # （3 天）是另一件事：那是「机制要不要改口」，改口比确认趋势更快是合理的——
+    # 确认趋势需要更多观察，改口只需要承认观察到的已经足够。
     ema_slope_lookback_days: int = 5
 
     # 快慢均线间距至少要走满 0.5 个 ATR。用 ATR 归一化而非绝对价格：币圈价格量级
@@ -255,25 +262,56 @@ class JudgementConfig:
 
 @dataclass(frozen=True)
 class JudgementLifecycleConfig:
-    """判定结论的时间约束。
+    """判定链路的时间约束：什么时候出结论、结论要站多久、多久算过期。
 
-    两个数管的是两件不同的事，但都在回答「上一版结论还算不算数」，会被一起调整，
-    所以同组：
+    三个数管的是三件不同的事，但都是「日频节奏」上的旋钮，会被一起调整，所以同组：
 
-    - `min_dwell_days`：阶段是慢变量，切换后至少站住 5 个自然日才允许再切。
-      挡的是判定在阈值附近来回抖（每天都换个说法，日报就没法读）。
+    - `judgement_hour` / `judgement_minute`：**业务日 D 的判定时刻**（业务时区钟点）。
+      业务日界之后的第一个 `>= 这个钟点` 的心跳 tick 才会为 D 出结论。默认北京 23:30。
+      **它不是业务日界**：日界必须留在北京 08:00（= UTC 00:00 = 日线换线），那一条由
+      `apps/common/time_utils.BUSINESS_DAY_START_HOUR` 钉住、`test_timing.py` 守着。
+      本字段只决定「日界之后要等到几点才判」，两个概念刻意分开——合成一个常量的话，
+      想挪判定时刻就必然连带挪动日线对齐，而后者是整条链路的锚。
+      **必须落在业务日内**（`>= 业务日界钟点`），否则那一天的闸永远不会开，判定会静默
+      退化成「日界一过就判」，也就是本次改动前的行为。`__post_init__` 拦这一类。
+    - `min_dwell_days`：阶段是慢变量，切换后至少站住 3 个自然日才允许再切。
+      挡的是判定在阈值附近来回抖（每天都换个说法，日报就没法读）。**2026-11-16 由 5
+      调低到 3**：防抖要滤掉的是「单日跳变」，而日频判定 + 次日生效这条链上，一个候选
+      已经被连续观察 3 天就足以说明它不是噪声；5 天多出来的两天不增加任何信息，只是在
+      行情拐头之后继续按旧档位指挥停用。注意它现在短于 `ema_slope_lookback_days`（5
+      天）——斜率窗口比持续期长是**刻意**的：斜率看的是「趋势有没有在走」，不必等机制
+      承认换档。
     - `stale_after_days`：状态过期超 3 个自然日就不再新增停用决策。判定任务故障
       时**保持上一有效状态**（绝不降级成「最保守」——那会让任务故障伪装成风控
       动作），但一个过期太久的结论不该继续指挥停用。
     """
 
-    min_dwell_days: int = 5
+    judgement_hour: int = 23
+    judgement_minute: int = 30
+
+    min_dwell_days: int = 3
     stale_after_days: int = 3
 
     def __post_init__(self) -> None:
         for name in ("min_dwell_days", "stale_after_days"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} 不能为负，当前 {getattr(self, name)}")
+
+        if not 0 <= self.judgement_hour <= 23:
+            raise ValueError(f"judgement_hour 落在 [0, 23]，当前 {self.judgement_hour}")
+        if not 0 <= self.judgement_minute <= 59:
+            raise ValueError(
+                f"judgement_minute 落在 [0, 59]，当前 {self.judgement_minute}"
+            )
+        # **必须落在业务日内**。钟点早于日界时，「业务日 D 的判定时刻」在 D 开始之前
+        # 就已经过去了，闸恒开——不是报错，是静默退化成「日界一过就判」（改动前的行为），
+        # 而那种退化在日报上完全看不出来：结论照出、时间照旧、只是没等人。
+        if self.judgement_hour < BUSINESS_DAY_START_HOUR:
+            raise ValueError(
+                f"judgement_hour({self.judgement_hour}) 必须不早于业务日界"
+                f"（{BUSINESS_DAY_START_HOUR} 点）：早于它那一天就永远等不到判定时刻，"
+                "闸形同不存在"
+            )
 
 
 @dataclass(frozen=True)
@@ -842,8 +880,12 @@ class ReportConfig:
     升级告警」——所以它是**看门狗**的时刻，不是发送时刻，取名与用途必须一致，否则
     下一个人会照着它去改发送逻辑。
 
-    时刻按**业务时区（北京时间）**解读：这个字段是给人看的钟点（「早九点还没收到日报
-    就该响了」），而系统里所有的绝对时刻都存 UTC。口径写在 `apps/common/time_utils.py`。
+    时刻按**业务时区（北京时间）**解读：这个字段是给人看的钟点（「当晚 23:50 还没收到
+    日报就该响了」），而系统里所有的绝对时刻都存 UTC。口径写在 `apps/common/time_utils.py`。
+
+    **它的位置由判定时刻决定**：日报是判定任务的下游，判定在北京 23:30 落结论（见
+    `JudgementLifecycleConfig.judgement_hour`），日报紧接着写、紧接着投，所以截止时刻
+    只能排在它之后——本组给 20 分钟余量（心跳 5 分钟一轮，够重试 4 次）。
 
     `event_horizon_days`（7）是第③段「未来 N 天的高影响事件」的那个 N。它进统一配置面
     是 CONTEXT.md 第 80 条点名的（「`query_events` 的查询天数」），而它同时是
@@ -856,8 +898,12 @@ class ReportConfig:
     同一个理由），不是为了让它可被调用方覆盖。
     """
 
-    watchdog_hour: int = 9
-    watchdog_minute: int = 0
+    #: **必须晚于 `JUDGEMENT_LIFECYCLE` 的判定时刻**（默认 23:30 → 本组 23:50）。
+    #: 早于它的话，判定还没跑，日报就会先写下一份「今日判定缺失」——而日报一天一条
+    #: （`(symbol, run_day)` 唯一），那份缺失日报会把这一天**永久钉死**，后面等到结论
+    #: 也改不回来。这一条跨组关系由 `tests/test_report.py::TestContract` 钉住。
+    watchdog_hour: int = 23
+    watchdog_minute: int = 50
     event_horizon_days: int = 7
 
     def __post_init__(self) -> None:

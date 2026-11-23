@@ -2,17 +2,24 @@
 
 ## 一天里发生的事
 
-运行日 D（北京时间）的某个时刻，机制取**已收盘的最后一条日线**（签署日 D−1），跑一次
-纯量化判定，把结论落成一条 `RegimeJudgement`，让它从北京时间 D+1 08:00 起生效。于是
-今天出的结论明天才咬人，中间有整整一天可见期——异常在生效前就能被拦下（CONTEXT.md）。
+运行日 D（北京时间）的**判定时刻**（默认当晚 23:30，`config.JUDGEMENT_LIFECYCLE`），
+机制取**已收盘的最后一条日线**（签署日 D−1），跑一次纯量化判定，把结论落成一条
+`RegimeJudgement`，让它从北京时间 D+1 08:00 起生效。于是今天出的结论明天才咬人，
+中间有一整段可见期——异常在生效前就能被拦下（CONTEXT.md）。
 
-三个时刻的关系由 `regime_judgement` 一处实现，模型上的 `run_day` / `run_at` 只是它的
-派生展示：
+四个时刻的关系由本模块一处实现，模型上的 `run_day` / `run_at` 只是它的派生展示：
 
-    运行日 D  ── 签署日 D−1（判定依据的日线）── 生效时刻 D+1 北京 08:00
+    业务日 D ── 判定时刻 D 23:30 ── 签署日 D−1（判定依据的日线）── 生效时刻 D+1 08:00
 
-北京时间 08:00 恰好是 UTC 00:00，也就是日线换线的那一刻，所以「业务日 = UTC 开盘日 =
-北京同一自然日」这条口径在判定链路里不需要任何跨日推断。
+**业务日界（北京 08:00）与判定时刻是两个不同的东西，不要合成一个常量。** 日界必须留在
+08:00，因为那是 UTC 00:00、是日线换线的那一刻（`apps/common/time_utils.BUSINESS_DAY_START_HOUR`
+钉住，`test_timing.py` 守着）；而判定时刻只决定「日界之后要等到几点才判」，把它俩绑在
+一起的话，想挪判定时刻就必然连带挪动日线对齐。两者分开之后，`attribute_date`（签署日）
+与 `effective_at`（生效时刻）都只由 `run_day` 和日线决定，**与判定时刻无关**。
+
+在业务日 D 的日界（08:00）到判定时刻（23:30）之间，心跳照跑但**不出结论**：它回一个
+`skipped="before_judgement_moment"` 的收场。那段时间里「此刻生效中的」仍是 D−1 那条
+（它的 `effective_at` 是 D 08:00），而 D 的结论要等到 23:30 才产出、D+1 08:00 才咬人。
 
 ## 「待生效」是查询语义，不是状态机
 
@@ -49,9 +56,10 @@ CONTEXT.md 写的是「调度用 beat 的 crontab，且业务时区在 crontab �
 2. beat 用的是 `DatabaseScheduler`：`celery_app.py` 里的 `beat_schedule` 只是**播种**，
    DB 里的 `PeriodicTask`/`CrontabSchedule` 行才是活的事实，且启动时 `update_or_create`
    会按名字把同名行**覆写**回去。往这套东西里加条目或改时区，动的是正在跑的调度面。
-3. 5 分钟心跳本身就满足「北京 08:00 出结论」：00:00 UTC 之后第一个 tick 就会写当天记录，
-   `(symbol, effective_at)` 的唯一约束让它天然幂等，且失败会在 5 分钟后自动重试——
-   不需要「必须在日界准确跑」这种脆弱前提，也就没有「beat 没起来 ⇒ 结论永不产生」的单点。
+3. 5 分钟心跳本身就满足「到点出结论」：判定时刻（默认北京 23:30）之后第一个 tick 就会写
+   当天记录，`(symbol, effective_at)` 的唯一约束让它天然幂等，且失败会在 5 分钟后自动
+   重试——不需要「必须在那一刻准确跑」这种脆弱前提，也就没有「beat 没起来 ⇒ 结论永不
+   产生」的单点。「到点」由本模块自己判（`judgement_moment`），不由调度面判。
 4. 判定记录自己带着运行日，所以「今天到底出了结论没有」由数据回答，不由「beat 有没有
    触发」推断。
 
@@ -114,6 +122,7 @@ from apps.regime.models import (
     Escalation,
     RegimeJudgement,
     business_midnight,
+    judgement_moment,
 )
 from apps.regime.news_verdict import run_news_judgement
 from apps.regime.quant import PRIORITY, BaseRegime, latest_label
@@ -126,6 +135,12 @@ SYMBOL = config.CANDLES.symbol
 _DECISION_ADOPTED = "adopted"
 _DECISION_CARRIED = "carried"
 _REASON_MIN_DWELL = "min_dwell"
+
+#: `apply_min_dwell` 采纳一个**不等持续期**的候选时的留痕值，写进
+#: `evidence["decision"]["dwell_exempt"]`。今天只有一个取值：保命档。
+#: 它不复用 `reason`：`reason` 的语义是「为什么最后用的不是量化判出的那个」，
+#: 而豁免时用的**正是**量化判出的那个，两者在日报里会写出互相矛盾的句子。
+_EXEMPT_HIGH_VOL = "high_vol"
 
 
 # --------------------------------------------------------------------------- #
@@ -300,9 +315,10 @@ def apply_min_dwell(
     理由，任何一条单独成立就够：
 
     1. CONTEXT.md 第 104 条：**资讯抬升不受最小持续期约束、按日生效**，理由写着「若要求
-       抬升自身维持 5 天，会出现『第 2 天资讯已撤回、抬升却撤不掉』的怪状态」。拿
-       `effective_regime` 当尺子，抬升立刻把生效阶段变成高波动，而持续期量的正是这个
-       阶段——于是抬升**事实上**被锁了 5 天，那一条规则被实现悄悄取消了。
+       抬升自身维持 `min_dwell_days` 天，会出现『第 2 天资讯已撤回、抬升却撤不掉』的
+       怪状态」。拿 `effective_regime` 当尺子，抬升立刻把生效阶段变成高波动，而持续期
+       量的正是这个阶段——于是抬升**事实上**被锁了 `min_dwell_days` 天，那一条规则被
+       实现悄悄取消了。
     2. 三值留痕（基础 / 抬升 / 生效）存在的唯一目的是回答「今天这个阶段是量化判出来的，
        还是资讯抬上来的」。把 `effective_regime` 写进 `base_regime`，这一列就在撒谎：
        量化明明判的是箱体震荡，库里记着高波动，归因只能靠翻 `evidence` JSON。
@@ -317,6 +333,33 @@ def apply_min_dwell(
     冷启动（`current is None`）直接采纳：没有「当前阶段」可站，持续期无从谈起。CONTEXT.md
     的「冷启动默认不执行任何停用」是停用决策那一侧的规则，不是这里——首条判定必须落下来，
     否则查询语义永远返回 `None`，整个机制卡在起点。
+
+    ## 保命档（`HIGH_VOL`）不受持续期约束
+
+    候选是 `HIGH_VOL` 时**直接采纳**，不等 `min_dwell_days`。这与资讯抬升那条豁免同源，
+    理由却更硬：
+
+    1. 持续期是**防抖**的尺子，而它默认「两个方向对称地错」——早切一天与晚切一天代价相当。
+       保命档没有这个对称性：它管的是「此刻谁都不该开新仓」。早到一天是少赚，晚到一天是
+       在极端行情里继续加敞口。**这一个方向的不对称足以推翻防抖的正当性**。
+    2. CONTEXT.md 第 128 条把高波动定为「叠加在当前状态上的保命层」，与事件熔断同属
+       `halt` 的触发源而非适用性结论；事件熔断按窗口即时生效、从不看持续期。让同一个
+       语义在两个触发源上要求不同的等待天数，等于让「保命」这个名字在一条路径上是假的。
+    3. 量化的 `HIGH_VOL` 判据本身已经是一道**慢闸**：ATR% 分位要越过第 80 百分位、且窗口
+       是 250 天。它天然滞后于行情，再叠一道防抖闸是拿两把尺子量同一件事。
+    4. 实测代价（2026-11-16，txy 生产，当时 `min_dwell_days` 还是 5）：11-14 的
+       `atr_pct_rank` 已达 0.916、量化判 `high_vol`，而落库仍是 `range`，`in_force_days`
+       只走到 3——**保命档被自己的防抖闸拦在门外 4 天**，同期 BTC 从 80476 跌到 65351
+       （−18.8%）。这正是 `config.py` 里「它恰恰在该保命的日子里说不必保命」那句注释
+       预言的情形。**同一个失效还有另一半**：那把闸本身也偏长，2026-11-16 已由 5 收到 3。
+
+    **豁免只针对 `HIGH_VOL` 候选，不对其它三档开口子**：`DOWNTREND` / `UPTREND` / `RANGE`
+    之间的切换照旧等满 `min_dwell_days`。这是「保命档单向」的又一处落地——它只能让系统
+    更早进入风险状态，不能让任何档位更早离开。
+
+    豁免被采纳时 `numbers` 里带 `dwell_exempt: "high_vol"`，`action` 仍是 `adopted`、
+    `reason` 仍为空：豁免不是一次「被拦下」，把它记成 `carried` 会让日报第①段写出
+    「维持不变：持续期不足」这句与事实相反的话。留痕靠那个键，不靠 reason。
     """
     if current is None:
         return candidate, "", {"in_force_days": None, "carried_from_effective_at": None}
@@ -327,6 +370,10 @@ def apply_min_dwell(
 
     if candidate is _base_regime_of(current):
         return candidate, "", numbers
+
+    if candidate is BaseRegime.HIGH_VOL:
+        # 保命档：不设防抖闸。见 docstring「保命档（HIGH_VOL）不受持续期约束」。
+        return candidate, "", {**numbers, "dwell_exempt": _EXEMPT_HIGH_VOL}
 
     if in_force_days >= min_dwell_days:
         return candidate, "", numbers
@@ -349,7 +396,7 @@ def _base_regime_of(record: RegimeJudgement) -> BaseRegime:
 
     **不要再加一个 `_regime_of` 读 `effective_regime` 的兄弟函数给这里用**：那样
     「这条规则比的是哪根轴」又只剩 docstring 记得，而这次修的正是那个错误
-    （拿 `effective_regime` 当尺子 → 资讯抬升借走 5 天免疫期）。
+    （拿 `effective_regime` 当尺子 → 资讯抬升借走 `min_dwell_days` 天免疫期）。
     """
     return BaseRegime(record.base_regime)
 
@@ -463,6 +510,35 @@ def run_daily_judgement(
     """
     now = now or timezone.now()
     run_day = business_day(now)
+    effective_at = business_midnight(run_day + timedelta(days=1))
+
+    existing = _find_record(symbol, effective_at)
+    if existing is not None:
+        # 今天已经判过了——心跳一天里绝大多数 tick 走这条路。**资讯通道不能重跑**：
+        # 记录是事件、不更新，重跑只是把同一批条目再投一次 LLM，而那些结论永远没有
+        # 落库的机会。
+        #
+        # **这一支排在所有别的东西之前，包括日线库与判定时刻闸。** 两条理由：
+        #
+        # 1. 「今天已经出过结论」是比「今天还没到点」更强的事实。顺序反过来时，任何
+        #    把判定时刻往后调的改法（包括本次改动当天）都会让一条**已经写下的**结论在
+        #    当天剩下的时间里被报成「还没到判定时刻」——而日报与 Shadow 都按返回值走，
+        #    它们会跟着说「今天没有结论」，尽管库里躺着一条。
+        # 2. 它也是这里唯一**只需要 run_day** 的一支：日线要全量读一遍、标签要整条重算，
+        #    而它们的结果在这一支里一个都用不上。心跳每 5 分钟一轮，省下的是每一次 tick
+        #    的 2500 根日线读取与全序列指标重算。
+        return _describe(existing, run_day)
+
+    moment = judgement_moment(run_day)
+    if now < moment:
+        # 业务日 D 的日界（北京 08:00）已过，但还没到 D 的判定时刻（默认当晚 23:30）。
+        # 这段时间**有意不出结论**：判定时刻是可调的日频节奏，而「日界一过就判」是旧行为。
+        return {
+            "skipped": "before_judgement_moment",
+            "symbol": symbol,
+            "run_day": run_day.isoformat(),
+            "judgement_at": moment.isoformat(),
+        }
 
     candles = load_candles(symbol)
     if not candles:
@@ -508,14 +584,6 @@ def run_daily_judgement(
             "attribute_date": attribute_date.isoformat(),
             "atr_pct_rank": None if label is None else label.atr_pct_rank,
         }
-
-    effective_at = business_midnight(run_day + timedelta(days=1))
-    existing = _find_record(symbol, effective_at)
-    if existing is not None:
-        # 今天已经判过了——心跳一天里绝大多数 tick 走这条路。**资讯通道不能重跑**：
-        # 记录是事件、不更新，重跑只是把同一批条目再投一次 LLM，而那些结论永远没有
-        # 落库的机会。
-        return _describe(existing, run_day)
 
     if escalation is None:
         outcome = run_news_judgement(symbol, now)

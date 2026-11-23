@@ -18,8 +18,9 @@
 7. **词表是落库契约**：`state`/`reason` 在模型上是裸 `CharField`，所以「池化的词表被
    覆盖全了、且认不出来的取值不会变成『该停』」必须由本文件钉住。
 
-门槛一律用**缩小**的那组生命周期参数（与 `test_pool.py` 同一做法）：默认的 5 天待机 /
-3 天过期要造很久的时钟才出结论，断言只会被埋进日期算术里。缩小的只是规模。
+门槛一律用**缩小**的那组生命周期参数（与 `test_pool.py` 同一做法）：要造很久的时钟才
+出结论，断言只会被埋进日期算术里。缩小的只是规模。注意 `min_dwell_days` 在本模块
+**不参与任何计算**（`_gate` 只读 `stale_after_days`），传它只是为了给全同一份配置类。
 """
 
 from __future__ import annotations
@@ -37,8 +38,8 @@ HIGH_VOL = BaseRegime.HIGH_VOL.value
 DOWNTREND = BaseRegime.DOWNTREND.value
 UPTREND = BaseRegime.UPTREND.value
 
-#: 生命周期参数：过期门槛 3 天（默认值）+ 一个不参与本模块的待机天数。
-LIFE = JudgementLifecycleConfig(min_dwell_days=5, stale_after_days=3)
+#: 生命周期参数：过期门槛 3 天（默认值）+ 一个不参与本模块的待机天数（同为默认值）。
+LIFE = JudgementLifecycleConfig(min_dwell_days=3, stale_after_days=3)
 
 DAY0 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
 

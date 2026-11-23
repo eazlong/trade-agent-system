@@ -23,6 +23,7 @@ DB 用的都是 `TestCase`（真事务回滚），K 线用合成序列而不是�
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
@@ -51,6 +52,7 @@ from apps.regime.models import (
     Escalation,
     RegimeJudgement,
     business_midnight,
+    judgement_moment,
 )
 from apps.regime.news_verdict import NewsOutcome
 from apps.regime.quant import PRIORITY, BaseRegime
@@ -61,9 +63,10 @@ SYMBOL = config.CANDLES.symbol
 #: 但这里的时刻刻意不落在日界上。
 RUN_DAY = date(2026, 9, 22)
 
-#: 名义运行时刻：北京 2026-09-22 11:00（= UTC 03:00）。刻意不取日界那一刻——
-#: 判定挂在 5 分钟心跳上，绝大多数 tick 都发生在日界之后的白天，那才是常态。
-NOW = datetime(2026, 9, 22, 3, 0, tzinfo=timezone.utc)
+#: 名义运行时刻：北京 2026-09-22 23:35（= UTC 15:35）。**刻意取判定时刻（23:30）之后
+#: 5 分钟**：判定只在北京 23:30 到次日 08:00 之间落结论（`judgement_moment`），而心跳每
+#: 5 分钟一轮，所以「过点之后的第一轮 tick」才是这条链路上的常态。
+NOW = datetime(2026, 9, 22, 15, 35, tzinfo=timezone.utc)
 
 #: 此刻应已收盘的那根日线（运行日 D → 签署日 D−1）。
 SIGNED_DAY = RUN_DAY - timedelta(days=1)
@@ -653,6 +656,86 @@ class TestMinDwellRule(TestCase):
         self.assertIs(base, BaseRegime.DOWNTREND)
         self.assertEqual(reason, "")
 
+    def test_high_vol_is_adopted_without_waiting_for_the_dwell(self):
+        """保命档不受持续期约束——它**当天就采纳**，不等 `min_dwell_days`。
+
+        持续期是**防抖**的尺子，默认「早切一天与晚切一天代价相当」。保命档没有这个
+        对称性：它管的是「此刻谁都不该开新仓」，早到一天是少赚，晚到一天是在极端行情里
+        继续加敞口。方向上的不对称足以推翻防抖的正当性。
+
+        实测代价（2026-11-16，txy 生产）：11-14 的 `atr_pct_rank` 已是 0.916、量化判
+        `high_vol`，而落库仍是 `range`、`in_force_days` 只走到 3——保命档被自己的防抖闸
+        拦在门外 4 天，同期 BTC 从 80476 跌到 65351（−18.8%）。
+        """
+        current = make_judgement(RUN_DAY, BaseRegime.RANGE)
+        base, reason, numbers = apply_min_dwell(
+            BaseRegime.HIGH_VOL, self.candidate_effective_at, current, self.MIN
+        )
+        self.assertIs(base, BaseRegime.HIGH_VOL, "保命档不许被持续期拦下")
+        self.assertEqual(reason, "", "豁免不是「被拦下」，reason 必须为空")
+        self.assertLess(numbers["in_force_days"], self.MIN, "前提：确实没站满")
+        self.assertEqual(
+            numbers["dwell_exempt"],
+            judgement._EXEMPT_HIGH_VOL,
+            "豁免必须留痕——它的形状（adopted + reason 为空）与一次普通切换完全相同，"
+            "不写这个键就事后分不出「今天该保命」与「机制在防抖」",
+        )
+
+    def test_the_high_vol_exemption_does_not_open_a_door_for_the_other_stages(self):
+        """豁免只给 `HIGH_VOL` 候选，另三档之间的切换照旧等满 `min_dwell_days`。
+
+        这是「保命档单向」的又一处落地：它只能让系统**更早**进入风险状态，不能让任何档位
+        更早离开。开成「任何候选都不等」等于取消整条规则，而取消它的代价是量化在阈值附近
+        来回抖时每天换一次档、每天停一次场。
+        """
+        current = make_judgement(RUN_DAY, BaseRegime.HIGH_VOL)
+        for candidate in (
+            BaseRegime.DOWNTREND,
+            BaseRegime.UPTREND,
+            BaseRegime.RANGE,
+        ):
+            with self.subTest(candidate=candidate):
+                base, reason, numbers = apply_min_dwell(
+                    candidate, self.candidate_effective_at, current, self.MIN
+                )
+                self.assertIs(base, BaseRegime.HIGH_VOL, "离开保命档要老实等")
+                self.assertEqual(reason, _REASON_MIN_DWELL)
+                self.assertNotIn(
+                    "dwell_exempt",
+                    numbers,
+                    "没豁免就不许留下豁免的痕迹——否则日报会把一次「维持不变」"
+                    "渲染成「保命档豁免」",
+                )
+
+    def test_leaving_high_vol_still_waits_for_the_dwell(self):
+        """从保命档回落同样受持续期约束，且 `in_force_days` 按量化轴计。
+
+        高波动是**叠加层**：它的解除是状态派生的（CONTEXT.md 第 128 条），但「解除」与
+        「换到另一个基础阶段」是两件事。这里钉的是后者——量化真的换档时，那把防抖尺子
+        还在，只是量对了对象。豁免单向的意思正是「进得早、出不早」。
+        """
+        current = make_judgement(RUN_DAY, BaseRegime.HIGH_VOL)
+        base, reason, numbers = apply_min_dwell(
+            BaseRegime.RANGE, self.candidate_effective_at, current, self.MIN
+        )
+        self.assertIs(base, BaseRegime.HIGH_VOL)
+        self.assertEqual(reason, _REASON_MIN_DWELL)
+        self.assertEqual(numbers["in_force_days"], 1)
+
+    def test_high_vol_when_already_high_vol_is_a_plain_adoption(self):
+        """候选与当前同为高波动时，走「没换档」那条早返回，不留豁免痕迹。
+
+        两种情形的区别不是措辞：`dwell_exempt` 的意思是「这次切换绕过了闸」，而没切换时
+        根本没有闸可绕。混起来会让日报在保命档持续的每天都报一句「本次直接采纳」。
+        """
+        current = make_judgement(RUN_DAY, BaseRegime.HIGH_VOL)
+        base, reason, numbers = apply_min_dwell(
+            BaseRegime.HIGH_VOL, self.candidate_effective_at, current, self.MIN
+        )
+        self.assertIs(base, BaseRegime.HIGH_VOL)
+        self.assertEqual(reason, "")
+        self.assertNotIn("dwell_exempt", numbers)
+
     def test_the_comparison_uses_the_base_stage_not_the_effective_stage(self):
         """当前记录被资讯抬升过时，比较对象是**量化阶段**，不是生效阶段。
 
@@ -660,7 +743,8 @@ class TestMinDwellRule(TestCase):
         今天的候选也是上行趋势：与**基础**阶段比，量化没有切换（`base_regime` 照旧写
         上行趋势，只是不经过持续期这一道闸）；与生效阶段比，则会凭空多出一条
         「载体维持 min_dwell 天」的要求——而资讯抬升按 CONTEXT.md 第 104 条**不受**持续期
-        约束，理由写着「若要求抬升自身维持 5 天，会出现『第 2 天资讯已撤回、抬升却撤不掉』
+        约束，理由写着「若要求抬升自身维持 min_dwell 天，会出现『第 2 天资讯已撤回、抬升却
+        撤不掉』
         的怪状态」。
 
         实测代价：生产库 32 条记录里 10 天处于高波动，其中 6 天是持续期借着资讯抬升
@@ -826,6 +910,44 @@ class TestRunDailyJudgementSkipsWhatItCannotJudge(TestCase):
         self.assertEqual(
             NEWS.calls, [], "判不出量化的日子连资讯都不用抓——反正没有记录可写"
         )
+
+    def test_a_tick_before_the_judgement_moment_writes_nothing(self):
+        """日界之后、判定时刻之前**不出结论**。
+
+        这是 2026-11-17 那次改动的全部行为差异：原先「日界一过判」，现在等到当晚 23:30。
+        这段时间返回一个明确的 slug 而不是静默返回空，因为日报与 Shadow 都按返回值说话，
+        「今天还没到点」必须与「判不出来」是两句不同的话。
+        """
+        persist(series(), last_day=SIGNED_DAY)
+        moment = judgement_moment(RUN_DAY)
+        before = moment - timedelta(minutes=5)
+        result = run_daily_judgement(now=before)
+        self.assertEqual(result["skipped"], "before_judgement_moment")
+        self.assertEqual(result["run_day"], RUN_DAY.isoformat())
+        self.assertEqual(result["judgement_at"], moment.isoformat())
+        self.assertEqual(RegimeJudgement.objects.count(), 0)
+        self.assertEqual(NEWS.calls, [], "还没到点就不该去抓资讯")
+
+    def test_the_gate_opens_at_the_judgement_moment_itself(self):
+        """闸门是**闭区间**：正好到点那一刻就该判。
+
+        用「>=」而不是「>」的理由与 `_ready` 的截止时刻一致——边界含糊会让「到点了没有」
+        在恰好那一刻无法回答，而心跳每 5 分钟才来一轮，误差不是几分钟的事。
+        """
+        persist(series(), last_day=SIGNED_DAY)
+        result = run_daily_judgement(now=judgement_moment(RUN_DAY))
+        self.assertNotIn("skipped", result)
+        self.assertEqual(RegimeJudgement.objects.count(), 1)
+
+    def test_a_moment_before_the_day_start_would_be_a_config_error(self):
+        """判定时刻早于业务日界时必须在配置层就报错，不能静默退化。
+
+        退化的表现是「闸恒开」——结论照出、时间照旧，日报上完全看不出来，而它正是本次
+        改动要消灭的旧行为。所以这一类必须当场抛错，而不是等到某天有人发现判定又变早了。
+        """
+        with self.assertRaises(ValueError) as ctx:
+            replace(config.JUDGEMENT_LIFECYCLE, judgement_hour=7)
+        self.assertIn("业务日界", str(ctx.exception))
 
     def test_a_skip_does_not_disturb_the_record_in_force(self):
         """判不出来时保持上一有效状态——由查询语义天然承担，不需要写一条「沿用」记录。"""

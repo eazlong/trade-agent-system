@@ -129,9 +129,9 @@ app.conf.beat_schedule = {
     # **与投递任务分开一条 beat 条目是必须的**：合成一条等于让看门狗去报自己的失败——
     # 它恰好是失败的那一个时，它不会响（CONTEXT.md:175）。
     # 一天绝大多数轮次是「未到截止时刻」或「已投递」，都是不写一行、不发一条的空转。
-    # 不用 crontab 表达式把「北京 09:00」翻成 UTC 小时：判定链路之所以反复强调
+    # 不用 crontab 表达式把「北京 23:50」翻成 UTC 小时：判定链路之所以反复强调
     # 「北京 08:00 == 日线换线」，就是因为口译钟点的地方只能有一处，而
-    # CELERY_TIMEZONE 是 UTC——`crontab(hour=9)` 会在北京 17:00 触发。
+    # CELERY_TIMEZONE 是 UTC——`crontab(hour=23)` 会在北京次日 07:00 触发。
     "regime-report-delivery-watchdog": {
         "task": "apps.regime.tasks.check_report_delivery",
         "schedule": 300.0,

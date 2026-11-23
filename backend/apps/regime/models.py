@@ -27,15 +27,15 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Iterable
 
 from django.db import models
 
-from apps.common.time_utils import business_day_start
-from apps.regime.config import NewsSourceKind
+from apps.common.time_utils import business_day_start, business_tz
+from apps.regime.config import JUDGEMENT_LIFECYCLE, NewsSourceKind
 from apps.regime.quant import BaseRegime
 
 # 必须与下面 DecimalField 的 decimal_places 一致：写入方按这个精度量化后再落库，
@@ -183,6 +183,34 @@ def business_midnight(day: date) -> datetime:
     return business_day_start(day)
 
 
+def judgement_moment(
+    day: date, *, hour: int | None = None, minute: int | None = None
+) -> datetime:
+    """业务日 `day` 的**判定时刻**：北京时间当天 `judgement_hour:judgement_minute`。
+
+    这是「什么时候为这一天出结论」，与 `business_midnight`（业务日界，北京 08:00）是
+    **两个不同的概念**，刻意分开：
+
+    - **日界**是 08:00，因为那是 UTC 00:00、是日线换线的那一刻。挪它等于挪动「签署日
+      / 运行日 / 生效时刻」三者的对齐基准，代价是整条链路平移半天。
+    - **判定时刻**只是「日界之后要等到几点才判」，默认北京 23:30。它不参与任何跨日
+      推断——`attribute_date`（签署日 = 最后一条已收盘日线）与 `effective_at`
+      （= `business_midnight(run_day + 1)`）都只由 `run_day` 和日线决定，与它无关。
+
+    合成一个常量的话，想挪判定时刻就必然连带挪动日线对齐；分开之后两者互不牵连。
+    钟点必须落在业务日内（`>= 08:00`），由 `JudgementLifecycleConfig.__post_init__`
+    在配置层拦下。
+
+    `hour` / `minute` 留空就取当前配置。**给了值的那条路是给 `run_at` 用的**：历史记录
+    要按它自己写下来时的钟点算，不能被今天的配置改写（见 `RegimeJudgement.run_at`）。
+    """
+    if hour is None:
+        hour = JUDGEMENT_LIFECYCLE.judgement_hour
+    if minute is None:
+        minute = JUDGEMENT_LIFECYCLE.judgement_minute
+    return datetime.combine(day, time(hour, minute), tzinfo=business_tz())
+
+
 class RegimeJudgement(models.Model):
     """一次行情阶段判定的事件记录。
 
@@ -267,13 +295,26 @@ class RegimeJudgement(models.Model):
 
     @property
     def run_at(self) -> datetime:
-        """名义运行时刻（= 生效时刻前一天的业务日界）。
+        """名义运行时刻（= 本记录写下来时那一刻生效的判定时刻）。
 
         唯一的用途是回答「机制多久没出结论了」：拿它跟现在比，得到的是结论的新鲜度。
         用 `effective_at` 直接比会得到负数（最新一条的正常状态是「明天生效」），用
         `attribute_date` 比则要额外记一层「正常滞后几天」的偏移。
+
+        **钟点从本记录自己的 `config_snapshot` 里读，不读当前配置。** 判定时刻是可调
+        的，用今天的配置去反推一条历史记录的名义运行时刻，就等于用今天的规则改写历史
+        ——与 `attribute_date` / `effective_at` 存成列是同一条纪律（见类 docstring）。
+
+        快照里没有这两个键的记录写于「判定时刻」引入之前（2026-11-17 之前），那时的
+        名义运行时刻就是业务日界本身——**回落值不是猜测，是那批记录的历史事实**。
         """
-        return business_midnight(self.run_day)
+        moment = (self.config_snapshot or {}).get("judgement_lifecycle") or {}
+        hour = moment.get("judgement_hour")
+        if hour is None:
+            return business_midnight(self.run_day)
+        return judgement_moment(
+            self.run_day, hour=hour, minute=moment.get("judgement_minute", 0)
+        )
 
     def __str__(self) -> str:
         return (

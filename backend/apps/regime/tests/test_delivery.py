@@ -39,7 +39,7 @@ from unittest.mock import AsyncMock, patch
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from apps.common.time_utils import business_tz
+from apps.common.time_utils import business_tz, to_business
 from apps.regime import report
 from apps.regime.models import DailyReport
 from apps.regime.tests.test_shadow import (
@@ -51,11 +51,12 @@ from apps.regime.tests.test_shadow import (
 )
 from apps.trading.models import LiveSession, Strategy
 
-#: 判定机制的名义时刻：北京 2026-09-22 08:00（= UTC 00:00）。
-NOW = datetime.combine(RUN_DAY, time(8, 0), tzinfo=business_tz())
-#: 日报截止时刻 = `REPORT.watchdog_hour:watchdog_minute`（北京 09:00）。看门狗还要再加
+#: 判定机制的名义时刻：北京 2026-09-22 23:35——判定时刻（23:30）之后、日报截止之前，
+#: 也就是「今天结论刚落库、日报刚写完」那一刻。
+NOW = datetime.combine(RUN_DAY, time(23, 35), tzinfo=business_tz())
+#: 日报截止时刻 = `REPORT.watchdog_hour:watchdog_minute`（北京 23:50）。看门狗还要再加
 #: `WATCHDOG_GRACE` 才动手，所以下面三个时刻分别落在「截止前」「宽限内」「宽限外」。
-DEADLINE = datetime.combine(RUN_DAY, time(9, 0), tzinfo=business_tz())
+DEADLINE = datetime.combine(RUN_DAY, time(23, 50), tzinfo=business_tz())
 INSIDE_GRACE = DEADLINE + timedelta(minutes=1)
 AFTER_GRACE = DEADLINE + report.WATCHDOG_GRACE + timedelta(minutes=1)
 
@@ -314,6 +315,35 @@ class TestTheWatchdog(TestCase):
         self.assertFalse(summary["checked"])
         self.assertFalse(summary["escalated"])
         self.assertEqual(summary["reason"], "before_deadline")
+
+    def test_the_grace_lands_past_midnight_and_still_looks_at_the_right_day(self):
+        """宽限之后的时刻落在**次日凌晨**，而它查的必须仍是**昨天**那个运行日。
+
+        这是 2026-11-17 改动暴露出的一处潜伏错误：`_business_day` 原先返回业务时区的
+        **日历日**（`to_business(now).date()`），而调用方要的是**业务日**。旧的截止时刻
+        是 09:00、宽限后 09:15，两者恰好相等，错误因此从未显形；截止挪到 23:50、宽限后
+        落点是次日 00:05 之后，日历日比业务日大一天，于是看门狗会去查一份**还没生成的**
+        日报，**每天夜里必然响一条假告警**——而假告警的真实代价是真告警跟着被忽略。
+        """
+        _users(1)
+        _row()  # RUN_DAY 那一份，已投递
+        row = DailyReport.objects.get(symbol=SYMBOL, run_day=RUN_DAY)
+        row.delivery = {"x": {"ok": True}}
+        row.delivered_at = AFTER_GRACE
+        row.save()
+
+        # 前提：这个时刻确实已经越过午夜（否则这条用例没有在测它要测的东西）。
+        self.assertGreater(to_business(AFTER_GRACE).date(), RUN_DAY)
+
+        with _notify(True) as mock:
+            summary = report.check_report_delivery(now=AFTER_GRACE)
+        self.assertEqual(
+            summary["run_day"],
+            RUN_DAY.isoformat(),
+            "宽限后落在次日凌晨，但查的仍是昨天那个运行日",
+        )
+        self.assertEqual(summary["reason"], "delivered")
+        self.assertEqual(mock.await_count, 0)
 
     def test_it_does_not_race_the_report_that_has_just_become_ready(self):
         """刚过截止时刻也不响——**这是上一条的反面，也是 `WATCHDOG_GRACE` 的全部理由**。

@@ -83,7 +83,7 @@ UPTREND = BaseRegime.UPTREND
 
 #: 生命周期参数（与 `test_deactivation_run` 同一份）：过期门槛 3 天。本模块自己不用它
 #: 算任何东西，但 `deactivation.derive` 会——传半份配置会让「用错了哪一组参数」看不出来。
-LIFE = JudgementLifecycleConfig(min_dwell_days=5, stale_after_days=3)
+LIFE = JudgementLifecycleConfig(min_dwell_days=3, stale_after_days=3)
 
 NOW = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
 

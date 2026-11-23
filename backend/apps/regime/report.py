@@ -4,10 +4,14 @@ CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。�
 
 ## 报的是「今天刚产出、明日 08:00 才生效」的那条，不是此刻生效中的那条
 
-一天可见期的全部价值就是「异常在生效前被拦下」，而日报是用户**唯一**能看到待生效结论的
+可见期的全部价值就是「异常在生效前被拦下」，而日报是用户**唯一**能看到待生效结论的
 地方——只报当前生效态，等于让可见期只存在于代码里。所以第①段必须读 `effective_at`
 （= `business_midnight(run_day + 1)`，也就是「自明日 08:00 起生效」那句话的字面出处），
 **必须明写生效时刻**，否则「今日判定」这个词就在撒谎：此刻咬人的是另一条。
+
+可见期的长度 = 判定时刻到次日 08:00。判定在北京 23:30（`JUDGEMENT_LIFECYCLE`）时是
+**8.5 小时**，比 2026-11-17 之前的 24 小时短——这是把判定挪到当晚的直接代价，换来的是
+结论用的是当天已收盘的那根日线，而不是前一天那根。
 
 代价是第①②段读起来是未来时。这与「停自动、恢复人工」是同一种时间观：机制先把话说出来，
 再动手。
@@ -21,10 +25,11 @@ CONTEXT.md 第 173 条是这一段的全部正文，本模块是它的实现。�
 
 等多久是这条规则唯一需要第二个出口的地方。判定的失败分两类，出口也分两个：
 
-- **数据类失败**（`skipped`：日线没到、预热未满）——判定任务正常返回，只是没有结论。
-  等到 `config.REPORT` 的业务日界 + `watchdog_hour:watchdog_minute`，照发一份写着
-  「今日判定缺失，处于保持的上一有效状态」的日报。**沉默必须能被识别为异常**，而一份
-  永不出现的日报与「今天没什么事」在聊天窗口里长得一样。
+- **数据类失败**（`skipped`：日线没到、预热未满、还没到判定时刻）——判定任务正常返回，
+  只是没有结论。等到 `config.REPORT` 的 `watchdog_hour:watchdog_minute`（默认当晚
+  23:50，**晚于判定时刻 23:30**），照发一份写着「今日判定缺失，处于保持的上一有效状态」
+  的日报。**沉默必须能被识别为异常**，而一份永不出现的日报与「今天没什么事」在聊天窗口
+  里长得一样。
 - **故障类失败**（抛异常）——`apps.trading.tasks` 的这条链路直接中断，本模块根本不被
   调用。这一类的兜底是单元 8iv 的独立看门狗（「当天日报在固定时刻仍未成功投递则升级
   告警」）。**这不是漏洞，是那句「独立」的全部含义**：让日报自己报告「日报没发出去」，
@@ -68,7 +73,7 @@ from datetime import date, datetime, time, timedelta
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from apps.common.time_utils import business_tz, format_business, to_business
+from apps.common.time_utils import business_day, business_tz, format_business
 from apps.regime import config, halt, judgement, mechanism_switch
 from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
@@ -129,6 +134,10 @@ _SKIP_DISPLAY = {
     "stale_candles": "日线还没到签署日（数据管道比日界慢）",
     "empty_series": "日线序列为空",
     "undecidable": "量化判不出来（预热未满，或分位窗口还没攒满 250 日）",
+    # 这一条**正常情况下不该出现在日报里**：日报的截止时刻排在判定时刻之后，等它落笔
+    # 时判定早就到点了。真的看到它，说明截止时刻被调到了判定时刻之前——那是配置错，
+    # 而它的表现正是这份「缺失」日报本身（见 `ReportConfig.watchdog_hour`）。
+    "before_judgement_moment": "还没到当天判定时刻（日报截止被调早了？）",
 }
 
 #: 写库的收场。
@@ -142,6 +151,11 @@ OUTCOME_WAITING = "waiting"
 #: 于是沿用了当前阶段。与 `judgement._DECISION_CARRIED` 是同一个字面量——那边是私有名，
 #: 这里照抄一份并把耦合写在明面上：两处必须一起改，而 `test_report.py` 钉着这个等式。
 ACTION_CARRIED = "carried"
+
+#: `evidence["decision"]["dwell_exempt"]` 的取值：候选是保命档（高波动），因此**没有**
+#: 经过最小持续期那一道闸。与 `judgement._EXEMPT_HIGH_VOL` 是同一个字面量，耦合关系与
+#: 上面 `ACTION_CARRIED` 同一性质：两处一起改，`test_report.py` 钉着等式。
+DWELL_EXEMPT_HIGH_VOL = "high_vol"
 
 
 # --------------------------------------------------------------------------- #
@@ -224,11 +238,16 @@ def _ready(judgement_result: dict, run_day: date, now: datetime) -> bool:
     """今天这份日报该不该写了。
 
     两条路（见模块 docstring）：判定出了结论，或者等到了截止时刻。截止时刻按**业务时区**
-    解读——`watchdog_hour` 是给人看的钟点（「早九点还没收到就该响了」），不是 UTC 小时。
+    解读——`watchdog_hour` 是给人看的钟点（「当晚 23:50 还没收到就该响了」），不是 UTC 小时。
 
-    截止时刻早于业务日界（北京 08:00）时，`deadline <= 日界` 恒真，于是当天第一轮心跳
-    就会写一份「判定缺失」——那是配置写错了，不是时序问题。这里不拦，但 `ReportConfig`
-    的 docstring 与它的默认值（9 点）已经把正常形状说清楚了。
+    **它必须排在判定时刻（北京 23:30）之后**，这是本函数唯一的时序前提。排在之前的话，
+    判定还没跑，这里就先满足 `now >= deadline`，于是当天第一份日报写成「今日判定缺失」；
+    而日报一天一条（`(symbol, run_day)` 唯一），那份缺失日报会把这一天**永久钉死**——
+    等到 23:30 判定真出结论，也没有第二条可以发。这一条跨组关系由 `ReportConfig` 的
+    docstring 与 `tests/test_report.py::TestContract` 一起钉住。
+
+    截止时刻早于业务日界（北京 08:00）时，`deadline <= 日界` 恒真，同一类配置错有同样的
+    后果。这里不拦，但默认值已经把正常形状说清楚了。
     """
     if judgement_result.get("base_regime"):
         return True
@@ -262,12 +281,19 @@ def _run_day(judgement_result: dict, shadow: dict, now: datetime) -> date:
 
 
 def _business_day(now: datetime) -> date:
-    """这个绝对时刻落在哪个**业务日**（业务时区的自然日）。
+    """这个绝对时刻落在哪个**业务日**。
 
     与 `business_midnight` 是同一个口径的两面：日界是业务时区的 08:00（== 日线换线），
     所以「今天的日报」按业务日算，不按进程时区的自然日算。
+
+    **不能拿 `to_business(now).date()` 顶替**——那给的是业务时区的**日历日**，它在
+    北京 00:00–08:00 这 8 小时里比业务日大一天（`business_day()` 的 docstring 里记着
+    这个坑，判定链路当年正是踩它踩出了一整批错一天的历史记录）。这里要用它，是因为
+    投递与看门狗都在**午夜前后**跑：日报的截止时刻是 23:50，看门狗再宽限 15 分钟，
+    落点就在次日 00:05；拿日历日去查，问的是「明天那份日报送到了吗」——一份根本还没
+    生成的日报，于是**每天夜里必然响一条假告警**。
     """
-    return to_business(now).date()
+    return business_day(now)
 
 
 # --------------------------------------------------------------------------- #
@@ -376,6 +402,28 @@ def _section_today(
             f"但当前阶段只站了 {days} 个自然日（不足 "
             f"{config.JUDGEMENT_LIFECYCLE.min_dwell_days} 天），本次沿用 {effective}"
         )
+    elif decision.get("dwell_exempt") == DWELL_EXEMPT_HIGH_VOL:
+        # 保命档豁免了持续期。必须写出来：这是「今天就该保命」与「机制在防抖」两种
+        # 情形唯一的分界，而它看着就像一次普通的阶段切换（action=adopted、reason 为空）。
+        #
+        # **句子要分两种成因**，不能只说「不够所以豁免」：豁免是**无条件**的，天数够
+        # 不够都会被采纳。打成一句「只站了 N 天（通常要满 M 天）」在 N >= M 时会自相
+        # 矛盾——实测 2026-11-17 的日报就写成了「只站了 36 个自然日（通常要满 3 天）」，
+        # 读者只能理解成「36 小于 3」或者「这机制算错了」。
+        days = decision.get("in_force_days")
+        min_days = config.JUDGEMENT_LIFECYCLE.min_dwell_days
+        if isinstance(days, int) and days < min_days:
+            lines.append(
+                "保命档：量化判出高波动，**不适用**最小持续期"
+                f"（当前阶段只站了 {days} 个自然日，通常要满 {min_days} 天），本次直接采纳"
+            )
+        else:
+            lines.append(
+                "保命档：量化判出高波动，**不适用**最小持续期"
+                f"（当前阶段已站 {days} 个自然日，本就够 {min_days} 天），本次直接采纳"
+                "——留这个标记是为了让「保命档走的是自己的路径」在日报上可见，"
+                "不是因为天数不足"
+            )
 
     numbers = _quant_lines(record)
     if numbers:
@@ -1159,7 +1207,7 @@ def _declaration_lines(*, now: datetime, regime: object) -> list[str]:
     """停止声明表**此刻**的实数（第③段 W4）。
 
     **这一行说的是「此刻」，不是今天那条判定的效果**：声明表吃的是**生效中**的判定
-    （`judgement.current_judgement`），而今天 08:00 刚产出、明日 08:00 才生效的那一条此刻
+    （`judgement.current_judgement`），而今天 23:30 刚产出、明日 08:00 才生效的那一条此刻
     还没咬人。本段上面那行「上次判定成功（结论 …）」报的正是**待生效**的那条——两个阶段名
     会不一样，所以这一行必须把「按生效中的阶段」写出来，否则读的人只能在两句里挑一句信。
 
@@ -1384,7 +1432,7 @@ _DELIVERY_FAILED = "出站通知口返回未送达（推送通路失败，或接
 #: 看门狗去抢它盯的那个写入者，而抢跑制造的是**每天必然出现**的假告警；假告警的真实
 #: 代价是真告警跟着一起被忽略。
 #:
-#: 晚三个心跳在这里不损失什么：「今天这份日报有没有送到」等到 09:15 与等到 09:00 没有
+#: 晚三个心跳在这里不损失什么：「今天这份日报有没有送到」等到 23:05 与等到 23:50 没有
 #: 区别，那是一条日频结论，不是一条行情信号。
 #:
 #: **它与 beat 的间隔是一对**：余量必须大于投递任务与心跳两条 beat 条目各自的间隔之和。
@@ -1576,8 +1624,8 @@ def check_report_delivery(
     所以改配置不会只改到一处。
 
     **不用 crontab 表达式定时**：本仓 Celery 的 `TIME_ZONE` / `CELERY_TIMEZONE` 都是
-    UTC，`crontab(hour=9)` 会在北京 17:00 触发，而把北京钟点翻译成 UTC 表达式等于把
-    「09:00 是给人看的钟点」这条口径复制到第二个地方。改成固定间隔轮询 + 在函数里按
+    UTC，`crontab(hour=23)` 会在北京次日 07:00 触发，而把北京钟点翻译成 UTC 表达式等于把
+    「23:50 是给人看的钟点」这条口径复制到第二个地方。改成固定间隔轮询 + 在函数里按
     业务时区判时刻，口径就只有一处。
     """
     now = now or timezone.now()

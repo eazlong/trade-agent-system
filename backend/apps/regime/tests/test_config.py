@@ -100,7 +100,17 @@ class TestSnapshot(SimpleTestCase):
                 "trend_separation_min_atr",
                 "warmup_days",
             ),
-            "judgement_lifecycle": ("min_dwell_days", "stale_after_days"),
+            # `judgement_hour` / `judgement_minute` 是「业务日 D 的判定时刻」，
+            # 2026-11-17 从「日界一过就判」改成显式的北京 23:30。它们进快照的理由与
+            # `report` 那组同类：不参与判定逻辑本身，但**决定一条记录的名义运行时刻**
+            # （`RegimeJudgement.run_at` 就是按记录自己的快照反推的），所以改了就一定
+            # 看得见，也一定不能被今天的配置回改历史。
+            "judgement_lifecycle": (
+                "judgement_hour",
+                "judgement_minute",
+                "min_dwell_days",
+                "stale_after_days",
+            ),
             "evidence": ("min_trades", "min_months"),
             "deactivation": ("exemption_days",),
             "news": (
@@ -263,7 +273,13 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         self.assertEqual(config.JUDGEMENT.trend_separation_min_atr, 0.5)
 
     def test_lifecycle_defaults(self):
-        self.assertEqual(config.JUDGEMENT_LIFECYCLE.min_dwell_days, 5)
+        self.assertEqual(
+            config.JUDGEMENT_LIFECYCLE.min_dwell_days,
+            3,
+            "2026-11-16 由 5 调低到 3：防抖要滤的只是单日跳变，而 5 天让量化已经连续"
+            "判出同一档两天之后，机制仍按旧档位指挥停用。这个数是**行为契约**，"
+            "改了它等于改了机制对行情拐头的反应速度，所以字面钉死。",
+        )
         self.assertEqual(config.JUDGEMENT_LIFECYCLE.stale_after_days, 3)
 
     def test_evidence_defaults(self):
@@ -297,14 +313,18 @@ class TestThresholdsAreTheDocumentedOnes(SimpleTestCase):
         前者是**当天日报最晚该到几点**的判据：到点还没投递成功才升级告警。定得早会
         在判定还没跑完时误报，定得晚会把「今天的日报没送到」压到第二天。
 
+        **2026-11-17 由 09:00 挪到 23:50**，因为判定时刻挪到了当晚 23:30：截止排在判定
+        之前的话，日报会先写一份「今日判定缺失」，而日报一天一条，那天就永久钉死了。
+        下面 `test_the_deadline_is_after_the_judgement_moment` 钉着这条跨组关系。
+
         后者（`event_horizon_days`）是「未来 N 天的高影响事件」的那个 N。它进统一
         配置面是 CONTEXT.md 第 80 条点名的（「`query_events` 的查询天数」），而
         `query_events` 工具不吃天数参数（第 183 条）——所以这个数**同时**决定日报
         第③段与工具输出，两处必须同一个数。与 `/event list` 的默认天数的一致性由
         `apps/regime/tests/test_report.py` 那条跨模块断言守着，这里只钉字面值。
         """
-        self.assertEqual(config.REPORT.watchdog_hour, 9)
-        self.assertEqual(config.REPORT.watchdog_minute, 0)
+        self.assertEqual(config.REPORT.watchdog_hour, 23)
+        self.assertEqual(config.REPORT.watchdog_minute, 50)
         self.assertEqual(config.REPORT.event_horizon_days, 7)
 
     def test_events_defaults(self):
