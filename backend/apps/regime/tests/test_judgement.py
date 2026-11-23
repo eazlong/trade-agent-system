@@ -27,6 +27,8 @@ from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
+from types import SimpleNamespace
+
 import pytest
 from django.db import IntegrityError
 from django.test import TestCase
@@ -41,6 +43,7 @@ from apps.regime import serializers as ser
 from apps.regime.judgement import (
     _REASON_MIN_DWELL,
     apply_escalation,
+    apply_escalation_axes,
     apply_min_dwell,
     base_regime_since,
     build_evidence,
@@ -51,6 +54,7 @@ from apps.regime.judgement import (
     load_candles,
     pending_judgement,
     run_daily_judgement,
+    volatility_to_base,
 )
 from apps.regime.models import (
     Escalation,
@@ -132,16 +136,20 @@ def series(
     end_from: int | None = None,
     end_step: float | None = None,
     end_band: float | None = None,
+    spike_at: int | None = None,
+    spike_pct: float = 0.10,
 ) -> list[dict]:
     """合成一条能在**默认参数**下判定的日线序列。
 
     形状：前段用 ±3% 的日内振幅把 ATR% 抬起来，末段用 ±0.3% 压下去，于是最后一天的
-    ATR% 分位落在窗口最低端（远低于 `high_vol_quantile`），再由末段的 EMA 斜率与间距
-    决定档位。三个变体（上行 / 下行 / 高波动）都由这几个开关摆出来：
+    ATR% 分位落在窗口最低端。档位由末段的 EMA 斜率与间距、以及**事件证据**决定：
 
-    - 默认 → 上行趋势（末段单边上涨）
+    - 默认 → 上行趋势（末段单边上涨，四条事件证据都不成立）
     - `end_step=-1.5` → 下行趋势
-    - `end_band=0.06` → 高波动（末段恢复宽幅，分位跳到 1.0）
+    - `spike_at=i` → 第 i 天跳 **+10%**（`spike_pct`）：这是**事件波动日**。
+      #65 之后高波动由「跳空 / 放量 / ATR 骤升 / 单日大幅」判，所以夹具必须真的
+      制造一次事件——旧夹具靠「末段加宽振幅让 ATR% 分位跳到 1.0」，那条路径已经
+      不再是判据（分位仍在算、仍进 evidence，但不再定档）。
     - `n=100` → 判不出来（分位窗口只攒到 86 天）
     """
     rows = []
@@ -160,6 +168,21 @@ def series(
         rows.append(
             {"close": close, "high": close * (1 + half), "low": close * (1 - half)}
         )
+    if spike_at is not None:
+        # 「跳」只加在 `spike_at` **这一根**上（之后的收盘价回到原轨迹），这样
+        # `close_t / close_{t-1} - 1` 才是那一根的真实涨幅。整段平移的话，
+        # `close_{t-1}` 会跟着一起被放大，涨幅恒等于 0——用例看着红/绿都不说明问题。
+        #
+        # 写在**收盘价**上而不是开销盘价：`move`（单日大幅）是四条证据里最直观的一条，
+        # 且它不依赖 `open`/`volume`（`judgement.load_candles` 只取 high/low/close）。
+        # 写在这里，事件在**真实生产取数路径**上也成立，而不是只在测试的合成行里成立。
+        row = rows[spike_at]
+        rows[spike_at] = {
+            **row,
+            "close": row["close"] * (1 + spike_pct),
+            "high": row["high"] * (1 + spike_pct),
+            "low": row["low"] * (1 + spike_pct),
+        }
     return rows
 
 
@@ -595,6 +618,70 @@ class TestEscalationOnlyEverGoesConservative(TestCase):
             apply_escalation(BaseRegime.RANGE, "halt")
 
 
+class TestEscalationSetsOnlyTheVolatilityAxis(TestCase):
+    """资讯抬升**只设波动维、不动周期维**（#65）——本票语义上最核心的一处改动。
+
+    旧实现返回四档里的 `HIGH_VOL`，那是一个「有波动就没有方向」的取值，于是资讯说
+    一句「谨慎」，那天的 `cycle` 就没了。两维拆开之后，「进入风险状态」的准确说法是
+    「波动维置为 `event_spike`」，周期维原样保留。
+    """
+
+    def test_the_cycle_survives_the_escalation(self):
+        """抬升当天：`cycle` 与抬升前一模一样，`volatility` 变成事件波动。
+
+        这是「熊市里的风险事件」的正确形状——保命档照开，但方向没被抹掉。
+        """
+        for cycle in (Cycle.BULL, Cycle.BEAR, Cycle.SIDEWAYS, Cycle.UNCLEAR):
+            with self.subTest(cycle=cycle.value):
+                got_cycle, got_volatility = apply_escalation_axes(
+                    cycle, Volatility.NORMAL, Escalation.NEWS.value
+                )
+                self.assertIs(got_cycle, cycle, "周期维必须原样保留")
+                self.assertIs(got_volatility, Volatility.EVENT_SPIKE)
+
+    def test_a_missing_cycle_stays_missing(self):
+        """`cycle` 本来就为空时**不要**顺手编一个。
+
+        「没有周期结论」这个事实与「资讯抬升了」无关，抬升不该把它变成一个看起来
+        有方向的结论。
+        """
+        got_cycle, got_volatility = apply_escalation_axes(
+            None, Volatility.NORMAL, Escalation.NEWS.value
+        )
+        self.assertIsNone(got_cycle)
+        self.assertIs(got_volatility, Volatility.EVENT_SPIKE)
+
+    def test_no_flag_changes_nothing_on_either_axis(self):
+        """没有抬升标志时两维原样返回——抬升是唯一会改波动维的输入。"""
+        for volatility in (Volatility.NORMAL, Volatility.EVENT_SPIKE):
+            with self.subTest(volatility=volatility.value):
+                got = apply_escalation_axes(Cycle.BEAR, volatility, "")
+                self.assertEqual(got, (Cycle.BEAR, volatility))
+
+    def test_the_escalation_never_loosens_the_volatility_axis(self):
+        """抬升**只能更保守**：`event_spike` 不会被降回 `normal`。"""
+        got_cycle, got_volatility = apply_escalation_axes(
+            Cycle.BEAR, Volatility.EVENT_SPIKE, Escalation.NEWS.value
+        )
+        self.assertIs(got_volatility, Volatility.EVENT_SPIKE)
+        self.assertIs(got_cycle, Cycle.BEAR)
+
+    def test_an_unknown_flag_is_a_loud_error_here_too(self):
+        """两个入口（四档版与两维版）必须认同一张标志表，不存在「一边认一边不认」。"""
+        with self.assertRaises(ValueError):
+            apply_escalation_axes(Cycle.BEAR, Volatility.NORMAL, "halt")
+
+    def test_the_four_tier_form_now_derives_from_the_volatility_axis(self):
+        """生效阶段（四档）**从波动维派生**：保命档 ⟺ 波动维是事件波动。
+
+        这样 `effective_regime == high_vol` 与 `volatility == event_spike` 在结构上
+        是同一句话，不会再出现「四档说保命档、波动维说没事」这种互相打脸的记录。
+        """
+        self.assertIs(volatility_to_base(Volatility.EVENT_SPIKE), BaseRegime.HIGH_VOL)
+        self.assertIsNone(volatility_to_base(Volatility.NORMAL))
+        self.assertIsNone(volatility_to_base(None))
+
+
 class TestMinDwellRule(TestCase):
     """阶段是慢变量：切换要等当前阶段站稳 `min_dwell_days` 个自然日。"""
 
@@ -855,6 +942,9 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             separation = 3.0
             slope_strength = 2.0
             slope_consistency = 1.0
+            metrics = SimpleNamespace(
+                gap=0.001, volume_ratio=1.1, atr_jump=1.0, move=0.004
+            )
 
         evidence = build_evidence(Label(), {"action": "adopted", "reason": ""})
         self.assertEqual(
@@ -862,14 +952,22 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
         )
         self.assertEqual(evidence["quant"]["regime"], "uptrend")
         self.assertEqual(evidence["quant"]["quantile_sample"], 250)
-        # 两维（#63）与四档同源，一起记在 quant 那组里。
+        # 两维（#63 / #65）记在 quant 那组里，各带自己的来源。
         self.assertEqual(evidence["quant"]["cycle"], "bull")
         self.assertEqual(evidence["quant"]["volatility"], "normal")
+        self.assertEqual(
+            evidence["quant"]["volatility_source"],
+            quant.VOLATILITY_SOURCE_PROXY,
+            "波动维有结论就必须带来源——否则读的人分不清判出来的与映射来的",
+        )
 
-    def test_a_high_vol_day_records_an_empty_cycle(self):
-        """`high_vol` 那天 evidence 里的 `cycle` 是 `None`，不是缺键、也不是编的。
+    def test_an_unjudged_cycle_is_recorded_as_null_not_invented(self):
+        """`cycle` 为空时 evidence 里是 `None`，不是缺键、也不是编的。
 
-        留空是本票的硬要求：旧结构里波动吃掉了周期，那天的周期信息真的不存在。
+        这一格在 #65 之后**不再是 `high_vol` 的形状**：保命档现在由波动维判出来，
+        那天 `cycle` 照样有值（两维并存）。真正留空的是「周期维判不出来」——
+        `classify_day` 在就绪条件缺一时给 `None`。留空这件事本身必须仍能表达，
+        否则前端会把「这一维不存在」画成「判不出」。
         """
 
         class Label:
@@ -886,6 +984,9 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             separation = -3.0
             slope_strength = 2.0
             slope_consistency = 1.0
+            metrics = SimpleNamespace(
+                gap=0.09, volume_ratio=1.0, atr_jump=1.0, move=0.12
+            )
 
         quant_block = build_evidence(Label(), {"action": "adopted", "reason": ""})[
             "quant"
@@ -893,6 +994,11 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
         self.assertIn("cycle", quant_block)
         self.assertIsNone(quant_block["cycle"])
         self.assertEqual(quant_block["volatility"], "event_spike")
+        self.assertEqual(
+            quant_block["volatility_source"],
+            quant.VOLATILITY_SOURCE_PROXY,
+            "有波动结论就一定有来源",
+        )
 
     def test_an_undecidable_label_keeps_the_numbers(self):
         class Label:
@@ -909,12 +1015,19 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
             separation = None
             slope_strength = None
             slope_consistency = None
+            metrics = SimpleNamespace(
+                gap=None, volume_ratio=None, atr_jump=None, move=None
+            )
 
         evidence = build_evidence(Label(), {"action": "adopted", "reason": ""})
         self.assertIsNone(evidence["quant"]["regime"])
         # 未判定日两维都是 None——不填 sideways/normal 那种安静的假结论。
         self.assertIsNone(evidence["quant"]["cycle"])
         self.assertIsNone(evidence["quant"]["volatility"])
+        self.assertIsNone(
+            evidence["quant"]["volatility_source"],
+            "没有波动结论就没有来源，别把 `proxy` 写在一格空结论上",
+        )
         self.assertEqual(
             evidence["quant"]["quantile_sample"],
             86,
@@ -949,17 +1062,39 @@ class TestTwoAxesReachTheRecord(TestCase):
         self.assertEqual(result["cycle"], record.cycle)
         self.assertEqual(result["volatility"], record.volatility)
 
-    def test_the_source_is_marked_as_a_projection_not_a_judgement(self):
-        """`volatility` 仍是**投影**，来源列必须这么说（#65 落地后才变 proxy）。
+    def test_the_source_is_marked_as_a_proxy_judgement(self):
+        """`volatility` 现在由**事件代理判出来**，来源列必须这么说（#65）。
 
-        与迁移回填的 `legacy_mapping` 分开标，是为了让「映射来的」永远不被读成
-        「判出来的」——#65 引入事件代理后还会写 `proxy`，三者必须可区分。
+        三个来源取值必须可区分：`legacy_mapping`（迁移按四档回填的历史行）、
+        `compatible_projection`（#63 过渡期写入的行）、`proxy`（#65 起的写入）。
+        混起来的话，「那天的高波动是判出来的、映射来的、还是消息面确认的」永远答不上来
+        ——而 #67 的日报正要把这句话印给读的人看。
         """
         persist(series(), SIGNED_DAY)
         run_daily_judgement(now=NOW)
 
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
-        self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROJECTION)
+        self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROXY)
+
+    def test_the_evidence_says_the_proxy_is_the_source(self):
+        """日报要能说「本次高波动来自价格代理」——依据栏里必须有这句话的原料。
+
+        代理会有假阳性（一次大幅波动未必有新闻）。不标注的话，读者会以为每一个高波动日
+        都有新闻佐证，而那正是这次改造最该避免的误读。
+        """
+        persist(series(), SIGNED_DAY)
+        run_daily_judgement(now=NOW)
+
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        quant_block = (record.evidence or {})["quant"]
+        self.assertEqual(
+            quant_block["volatility_source"], quant.VOLATILITY_SOURCE_PROXY
+        )
+        # 四条证据的原始数字必须逐项可见：「跳空 0.4%、但单日走了 9%」与「跳空 8%」
+        # 是两种完全不同的事件日，只有原始数字能分开它们。
+        for name in ("gap", "volume_ratio", "atr_jump", "move"):
+            with self.subTest(field=name):
+                self.assertIn(name, quant_block)
 
     def test_a_high_vol_day_still_records_the_cycle(self):
         """`high_vol` 那天 `cycle` **不再落 NULL**——#64 要结束的正是这个状态。
@@ -972,9 +1107,12 @@ class TestTwoAxesReachTheRecord(TestCase):
         `project_to_axes(base)`——后者会把那天重新变回 `None`，等于在写入这一层把
         本票的改动悄悄装回去。
         """
-        # 末段从 320 起恢复宽幅（`end_band` 只在给了 `end_from` 时生效），
-        # ATR% 分位跳到 1.0 → 高波动。
-        persist(series(end_from=320, end_band=0.06), SIGNED_DAY)
+        # **最后一根**制造一次 +10% 的跳涨——`move`（单日大幅）这条事件证据成立，
+        # 于是判保命档。跳涨必须落在最后一根上：判定只看序列尾巴那一天的标签，
+        # 把事件放在历史里（比如下标 320 而序列有 340 根）不会影响今天这一条。
+        # **也不能再用「末段加宽振幅把 ATR% 分位推到 1.0」**：那条路径在 #65 之后
+        # 不再是判据，靠它构造「高波动日」会让这条用例悄悄空转。
+        persist(series(spike_at=339), SIGNED_DAY)
         run_daily_judgement(now=NOW)
 
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
@@ -997,8 +1135,9 @@ class TestTwoAxesReachTheRecord(TestCase):
         断言方式：高波动日 `base=high_vol`，而 `project_to_axes(HIGH_VOL)` 的 cycle 是
         `None`。于是「cycle 非空」这一条就足以区分两种实现——若有人改回投影，这里立刻红。
         """
-        # 末段恢复宽幅 → ATR% 分位顶到 1.0 → base 判高波动。
-        persist(series(end_from=320, end_band=0.06), SIGNED_DAY)
+        # 最后一根一次 +10% 跳涨 → 事件证据成立 → base 判高波动（#65 的判据来源）。
+        # 必须在最后一根：判定只看尾巴那一天的标签，事件落在历史里不影响今天。
+        persist(series(spike_at=339), SIGNED_DAY)
         run_daily_judgement(now=NOW)
 
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
@@ -1047,9 +1186,26 @@ class TestTwoAxesReachTheRecord(TestCase):
             state.base_regime, BaseRegime.RANGE.value, "基础阶段仍是量化口径"
         )
         self.assertTrue(state.blanket, "保命档判据看生效阶段")
-        # 两维归基础轴：横盘 + 无事件波动，而不是 event_spike。
-        self.assertEqual(state.cycle, Cycle.SIDEWAYS.value)
-        self.assertEqual(state.volatility, Volatility.NORMAL.value)
+        # 两维归**基础**轴：横盘 + 无事件波动。
+        #
+        # **#65 之后这一行与 `blanket` 并存，而这不是矛盾**：这一行是迁移回填的旧行
+        # （`volatility_source = legacy_mapping`），它的世界里还没有「抬升改波动维」这回事
+        # ——资讯抬升当场记在 `effective_regime` 上。所以 `RegimeState.blanket` 在
+        # `volatility` 有值时必须**读两维**（这里是 normal ⇒ 不是保命档），而旧行的
+        # 保命档信息只存在于 `regime` 这一列。
+        #
+        # 这正是本组用例要钉的取舍：新行的保命判据是波动维，旧行回落到 slug。两者在
+        # 同一份读面上必须**都判对**，否则回滚窗口内的行会被误读成「不保命」。
+        self.assertEqual(
+            state.cycle,
+            Cycle.SIDEWAYS.value,
+            "迁移回填的是基础轴：range ⇒ sideways",
+        )
+        self.assertEqual(
+            state.volatility,
+            Volatility.NORMAL.value,
+            "迁移回填的是基础轴：range ⇒ normal（而生效阶段仍是 high_vol，两者归属不同轴）",
+        )
 
 
 class TestTwoAxesReachTheReadSurface(TestCase):

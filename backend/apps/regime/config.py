@@ -253,11 +253,34 @@ class JudgementConfig:
     # 而是 unclear——不是箱体。把这种日子判成横盘正是旧结构的主要失败形态。
     cycle_consistency_min: float = 0.60
 
-    # 放量倍数的分母窗口。**本阶段只用于算「放量倍数」这个中间量，不参与定档**——
-    # 进配置面而不是写成模块常量，是因为它一旦参与判定就是阈值的一部分，而阈值必须
-    # 随判定记录一起落快照才谈得上「事后能解释当时为什么这么判」；等它真的开始参与
-    # 判定再补进来，历史记录就已经缺了这一格。
+    # 放量倍数的分母窗口。本阶段只用于算「放量倍数」这个中间量。
     volume_ma_period: int = 20
+
+    # ---- 波动维（volatility）的事件驱动代理（#65）----
+    #
+    # 四个数是「有没有发生事件」的四条独立证据，任一成立即 event_spike——它们是
+    # **或**不是**与**：一次跳空本身已经足够说明那天不是平静日，再要求「同时又放量」
+    # 等于把识别窗口缩到少数几天，而那几天恰恰是最典型的事件日。
+    #
+    # 它们替代的是 high_vol_quantile：分位判据在数学上锁死「250 日窗口里必有 20%
+    # 的日子判高波动」（实测 434 天 = 19.3%），而人工真值里高波动是 **0 天**。按配额
+    # 判出来的档位不是「观察到的波动」，是「窗口的算术必然」——那种判据无法随行情
+    # 自然变化，也就无法被证伪。
+    #
+    # 起手参数取自 ADR 0007 的对照实验（约 6.8% 的日子命中）：
+    #
+    #   move_ratio      = 0.07  单日涨跌超 7%
+    #   gap_ratio       = 0.03  跳空超 3%
+    #   volume_multiple = 2.5   量能超 20 日均量 2.5 倍
+    #   atr_jump_ratio  = 1.8   ATR 相对前一日涨 1.8 倍
+    #
+    # **为什么用价格代理而不是真实资讯**：消息面数据源当前没有（ADR 0007 的遗留项），
+    # 代理会有假阳性（一次大幅波动未必有新闻）。这一点不靠注释掩盖，而是靠
+    # volatility_source = "proxy" 落库 + 日报显式标注，让读的人知道这一格的来处。
+    move_ratio: float = 0.07
+    gap_ratio: float = 0.03
+    volume_multiple: float = 2.5
+    atr_jump_ratio: float = 1.8
 
     @property
     def warmup_days(self) -> int:
@@ -326,6 +349,33 @@ class JudgementConfig:
                 "cycle_consistency_min 必须落在 (0, 1]，当前 "
                 f"{self.cycle_consistency_min}"
                 "——取 0 等于取消这条门；取 > 1 则它永远不可能成立"
+            )
+        # ---- 波动维事件代理（#65）----
+        # 四个阈值的错法各不同，但后果同一种：把一整类日子静默判成「没有事件」或
+        # 「天天有事件」。取 0 会让判据恒成立（每一天都是 event_spike，保命档天天开，
+        # 全场策略永远停着）；取到 1 以上则单日涨跌幅那条永远不可能成立。
+        # 放宽到 1 本身也不拦——单日翻倍是真实事件——所以上界只要求「正数」。
+        for name in ("move_ratio", "gap_ratio"):
+            value = getattr(self, name)
+            if not 0.0 < value < 1.0:
+                raise ValueError(
+                    f"{name} 必须在开区间 (0, 1) 内，当前 {value}"
+                    "——它是相对前一日的比值：取 0 时判据恒成立（每天都判事件波动，"
+                    "保命档永不解除），取 >= 1 则要求单日翻倍才算，真实事件会被漏掉"
+                )
+        if self.volume_multiple <= 1.0:
+            raise ValueError(
+                "volume_multiple 必须 > 1.0，当前 "
+                f"{self.volume_multiple}"
+                "——它是「相对 20 日均量的倍数」：取 <= 1 时低于均量的日子也算放量，"
+                "这条证据退化成恒成立"
+            )
+        if self.atr_jump_ratio <= 1.0:
+            raise ValueError(
+                "atr_jump_ratio 必须 > 1.0，当前 "
+                f"{self.atr_jump_ratio}"
+                "——它是 ATR 环比：取 <= 1 时 ATR 下降的日子也算骤升，"
+                "「骤升」这个名字就不再成立"
             )
 
 

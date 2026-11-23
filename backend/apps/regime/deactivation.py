@@ -73,7 +73,7 @@ from typing import Any, Iterable, Mapping
 from django.utils import timezone
 
 from apps.regime import config
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Volatility
 from apps.regime.slice import (
     STATE_BLANKET,
     STATE_FIT,
@@ -134,14 +134,43 @@ BLOCKED_DISPLAY = {
 }
 
 
+#: 波动维里那个「事件波动」取值。保命档的判据自 #65 起是它，不再是一个档位名。
+VOLATILITY_SPIKE = Volatility.EVENT_SPIKE.value
+
+
+def is_event_spike(volatility: str | None) -> bool:
+    """这一条判定的**波动维**是不是事件波动——保命档的唯一判据（#65）。
+
+    保命档从「四档之一」变成「波动维的一个取值」之后，判据也换了源：问的不再是
+    「这个阶段叫不叫 high_vol」，而是「这条判定的波动维是不是 event_spike」。两者在
+    正常数据上等值（写入路径从波动维派生 `effective_regime`，见 `judgement.
+    volatility_to_base`），但**语义不同**：#65 之后「保命」是叠加层的性质，不是某个
+    档位的性质。批量重算、SliceVersion 进位之类的四档遗留路径也不会再让它们分家。
+
+    `None`（没有波动结论，冷启动或旧行）**不是**保命档：说不出来就别说要停全场。
+    """
+    return volatility == VOLATILITY_SPIKE
+
+
 def is_blanket(regime: str | None) -> bool:
-    """这个阶段是不是**保命档**（高波动）。
+    """这个**阶段 slug** 是不是保命档（高波动）。
 
     保命档的判据只能有一处。做成模块级函数而不只留 `RegimeState.blanket` 一个属性，是
     因为还有调用方**手里只有阶段 slug、没有 `RegimeState`**（`deactivation_run.
     close_left_regime_exemptions` 收的就是 slug）：那里判错的表现是把每一条在期豁免都
     关掉，而 `closed_at` 写下去没有复活路径。
+
+    **#65 起它是 `is_event_spike` 的兼容外壳**：手上真有波动维时用那个，别把
+    `volatility` 再投影回 slug 来喂本函数。两条路留着是因为历史行与日报快照里存的是
+    slug（`landscape["regime"]`），把它们逐个改成读两维属于 #67 的范围。
+
+    slug 判据仍然要认 `high_vol`：四档兼容层继续产出它（`quant._classify` 从波动维
+    派生），而库里还有存量行。
     """
+    if regime is None:
+        return False
+    # 直接比 slug，不解析成枚举：脏值（认不出的阶段）**不是**保命档。解析失败会抛，
+    # 而这里抛会让一条脏记录把整轮停机链打断。
     return regime == BaseRegime.HIGH_VOL.value
 
 
@@ -180,11 +209,25 @@ class RegimeState:
 
     @property
     def blanket(self) -> bool:
-        """当前是不是保命档（高波动）。日报要拿它写一句「全场停用由保命档负责」。
+        """当前是不是保命档（事件波动）。日报要拿它写一句「全场停用由保命档负责」。
 
-        放在这里而不是从格子上推：这是**阶段本身**的性质，与这一代池化表算出了什么无关。
+        放在这里而不是从格子上推：这是**这条判定本身**的性质，与这一代池化表算出了什么
+        无关。
+
+        ## 两个判据取**或**，不是替代
+
+        #65 把保命档的判据换成了波动维，但**不能只读它**：库里有一整类行是「基础阶段
+        横盘、资讯抬升成 high_vol」，它们的两维按 `base_regime` 回填（`range` ⇒
+        `normal`），于是 `volatility` 有值却说「没有事件波动」，而 `effective_regime`
+        正停着全场。只读 `volatility` 会把这类行读成「不是保命档」——**保命档的第一天
+        就把全场解除**，而解除的代价不可逆。
+
+        取或的取向与这一层其余判断一致：两个判据都只会让系统**更保守**（多认一次保命档
+        = 少解除一次），没有任何一条会把「正在停全场」读成「可以放行」。新写入的行两者
+        恒等（`effective_regime` 由波动维派生，见 `judgement.volatility_to_base`），
+        所以这个「或」只在旧行与回滚窗口上起作用。
         """
-        return is_blanket(self.regime)
+        return is_blanket(self.regime) or is_event_spike(self.volatility)
 
 
 @dataclass(frozen=True)

@@ -259,6 +259,63 @@ class TestBlanketIsStructural(SimpleTestCase):
         self.assertFalse(dea.RegimeState(regime=DOWNTREND, effective_at=at()).blanket)
 
 
+class TestBlanketReadsTheVolatilityAxis(SimpleTestCase):
+    """保命档的判据自 #65 起是**波动维**，不是某个档位名。
+
+    ADR 0007 把高波动从「四档之一」改成「叠加层」——它不再是一个阶段，而是叠加在阶段
+    上的一个性质。判据跟着换源之后，这里钉三件事：新行读波动维、旧行回落 slug、
+    以及**两个判据取或**（少认一次保命档的代价是不可逆的解除）。
+    """
+
+    def test_the_volatility_axis_alone_can_declare_the_blanket(self):
+        """`volatility=event_spike` 单独就足以判保命档，不必 slug 配合。
+
+        正常数据下两者恒等（写入路径由波动维派生 `effective_regime`），所以这一条
+        用一个人为不一致的组合来证明**波动维确实是判据之一**——若判据还只看 slug，
+        它就会红。
+        """
+        self.assertTrue(
+            dea.RegimeState(
+                regime=DOWNTREND, volatility="event_spike", effective_at=at()
+            ).blanket
+        )
+
+    def test_a_legacy_row_without_the_axis_still_counts_as_blanket(self):
+        """旧行（回滚窗口内写的 / 迁移没回填出来的）`volatility` 为空 ⇒ 按 slug 判。
+
+        「读不到新列」绝不能被读成「不是保命档」：那会让保命档第一天就解除全场，
+        而解除没有复活路径。
+        """
+        self.assertTrue(dea.RegimeState(regime=HIGH_VOL, volatility=None).blanket)
+        self.assertFalse(dea.RegimeState(regime=DOWNTREND, volatility=None).blanket)
+
+    def test_the_two_criteria_are_ored_so_a_stale_axis_never_unblanks_the_system(self):
+        """**两个判据取或**——这是本层最要紧的一格。
+
+        库里有一整类行是「基础阶段横盘、资讯抬升成 `high_vol`」：它们的两维按
+        `base_regime` 回填（`range` ⇒ `normal`），于是 `volatility` **有值**却说
+        「没有事件波动」，而 `effective_regime` 正停着全场。只读波动维会把这类行
+        读成「不是保命档」——保命档的第一天就把全场解除。
+        """
+        legacy_escalated = dea.RegimeState(
+            regime=HIGH_VOL, base_regime="range", cycle="sideways", volatility="normal"
+        )
+        self.assertTrue(
+            legacy_escalated.blanket,
+            "slug 说是保命档而波动维说是 normal 时，取向必须是「多认一次保命档」",
+        )
+
+    def test_the_two_helpers_agree_with_the_property(self):
+        """`is_blanket` / `is_event_spike` 是这套判据的唯一实现，属性只是把它接到
+        读面上。三者分家的话，「谁算保命档」就会有两处口径。"""
+        self.assertTrue(dea.is_blanket(HIGH_VOL))
+        self.assertTrue(dea.is_event_spike("event_spike"))
+        for value in (None, "", DOWNTREND, "range", "unclear", "normal"):
+            with self.subTest(value=value):
+                self.assertFalse(dea.is_blanket(value))
+                self.assertFalse(dea.is_event_spike(value))
+
+
 class TestBlocked(SimpleTestCase):
     """性质 5：不产出，但要说出来。"""
 

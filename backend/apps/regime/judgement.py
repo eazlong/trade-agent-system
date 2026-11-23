@@ -267,6 +267,55 @@ def in_force_since(record: RegimeJudgement) -> datetime:
 # --------------------------------------------------------------------------- #
 
 
+def apply_escalation_axes(
+    cycle: quant.Cycle | None,
+    volatility: quant.Volatility | None,
+    escalation: str,
+) -> tuple[quant.Cycle | None, quant.Volatility | None]:
+    """资讯抬升**只设波动维**，不动周期维（#65）。
+
+    这是这一票语义上最重要的一处改动。旧实现 `apply_escalation` 返回的是**四档**里的
+    `HIGH_VOL`——一个「有波动就没有方向」的取值，于是资讯说一句「谨慎」，那天的
+    `cycle` 就没了。两维拆开之后，「进入风险状态」这个动作的准确说法是：**波动维置为
+    `event_spike`**，周期维原样保留。
+
+    这不是换了个写法，是换了个结论：抬升当天现在的形状是
+    `cycle=bear + volatility=event_spike`（熊市里的风险事件，保命档照开），
+    而不是 `cycle=None + volatility=event_spike`（连方向都丢了）。
+
+    ## 为什么抬升不动 cycle
+
+    资讯只能让系统更保守，而「更保守」在保命档上已经完全兑现：`volatility=event_spike`
+    就是全场停开新仓。把 cycle 也一起改掉不会多保守一分，只会让「那天机器看到的方向是
+    什么」不可考——而周期维是慢变量，改造它恰恰是资讯最没有资格做的事（一段不可复现的
+    文本推理不该有改写趋势判定的权力）。
+
+    ## 为什么入参是两维、出参是两维
+
+    留 `base_regime` 那一版签名会让调用方继续拿四档当世界中心，而四档已经降级成兼容层：
+    「抬升」在四档里只能表达成 `HIGH_VOL`，于是「抬升之后 cycle 是什么」这个问题在
+    类型上就问不出来。这里让形状本身挡住那次退化。
+    """
+    escalation = escalation or ""
+    if not escalation:
+        return (cycle, volatility)
+    if escalation != Escalation.NEWS.value:
+        raise ValueError(f"未知的抬升标志：{escalation!r}")
+    return (cycle, quant.Volatility.EVENT_SPIKE)
+
+
+def volatility_to_base(volatility: quant.Volatility | None) -> BaseRegime | None:
+    """波动维 → 四档兼容层里的保命档。`event_spike` 就是 `high_vol`，其余为空。
+
+    **这是「保命档 ⟺ 波动维为 event_spike」这条不变量的唯一实现**：它让「拿 slug 判
+    保命档」这件事有据可依，而不是又写一份 `== "high_vol"`。`deactivation.volatility_of_regime`
+    是它的反向（slug → 波动维），两侧共用同一张 `_TO_AXES`。
+    """
+    if volatility is quant.Volatility.EVENT_SPIKE:
+        return BaseRegime.HIGH_VOL
+    return None
+
+
 def apply_escalation(base: BaseRegime, escalation: str) -> BaseRegime:
     """把基础阶段按抬升标志合成出生效阶段。
 
@@ -456,11 +505,17 @@ def build_evidence(label, decision: dict) -> dict:
     拦下、沿用了哪条记录、已持续几天）。混成一组之后，「今天的基础阶段为什么是箱体震荡」
     就需要读者自己去推。
 
-    `quant` 里另带两维。#64 之后它们**不再同源**，记进 evidence 正是为了让这件事可查：
+    `quant` 里另带两维。**#65 之后两者都由独立判据产出**，记进 evidence 正是为了让
+    「那天为什么这么判」可查：
 
     - `cycle` 来自独立判定（两条路径 + 显式横盘），`*_strength` / `*_consistency` 是它的
       依据数字，能回答「那天为什么判 unclear」；
-    - `volatility` 仍是 `regime` 的投影（#65 才改独立）。
+    - `volatility` 来自四条事件证据（跳空 / 放量 / ATR 骤升 / 单日大幅），四个代理量
+      全部照落——**「那天为什么判 event_spike」必须能在这条记录里答上**，而不是靠事后
+      重跑一遍（重跑会用到今天的参数，而当时是哪套参数已经不可知）。
+
+    `volatility_source` 与两维并列出现：它说明这一格的波动结论**是怎么来的**（价格
+    代理 / 迁移映射 / 旧版投影）。代理会有假阳性，读的人必须先看到这句话。
 
     所以「两维说 bear、四档说 high_vol」是同一条记录里的**两条独立证据**，不是矛盾。
     """
@@ -468,10 +523,20 @@ def build_evidence(label, decision: dict) -> dict:
     return {
         "quant": {
             "regime": label.regime.value if label.regime else None,
-            # 两维。#64 起 `cycle` 独立判定，high_vol 那天也可以有方向（如 bear）；
-            # 只有「今天判不出来」时它才是 None。
+            # 两维。两者都独立判定，high_vol（= event_spike）那天也可以有方向（如 bear）；
+            # 只有「今天判不出来」时它们才是 None。
             "cycle": cycle.value if cycle is not None else None,
             "volatility": volatility.value if volatility is not None else None,
+            # 来源：`proxy` = 价格代理判出来的（#65）。空表示这一行没有波动结论。
+            "volatility_source": quant.VOLATILITY_SOURCE_PROXY
+            if volatility is not None
+            else None,
+            # 四条事件证据的原始数字。判据本身是「任一越阈值」，但依据必须逐项可见：
+            # 「跳空 0.4% 不算、但单日走了 9%」与「跳空 8%」是两种完全不同的事件日。
+            "gap": label.metrics.gap,
+            "volume_ratio": label.metrics.volume_ratio,
+            "atr_jump": label.metrics.atr_jump,
+            "move": label.metrics.move,
             "atr": label.atr,
             "atr_pct": label.atr_pct,
             "atr_pct_rank": label.atr_pct_rank,
@@ -615,7 +680,21 @@ def run_daily_judgement(
         current,
         config.JUDGEMENT_LIFECYCLE.min_dwell_days,
     )
-    effective_regime = apply_escalation(base, escalation)
+    # 两维（#64 / #65）**独立于四档**，各有自己的判据与中间量。`base` 那条持续期只
+    # 约束「四档要不要改口」（保命档与机制停用看的是它），两维是描述性的：把它们也
+    # 冻住只会让描述比行情慢一拍，且没有任何调用方依赖那份滞后。
+    axes_cycle = label.cycle
+    axes_volatility = label.volatility
+
+    # 资讯抬升**只设波动维、不动周期维**（#65）。旧实现返回四档 HIGH_VOL，那是一个
+    # 「有波动就没有方向」的取值，于是资讯说一句「谨慎」就把那天的 cycle 抹掉了。
+    axes_cycle, axes_volatility = apply_escalation_axes(
+        axes_cycle, axes_volatility, escalation
+    )
+    # 生效阶段（四档）现在**从两维派生**：保命档 ⟺ volatility 是 event_spike。
+    # 这样 `effective_regime == high_vol` 与 `volatility == event_spike` 在结构上是
+    # 同一句话，不会再出现「四档说保命档、波动维说没事」这种互相打脸的记录。
+    effective_regime = volatility_to_base(axes_volatility) or base
 
     # 两维的来源在 #64 之后**分开了**，这是本票与 #63 最大的一处不同：
     #
@@ -662,9 +741,15 @@ def run_daily_judgement(
         "base_regime": base.value,
         "escalation": escalation or "",
         "effective_regime": effective_regime.value,
-        # 两维（#63），与落库的三列同源（都从 `base` 投影），所以返回值与记录一致。
+        # 两维（#63 / #65），与落库的两列同源，所以返回值与记录一致。
         "cycle": axes_cycle.value if axes_cycle else None,
         "volatility": axes_volatility.value if axes_volatility else None,
+        # 波动维的**判据来源**（#65）：`proxy` = 事件驱动价格代理判出来的。
+        # 日报要拿它说清「今天的高波动来自价格代理，没有消息面确认」——代理会
+        # 有假阳性，不标注的话读者会以为每个高波动日都有新闻佐证。
+        "volatility_source": quant.VOLATILITY_SOURCE_PROXY
+        if axes_volatility is not None
+        else None,
         "decision": _DECISION_CARRIED if reason else _DECISION_ADOPTED,
         "reason": reason,
         "recorded": created,
@@ -698,10 +783,14 @@ def _describe(record: RegimeJudgement, run_day: date) -> dict:
         "base_regime": record.base_regime,
         "escalation": record.escalation,
         "effective_regime": record.effective_regime,
-        # 两维（#63）。读回落库的值，**不重算**——这条路径的职责是「今天早就有结论」，
-        # 重算会让返回值与记录里的那一行说不同的话（何况历史行是迁移映射来的）。
+        # 两维（#63 / #65）。读回落库的值，**不重算**——这条路径的职责是「今天早就有
+        # 结论」，重算会让返回值与记录里的那一行说不同的话（何况历史行是迁移映射来的）。
         "cycle": record.cycle,
         "volatility": record.volatility,
+        # 与首次返回值**字段表一致**：同一业务日的两次心跳必须逐字段说同一句话，
+        # 少一个键就会让「今天的结论」在两份返回值里长得不一样（日报与 Shadow 都
+        # 按返回值走）。历史行的来源可能是 `legacy_mapping`，这正是它该说的话。
+        "volatility_source": record.volatility_source,
         "decision": decision.get("action", ""),
         "reason": decision.get("reason", ""),
         "recorded": False,
@@ -724,14 +813,21 @@ def _record_once(**fields) -> tuple[RegimeJudgement, bool]:
                     "base_regime": fields["base_regime"].value,
                     "escalation": fields["escalation"],
                     "effective_regime": fields["effective_regime"].value,
-                    # 两维（#63）。本版由 `base_regime` 投影而来，所以来源标成投影而不是
-                    # 判据——与迁移回填的 `legacy_mapping` 分开，才不会把「映射来的」
-                    # 说成「判出来的」。
+                    # 两维（#63 / #65）。`volatility` 现在由事件驱动代理判出来，来源标
+                    # `proxy`——与迁移回填的 `legacy_mapping` 和过渡期的
+                    # `compatible_projection` 都分开。三者必须可区分：读的人要能答上
+                    # 「那天的高波动是判出来的、映射来的、还是消息面确认的」。
+                    #
+                    # `cycle` 也有来源语义（独立判定 vs 迁移回填），但库里只有
+                    # `volatility_source` 一列。周期维的来处由 `evidence["quant"]`
+                    # 里的 `slope_*` 中间量佐证，不必再加一列。
                     "cycle": fields["cycle"].value if fields["cycle"] else None,
                     "volatility": fields["volatility"].value
                     if fields["volatility"]
                     else None,
-                    "volatility_source": quant.VOLATILITY_SOURCE_PROJECTION,
+                    "volatility_source": quant.VOLATILITY_SOURCE_PROXY
+                    if fields["volatility"]
+                    else None,
                     "evidence": fields["evidence"],
                     "config_snapshot": config.full_snapshot(),
                     "news_ref": fields["news_ref"],

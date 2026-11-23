@@ -109,6 +109,14 @@ class TestSnapshot(SimpleTestCase):
                 # 中间量（波动代理），但仍然进快照——等它真的开始参与判定那天再补，
                 # 历史记录就已经缺了这一格，而「当时用的哪个窗口」再也答不上来。
                 "volume_ma_period",
+                # 2026-11-23（#65）：波动维的**四条事件证据**阈值。它们替代了
+                # `high_vol_quantile` 这条分位判据（该字段仍在快照里——历史记录里
+                # 存过它，键不能删），所以这四个数必须随判定落快照：「那天为什么判
+                # event_spike」要能用当时的阈值回答，而不是拿今天的阈值重跑一遍。
+                "move_ratio",
+                "gap_ratio",
+                "volume_multiple",
+                "atr_jump_ratio",
                 "warmup_days",
             ),
             # `judgement_hour` / `judgement_minute` 是「业务日 D 的判定时刻」，

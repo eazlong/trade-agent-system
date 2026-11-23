@@ -69,12 +69,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
+from typing import Mapping
 
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from apps.common.time_utils import business_day, business_tz, format_business
-from apps.regime import config, halt, judgement, mechanism_switch
+from apps.regime import config, halt, judgement, mechanism_switch, quant
 from apps.regime.deactivation import BLOCKED_DISPLAY, is_blanket
 from apps.regime.events import describe_candidate, describe_event
 from apps.regime.models import (
@@ -392,6 +393,8 @@ def _section_today(
     elif base != effective:
         lines.append(f"基础阶段：{base}")
 
+    lines.extend(_axes_lines(judgement_result, record))
+
     decision = (record.evidence or {}).get("decision") if record else None
     decision = decision or {}
     if decision.get("action") == ACTION_CARRIED:
@@ -473,6 +476,81 @@ def _missing_judgement_lines(
     return lines
 
 
+#: 波动维的来源取值。与 `quant.VOLATILITY_SOURCE_*` 同源，这里只做展示映射。
+_VOLATILITY_SOURCE_DISPLAY = {
+    "proxy": "价格代理（跳空 / 放量 / ATR 骤升 / 单日大幅），没有消息面确认",
+    "legacy_mapping": "按旧四档回填的映射值，不是判出来的",
+    "compatible_projection": "旧版按四档投影写入的值，不是判出来的",
+}
+
+
+def _axes_lines(judgement_result: dict, record: RegimeJudgement | None) -> list[str]:
+    """第①段的**两维**那几行（#65，为 #67 打底）。
+
+    为什么这两维必须进日报第①段：#65 之前「今天高点」只有一句「高波动」，而#65 之后
+    「高波动」不再是一个阶段，而是叠加在周期之上的一个性质。**不写周期维的话，读者会
+    以为今天没有方向**——而那恰恰是这次改造要结束的误读（「牛市里的暴跌日」是有方向的）。
+
+    ## 代理来源必须显式写出来
+
+    波动维的判据是**价格代理**（跳空 / 放量 / ATR 骤升 / 单日大幅），消息面数据源当前
+    没有接。代理会有假阳性：一次没有新闻的大波动也会被判成事件波动。不标注的话，读者
+    会以为每一个高波动日都有新闻佐证——而那是这条代理判据最容易被高估的地方。
+
+    所以只要波动维有结论，就同时印出来源。来源取**记录上的列**（`volatility_source`），
+    不按今天的参数重算：重算会把历史行说成「判出来的」，而它可能是迁移映射来的。
+    """
+    lines: list[str] = []
+    # 两维优先从**记录**读：判定结果 dict 里那两格是本次运行的值，而日报要讲的是
+    # 「这条记录说了什么」。取不到才回落到 judgement_result（未落库的预演路径）。
+    #
+    # `getattr` 而不是直接取属性：日报的渲染用例会传一个只带那几格证据的假 record，
+    # 而「这一行没有两维」是合法状态（#63 之前的旧行、或渲染用例的简化形状）——
+    # 让渲染因为一个可选字段崩掉，等于用旧行把整份日报打死。
+    cycle = _axis(record, judgement_result, "cycle")
+    volatility = _axis(record, judgement_result, "volatility")
+    if cycle is None and volatility is None:
+        # 两维全空是合法状态（数据不足 / 旧行）：整段不渲染，不写「没有结论」那种噪音。
+        return lines
+
+    parts: list[str] = []
+    if cycle is not None:
+        parts.append(f"周期：{_enum_display(quant.CYCLE_DISPLAY, cycle)}")
+    if volatility is not None:
+        parts.append(f"波动：{_enum_display(quant.VOLATILITY_DISPLAY, volatility)}")
+    if parts:
+        lines.append("；".join(parts))
+        if cycle is not None and volatility is not None:
+            lines.append("（两维同时成立、互不覆盖：高波动是叠加层，不吞掉周期）")
+
+    source = _axis(record, judgement_result, "volatility_source")
+    if volatility is not None:
+        text = _VOLATILITY_SOURCE_DISPLAY.get(source or "")
+        if text:
+            lines.append(f"波动来源：{text}")
+    return lines
+
+
+def _axis(record: RegimeJudgement | None, result: dict, name: str):
+    """取一维的取值：**先看记录，再看本次运行结果**。
+
+    两处都必须能取：日报正文讲的是「这条记录说了什么」（`record` 是落库后的那一行），
+    而预演 / 未落库的路径只有 `result`。取不到返回 `None`——那是一个合法状态（旧行
+    没有这两列），不是错误。
+    """
+    if record is not None:
+        value = getattr(record, name, None)
+        if value is not None:
+            return value
+    return result.get(name)
+
+
+def _enum_display(table: Mapping[str, str], value: object) -> str:
+    """查展示名表。查不到就原样回显——**不猜、不回落**（口径同 `serializers._from_table`）。"""
+    key = str(value)
+    return table.get(key, key)
+
+
 def _quant_lines(record: RegimeJudgement | None) -> list[str]:
     """依据的具体数字（CONTEXT.md 第 173 条：分位/斜率，不是「市场波动加大」这类话）。
 
@@ -492,11 +570,14 @@ def _quant_lines(record: RegimeJudgement | None) -> list[str]:
         if rank is not None:
             text += f"，{sample or config.JUDGEMENT.quantile_window_days} 日分位 {_pct(rank)}"
             if rank >= config.JUDGEMENT.high_vol_quantile:
-                # 阈值是**分位**的阈值（判据就是「ATR% 分位 > 80%」），拿来比的是分位这
-                # 个数，不是 ATR% 本身——两个量纲差着一个数量级，混起来会把「今天波动
-                # 很大」判成常态化。比较发生在 `rank is not None` 里面，因为分位算不出来
-                # 时这个判据压根没有取值。
-                text += "（高于高波动阈值）"
+                # **#65 之后分位不再是判据**，这条注释必须跟着改：旧文案写的是「高于高
+                # 波动阈值」，而那会让人以为「分位高 ⇒ 今天是高波动日」——正是本票要结束
+                # 的那个误读（分位在数学上锁死 20%）。现在它只是**一条观察**：那天的波动
+                # 处在窗口高位，而保命档看的是四条事件证据。
+                #
+                # 保留这条观察而不是删掉：读者仍然需要知道「今天波动在一年里的位置」，
+                # 只是不能再把它读成结论。
+                text += "（波动处在窗口高位；#65 起高波动由事件证据判定，不看分位）"
         lines.append(text)
 
     slow = quant.get("ema_slow")

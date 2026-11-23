@@ -183,11 +183,15 @@ class Volatility(str, Enum):
 #: `volatility_source` 的取值。**取值即落库契约**，改名等于让新旧行出现两套口径。
 #:
 #: - `legacy_mapping`：迁移按 `base_regime` 回填的历史行（#63）。那不是判据，是投影。
-#: - `compatible_projection`：本版新写入的行。两维目前仍由四档投影而来，所以它与历史行
-#:   **同样是投影**，只是发生在写入时而不是迁移时。分开标是为了让「那天的高波动是判出来
-#:   的还是映射来的」答得上——#65 引入事件代理之后会写 `proxy`，届时三者必须可区分。
+#: - `compatible_projection`：`volatility` 仍由四档投影而来的那段过渡期写下的行（#63）；
+#:   新写入的行不再产生这个值，但历史行的读法不能变，所以常量留着。
+#: - `proxy`：**#65 起**写入的行。波动维由事件驱动**价格代理**判出来（跳空 / 放量 /
+#:   ATR 骤升 / 单日大幅）——它是判据，但不是真实资讯确认，所以名字必须带上「代理」。
+#:   三个取值必须可区分，否则「那天的高波动是判出来的、映射来的、还是消息面确认的」
+#:   这个问题永远答不上来（#67 的日报要把它印出来）。
 VOLATILITY_SOURCE_LEGACY = "legacy_mapping"
 VOLATILITY_SOURCE_PROJECTION = "compatible_projection"
+VOLATILITY_SOURCE_PROXY = "proxy"
 
 #: 四档 → 两维。**唯一一处投影表**，两个方向都从它派生（反向表由它生成，不另写一份）。
 #:
@@ -246,16 +250,18 @@ def project_to_base_axes(
         if volatility is Volatility.EVENT_SPIKE:
             return BaseRegime.HIGH_VOL
         raise ValueError("cycle 为空且波动正常：旧四档里没有这一格")
-    if cycle is Cycle.UNCLEAR:
-        if volatility is Volatility.EVENT_SPIKE:
-            # 判不出方向 + 事件波动：旧结构里这天就是 high_vol。
-            return BaseRegime.HIGH_VOL
-        return None
     if volatility is Volatility.EVENT_SPIKE:
-        raise ValueError(
-            f"{cycle.value} + event_spike 还原不了四档：旧结构表达不了「有方向又高波动」，"
-            "静默丢掉方向比报错更坏"
-        )
+        # 有方向 + 事件波动（`bull + event_spike` = 牛市暴跌日）。**#65 起这是正常产出**，
+        # 不再抛：投影是兼容读面，它的职责是把两维塌成四档，而四档表达不了「又有方向
+        # 又高波动」——塌法是保留保命档（`high_vol`），丢掉方向。方向没有丢，它在
+        # `cycle` 那一列里原样躺着，投影丢掉的只是这份**兼容视图**的分辨率。
+        #
+        # #63 当时抛是对的：那时两维还只是四档的投影，「bull + event_spike」出现意味着
+        # 投影表自相矛盾。现在两维是真判定，这个组合是它的正常产物，再抛就成了「一有
+        # 事件波动日，整条历史标注链挂掉」。
+        return BaseRegime.HIGH_VOL
+    if cycle is Cycle.UNCLEAR:
+        return None
     for regime, (mapped_cycle, mapped_vol) in _TO_AXES.items():
         if mapped_cycle is cycle and mapped_vol is volatility:
             return regime
@@ -316,10 +322,13 @@ class DayMetrics:
     slope_strength: float | None
     slope_consistency: float | None
 
-    # 波动代理（事件驱动判定用；本阶段不参与定档）
+    # 波动代理（事件驱动判定的四条证据，#65）。任一越阈值即 `event_spike`。
     gap: float | None
     volume_ratio: float | None
     atr_jump: float | None
+    #: 单日大幅：`|close_t / close_{t-1} - 1|`。取绝对值——它问的是「今天走没走出
+    #: 一根大阴大阳」，方向由周期维回答，两维各自只答自己的问题。
+    move: float | None
 
 
 @dataclass(frozen=True)
@@ -341,10 +350,12 @@ class DayLabel:
     regime: BaseRegime | None
     metrics: DayMetrics
 
-    #: 两维。#64 之后**来源不同**，这一点必须看清：
-    #:   - `cycle` 由 `_classify_cycle` **独立判定**产出，与 `regime` 无关；
-    #:   - `volatility` 仍由 `regime` 投影而来（`project_to_axes`），#65 才改独立。
+    #: 两维。**#65 之后两者都由独立判据产出，与 `regime` 无关**：
+    #:   - `cycle` 走 `_classify_cycle` 的两条路径 + 显式横盘；
+    #:   - `volatility` 走 `_classify_volatility` 的四条事件证据。
     #: 未判定日两维**同时**是 `None`；`cycle` 判不出来时是 `UNCLEAR`，不是 `None`。
+    #: `regime`（四档）仍是兼容层，它自己的优先级里保命档排第一——两维与它允许不一致，
+    #: 且不一致正是 ADR 0007 要的形状：`base=high_vol + cycle=bear` 是牛市里的暴跌日。
     cycle: "Cycle | None"
     volatility: "Volatility | None"
 
@@ -364,6 +375,11 @@ class DayLabel:
     #: 所以这里也各留一格——事后要解释「那天为什么判 unclear」，答案必须在这一行里。
     slope_strength: float | None
     slope_consistency: float | None
+
+    #: 波动维的单日大幅（#65）。与另三个代理量一样随标签带出来，好让「那天为什么判
+    #: event_spike」能在这一行里答上，而不是靠重跑一遍。它没有对应的落库列（另外三个
+    #: 也没有）——依据数字整体走 `evidence["quant"]`。
+    move: float | None = None
 
     @property
     def judged(self) -> bool:
@@ -576,6 +592,7 @@ def metrics_series(
                 gap=_gap_ratio(opens[i], closes[i - 1]) if i >= 1 else None,
                 volume_ratio=_volume_ratio(volumes[i], volume_ma[i]),
                 atr_jump=_atr_jump(atr[i], atr[i - 1]) if i >= 1 else None,
+                move=_move_ratio(closes[i], closes[i - 1]) if i >= 1 else None,
                 **available,
             )
         )
@@ -595,6 +612,19 @@ def _gap_ratio(open_: float, previous_close: float) -> float | None:
         # 前一日收盘非正只能来自坏数据；除下去会得到 inf 再被吞成 nan，看起来像「没跳空」。
         return None
     return float(abs(open_ / previous_close - 1.0))
+
+
+def _move_ratio(close: float, previous_close: float) -> float | None:
+    """单日大幅：`|close_t / close_{t-1} - 1|`。
+
+    与跳空共用同一套「前一天收盘为坏数据就返 None」的纪律：除下去会得到 inf 再被吞成
+    nan，看起来像「没走大行情」——而它实际上是「这一天的数据不足以下任何结论」。
+    """
+    if not (np.isfinite(close) and np.isfinite(previous_close)):
+        return None
+    if previous_close <= 0:
+        return None
+    return float(abs(close / previous_close - 1.0))
 
 
 def _volume_ratio(volume: float, volume_ma: float) -> float | None:
@@ -700,9 +730,24 @@ def label_series(
 def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> DayLabel:
     """把一天的中间量定成档位，连同那批中间量一起返回。
 
-    定不出来（三个条件缺一）时 `regime is None`，**绝不退化成某个档位**——说不出来
-    就说说不出来。这里的判断刻意放在分类侧而不是算数侧：中间量只回答「这个数是多少」，
-    「够不够下结论」是分类器的事，两个维度可以有不同的门槛。
+    定不出来时 `regime is None`，**绝不退化成某个档位**——说不出来就说说不出来。这里的
+    判断刻意放在分类侧而不是算数侧：中间量只回答「这个数是多少」，「够不够下结论」是
+    分类器的事，两个维度可以有不同的门槛。
+
+    ## 三个就绪条件里，有一个是**预热门槛**而不是判据依赖
+
+    #65 把保命档的判据从「ATR% 分位」换成了事件证据，于是 `atr_pct_rank` 不再是任何
+    分类器的输入。但它**仍然**留在就绪条件里，这是刻意的：
+
+    - 它是这套判定的**预热门槛**：分位窗口（默认 250 天）攒满，才说明这段历史足够长、
+      指标成熟，可以开始对外发布结论。这条政策与「哪个分类器需要哪个数」是两件事——
+      后者随时会变（#64 加了两条通道、#65 换掉一条判据），前者不该跟着晃。
+    - 拿掉它会让标注序列从第 64 天左右就开始出结论，**而这不是本票要改的东西**。
+      `JudgementConfig.warmup_days`（= 分位窗口）与切片预取天数都建立在它上面；静默
+      提前 186 天开始判，会让「同一段历史重算」产出与上一版不可比的结果。
+
+    另两个（斜率 / 间距）是真正的**判据依赖**：没有它们连「往哪走」都无从谈起。四档的
+    `_classify` 自己会再验一遍它需要的那两项，缺了就抛。
     """
     ready = (
         metrics.atr_pct_rank is not None
@@ -711,14 +756,21 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
     )
     regime = _classify(metrics, params) if ready else None
 
-    # 周期维（#64）**不再由四档投影**：它有了自己的判据（两条独立路径 + 显式横盘），
-    # 投影只在 `volatility` 那一条上还成立。这条分开是本票的全部内容——只要 cycle
-    # 还是 `project_to_axes` 的产物，`sideways` 就永远是「其余」，缓慢阴跌必然落进箱体。
+    # 两维（#64 / #65）**都不再由四档投影**，各自有独立判据：
     #
-    # `regime is None` 的日子 cycle 也必须是 `None`：判不出来就是判不出来，给一个
-    # `sideways` 等于拿安静的假结论去喂切片。
+    # - `cycle`：两条独立路径 + 显式横盘，判不出来落 `unclear`（#64）。
+    # - `volatility`：事件驱动代理，跳空 / 放量 / ATR 骤升 / 单日大幅任一成立即
+    #   `event_spike`（#65）。
+    #
+    # `project_to_axes` 仍在，但只服务于兼容读面与历史回填——**写入路径不再调它**。
+    # 拿投影去顶替任何一维，都会把这一版刚结束的那个缺陷悄悄装回去：投影出来的
+    # `volatility` 是 `high_vol` 这一档的影子（分位配额，必然 20%），而真正的
+    # 事件日与「ATR% 分位刚好靠前」是两件事。
+    #
+    # `regime is None` 的日子两维也必须是 `None`：判不出来就是判不出来。给一个
+    # `sideways + normal` 等于拿安静的假结论去喂切片。
     cycle = _classify_cycle(metrics, params) if ready else None
-    volatility = project_to_axes(regime)[1] if regime is not None else None
+    volatility = _classify_volatility(metrics, params) if ready else None
     return DayLabel(
         date=metrics.date,
         regime=regime,
@@ -735,6 +787,7 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
         separation=metrics.separation,
         slope_strength=metrics.slope_strength,
         slope_consistency=metrics.slope_consistency,
+        move=metrics.move,
     )
 
 
@@ -815,6 +868,55 @@ def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle:
     return Cycle.UNCLEAR
 
 
+def _classify_volatility(metrics: DayMetrics, params: JudgementConfig) -> Volatility:
+    """波动维的**真判定**（#65）：事件驱动代理，四条独立证据任一成立即 `EVENT_SPIKE`。
+
+    ## 为什么不再按分位判
+
+    旧的 `rank > high_vol_quantile` 在数学上锁死「250 日窗口里必有 20% 的日子判高波动」
+    ——实测 434 天（19.3%），而人工真值里高波动是 **0 天**。按配额判出来的东西不是
+    「观察到的波动」，是窗口的算术必然：它无法随行情自然变化，因此也**无法被证伪**
+    ——你永远无法用「今年高波动日子太少」去反驳它，它每年都会给你 20%。
+
+    ## 四条证据（或，不是与）
+
+    - **跳空** `|open_t / close_{t-1} - 1|` > `gap_ratio`：隔夜信息一次性重定价。
+    - **放量** `volume_t / MA20(volume)` > `volume_multiple`：参与度异常放大。
+    - **ATR 骤升** `ATR_t / ATR_{t-1}` > `atr_jump_ratio`：波动率水平本身跳变。
+    - **单日大幅** `|close_t / close_{t-1} - 1|` > `move_ratio`：当天就走完了。
+
+    任何一条单独成立就够：一次 10% 的单日下跌本身就是事件，要求「同时又放量、
+    又跳空」等于把识别窗口缩到少数几天——而那几天恰恰是最该被认出来的。
+
+    ## 代理的假阳性必须可追溯
+
+    消息面数据源当前没有，所以这四条是**价格代理**：它会把「没有新闻的大波动」也
+    判成事件波动。这一点不在这里掩饰，而是由写入路径落 `volatility_source = "proxy"`
+    + 日报显式标注来承担——读日报的人必须能分清「这一格是判出来的代理」与「这一格是
+    消息面确认过的」。
+
+    ## 只吃中间量，不碰 K 线
+
+    与另两个分类器同一纪律：规则可以脱离行情直接被测。四个量全为 `None` 时**不是**
+    事件波动——「没有量能数据」与「量能平静」是两件事，编一个 1.0 会让它们长得一样。
+    这里的选择是「证据不足 ⇒ normal」，与 `_classify_cycle` 证据不足 ⇒ `unclear` 的
+    取向不同，理由是不对称的：`event_spike` 会**停掉全场**，缺证据时朝「不停」倒才对；
+    而 `cycle` 判不出来没有这种代价，所以它如实说 `unclear`。
+    """
+    if metrics.move is not None and metrics.move > params.move_ratio:
+        return Volatility.EVENT_SPIKE
+    if metrics.gap is not None and metrics.gap > params.gap_ratio:
+        return Volatility.EVENT_SPIKE
+    if (
+        metrics.volume_ratio is not None
+        and metrics.volume_ratio > params.volume_multiple
+    ):
+        return Volatility.EVENT_SPIKE
+    if metrics.atr_jump is not None and metrics.atr_jump > params.atr_jump_ratio:
+        return Volatility.EVENT_SPIKE
+    return Volatility.NORMAL
+
+
 def _classify(metrics: DayMetrics, params: JudgementConfig) -> BaseRegime:
     """按固定优先级定档。顺序即 `PRIORITY`：先问「该不该保命」，再问「往哪走」。
 
@@ -825,15 +927,18 @@ def _classify(metrics: DayMetrics, params: JudgementConfig) -> BaseRegime:
     震荡：箱体震荡是兜底档，拿它去接「算不出来」正是本模块反复在防的那类失败——一条
     安静的假标签，切片会当真。
     """
-    rank = metrics.atr_pct_rank
     slope = metrics.ema_slope
     separation = metrics.separation
-    if rank is None or slope is None or separation is None:
+    if slope is None or separation is None:
         raise ValueError(
-            "中间量不足以定档（需要 atr_pct_rank / ema_slope / separation），"
-            f"当前 {metrics.date}: rank={rank}, slope={slope}, separation={separation}"
+            "中间量不足以定档（需要 ema_slope / separation），"
+            f"当前 {metrics.date}: slope={slope}, separation={separation}"
         )
-    if rank > params.high_vol_quantile:
+    # **保命档的判据自 #65 起改源**：不再是「ATR% 分位 > 80%」，而是与波动维同一个
+    # 事件驱动代理。四档是兼容层，它必须说与 volatile 维同一件事——两处判据各写一份
+    # 的话，同一条记录里 `regime=high_vol` 而 `volatility=normal` 会天天出现，而两边
+    # 各自看都自洽。这里直接调那个分类器，不重写阈值。
+    if _classify_volatility(metrics, params) is Volatility.EVENT_SPIKE:
         return BaseRegime.HIGH_VOL
     threshold = params.trend_separation_min_atr
     # 符号与间距**同时**指向同一方向才算趋势：只看向间距会让 (EMA20−EMA60) 为负的

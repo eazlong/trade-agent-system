@@ -278,7 +278,10 @@ def in_force_exemptions(*, now: datetime | None = None) -> dict[tuple[UUID, str]
 
 
 def close_left_regime_exemptions(
-    regime: str | None, *, now: datetime | None = None
+    regime: str | None,
+    *,
+    volatility: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[int, ...]:
     """阶段离开该阶段 → 豁免自然失效（CONTEXT.md 第 120 条）。返回被关掉的豁免 id。
 
@@ -295,10 +298,15 @@ def close_left_regime_exemptions(
     被关掉，且没有复活路径；等保命档过去、系统回落到适用性层，那条策略直接进停用，
     而用户什么都没做。代价只是「阶段离开」的判定在高波动期间延后一轮，且豁免本身还有
     「到期」兜底（10 个自然日）——两个方向不对称，就往不会造成不可逆损失的那边倒。
+
+    `volatility` 是**保命档的判据来源**（#65）：它与 slug 取**或**，理由与
+    `RegimeState.blanket` 逐字相同——旧行里 `base=range` 被资讯抬成 `high_vol` 时，
+    两维按基础轴回填成 `normal`，只看波动维就会在保命档第一天关掉每一条在期豁免，
+    而 `closed_at` 写下去没有复活路径。两个判据都只会**多认**保命档，方向一致。
     """
     if regime is None:
         return ()
-    if deactivation.is_blanket(regime):
+    if deactivation.is_blanket(regime) or deactivation.is_event_spike(volatility):
         return ()
     now = now or timezone.now()
     stale = list(
@@ -450,7 +458,8 @@ def run_deactivation(
         return summary
 
     summary["exemptions_closed"] = len(
-        close_left_regime_exemptions(state.regime, now=now)
+        # 波动维一起传：保命档的判据是它，不是 slug（#65）。
+        close_left_regime_exemptions(state.regime, volatility=state.volatility, now=now)
     )
     for outcome in derivation.writable:
         row = cells.get((outcome.strategy_id, outcome.regime))

@@ -325,7 +325,11 @@ class TestQueryRegime(TestCase):
         self.assertIn("依据：", text)
         self.assertIn("ATR% 3.2146", text)
         self.assertIn("120 日分位 91.0%", text)
-        self.assertIn("高于高波动阈值", text)
+        # #65 之后分位不再是保命档的判据，那句话改成了「波动处在窗口高位」——
+        # 旧文案「高于高波动阈值」会让人以为「分位高 ⇒ 今天是高波动日」，而那正是
+        # 这次改造要结束的误读（分位在数学上锁死 20%）。
+        self.assertIn("波动处在窗口高位", text)
+        self.assertNotIn("高于高波动阈值", text)
         self.assertIn("分离度 (EMA快−EMA慢)/ATR = -0.432", text)
 
 

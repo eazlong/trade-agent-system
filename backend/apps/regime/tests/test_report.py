@@ -434,7 +434,12 @@ class TestPureRendering(TestCase):
             }
         )
         body = report._section_today(result, record, SYMBOL)
-        self.assertIn("ATR% 4.2000，250 日分位 91.0%（高于高波动阈值）", body)
+        self.assertIn("ATR% 4.2000，250 日分位 91.0%", body)
+        # #65 之后分位不再是保命档的判据，那句话必须**不再**说「高于高波动阈值」——
+        # 留旧文案会让读者以为「分位高 ⇒ 今天是高波动日」，而那正是本票要结束的误读
+        # （分位在数学上锁死 20%）。现在它只标一条观察：波动处在窗口高位。
+        self.assertIn("波动处在窗口高位", body)
+        self.assertNotIn("高于高波动阈值", body)
         self.assertIn("分离度 (EMA快−EMA慢)/ATR = -0.750", body)
 
     def test_the_high_vol_note_compares_the_rank_not_the_percentage(self):
@@ -447,6 +452,39 @@ class TestPureRendering(TestCase):
         body = report._section_today(result, record, SYMBOL)
         self.assertIn("ATR% 0.9000，250 日分位 10.0%", body)
         self.assertNotIn("高于高波动阈值", body)
+        self.assertNotIn("波动处在窗口高位", body)
+
+    def test_the_today_section_prints_both_axes_and_the_proxy_source(self):
+        """第①段必须同时印出两维，并把波动维的**来源**讲清楚（#65 / 为 #67 打底）。
+
+        为什么这两句是硬要求：
+        - 「高波动」现在只是叠加层，不印周期维的话，读者会以为今天没有方向——而那正是
+          这次改造要结束的误读（牛市里的暴跌日是有方向的）；
+        - 代理判据会有假阳性，不印来源的话，读者会以为每个高波动日都有新闻佐证。
+        """
+        result = concluded_payload(regime="high_vol", with_record=False)
+        result["cycle"] = "bull"
+        result["volatility"] = "event_spike"
+        result["volatility_source"] = "proxy"
+        body = report._section_today(result, None, SYMBOL)
+
+        self.assertIn("周期：上行周期", body)
+        self.assertIn("波动：事件波动", body)
+        self.assertIn("两维同时成立、互不覆盖", body)
+        self.assertIn("波动来源", body)
+        self.assertIn("价格代理", body)
+        self.assertIn("没有消息面确认", body)
+
+    def test_a_legacy_projection_source_is_not_dressed_up_as_a_judgement(self):
+        """迁移回填的行必须被说成「映射值」，不能被读成「判出来的」。"""
+        result = concluded_payload(regime="high_vol", with_record=False)
+        result["cycle"] = "sideways"
+        result["volatility"] = "event_spike"
+        result["volatility_source"] = "legacy_mapping"
+        body = report._section_today(result, None, SYMBOL)
+
+        self.assertIn("旧四档回填", body)
+        self.assertNotIn("价格代理", body)
 
     def test_a_record_that_says_nothing_yields_no_numbers(self):
         # 取不到就不写，不拿别的量凑：一句编出来的「依据」比没有依据更坏。

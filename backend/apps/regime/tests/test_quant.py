@@ -156,9 +156,16 @@ def metrics(rank=0.5, slope=1.0, separation=1.0, **overrides):
         # ATR=1.0，所以 strength 就等于 |slope|。
         slope_strength=abs(slope),
         slope_consistency=1.0,
+        # 波动维的四条事件证据（#65）。默认全 `None` = 「没有证据说明发生了事件」，
+        # 于是默认夹具判 `normal`——这与改动前「rank < 0.8 ⇒ normal」的默认结果一致，
+        # 只有显式覆盖它们时才进入 `event_spike` 那些分支。
+        #
+        # 刻意不给 `move`/`gap` 填一个「平静」的小数：那条路径会盖住「证据不足」
+        # 与「证据说平静」的区别，而那正是本维最该被钉住的一格。
         gap=None,
         volume_ratio=None,
         atr_jump=None,
+        move=None,
     )
     fields.update(overrides)
     return quant.DayMetrics(**fields)
@@ -175,23 +182,77 @@ class TestDecisionTable(SimpleTestCase):
     """
 
     def test_high_vol_beats_both_trends(self):
-        """优先级第一档：先问该不该保命，再问往哪走。"""
+        """优先级第一档：先问该不该保命，再问往哪走。
+
+        `event_spike` 的判据自 #65 起是四条事件证据，与 ATR% 分位无关——所以这里
+        显式给一条「单日大幅」证据，并且**故意把分位压到最低**：若保命档还在看分位，
+        这条就会落回箱体震荡。
+        """
         for slope, separation in ((1.0, 2.0), (-1.0, -2.0), (0.0, 0.0)):
             with self.subTest(slope=slope, separation=separation):
                 self.assertIs(
-                    quant._classify(metrics(0.95, slope, separation), PARAMS),
+                    quant._classify(
+                        metrics(0.0, slope, separation, move=PARAMS.move_ratio + 0.01),
+                        PARAMS,
+                    ),
                     BaseRegime.HIGH_VOL,
                 )
 
-    def test_threshold_is_strictly_exceeded(self):
-        """分位**恰好**等于阈值不算高波动：「超过第 80 百分位」不等于「达到」。"""
-        self.assertIs(
-            quant._classify(metrics(PARAMS.high_vol_quantile, 0.0, 0.0), PARAMS),
-            BaseRegime.RANGE,
+    def test_the_quantile_no_longer_decides_the_blanket_tier(self):
+        """**分位不再决定保命档**——这是 #65 要结束的那个缺陷。
+
+        旧判据在数学上锁死「250 日窗口里必有 20% 的日子判高波动」，而人工真值里是 0 天。
+        这里把分位推到最高（0.99）而四条事件证据全给平静值：若保命档还看分位，这条
+        就会是 `high_vol`；正确的结论是它落回趋势/箱体。
+        """
+        label = quant._classify(
+            metrics(
+                0.99,
+                0.0,
+                0.0,
+                move=PARAMS.move_ratio / 2,
+                gap=PARAMS.gap_ratio / 2,
+                volume_ratio=PARAMS.volume_multiple / 2,
+                atr_jump=1.0,
+            ),
+            PARAMS,
         )
+        self.assertIs(label, BaseRegime.RANGE)
+
+    def test_each_event_evidence_alone_flips_the_blanket_tier(self):
+        """四条证据是**或**：任何一条越阈值都足够，不必凑齐。
+
+        串成「与」会让识别窗口缩到极少数几天，而那几天恰恰是最典型的事件日。
+        """
+        cases = {
+            "move": {"move": PARAMS.move_ratio + 0.01},
+            "gap": {"gap": PARAMS.gap_ratio + 0.01},
+            "volume": {"volume_ratio": PARAMS.volume_multiple + 0.1},
+            "atr_jump": {"atr_jump": PARAMS.atr_jump_ratio + 0.1},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(evidence=name):
+                self.assertIs(
+                    quant._classify(metrics(0.0, 0.0, 0.0, **overrides), PARAMS),
+                    BaseRegime.HIGH_VOL,
+                )
+
+    def test_the_event_thresholds_are_strictly_exceeded(self):
+        """恰好等于阈值不算事件：「超过 N 倍均量」不等于「达到 N 倍」。"""
         self.assertIs(
-            quant._classify(metrics(PARAMS.high_vol_quantile + 0.01, 0.0, 0.0), PARAMS),
-            BaseRegime.HIGH_VOL,
+            quant._classify(
+                metrics(
+                    0.0,
+                    0.0,
+                    0.0,
+                    move=PARAMS.move_ratio,
+                    gap=PARAMS.gap_ratio,
+                    volume_ratio=PARAMS.volume_multiple,
+                    atr_jump=PARAMS.atr_jump_ratio,
+                ),
+                PARAMS,
+            ),
+            BaseRegime.RANGE,
         )
 
     def test_trend_needs_sign_and_separation_to_agree(self):
@@ -496,45 +557,60 @@ class TestArithmeticIsSeparateFromClassification(SimpleTestCase):
         「算不出来」就会变成一条安静的假标签——而箱体震荡是兜底档，切片会当真。
         抛异常是把「调用方漏了校验」变成一个立刻看得见的事故。
         """
-        with self.assertRaises(ValueError):
-            quant._classify(metrics(atr_pct_rank=None), PARAMS)
+        # `atr_pct_rank` **不在**这一组里（#65）：保命档改看事件证据之后，「ATR% 分位」
+        # 不再被 `_classify` 读。它仍在 `classify_day` 的就绪条件里——那是**预热**门槛
+        # （窗口攒满才发布结论），与「哪个分类器读哪个数」是两件事。
         with self.assertRaises(ValueError):
             quant._classify(metrics(ema_slope=None), PARAMS)
         with self.assertRaises(ValueError):
             quant._classify(metrics(separation=None), PARAMS)
 
 
-class TestVolatilityProxyMetrics(SimpleTestCase):
-    """波动代理的三个中间量：**本阶段只算不用**。
+class TestVolatilityProxyFeedsTheVerdict(SimpleTestCase):
+    """波动代理的四个中间量（#65）：**它们现在就是判据**。
 
-    它们进结构体是为了让波动维的分类器直接可取，现在一个都不参与定档。这条用例同时
-    钉住两件容易走偏的事：缺数据时必须是 `None`（不是 0 / 1.0），以及它们确实**没有**
-    影响档位。
+    #62 时这批量「只算不用」，那时钉的是「接进来也不影响档位」。#65 把它们接进了定档，
+    于是那条断言反过来失效了——它的本意是防止**意外**接线，现在接线是目的，留着它只会
+    变成一条要求「判据不许工作」的空转用例。
+
+    这里钉三件事：四个量都在结构体里、缺数据时是 `None`（不是 0 / 1.0）、以及把代理量
+    灌进去**确实**翻档位（接线的证据）。
     """
 
-    def test_the_three_proxy_fields_are_in_the_struct_but_not_in_the_verdict(self):
+    def test_the_four_proxy_fields_are_in_the_struct(self):
         fields = {f.name for f in dataclasses.fields(quant.DayMetrics)}
-        for name in ("gap", "volume_ratio", "atr_jump"):
-            self.assertIn(name, fields)
+        for name in ("gap", "volume_ratio", "atr_jump", "move"):
+            with self.subTest(field=name):
+                self.assertIn(name, fields)
 
+    def test_pouring_event_evidence_into_a_quiet_series_flips_it_to_spike(self):
+        """安静行情 + 极端代理量 ⇒ 那些天判 `event_spike`。
+
+        代理量刻意取极端值而不是「温和地有点跳空」：温和值只能证明「这个夹具碰巧没
+        触发阈值」，那种断言会随着阈值调整静默变成空转。
+        """
         params = replace(PARAMS, volume_ma_period=3)
-        # 代理量刻意取极端值（不是「温和地有点跳空」）：若哪天它们被接进了定档，
-        # 极端值必然翻档位。温和值只能证明「这个夹具碰巧没触发阈值」，那种断言会
-        # 随着阈值调整静默变成空转。
-        with_proxy = [
-            {**row, "open": row["close"] * 1.9, "volume": 100_000.0 * (i + 1)}
-            for i, row in enumerate(candles(RAMP))
-        ]
         bare = label_series(candles(RAMP), params)
-        enriched = label_series(with_proxy, params)
+        enriched = label_series(
+            [
+                {**row, "open": row["close"] * 1.9, "volume": 100_000.0 * (i + 1)}
+                for i, row in enumerate(candles(RAMP))
+            ],
+            params,
+        )
 
-        # 只算不用：档位逐日相等。
-        self.assertEqual([lb.regime for lb in bare], [lb.regime for lb in enriched])
-        # 但中间量确实算出来了。
-        last = enriched[-1].metrics
-        self.assertIsNotNone(last.gap)
-        self.assertIsNotNone(last.volume_ratio)
-        self.assertIsNotNone(last.atr_jump)
+        judged = [i for i, lb in enumerate(bare) if lb.judged]
+        self.assertTrue(judged, "夹具必须至少判出一天，否则这条用例是空转")
+        # 安静行情本身不该有事件波动日。
+        self.assertTrue(
+            all(lb.volatility is quant.Volatility.NORMAL for lb in bare if lb.judged)
+        )
+        # 灌进极端代理量之后，被判定那些天应当判成事件波动。
+        self.assertTrue(
+            all(enriched[i].volatility is quant.Volatility.EVENT_SPIKE for i in judged)
+        )
+        # 四档跟着翻：保命档的判据就是这一维（#65）。
+        self.assertTrue(all(enriched[i].regime is BaseRegime.HIGH_VOL for i in judged))
 
     def test_missing_open_and_volume_yield_none_not_a_default(self):
         """行情源不给量能是常态；编成 0 或 1.0 会让「没有数据」与「量能平稳」长得一样。
@@ -615,18 +691,61 @@ class TestVolatilityProxyMetrics(SimpleTestCase):
 class TestClassificationEndToEnd(SimpleTestCase):
     """同一套规则接到真实指标上的表现。"""
 
-    def test_steady_downtrend_is_reported_as_high_vol(self):
-        """急跌行情里波动分位必然顶格，所以优先级把它判成高波动而不是下行趋势。
+    def test_a_steady_downtrend_is_a_trend_not_a_high_vol_day(self):
+        """**稳步阴跌不是事件波动日**——这正是 #65 要结束的那个误判。
 
-        这条同时是优先级的证明：先断言趋势那一支**确实成立**（斜率与间距都过），
-        再断言最终落到的是高波动——否则「判为高波动」可能只是因为趋势压根没成立。
+        `STEADY_DOWN` 每天跌 1.5%，是一条清晰的趋势，而不是「发生了事件」。旧判据
+        （ATR% 分位 > 80%）会把它判成高波动：分位在急跌里必然顶格，于是那天的**周期
+        信息被丢掉**。新判据看的是「有没有跳空 / 放量 / ATR 骤升 / 单日大幅」，四条
+        都不成立，所以它落 `downtrend`——四档与周期维第一次对同一片行情给出同一个
+        方向。
         """
         labels = label_series(candles(STEADY_DOWN), PARAMS)
         last = labels[-1]
 
         self.assertLess(last.separation, -PARAMS.trend_separation_min_atr)
         self.assertLess(last.ema_slope, 0)
-        self.assertGreater(last.atr_pct_rank, PARAMS.high_vol_quantile)
+        self.assertLess(last.move, PARAMS.move_ratio, "每日 1.5% 不是事件级波动")
+        self.assertIs(last.volatility, quant.Volatility.NORMAL)
+        self.assertIs(last.cycle, quant.Cycle.BEAR)
+        self.assertIs(last.regime, BaseRegime.DOWNTREND)
+
+    def test_a_volume_spike_in_an_uptrend_keeps_both_axes(self):
+        """**同一时点两维并存**：上行途中放量 ⇒ `cycle=bull + volatility=event_spike`。
+
+        这是本票最核心的那一条验收判据。旧结构下 `HIGH_VOL` 排 `PRIORITY` 第一位，
+        这样的日子只会落一个 `high_vol`，周期信息**在判据里就不存在**；现在两维各自
+        独立判、互不覆盖。
+
+        夹具刻意选**放量**而不是暴跌：一根 −12% 的大阴线会把快线一起打下去，那时
+        `cycle=bear` 才是对的（趋势真的转了），用它做 `bull + spike` 的例子会把
+        「两维独立」这件事和「趋势拐头」混在一起。放量同样是一次事件，但它不改变
+        方向——这样才分得清「周期维没被波动维吃掉」与「周期维自己翻了」。
+        """
+        params = replace(PARAMS, volume_ma_period=3)
+        closes = [100 + i for i in range(16)]
+        rows = [
+            {
+                "date": DAY0 + timedelta(days=i),
+                "high": float(c) + 1.0,
+                "low": float(c) - 1.0,
+                "open": float(c),
+                "close": float(c),
+                # 前段量能平稳，最后一天 10 倍放量：事件证据，方向不变。
+                "volume": 10.0 if i < len(closes) - 1 else 200.0,
+            }
+            for i, c in enumerate(closes)
+        ]
+        last = label_series(rows, params)[-1]
+
+        self.assertGreater(last.metrics.volume_ratio, params.volume_multiple)
+        self.assertIs(last.volatility, quant.Volatility.EVENT_SPIKE)
+        self.assertIs(
+            last.cycle,
+            quant.Cycle.BULL,
+            "放量没有改变方向，周期维照样看见上行",
+        )
+        # 四档是兼容层：保命档优先，但它不再「吃掉」周期维（两列并存）。
         self.assertIs(last.regime, BaseRegime.HIGH_VOL)
 
     def test_calming_downtrend_is_a_downtrend(self):
@@ -866,17 +985,30 @@ class TestNoLookahead(SimpleTestCase):
     def test_mutating_later_data_does_not_change_earlier_labels(self):
         """把后半段改成一段平静的横盘：前面的标签必须一个字节都不动。
 
-        改的是数值而不是「让标签换个说法」——平静下来会让末段的 ATR% 分位塌到低位，
-        末段标签随之离开高波动，于是这条用例同时证明了「前缀没动」和「后缀确实动了」
-        （后者是前者不空转的凭据）。
+        改的是数值而不是「让标签换个说法」——平静下来之后末段不再有事件证据，末段标签
+        随之离开保命档，于是这条用例同时证明了「前缀没动」和「后缀确实动了」（后者是
+        前者不空转的凭据）。
+
+        **#65 之后这条夹具的末段行为变了**：`DOWN_CALMING` 是「每日跌 2~3 元」的
+        阴跌，不是事件日——单日跌幅始终低于 `move_ratio`，所以它现在判 `downtrend`
+        而不是 `high_vol`。那条「后缀确实动了」的断言因此改成钉趋势：前缀不动这件事
+        与档位叫什么无关，它依赖的是「指标只看过去」。
         """
         original = label_series(candles(DOWN_CALMING), PARAMS)
-        calm_tail = DOWN_CALMING[:12] + [166.0, 165.5, 165.2, 165.0]
+        # 尾巴改成一段**反弹**（166→180）：原来的尾巴是继续阴跌，改之后斜率方向真的
+        # 翻了——这才是「后缀确实动了」的凭据。写成「改成横盘」不行：贴着 166 不动
+        # 只把那段变平，末段仍然判 `bear`（前面那一整段下跌还在窗口里），用例会空转。
+        calm_tail = DOWN_CALMING[:12] + [166.0, 170.0, 175.0, 180.0]
         mutated = label_series(candles(calm_tail), PARAMS)
 
         self.assertEqual(original[:12], mutated[:12])
-        self.assertIs(original[-1].regime, BaseRegime.HIGH_VOL)
-        self.assertNotEqual(original[-1].regime, mutated[-1].regime)
+        # 原序列末段是下行趋势（阴跌，不是事件波动日）。
+        self.assertIs(original[-1].regime, BaseRegime.DOWNTREND)
+        # 「后缀确实动了」这条证据改钉在**周期维**上：四档在两条序列的末段恰好都是
+        # `downtrend`（平静下来的尾巴还不足以把四档翻成横盘），而 cycle 立刻就能分出
+        # 差别。这条断言的存在意义是证明前缀那半条不是空转——钉哪一维都行，钉**动了的**
+        # 那一维才有效。
+        self.assertNotEqual(original[-1].cycle, mutated[-1].cycle)
 
 
 class TestCycleHasNoLookahead(SimpleTestCase):
@@ -1054,16 +1186,32 @@ class TestTwoAxesAreProjectedFromOneVerdict(SimpleTestCase):
         两条路径，它与四档互不覆盖，于是同一天可以既是 `high_vol`（该保命）又是
         `bear`（方向是下行）。这正是 ADR 0007 要的「两维并存」。
 
-        这也解释了为什么 `project_to_base` 在这里必须**抛**：`bear + event_spike`
-        是旧四档表达不了的组合，静默丢掉方向比报错更坏。
+        `project_to_base` 在这里**不抛**（#65 改了这一点）：两维现在是真判定，
+        `bear + event_spike` 是它的**正常产物**——而 #63 当时抛是对的，那时两维只是
+        四档的投影，出现这个组合意味着投影表自相矛盾。现在投影是兼容视图，它的塌法是
+        保留保命档、丢掉方向；方向没丢，它在 `cycle` 那一列里躺着。
         """
-        label = label_series(candles(STEADY_DOWN), PARAMS)[-1]
+        # 上行途中放量：两维并存的那个形状（放量是事件，但它不改方向）。
+        params = replace(PARAMS, volume_ma_period=3)
+        closes = [100 + i for i in range(16)]
+        rows = [
+            {
+                "date": DAY0 + timedelta(days=i),
+                "high": float(c) + 1.0,
+                "low": float(c) - 1.0,
+                "open": float(c),
+                "close": float(c),
+                "volume": 10.0 if i < len(closes) - 1 else 200.0,
+            }
+            for i, c in enumerate(closes)
+        ]
+        label = label_series(rows, params)[-1]
 
         self.assertIs(label.regime, BaseRegime.HIGH_VOL)
         self.assertIs(label.volatility, quant.Volatility.EVENT_SPIKE)
-        self.assertIs(label.cycle, quant.Cycle.BEAR, "周期维独立看见了下行方向")
-        with self.assertRaises(ValueError):
-            quant.project_to_base(label)
+        self.assertIs(label.cycle, quant.Cycle.BULL, "周期维独立看见了上行方向")
+        # 投影仍还原出保命档（丢掉的是方向这一份分辨率，不是保命这件事）。
+        self.assertIs(quant.project_to_base(label), BaseRegime.HIGH_VOL)
 
     def test_the_other_three_tiers_map_one_to_one(self):
         expected = {
@@ -1089,14 +1237,72 @@ class TestTwoAxesAreProjectedFromOneVerdict(SimpleTestCase):
             quant.project_to_base_axes(quant.Cycle.UNCLEAR, quant.Volatility.NORMAL)
         )
 
-    def test_projection_refuses_a_combination_it_cannot_restore(self):
-        """`bull + event_spike` 投影回四档是**不可还原**的，必须拒绝而不是猜。
+    def test_a_directional_event_day_projects_to_the_blanket_tier(self):
+        """`bull + event_spike`（牛市暴跌日）投影回四档 ⇒ 保命档。
 
-        两维并存是本结构的目的（牛市暴跌日是合法状态），但旧四档表达不了它。投影函数
-        的职责是「还原」，所以它在这里必须说「还原不了」，而不是悄悄丢掉一维。
+        **#65 起这是正常产出**，不是矛盾：两维各自独立判定，同一天既是上行周期又是事件
+        波动日完全可能。投影是兼容视图，它把这一格塌成 `high_vol`——保命档这件事必须
+        保留（它决定要不要停全场），被丢掉的只是方向的分辨率，而方向在 `cycle` 列里
+        原样存在。
+
+        #63 时这里抛是对的：那时两维还只是四档的投影，出现这个组合说明投影表自相矛盾。
+        现在再抛就成了「一有事件波动日，整条历史标注链挂掉」。
         """
-        with self.assertRaises(ValueError):
-            quant.project_to_base_axes(quant.Cycle.BULL, quant.Volatility.EVENT_SPIKE)
+        self.assertIs(
+            quant.project_to_base_axes(quant.Cycle.BULL, quant.Volatility.EVENT_SPIKE),
+            BaseRegime.HIGH_VOL,
+        )
+        self.assertIs(
+            quant.project_to_base_axes(quant.Cycle.BEAR, quant.Volatility.EVENT_SPIKE),
+            BaseRegime.HIGH_VOL,
+        )
+
+
+class TestVolatilityRatioIsNotAQuota(SimpleTestCase):
+    """**高波动比例随行情自然变化，不再锁死 20%**（#65 的核心验收）。
+
+    旧判据 `atr_pct_rank > 0.80` 在数学上锁死「250 日窗口里必有 20% 的日子判高波动」。
+    这条用例用一个**分位数分布已知**的夹具证明新判据没有这个性质：同样的窗口长度，
+    事件日数取决于行情本身走了几根大阴大阳，而不是窗口大小。
+
+    真实历史上的实测（2026-11-23，BTC 2518 根日线）：19.29% → 4.83%，
+    逐年 2.1% ~ 10.4%。这里用合成序列钉同一条性质，不必依赖线上库。
+    """
+
+    def _ratio(self, closes, bands=1.0):
+        params = replace(PARAMS, volume_ma_period=3)
+        labels = label_series(candles(closes, bands), params)
+        judged = [lb for lb in labels if lb.judged]
+        spikes = [lb for lb in judged if lb.volatility is quant.Volatility.EVENT_SPIKE]
+        return len(spikes), len(judged)
+
+    def test_a_calm_series_has_no_event_days(self):
+        """平静序列 ⇒ 0 个事件日。旧判据在这里必然给出 20%——它与「行情平不平静」无关。"""
+        spikes, judged = self._ratio([100.0 + 0.01 * i for i in range(60)])
+        self.assertGreater(judged, 0, "夹具必须真的判出一些日子，否则用例空转")
+        self.assertEqual(spikes, 0)
+
+    def test_the_ratio_tracks_the_number_of_event_days_not_the_window(self):
+        """同一窗口长度、不同的行情 ⇒ 事件日数跟着行情走，而不是跟着窗口走。"""
+        calm = [100.0 + 0.01 * i for i in range(60)]
+        # 在平静序列里插几根 +10% 的大阳线：每一根都该被判成事件日。
+        choppy = list(calm)
+        for at in (30, 40, 50):
+            for i in range(at, len(choppy)):
+                choppy[i] *= 1.10
+        calm_spikes, calm_judged = self._ratio(calm)
+        choppy_spikes, choppy_judged = self._ratio(choppy)
+
+        self.assertEqual(calm_spikes, 0)
+        self.assertGreater(
+            choppy_spikes,
+            0,
+            "同样的窗口长度，有事件的日子必须被认出来——否则判据又在看窗口而不是看行情",
+        )
+        # 比例不同：这条是「不再锁死」的直接证据。
+        self.assertNotEqual(
+            calm_spikes / max(1, calm_judged), choppy_spikes / max(1, choppy_judged)
+        )
 
 
 class TestProjectionEquivalenceOnBulkHistory(SimpleTestCase):
