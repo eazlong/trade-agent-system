@@ -22,7 +22,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from apps.regime import truth
 from apps.regime.management.commands import check_truth_csv as mod
@@ -224,10 +224,14 @@ class TestSelfConflicts(TestCase):
         return mod.Row(line=line, day=date.fromisoformat(day), regime=regime, note="")
 
     def test_one_day_with_two_regimes_is_a_conflict_with_both_lines(self):
-        """那些天会成为冲突日、退出分母——**等于白标**，所以必须挡住。"""
+        """那些天会成为冲突日、退出分母——**等于白标**，所以必须挡住。
+
+        **用两个非叠加档位**（下行 + 箱体）造冲突：高波动是叠加层，它与另一档并存
+        是「这段在跌、其中某天崩了」，不是自相矛盾。
+        """
         rows = [
-            self._row(2, "2020-03-12", BaseRegime.HIGH_VOL),
-            self._row(5, "2020-03-12", BaseRegime.DOWNTREND),
+            self._row(2, "2020-03-12", BaseRegime.DOWNTREND),
+            self._row(5, "2020-03-12", BaseRegime.RANGE),
         ]
         problems = mod.self_conflicts(rows)
 
@@ -414,3 +418,349 @@ class TestCandleBoundsComeFromTheDatabase(TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("2020-01-01", problems[0].detail)
         self.assertFalse(problems[0].blocking)
+
+
+class TestTheAiTidyBranch(TestCase):
+    """`--ai-tidy`：原始材料 → AI 转写 → **同一条检查链**。
+
+    这一组钉的是一件事：**它没有第二条判据**。转写出来的 CSV 必须走 `parse_text`，于是
+    四类问题、合并规则、blocking 的划分全部与普通 CSV 路径逐字相同。任何一处差异都会
+    让「同一个材料在两处得出两个结论」，而两边各自看都自洽。
+    """
+
+    def setUp(self):
+        self.tmp = Path(self._testMethodName + "_ai")
+        self.tmp.mkdir(exist_ok=True)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for child in self.tmp.glob("*"):
+            child.unlink()
+        self.tmp.rmdir()
+
+    def _raw(self, body: str) -> Path:
+        path = self.tmp / "notes.txt"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def _run(self, path, *extra):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command(
+            "check_truth_csv", str(path), *extra, stdout=out, stderr=StringIO()
+        )
+        return out.getvalue()
+
+    def _stub(self, payload: dict):
+        """把 `tidy_raw` 换成「用生产校验器 + 生产渲染器造出来的那一个结果」。
+
+        不手搓 `TidyOutcome`：手搓的话，「命令用的是不是真的那条链」就没有被验证，
+        而那正是本组要钉的东西。
+        """
+        from unittest.mock import patch
+
+        from apps.regime import truth_tidy
+
+        spans = truth_tidy._validate(payload)
+        outcome = truth_tidy.TidyOutcome(
+            status=truth_tidy.STATUS_OK,
+            csv=truth_tidy.render_csv(spans),
+            intervals=spans,
+        )
+        return patch.object(truth_tidy, "tidy_raw", return_value=outcome)
+
+    def test_it_runs_the_same_checks_as_a_plain_csv(self):
+        """转写 → 检查 → 合并，三句话都要出现在输出里。
+
+        **区间契约**：一条覆盖两天的高波动区间，转写出来是**一条**，不是两行。
+        """
+        payload = {
+            "intervals": [
+                {
+                    "start": "2020-03-12",
+                    "end": "2020-03-13",
+                    "regime": "高波动",
+                    "note": "312",
+                    "source_text": "3 月 12 日到 13 日：高波动",
+                },
+            ]
+        }
+        with self._stub(payload):
+            output = self._run(self._raw("原始材料"), "--ai-tidy")
+
+        self.assertIn("AI 只做了转写", output, "边界那句话必须印在人看得到的地方")
+        self.assertIn("解析到 1 行已标注日", output, "一条区间就是一行，不按天展开")
+        self.assertIn("合并为 1 段区间", output)
+        self.assertIn("2020-03-12 → 2020-03-13", output)
+
+    def test_out_writes_the_csv_and_the_report_reads_it_back(self):
+        """`--out` 落盘的那份必须能被普通路径**再读一遍**，结论一致。"""
+        payload = {
+            "intervals": [
+                {
+                    "start": "2020-03-12",
+                    "end": "2020-03-12",
+                    "regime": "高波动",
+                    "note": "",
+                    "source_text": "3/12 高波动",
+                }
+            ]
+        }
+        target = self.tmp / "tidied.csv"
+        with self._stub(payload):
+            output = self._run(self._raw("原始材料"), "--ai-tidy", "--out", str(target))
+
+        self.assertTrue(target.exists())
+        self.assertIn(f"已把转写结果写到：{target}", output)
+
+        # 第二条路：把落盘的那份当普通 CSV 再检查一次，结论必须一致。
+        self.assertIn("解析到 1 行已标注日", self._run(target))
+
+    def test_an_unrecognised_word_still_blocks_after_transcription(self):
+        """AI 照抄了「极端波动」，于是它照旧被 `_parse_regime` 拦下。
+
+        这条是「词表只有一处」的可执行形式：如果 AI 顺手归一成 high_vol，这条用例会绿——
+        但绿的是一次**静默改写**，而人以为原文就是这么写的。所以这条用例的价值在于它
+        **必须红**：一旦 AI 开始归一，这里会先炸。
+        """
+        from django.core.management.base import CommandError
+
+        payload = {
+            "intervals": [
+                {
+                    "start": "2020-03-12",
+                    "end": "2020-03-12",
+                    "regime": "极端波动",
+                    "note": "",
+                    "source_text": "3/12 极端波动",
+                }
+            ]
+        }
+        with self._stub(payload):
+            with self.assertRaises(CommandError):
+                self._run(self._raw("原始材料"), "--ai-tidy")
+
+    def test_a_failed_tidy_raises_instead_of_passing_with_zero_rows(self):
+        """整理失败**必须**是一个错误，不能退化成「0 行已标注日 + 检查通过」。
+
+        后者与本命令存在的意义正好相反：一份整理失败的材料，看起来与一份没填档位的
+        模板一模一样。
+        """
+        from unittest.mock import patch
+
+        from django.core.management.base import CommandError
+
+        from apps.regime import truth_tidy
+
+        failed = truth_tidy.TidyOutcome(
+            status=truth_tidy.STATUS_FAILED,
+            csv="",
+            error="LLM 没有给出可用答复：timeout",
+        )
+        with patch.object(truth_tidy, "tidy_raw", return_value=failed):
+            with self.assertRaises(CommandError) as caught:
+                self._run(self._raw("原始材料"), "--ai-tidy")
+
+        self.assertIn("AI 整理失败", str(caught.exception))
+        self.assertIn("timeout", str(caught.exception))
+
+    def test_without_the_flag_the_path_is_still_a_csv(self):
+        """`--ai-tidy` 缺席时 `path` 仍然是 CSV——这一支逐位不变。"""
+        path = write_csv(self.tmp, "2020-03-12,高波动,312\n")
+        output = self._run(path)
+
+        self.assertNotIn("AI 只做了转写", output)
+        self.assertIn("解析到 1 行已标注日", output)
+
+
+class TestIntervalTablesAreReportedCorrectly(TestCase):
+    """区间表的两个措辞陷阱。都不影响录库，但都会让人读错这份材料。
+
+    第一条来自一次真实材料跑测：32 行区间覆盖 4251 天，而报告写着「原始标注 32 天」——
+    读的人会以为这份标注很稀，或者以为 AI 只标了 32 天。
+
+    第二条是同一个跑测里刷出的 435 条冲突：两条各跨半年的区间互相对撞时按天报，
+    而它们要人做的是同一个动作。
+    """
+
+    def setUp(self):
+        self.tmp = Path(self._testMethodName + "_iv")
+        self.tmp.mkdir(exist_ok=True)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for child in self.tmp.glob("*"):
+            child.unlink()
+        self.tmp.rmdir()
+
+    def _run(self, path, *extra):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command(
+            "check_truth_csv", str(path), *extra, stdout=out, stderr=StringIO()
+        )
+        return out.getvalue()
+
+    def _write(self, body: str) -> Path:
+        path = self.tmp / "intervals.csv"
+        path.write_text(f"起始日期,结束日期,档位,备注\n{body}", encoding="utf-8-sig")
+        return path
+
+    def test_the_summary_counts_intervals_not_days(self):
+        """「原始标注 N 条区间」——而 N 条区间可以覆盖几千天。"""
+        output = self._run(self._write("2020-03-13,2021-04-30,上行趋势,一年期上行\n"))
+
+        self.assertIn("原始标注 1 条区间", output)
+        self.assertIn("覆盖 414 天", output)
+
+    def test_a_long_interval_conflict_is_one_problem_not_one_per_day(self):
+        """两条各跨半年的区间对撞 = **一条**问题，不是 180 条。
+
+        实测一份 44 行的真实材料按天展开刷出 435 条——那种输出没人会读，而「没人读」
+        正是这个命令最怕的失效方式。
+        """
+        from django.core.management.base import CommandError
+
+        path = self._write(
+            "2020-01-01,2020-06-30,下行趋势,半年\n2020-04-01,2020-12-31,箱体震荡,也半年\n"
+        )
+        with self.assertRaises(CommandError) as caught:
+            self._run(path)
+
+        message = str(caught.exception)
+        self.assertEqual(message, "1 个问题", "180 天重叠只报一条")
+
+    def test_the_conflict_detail_names_both_lines_without_repeating_the_prefix(self):
+        """渲染出来不能是「第 3 行：第 3 行（…）」——detail 要说两条的行号。"""
+        from apps.regime.management.commands import check_truth_csv as mod
+
+        rows = [
+            mod.Row(2, date(2020, 1, 1), BaseRegime.DOWNTREND, "", date(2020, 6, 30)),
+            mod.Row(3, date(2020, 4, 1), BaseRegime.RANGE, "", date(2020, 12, 31)),
+        ]
+        problems = mod.self_conflicts(rows)
+
+        self.assertEqual(len(problems), 1)
+        rendered = problems[0].render()
+        self.assertNotIn("第 2 行：第 2 行", rendered, "前缀不该重复")
+        self.assertIn("第 2 行", rendered)
+        self.assertIn("第 3 行", rendered, "两条的行号都要出现，人才知道改哪一条")
+
+    def test_an_interval_missing_its_end_is_a_format_error(self):
+        """少了一端**不补成当天**：那正是 v1 把长区间缩成一天的形状。"""
+        from django.core.management.base import CommandError
+
+        path = self._write("2020-03-13,,上行趋势,\n")
+        with self.assertRaises(CommandError):
+            self._run(path)
+
+    def test_an_end_before_the_start_is_a_format_error(self):
+        """录反了：这条在比对里一天的并集都不贡献，必须挡在录入之前。"""
+        from django.core.management.base import CommandError
+
+        path = self._write("2020-06-30,2020-01-01,高波动,反了\n")
+        with self.assertRaises(CommandError):
+            self._run(path)
+
+    def test_the_daily_table_still_says_days(self):
+        """逐日表的措辞**逐字不变**——那一支不该被区间表这一次改动碰到。"""
+        path = self.tmp / "daily.csv"
+        path.write_text(
+            "日期,档位\n2020-03-12,高波动\n2020-03-13,高波动\n", encoding="utf-8-sig"
+        )
+
+        output = self._run(path)
+        self.assertIn("原始标注 2 天", output)
+        self.assertNotIn("条区间", output)
+
+
+class TestHighVolIsAnOverlayNotAConflict(SimpleTestCase):
+    """高波动是**叠加层**，不是普通档位（CONTEXT.md 第 128 条）。
+
+    真实材料里最常见的形状是「一段下行趋势中某天暴跌」：
+
+        2021-04-14 ~ 2021-07-20  下行趋势
+        2021-05-19                高波动      ← 519 暴跌
+
+    这两句不是矛盾，是「这段在跌，其中某天崩了」。把它们判成冲突的代价很具体：
+    冲突日退出分母，于是标注越细致，能参与成功标准①的样本反而越少。
+
+    实测一份 44 行材料在旧判据下有 7 条这类「冲突」，占了全部冲突的一半以上。
+    """
+
+    def _row(self, line, day, regime, end=None):
+        return mod.Row(
+            line=line,
+            day=date.fromisoformat(day),
+            regime=regime,
+            note="",
+            day_end=date.fromisoformat(end) if end else None,
+        )
+
+    def test_a_high_vol_day_inside_a_downtrend_is_not_a_conflict(self):
+        """519 暴跌叠在一段下行趋势里——这是本机制的正常形态。"""
+        rows = [
+            self._row(2, "2021-04-14", BaseRegime.DOWNTREND, "2021-07-20"),
+            self._row(3, "2021-05-19", BaseRegime.HIGH_VOL, "2021-05-19"),
+        ]
+        self.assertEqual(mod.self_conflicts(rows), [])
+
+    def test_two_non_overlay_regimes_still_conflict(self):
+        """去掉叠加层之后还剩两个判断在打架 —— 那是**真的**自相矛盾。"""
+        rows = [
+            self._row(2, "2021-04-14", BaseRegime.DOWNTREND, "2021-07-20"),
+            self._row(3, "2021-06-01", BaseRegime.RANGE, "2021-06-30"),
+        ]
+        self.assertEqual(len(mod.self_conflicts(rows)), 1)
+
+    def test_high_vol_plus_two_real_regimes_is_still_a_conflict(self):
+        """折叠掉高波动之后还有两个，仍然报——叠加层不能掩盖真正的矛盾。"""
+        rows = [
+            self._row(2, "2021-04-14", BaseRegime.DOWNTREND, "2021-07-20"),
+            self._row(3, "2021-06-01", BaseRegime.RANGE, "2021-06-30"),
+            self._row(4, "2021-06-15", BaseRegime.HIGH_VOL, "2021-06-15"),
+        ]
+        self.assertEqual(len(mod.self_conflicts(rows)), 1)
+
+    def test_fold_overlay_rules(self):
+        """四条折叠规则逐条钉住（`truth.fold_overlay` 是唯一实现）。"""
+        fold = truth.fold_overlay
+        VOL, DOWN, CALM = BaseRegime.HIGH_VOL, BaseRegime.DOWNTREND, BaseRegime.RANGE
+
+        self.assertEqual(fold({VOL}), {VOL}, "只有高波动时它自己就是结论，不能抹成空集")
+        self.assertEqual(fold({VOL, DOWN}), {DOWN}, "叠加层折叠，剩下底层档位")
+        self.assertEqual(
+            fold({VOL, DOWN, CALM}),
+            {VOL, DOWN, CALM},
+            "去掉叠加层还有两个在打架 → 原样保留，照报冲突",
+        )
+        self.assertEqual(fold({DOWN, CALM}), {DOWN, CALM}, "没有叠加层时原样返回")
+
+    def test_the_conflict_definition_is_shared_with_truth(self):
+        """命令、`conflicting_days`、`tally` 三处必须是同一个答案。"""
+        spans = [
+            truth.Interval(
+                start=date(2021, 4, 14),
+                end=date(2021, 7, 20),
+                regime=BaseRegime.DOWNTREND,
+            ),
+            truth.Interval(
+                start=date(2021, 5, 19),
+                end=date(2021, 5, 19),
+                regime=BaseRegime.HIGH_VOL,
+            ),
+        ]
+        rows = [
+            self._row(2, "2021-04-14", BaseRegime.DOWNTREND, "2021-07-20"),
+            self._row(3, "2021-05-19", BaseRegime.HIGH_VOL, "2021-05-19"),
+        ]
+
+        self.assertEqual(mod.self_conflicts(rows), [])
+        self.assertEqual(truth.conflicting_days(spans), set())
+        self.assertEqual(truth.tally(spans, {}).conflict_days, 0)

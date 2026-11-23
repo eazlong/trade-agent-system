@@ -19,6 +19,9 @@
   唯一的例外是 `--show-coverage`：它只说「这段落在日线范围里/外」，那是数据可得性，
   不是算法结论。
 - **不替人猜**：空档位就是空，不当成「沿用上一行」。
+- **`--ai-tidy` 也不是第二条判据**：它只是把原始材料**转写**成 CSV，再交回
+  `parse_text`——四类检查因此仍只有一份实现。AI 那一层连词表归一都不做（档位逐字
+  照抄、有歧义的日期原样抄），理由见 `apps.regime.truth_tidy` 的模块 docstring。
 
 ## CSV 形状
 
@@ -60,7 +63,6 @@
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -83,12 +85,23 @@ _DATE_HEADERS = ("日期", "date", "起始日期", "start")
 
 @dataclass(frozen=True)
 class Row:
-    """CSV 里的一行（已解析）。`line` 是文件里的行号（表头是第 1 行）。"""
+    """CSV 里的一行（已解析）。`line` 是文件里的行号（表头是第 1 行）。
+
+    `day_end` 只在**区间表**上有值：那一行的结束日。逐日表上它恒为 `None`，
+    此时这条记录就代表单独一天——于是「逐日」是「区间」在 `day_end is None` 时的
+    退化情形，下游的合并、冲突、越界三组检查对两种表说的是同一件事。
+    """
 
     line: int
     day: date
     regime: BaseRegime
     note: str
+    day_end: date | None = None
+
+    @property
+    def span(self) -> tuple[date, date]:
+        """这一行的 `(起, 止)` 闭区间。逐日行的两端是同一天。"""
+        return (self.day, self.day_end or self.day)
 
 
 @dataclass(frozen=True)
@@ -111,8 +124,11 @@ class Problem:
 
     def render(self) -> str:
         where = f"第 {self.line} 行" if self.line else "整份文件"
+        # detail 自己已经点名行号时不再前置，否则会渲染出「第 3 行：第 3 行（…）」——
+        # 两段区间对撞的那条 detail 必须说出**两条**的行号，只靠 `line` 那一列装不下。
+        prefix = "" if self.detail.startswith(f"第 {self.line} 行") else f"{where}："
         mark = "" if self.blocking else "（不阻止录入）"
-        return f"  [{self.kind}] {where}：{self.detail}{mark}"
+        return f"  [{self.kind}] {prefix}{self.detail}{mark}"
 
 
 def _pick(header: list[str], candidates: Iterable[str]) -> int | None:
@@ -162,10 +178,7 @@ def _parse_regime(raw: str) -> BaseRegime | None:
 
 
 def parse(path: Path) -> tuple[list[Row], list[Problem]]:
-    """把 CSV 读成 `(行, 问题)`。**任一问题都意味着这份文件不该被整体录入。**"""
-    rows: list[Row] = []
-    problems: list[Problem] = []
-
+    """把 CSV **文件**读成 `(行, 问题)`。**任一问题都意味着这份文件不该被整体录入。**"""
     try:
         # `utf-8-sig`：Excel 导出的 CSV 带 BOM，不剥掉的话第一列表头会变成
         # "\ufeff日期"，于是日期列匹配不上、每一行都报错。
@@ -174,6 +187,173 @@ def parse(path: Path) -> tuple[list[Row], list[Problem]]:
         raise CommandError(f"文件不存在：{path}")
     except UnicodeDecodeError as exc:
         raise CommandError(f"文件不是 UTF-8 编码（{exc}）：请另存为 CSV UTF-8")
+
+    return parse_text(text)
+
+
+#: 区间 CSV 的列名候选。与逐日 CSV 分开两套表头：**「起始日期 + 结束日期」一起出现
+#: 就是区间表的判据**，不另加一个 --format 开关去让调用方声明——那种开关的后果是
+#: 「声明错了不报错，只是按另一套规则解析出一堆看起来正常的结果」。
+_START_HEADERS = ("起始日期", "开始日期", "start", "start_date")
+_END_HEADERS = ("结束日期", "end", "end_date")
+
+
+def _looks_like_intervals(header: list[str]) -> bool:
+    """这份表头是区间表还是逐日表。**两条列名都认得出才算区间表**。"""
+    return (
+        _pick(header, _START_HEADERS) is not None
+        and _pick(header, _END_HEADERS) is not None
+    )
+
+
+def parse_intervals_text(text: str) -> tuple[list[Row], list[Problem]]:
+    """把**区间 CSV 文本**读成 `(行, 问题)`。
+
+    返回的 `Row` 复用逐日那条路的类型：`day` 装区间起点、`day_end` 装终点。于是合并、
+    自相矛盾、越界三组检查全部照旧复用——它们问的问题（哪几天被标成了什么）在两种表上
+    完全一样。
+
+    **一条区间少了一端就报错**，不补成「当天」：宽松地补一个「当天」会让一条本该覆盖
+    半年的区间悄悄缩成一天。那正是 v1 那个 bug 的形状，只是换成静默发生——真实材料跑
+    出来时约 2450 天只覆盖了 30 天。
+    """
+    rows: list[Row] = []
+    problems: list[Problem] = []
+
+    reader = csv.reader(text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise CommandError("文件是空的")
+
+    start_col = _pick(header, _START_HEADERS)
+    end_col = _pick(header, _END_HEADERS)
+    regime_col = _pick(header, _REGIME_HEADERS)
+    note_col = _pick(header, _NOTE_HEADERS)
+
+    missing = []
+    if start_col is None:
+        missing.append("起始日期")
+    if end_col is None:
+        missing.append("结束日期")
+    if regime_col is None:
+        missing.append("档位")
+    if missing:
+        problems.append(Problem(None, "表头", "找不到这些列：" + "；".join(missing)))
+        return rows, problems
+
+    for offset, record in enumerate(reader, start=2):
+        if not any(cell.strip() for cell in record):
+            continue
+
+        need = max(start_col, end_col, regime_col) + 1
+        if len(record) < need:
+            problems.append(
+                Problem(
+                    offset,
+                    "格式",
+                    f"列数不足（需要至少 {need} 列，实际 {len(record)} 列）",
+                )
+            )
+            continue
+
+        raw_start = record[start_col].strip()
+        raw_end = record[end_col].strip()
+        raw_regime = record[regime_col].strip()
+
+        # 档位留空 = 原文没写档位。与逐日那条路同一条语义：这不是错误。
+        if not raw_regime:
+            continue
+
+        start = _parse_date(raw_start)
+        if start is None:
+            problems.append(
+                Problem(
+                    offset,
+                    "格式",
+                    f"起始日期解析不了：{raw_start!r}"
+                    f"（这一条填了档位 {raw_regime!r}；认得 2020-03-12 / 2020/3/12）",
+                )
+            )
+            continue
+
+        end = _parse_date(raw_end)
+        if end is None:
+            problems.append(
+                Problem(
+                    offset,
+                    "格式",
+                    f"结束日期解析不了：{raw_end!r}"
+                    "——区间必须两端都给，不能把一条长区间当成一天",
+                )
+            )
+            continue
+
+        regime = _parse_regime(raw_regime)
+        if regime is None:
+            problems.append(
+                Problem(
+                    offset,
+                    "格式",
+                    f"{start} 的档位认不出：{raw_regime!r}"
+                    "（只认 高波动/下行趋势/上行趋势/箱体震荡 或 high_vol/downtrend/uptrend/range）",
+                )
+            )
+            continue
+
+        if end < start:
+            problems.append(
+                Problem(
+                    offset,
+                    "格式",
+                    f"区间终点 {end} 早于起点 {start}——录反了，这条在比对里一天的并集都不贡献",
+                )
+            )
+            continue
+
+        note = (
+            record[note_col].strip()
+            if note_col is not None and note_col < len(record)
+            else ""
+        )
+        rows.append(Row(line=offset, day=start, regime=regime, note=note, day_end=end))
+
+    return rows, problems
+
+
+def parse_text(text: str) -> tuple[list[Row], list[Problem]]:
+    """按表头自动分派：区间表走 `parse_intervals_text`，逐日表走逐日解析。
+
+    **分派只在读表头那一刻做一次**：两种表列名不同，一份表要么是这一种、要么是那一种，
+    不存在「两种都试一遍取更好的结果」——那会让一份坏掉的表以另一种形状「成功」解析
+    出来，而它的每一行都看着正常。
+
+    这是 AI 整理层与命令行共用的唯一入口：`truth_tidy` 产出的是区间表，人工手写的裸模板
+    是逐日表，两者都从这里进，四类检查因此只有一份实现。
+    """
+    reader = csv.reader(text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise CommandError("文件是空的")
+
+    if _looks_like_intervals(header):
+        return parse_intervals_text(text)
+    return _parse_daily_text(text)
+
+
+def _parse_daily_text(text: str) -> tuple[list[Row], list[Problem]]:
+    """把**逐日** CSV 文本读成 `(行, 问题)`——`parse` 去掉读盘之后的那一半。
+
+    **拆出来的唯一理由是 AI 整理那条路要复用这四类检查**（见 `truth_tidy`）：那一层
+    产出的是一段 CSV 文本，还没落盘；让它先写文件再读回来，等于凭空多一次 IO 和一个
+    「写哪儿、谁清理」的问题，而检查逻辑还是同一份。
+
+    所以这里**不是**一次重构：`parse` 的行为逐位不变（它现在只是读盘 + 委托），
+    而「四类问题的判据只有一份」这件事从此由**签名**保证——两条路都只能走到这里。
+    """
+    rows: list[Row] = []
+    problems: list[Problem] = []
 
     reader = csv.reader(text.splitlines())
     try:
@@ -265,27 +445,31 @@ def merge(rows: list[Row]) -> list[truth.Interval]:
     if not rows:
         return []
 
-    ordered = sorted(rows, key=lambda r: r.day)
+    ordered = sorted(rows, key=lambda r: r.span)
     spans: list[truth.Interval] = []
+    first = ordered[0]
     current = truth.Interval(
-        start=ordered[0].day,
-        end=ordered[0].day,
-        regime=ordered[0].regime,
-        note=ordered[0].note,
+        start=first.span[0],
+        end=first.span[1],
+        regime=first.regime,
+        note=first.note,
     )
     for row in ordered[1:]:
-        adjacent = (row.day - current.end).days == 1
+        start, end = row.span
+        # 相邻 = 下一条的起点正好接在当前这条终点后一天。**区间行**的终点取自它自己
+        # （`day_end`），逐日行的终点就是它那一天——两种表在这里走的是同一句话。
+        adjacent = (start - current.end).days == 1
         if adjacent and row.regime is current.regime:
             current = truth.Interval(
                 start=current.start,
-                end=row.day,
+                end=end,
                 regime=current.regime,
                 note=current.note,
             )
         else:
             spans.append(current)
             current = truth.Interval(
-                start=row.day, end=row.day, regime=row.regime, note=row.note
+                start=start, end=end, regime=row.regime, note=row.note
             )
     spans.append(current)
     return spans
@@ -302,25 +486,41 @@ def self_conflicts(rows: list[Row]) -> list[Problem]:
     判断口径仍与它一致（同档位重叠**不算**冲突，那是互相佐证），由下面 `len(set) > 1`
     钉住；`test_truth.py` 里 `conflicting_days` 的用例覆盖了同一条语义。
     """
-    by_day: dict[date, list[Row]] = defaultdict(list)
-    for row in rows:
-        by_day[row.day].append(row)
-
+    # **按「区间对」报，不按天报。** 两条各跨半年的区间互相对撞时，按天展开会产生
+    # 上百条同一形状的问题，而它们要人做的是**同一个动作**（改其中一条）。实测一份
+    # 44 行的真实材料刷出 435 条，那种输出没人会读——而「没人读」正是这个命令最怕的
+    # 失效方式。
+    #
+    # 判据仍是 `truth.conflicting_days` 那一句（按天展开、看档位集合大小），这里只是
+    # 把「哪些天冲突」收成「哪几行对撞」。同行不算（一条区间自己与自己重不了）。
     out: list[Problem] = []
-    for day in sorted(by_day):
-        bucket = by_day[day]
-        distinct = {row.regime for row in bucket}
-        if len(distinct) < 2:
-            continue
-        detail = "；".join(f"第 {row.line} 行标 {row.regime.display}" for row in bucket)
-        out.append(
-            Problem(
-                bucket[0].line,
-                "自相矛盾",
-                f"{day} 被标了 {len(distinct)} 个不同档位（{detail}）"
-                "——这一天会成为冲突日、退出分母（等于白标）",
+    ordered = sorted(rows, key=lambda r: r.span)
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            lo = max(left.span[0], right.span[0])
+            hi = min(left.span[1], right.span[1])
+            if lo > hi:
+                continue  # 不相交
+            if left.regime is right.regime:
+                continue  # 同档位重叠：互相佐证，不是冲突
+            # **叠加层不参与互斥**：`{高波动, 下行趋势}` 是「这段在跌，其中某天崩了」，
+            # 不是矛盾。判据取自 `truth.fold_overlay`——那是这份规则唯一的一处实现，
+            # 与 `tally` / `conflicting_days` 同源；在这里另抄一份「高波动不算冲突」
+            # 会让录入时的报数与本命令报的数分家。
+            if len(truth.fold_overlay({left.regime, right.regime})) <= 1:
+                continue
+            days = (hi - lo).days + 1
+            out.append(
+                Problem(
+                    left.line,
+                    "自相矛盾",
+                    f"第 {left.line} 行（{left.span[0]}~{left.span[1]} "
+                    f"{left.regime.display}）与第 {right.line} 行"
+                    f"（{right.span[0]}~{right.span[1]} {right.regime.display}）"
+                    f"重叠 {days} 天（{lo} → {hi}）——这些天会成为冲突日、退出分母"
+                    "（等于白标），改其中一条即可",
+                )
             )
-        )
     return out
 
 
@@ -339,12 +539,34 @@ class Command(BaseCommand):
             action="store_true",
             help="报出标注覆盖的天数落在日线范围里/外各多少（只说数据可得性，不含算法结论）",
         )
+        parser.add_argument(
+            "--ai-tidy",
+            action="store_true",
+            help=(
+                "把 path 当成**原始材料**（一段话/一张乱格式的表），先交给 AI 转写成 CSV "
+                "再走同一条检查。AI 只转写，不判断档位、不填空白、不写库"
+            ),
+        )
+        parser.add_argument(
+            "--out",
+            default=None,
+            metavar="CSV",
+            help=(
+                "把 AI 转写出来的 CSV 落在这里（只在 --ai-tidy 时有意义）。"
+                "不给就只打印到 stdout，不写任何文件"
+            ),
+        )
 
     def handle(self, *args, **options):
         path = Path(options["path"]).expanduser()
-        rows, problems = parse(path)
 
-        self.stdout.write(f"文件：{path}")
+        source = path
+        if options["ai_tidy"]:
+            rows, problems, source = self._ai_tidy(path, options["out"])
+        else:
+            rows, problems = parse(path)
+
+        self.stdout.write(f"文件：{source}")
         self.stdout.write(f"解析到 {len(rows)} 行已标注日")
 
         problems.extend(self_conflicts(rows))
@@ -352,9 +574,13 @@ class Command(BaseCommand):
         spans = merge(rows)
         if rows:
             span_days = sum(s.days for s in spans)
+            # 一行是什么，**按表决定**：区间表的每一行本来就是一段，逐日表的每一行是一天。
+            # 混成一句「原始标注 N 天」会在区间表上说出「32 天」——而那 32 行覆盖的是
+            # 4251 天，读的人会以为标得很稀。
+            unit = "条区间" if self._is_interval_table(rows) else "天"
             self.stdout.write(
                 f"合并为 {len(spans)} 段区间（覆盖 {span_days} 天；"
-                f"原始标注 {len(rows)} 天 → 相邻同档位已合并）"
+                f"原始标注 {len(rows)} {unit} → 相邻同档位已合并）"
             )
 
         if options["show_coverage"]:
@@ -401,6 +627,79 @@ class Command(BaseCommand):
             )
         )
 
+    @staticmethod
+    def _is_interval_table(rows: list[Row]) -> bool:
+        """这些行是区间表还是逐日表。
+
+        判据是「有没有任何一行带终点」：区间表的每一行都有 `day_end`，逐日表的每一行
+        都是 `None`。**不重新读表头**——表头在解析那一刻已经用过一次，再用一次就是
+        同一件事的第二处判断，而两处迟早分家。
+        """
+        return any(row.day_end is not None for row in rows)
+
+    # -- AI 整理 ----------------------------------------------------------- #
+
+    def _ai_tidy(
+        self, path: Path, out: str | None
+    ) -> tuple[list[Row], list[Problem], Path | str]:
+        """先把原始材料交给 AI 转写成 CSV，再走**同一条**检查链。
+
+        返回 `(行, 问题, 显示用的来源)`。来源是「哪里来的这份 CSV」：落盘了就是那个
+        文件，没落盘就是一句「AI 转写结果（未落盘）」——报告的第一行必须说清人手里这份
+        表是从哪儿冒出来的。
+
+        ## 失败就地收场，不降级成「没有标注」
+
+        整理失败（两跳全挂 / 答复不合形状）时抛 `CommandError`，与「格式错」同一档。
+        **不能**退化成「0 行已标注日 + 检查通过」：那正是这个命令存在的意义所在——
+        一份整理失败的材料看起来与一份没填档位的模板一模一样。
+
+        ## AI 那一层的问题与 CSV 那一层的问题**不混**
+
+        转写问题（没有 source_text、档位不在原文里）在 `truth_tidy` 里已经折成
+        `status="failed"`，到不了这里；这里出现的问题永远是 CSV 层的四类，因为
+        `parse_text` 是唯一入口。两层的词表因此不会互相污染。
+        """
+        from apps.regime import truth_tidy
+
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            raise CommandError(f"文件不存在：{path}")
+        except UnicodeDecodeError as exc:
+            raise CommandError(f"文件不是 UTF-8 编码（{exc}）：请另存为 UTF-8")
+
+        try:
+            outcome = truth_tidy.tidy_raw(raw)
+        except truth.TruthInputError as exc:
+            raise CommandError(str(exc))
+
+        if not outcome.ok:
+            raise CommandError(f"AI 整理失败：{outcome.error}")
+
+        self.stdout.write(
+            self.style.WARNING(
+                "AI 只做了转写（档位逐字照抄、空白不填）——"
+                "档位判断仍由人负责，下面的检查不含任何算法结论。"
+            )
+        )
+
+        if out:
+            target = Path(out).expanduser()
+            # `utf-8-sig`：与模板一致（Excel 会带 BOM），回读时 `parse` 也剥它。
+            target.write_text(outcome.csv, encoding="utf-8-sig")
+            self.stdout.write(f"已把转写结果写到：{target}")
+            return (*parse(target), target)
+
+        self.stdout.write("")
+        self.stdout.write("转写结果（未落盘；要留档请加 --out <文件名>）：")
+        for line in outcome.csv.rstrip().splitlines():
+            self.stdout.write(f"  {line}")
+        self.stdout.write("")
+
+        rows, problems = parse_text(outcome.csv)
+        return rows, problems, "AI 转写结果（未落盘）"
+
     # -- 两类附加检查 ------------------------------------------------------- #
 
     def _coverage(self, rows: list[Row]) -> list[Problem]:
@@ -424,8 +723,10 @@ class Command(BaseCommand):
         if first is None:
             return [Problem(None, "覆盖", "日线表是空的，无法判断越界——先回填日线")]
 
-        before = [r for r in rows if r.day < first]
-        after = [r for r in rows if r.day > last]
+        # 区间行的越界看**两端**：一条跨过日线起点的区间，前半段算法够不着。
+        # 只看起点会把整条划成「在里面」，而它实际有一半进了 missing。
+        before = [r for r in rows if r.span[1] < first]
+        after = [r for r in rows if r.span[0] > last]
         inside = len(rows) - len(before) - len(after)
 
         self.stdout.write("")

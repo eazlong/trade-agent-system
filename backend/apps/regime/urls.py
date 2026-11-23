@@ -104,5 +104,9 @@ urlpatterns = [
         name="regime-strategy-restore",
     ),
     path("briefing/<str:kind>/", views.briefing, name="regime-briefing"),
+    # `truth/tidy/` 是**只读**（`IsAuthenticated`）尽管它是 POST：它不写库，产出是一份
+    # 转写结果 + 检查报告（见 `views.truth_tidy_tool` 的 docstring）。与 `switch/` 的
+    # 区别不是方法，而是「它改不改状态」——所以两者不该被「都是 POST」推到同一个权限档。
+    path("truth/tidy/", views.truth_tidy_tool, name="regime-truth-tidy"),
     path("switch/", views.switch, name="regime-switch"),
 ]

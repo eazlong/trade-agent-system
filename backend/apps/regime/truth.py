@@ -205,14 +205,55 @@ def day_regimes(intervals: Iterable[Interval]) -> dict[date, set[BaseRegime]]:
     return out
 
 
+def fold_overlay(regimes: set[BaseRegime]) -> set[BaseRegime]:
+    """把**叠加层**（高波动）从一天的档位集合里折叠掉。
+
+    ## 为什么高波动不是普通档位
+
+    CONTEXT.md 第 128 条把高波动定为「**叠加在当前状态上的保命层**」，与事件熔断同属
+    `halt` 的触发源，而不是适用性结论。这个语义在人工标注上直接体现为：
+
+        2021-04-14 ~ 2021-07-20  下行趋势
+        2021-05-19                高波动      ← 519 暴跌，叠加在这段下行里
+
+    两句话**不是矛盾**，是「这段在跌，其中某天崩了」。把它当冲突会丢掉那 136 天以外的
+    全部信息，而冲突日不进分母——于是标注越细致，能参与比对的样本反而越少。
+
+    折叠规则（只折叠一天**恰好**只有一个非高波动档位的情形）：
+
+    - {高波动}                    → {高波动}：那天只有它，它自己就是结论
+    - {高波动, 下行趋势}           → {下行趋势}：高波动被叠加、折叠
+    - {高波动, 下行趋势, 箱体震荡} → 原样保留：去掉叠加层后仍有两天以上的判断在打架，
+      那是**真的**自相矛盾（一个人不可能同时认为这段是下行又是箱体）
+
+    **高波动单独出现时不折叠掉**：它是一条真实的人工结论，把它抹成空集会让那天既不算
+    冲突也不进分母，等于白标。
+    """
+    if BaseRegime.HIGH_VOL not in regimes:
+        return regimes
+    rest = regimes - {BaseRegime.HIGH_VOL}
+    if len(rest) <= 1:
+        return rest or {BaseRegime.HIGH_VOL}
+    return regimes
+
+
 def conflicting_days(intervals: Iterable[Interval]) -> set[date]:
-    """被**两个不同档位**同时覆盖的日子（第 164 条允许重叠，重叠到打架的要挑出来）。
+    """被**两个不同档位**同时覆盖、且**折叠叠加层之后仍然打架**的日子。
 
     同档位的重叠**不算冲突**：两段都说「那阵子是熊市」，那是互相佐证，只是标重了。
+
+    **高波动不参与互斥判定**（见 `fold_overlay`）：它是叠加层，与底层档位并存是这个
+    机制的正常形态，不是标注错误。
+
     这个函数是「录入时立刻报冲突」与 `tally` 里 `conflict_days` 的**同一份定义**——
-    两处各写一遍，报的冲突与扣掉的天数迟早会对不上。
+    两处各写一遍，报的冲突与扣掉的天数迟早会对不上。`check_truth_csv.self_conflicts`
+    也调 `fold_overlay`（它只是额外要知道是哪几行造成的），所以三处仍然同源。
     """
-    return {day for day, regimes in day_regimes(intervals).items() if len(regimes) > 1}
+    return {
+        day
+        for day, regimes in day_regimes(intervals).items()
+        if len(fold_overlay(regimes)) > 1
+    }
 
 
 def tally(
@@ -233,14 +274,22 @@ def tally(
     """
     intervals = list(intervals)
     covered = day_regimes(intervals)
-    conflicts = {day for day, regimes in covered.items() if len(regimes) > 1}
+    # 冲突判据与 `conflicting_days` 同源：**先折叠叠加层**再问「还剩几个档位」。
+    conflicts = {
+        day for day, regimes in covered.items() if len(fold_overlay(regimes)) > 1
+    }
     in_force = in_force or {}
 
     matched = differed = missing = misdirected = escalated = escalated_matched = 0
     for day, regimes in covered.items():
-        if len(regimes) > 1:
+        folded = fold_overlay(regimes)
+        if len(folded) > 1:
             continue  # 冲突日：不进分母，见模块 docstring
-        truth = next(iter(regimes))
+        # 折叠之后取剩下的那个作为当天真值：`{高波动, 下行趋势}` 那天的人真值是
+        # **下行趋势**，高波动只是叠加。用原集合取 `next(iter(...))` 会随机拿到高波动，
+        # 于是「人工标了下行、算法也判下行」这种显然的匹配被记成不匹配——而错误方向
+        # 还会把 `misdirected`（系统性错向）推成假阳性，一次就否掉整条成功标准①。
+        truth = next(iter(folded))
         pair = in_force.get(day)
         if pair is not None and pair[0] != pair[1]:
             escalated += 1  # 那天机制用的不是纯量化结论（资讯抬升）：也不进分母

@@ -277,10 +277,16 @@ class TestNewsEscalatedDays(SimpleTestCase):
         self.assertEqual((data.escalated, data.matched), (0, 1))
 
     def test_a_conflict_day_is_not_also_an_escalated_day(self):
-        """冲突优先：人工真值自己都没定义的那天，说「不能比」的理由更强，也只该记一次。"""
+        """冲突优先：人工真值自己都没定义的那天，说「不能比」的理由更强，也只该记一次。
+
+        **冲突这一侧必须用两个非叠加档位**（`DOWN` + `CALM`）来造：高波动是叠加层，
+        它与箱体并存是「震荡里的保命日」，不是自相矛盾（见 `truth.fold_overlay`）。
+        用 `VOL` + `CALM` 造出来的那天在新判据下**不是**冲突，于是这条用例会拐去验
+        `escalated`——测的就不再是「冲突优先」了。
+        """
         data = truth.tally(
             [
-                _iv("2024-01-05", "2024-01-05", VOL),
+                _iv("2024-01-05", "2024-01-05", DOWN),
                 _iv("2024-01-05", "2024-01-05", CALM),
             ],
             {},

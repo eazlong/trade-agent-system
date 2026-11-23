@@ -88,6 +88,7 @@ from apps.regime import breaker_switch, deactivation_run, gate_switch, mechanism
 from apps.regime import pool_rebuild
 from apps.regime import serializers as ser
 from apps.regime import strategy_lifecycle
+from apps.regime import truth
 from apps.regime.models import (
     ActorKind,
     MechanismKind,
@@ -1360,6 +1361,127 @@ def _strategy_or_404(strategy_id: UUID) -> tuple[Strategy | None, Response | Non
     if strategy is None:
         return None, _not_found(f"没有 id={strategy_id} 的这一条策略")
     return strategy, None
+
+
+# 原文上限**不在这一层写第二个数**：truth_tidy.MAX_RAW_CHARS 是唯一一份，超长由
+# truth_tidy.tidy_raw 抛 TruthInputError，本视图把它折成 400。两处各一个上限时，命令行
+# 能过、HTTP 拒绝（或反过来），而两边的报错都只说自己那一半。
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def truth_tidy_tool(request: Request) -> Response:
+    """AI 整理 / 预检（POST api/regime/truth/tidy/）。**只读：一行都不写库。**
+
+    ## 这个端点属于读面，尽管它是 POST
+
+    它不写库、不改任何状态，产出是一份**转写结果 + 检查报告**——按 ADR 0005 的划分那是
+    读（所有登录用户），不是写（is_staff）。用 POST 是因为请求体里有一段可能上千字的
+    原文，塞进 query string 会被长度限住、也会被日志记全；这与 retire/ 用 POST 的理由
+    不同（那里是「一次动作」），所以两条路由的权限也不该被「方法一样」推到同一个档。
+
+    LLM 有成本，但这一层不提供任何「反复刷就能刷出信息」的东西：它不读判定表、不算
+    一致率，刷十次得到的还是同一段原文的转写。真要按成本收紧，改这一处的权限类即可
+    （IsStaffUser），其余一行不用动——这正是它被做成独立视图、而不是塞进 briefing
+    一类重请求的理由。
+
+    ## 它与 check_truth_csv --ai-tidy 是同一条链
+
+    两者都只做一件事：truth_tidy.tidy_raw → check_truth_csv.parse_text。四类检查
+    只有一份实现，本端点不自带任何判据。**返回的 csv 与命令行 --out 落盘的内容逐字
+    相同**（同一次 render_csv），所以人可以把响应里的 csv 直接另存，再拿
+    check_truth_csv 复核一遍——两条路的产物必须能互相对上。
+
+    ## 四种收场
+
+    | 情形 | 状态码 | 说明 |
+    | --- | --- | --- |
+    | 整理成功 | 200 | status=ok + csv/rows/intervals/problems |
+    | **AI 整理失败** | **200** | status=failed + error。**不是 5xx** |
+    | 原文为空 / 首尾空白 / 超长 | 400 | 调用方的输入错 |
+    | 未知或匿名 | 401 | IsAuthenticated |
+
+    失败用 200 而不是 5xx：这不是服务端故障，是「这一份材料没整理出来」——一份可以原样
+    显示给操作者看的结果。用 5xx 会让前端把它渲染成「后端挂了」，而人该做的动作是
+    「改写材料」或「再试一次」。
+
+    ## intervals 里的档位是**原文的词**，不是枚举
+
+    转写层刻意不归一成四档（词表只有 check_truth_csv._parse_regime 一处），所以
+    这里给的是这段合并区间上第一行的 regime——它来自 parse_text 已经认得的那几个词，
+    也就是说：**认不出的词压根走不到 intervals**，它会以一条「格式」问题的形式出现在
+    problems 里。这正是词表只有一处的好处：本端点没有第二套判定。
+    """
+    raw = request.data.get("raw") if isinstance(request.data, Mapping) else None
+    if not isinstance(raw, str):
+        return Response({"error": "请求体要有 raw 字段（字符串原文）"}, status=400)
+
+    from apps.regime import truth_tidy
+    from apps.regime.management.commands import check_truth_csv
+
+    try:
+        outcome = truth_tidy.tidy_raw(raw)
+    except truth.TruthInputError as exc:
+        return Response({"error": str(exc)}, status=400)
+
+    if not outcome.ok:
+        response = Response(
+            {
+                "status": outcome.status,
+                "error": outcome.error,
+                "csv": "",
+                "rows": [],
+                "intervals": [],
+                "problems": [],
+            }
+        )
+        response["Cache-Control"] = "no-store"
+        return response
+
+    # **两条路都走到这里**：命令行与端点共用 parse_text，四类检查因此不会分家。
+    # **两条路都走到这里**：命令行与端点共用 parse_text，四类检查因此不会分家。
+    # truth_tidy 现在产出的是**区间表**，parse_text 按表头自动分派到区间解析器。
+    rows, problems = check_truth_csv.parse_text(outcome.csv)
+    problems = [*problems, *check_truth_csv.self_conflicts(rows)]
+    intervals = check_truth_csv.merge(rows)
+
+    response = Response(
+        {
+            "status": outcome.status,
+            "error": "",
+            # 与 `--out` 落盘的那份逐字相同（同一次 render_csv）：人另存之后能拿
+            # `check_truth_csv` 复核，而两条路的产物必须对得上。
+            "csv": outcome.csv,
+            # 转写出来的**区间**（AI 的原始产物），与下面从 CSV 回读再合并的 intervals
+            # 是两件事：前者是一条对一条，后者跑了合并与冲突检查。两个都给，人才看得出
+            # 「AI 写了什么」与「检查之后剩下什么」。
+            "rows": [span.as_payload() for span in outcome.intervals],
+            "intervals": [
+                {
+                    "start": span.start.isoformat(),
+                    "end": span.end.isoformat(),
+                    "days": span.days,
+                    "regime": ser.regime_payload(span.regime.value),
+                    "note": span.note,
+                }
+                for span in intervals
+            ],
+            "problems": [
+                {
+                    "line": problem.line,
+                    "kind": problem.kind,
+                    "detail": problem.detail,
+                    "blocking": problem.blocking,
+                    "render": problem.render().strip(),
+                }
+                for problem in problems
+            ],
+        }
+    )
+    # 同一段原文每次都可能转写出不同的结果（LLM 有采样随机性），缓存它等于把一次
+    # 随机产物伪装成一个稳定事实。
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 @api_view(["GET"])
