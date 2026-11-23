@@ -1076,6 +1076,68 @@ class TestTwoAxesReachTheRecord(TestCase):
         record = RegimeJudgement.objects.get(symbol=SYMBOL)
         self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROXY)
 
+    def test_an_escalation_day_stores_event_spike_not_a_projection(self):
+        """**抬升日落库的必须是 `event_spike`，不能是四档投影**——这是 review 抓出的真缺陷。
+
+        背景：写入路径上曾留着一行 #64 的旧代码 `axes_volatility = project_to_axes(base)[1]`，
+        它把刚判出来、刚被资讯抬升过的波动维整个覆盖掉。抬升日 `base=uptrend`，
+        投影给的答案是 `normal`，于是记录里 `effective_regime=high_vol` 而
+        `volatility=normal`——**同一行自己打自己的脸**。
+
+        这条用例同时钉住三件事：列上的值、来源标记、以及它不与 `base` 投影同值。
+        """
+        persist(series(), SIGNED_DAY)
+        run_daily_judgement(now=NOW, escalation=Escalation.NEWS.value)
+
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        # 基础阶段是量化口径（上行），生效阶段被资讯抬成保命档。
+        self.assertEqual(record.base_regime, BaseRegime.UPTREND.value)
+        self.assertEqual(record.effective_regime, BaseRegime.HIGH_VOL.value)
+        # 波动维必须是**抬升后的** event_spike，而不是 uptrend 的投影 normal。
+        self.assertEqual(
+            record.volatility,
+            Volatility.EVENT_SPIKE.value,
+            "落库的波动维被四档投影覆盖了——那会让「生效高波动 / 波动正常」并存在同一行里",
+        )
+        self.assertNotEqual(
+            record.volatility,
+            quant.project_to_axes(BaseRegime(record.base_regime))[1].value,
+            "与 base 投影同值说明写入路径又退回 project_to_axes 了",
+        )
+        # 值由资讯置上，来源就必须这么说——不能标成「价格代理判出来的」。
+        self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_NEWS)
+
+    def test_a_carried_day_keeps_the_judged_volatility_not_the_stale_base(self):
+        """min_dwell 沿用上一档时，波动维仍报**今天**的判定，不跟着 `base` 走。
+
+        这条与上一条是同一个缺陷的两个面：投影会让波动维跟着 `base` 滞后。
+        今天量化判的是箱体（无事件），而 `base` 因为持续期沿用上一档 —— 波动维必须
+        是今天的 `normal`，而不是上一档的投影。
+        """
+        # 先落一条**下行趋势**的判定，让后续「沿用」有东西可沿。
+        # `end_step` 只在给了 `end_from` 时生效（见夹具 docstring），两处必须一起给。
+        persist(series(end_from=320, end_step=-1.5), SIGNED_DAY - timedelta(days=1))
+        run_daily_judgement(now=NOW - timedelta(days=1))
+        previous = RegimeJudgement.objects.get(symbol=SYMBOL)
+        self.assertEqual(previous.base_regime, BaseRegime.DOWNTREND.value)
+
+        # 第二天换成安静的上行（无事件证据），但持续期不足 ⇒ base 沿用 downtrend。
+        persist(series(), SIGNED_DAY)
+        result = run_daily_judgement(now=NOW)
+
+        record = RegimeJudgement.objects.get(
+            symbol=SYMBOL,
+            effective_at=judgement.business_midnight(SIGNED_DAY + timedelta(days=1)),
+        )
+        self.assertEqual(result["decision"], "carried", "夹具必须真的走沿用那一支")
+        self.assertEqual(record.base_regime, BaseRegime.DOWNTREND.value)
+        self.assertEqual(
+            record.volatility,
+            Volatility.NORMAL.value,
+            "波动维跟着 base 投影走了：今天没有事件证据，就该是 normal",
+        )
+        self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROXY)
+
     def test_the_evidence_says_the_proxy_is_the_source(self):
         """日报要能说「本次高波动来自价格代理」——依据栏里必须有这句话的原料。
 

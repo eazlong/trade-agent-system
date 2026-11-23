@@ -479,6 +479,9 @@ def _missing_judgement_lines(
 #: 波动维的来源取值。与 `quant.VOLATILITY_SOURCE_*` 同源，这里只做展示映射。
 _VOLATILITY_SOURCE_DISPLAY = {
     "proxy": "价格代理（跳空 / 放量 / ATR 骤升 / 单日大幅），没有消息面确认",
+    # 资讯抬升置上去的波动维。与 `proxy` 分开是必需的：读者要能分清「价格走出来了」
+    # 与「消息面说了要谨慎」，两者的假阳性特征完全不同。
+    "news_escalation": "资讯抬升置上（消息面要求进入风险状态，价格代理本身没判出事件）",
     "legacy_mapping": "按旧四档回填的映射值，不是判出来的",
     "compatible_projection": "旧版按四档投影写入的值，不是判出来的",
 }

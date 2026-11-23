@@ -192,6 +192,11 @@ class Volatility(str, Enum):
 VOLATILITY_SOURCE_LEGACY = "legacy_mapping"
 VOLATILITY_SOURCE_PROJECTION = "compatible_projection"
 VOLATILITY_SOURCE_PROXY = "proxy"
+#: 波动维由**资讯抬升**置上的（资讯说「进入风险状态」，而价格代理本身没判出事件）。
+#: 与 `proxy` 分开是必需的：#67 的日报要回答「今天的高波动来自价格代理还是消息面」，
+#: 两者都写 `proxy` 的话，那个问题永远答不上来。代理判据本来就有假阳性，再把「消息面
+#: 说的」混进去，「每个高波动日都有新闻佐证」这个误读就被焊死了。
+VOLATILITY_SOURCE_NEWS = "news_escalation"
 
 #: 四档 → 两维。**唯一一处投影表**，两个方向都从它派生（反向表由它生成，不另写一份）。
 #:
@@ -222,18 +227,23 @@ def project_to_axes(
 def project_to_base_axes(
     cycle: Cycle | str | None, volatility: Volatility | str | None
 ) -> BaseRegime | None:
-    """`(cycle, volatility)` → 四档。**还原不出来的组合必须抛**，不许猜。
+    """`(cycle, volatility)` → 四档。**还原不出来的组合在半截数据上抛，在完整数据上塌。**
 
     这是反向投影，唯一用途是把两维读回本版既有的四档世界（读面兼容、历史回填校验）。
-    它有两处「还原不了」，各自抛而不是回落到某档：
+    它的错误面分两类，处理方式不同：
 
-    - `cycle is None`（且有波动结论）：这正是 `high_vol` 的形状，还原得出来。
-      但 `cycle is None` 配 `normal` 还原不出来——没有方向、也没有事件波动，
-      旧四档里没有这一格。
-    - `bull`/`bear`/`sideways` 配 `event_spike`：旧四档表达不了「有方向又高波动」，
-      只能退回 `high_vol` 而丢掉方向。那正是这次要结束的状态，静默丢一维比抛更坏。
+    - **半截数据 → 抛**。`cycle is None` 配 `volatility=normal` 是「没有方向、也没有
+      事件波动」，旧四档里没有这一格；只有一维为空更是写入路径漏了一半。这些都不是
+      「某种状态」，是数据坏了——猜一个档位下去，切片会当真。
+    - **完整数据但四档表达不了 → 塌，不抛**（#65 改了这一点）。`bull`/`bear`/
+      `sideways`/`unclear` 配 `event_spike` 是**两维判定的正常产物**（牛市暴跌日），
+      不是矛盾。投影的职责是给兼容读面一个答案，塌法是保留 `high_vol`——保命这件事必须
+      保留（它决定要不要停全场），丢掉的只是方向的分辨率，而方向在 `cycle` 列里原样躺着。
 
-    `UNCLEAR`（判不出来）还原成 `None`：两维都说了「说不出来」，与未判定同形。
+      **#63 时这里抛是对的**：那时两维只是四档的投影，出现这个组合说明投影表自相矛盾。
+      现在两维是真判定，再抛就成了「一有事件波动日，整条历史标注链挂掉」。
+
+    `UNCLEAR + normal`（有结论、结论是判不出来）还原成 `None`：与未判定同形。
     """
     if cycle is None and volatility is None:
         # 两维同时为空 = 未判定（数据不够，还没有资格下结论）。这正是 `regime=None`

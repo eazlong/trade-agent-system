@@ -475,6 +475,26 @@ class TestPureRendering(TestCase):
         self.assertIn("价格代理", body)
         self.assertIn("没有消息面确认", body)
 
+    def test_a_news_escalated_spike_is_not_reported_as_a_price_proxy(self):
+        """资讯抬升置上的波动维，不能被日报说成「价格代理判出来的」（#65）。
+
+        这两个来源的假阳性特征完全不同：代理说的是「价格走出来了」，资讯说的是
+        「消息面要求谨慎，而价格未必走出来」。混成一句会让读者以为每个高波动日都有
+        消息佐证，或者反过来以为消息面判断都能在价格上看见。
+        """
+        result = concluded_payload(regime="high_vol", with_record=False)
+        result["cycle"] = "bull"
+        result["volatility"] = "event_spike"
+        result["volatility_source"] = "news_escalation"
+        body = report._section_today(result, None, SYMBOL)
+
+        self.assertIn("资讯抬升置上", body)
+        # 文案里为了**区分**会提到「价格代理本身没判出事件」，所以不能断言这个词不出现
+        # ——那会逼着文案写得更含糊。真正要钉的是「没有把它说成代理那条路」：
+        # 代理那一句的判据是「没有消息面确认」，而这里恰恰是消息面说的。
+        self.assertNotIn("没有消息面确认", body)
+        self.assertNotIn("波动来源：价格代理", body)
+
     def test_a_legacy_projection_source_is_not_dressed_up_as_a_judgement(self):
         """迁移回填的行必须被说成「映射值」，不能被读成「判出来的」。"""
         result = concluded_payload(regime="high_vol", with_record=False)

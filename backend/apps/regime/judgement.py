@@ -126,7 +126,7 @@ from apps.regime.models import (
 )
 from apps.regime.news_verdict import run_news_judgement
 from apps.regime import quant
-from apps.regime.quant import PRIORITY, BaseRegime, latest_label, project_to_axes
+from apps.regime.quant import PRIORITY, BaseRegime, latest_label
 
 logger = logging.getLogger(__name__)
 
@@ -514,8 +514,10 @@ def build_evidence(label, decision: dict) -> dict:
       全部照落——**「那天为什么判 event_spike」必须能在这条记录里答上**，而不是靠事后
       重跑一遍（重跑会用到今天的参数，而当时是哪套参数已经不可知）。
 
-    `volatility_source` 与两维并列出现：它说明这一格的波动结论**是怎么来的**（价格
-    代理 / 迁移映射 / 旧版投影）。代理会有假阳性，读的人必须先看到这句话。
+    `volatility_source` 与两维并列出现：它说明这一格的波动结论**是怎么来的**。
+    这里只写**量化判据**的来处（`proxy` = 价格代理）：资讯抬升改的是记录列上的
+    `volatility`（见 `run_daily_judgement`），而 `evidence["quant"]` 记的是**量化原始
+    输出**——两者不同源是刻意的，抬升那句「为什么今天高波动」由 `escalation` 字段回答。
 
     所以「两维说 bear、四档说 high_vol」是同一条记录里的**两条独立证据**，不是矛盾。
     """
@@ -527,7 +529,10 @@ def build_evidence(label, decision: dict) -> dict:
             # 只有「今天判不出来」时它们才是 None。
             "cycle": cycle.value if cycle is not None else None,
             "volatility": volatility.value if volatility is not None else None,
-            # 来源：`proxy` = 价格代理判出来的（#65）。空表示这一行没有波动结论。
+            # 来源：`proxy` = 价格代理**判**出来的（#65）。空表示这一行没有波动结论。
+            # 注意这里跟的是 `label.volatility`（量化原始输出），**不含资讯抬升**：
+            # 抬升是另一根轴的输入，它改的是记录列 `volatility`，不该被记成「价格
+            # 代理判出了事件波动」——那是两件不同的事，混起来归因就断了。
             "volatility_source": quant.VOLATILITY_SOURCE_PROXY
             if volatility is not None
             else None,
@@ -688,31 +693,30 @@ def run_daily_judgement(
 
     # 资讯抬升**只设波动维、不动周期维**（#65）。旧实现返回四档 HIGH_VOL，那是一个
     # 「有波动就没有方向」的取值，于是资讯说一句「谨慎」就把那天的 cycle 抹掉了。
+    # 来源要先算：抬升会不会**改变**波动维，决定了这一列的来处是「价格代理判出来的」
+    # 还是「资讯置上去的」。两者都写 `proxy` 的话，#67 要回答的那个问题
+    # （「今天的高波动来自价格代理还是消息面」）就永远答不上来。
     axes_cycle, axes_volatility = apply_escalation_axes(
         axes_cycle, axes_volatility, escalation
     )
+    volatility_source = _volatility_source(label.volatility, axes_volatility)
     # 生效阶段（四档）现在**从两维派生**：保命档 ⟺ volatility 是 event_spike。
     # 这样 `effective_regime == high_vol` 与 `volatility == event_spike` 在结构上是
     # 同一句话，不会再出现「四档说保命档、波动维说没事」这种互相打脸的记录。
     effective_regime = volatility_to_base(axes_volatility) or base
 
-    # 两维的来源在 #64 之后**分开了**，这是本票与 #63 最大的一处不同：
+    # **不要再在这里从 `base` 投影两维**（#65）：`project_to_axes(base)` 会把
+    # 上面刚判出来、刚被资讯抬升过的波动维整个覆盖掉——
     #
-    # - `volatility` 仍是**投影**：它由 `base_regime` 派生（#65 才会改成独立判定）。
-    # - `cycle` 现在是**判出来的**：`label.cycle` 走自己的两条路径，与四档无关。
-    #   拿 `project_to_axes(base)` 去顶替它，等于把「缓慢阴跌」重新按四档兜底成
-    #   sideways——那正是本票要解决的缺陷，会在写入路径上被悄悄装回去。
+    #   - 抬升日（`base=uptrend` + news）：`effective_regime` 是 `high_vol`，而落库的
+    #     `volatility` 会被投影成 `normal`，记录自己打自己的脸；
+    #   - min_dwell 沿用日遇事件：同上；
+    #   - 反过来，事件消失而 `base` 仍停在 `high_vol` 时，投影会写入 `event_spike`，
+    #     而 `evidence["quant"]["volatility"]`（取自 `label.volatility`）写的是 `normal`
+    #     ——同一条记录里两处波动态互相矛盾。
     #
-    # `base_regime` 与 `cycle` 因此**允许不一致**，且不一致是有意义的：
-    #   base=high_vol（波动吃掉了周期）+ cycle=bear（周期维独立看见了方向）。
-    # 这正是 ADR 0007 要的「两维并存、互不覆盖」，也是 #65 落地后唯一正确的形状。
-    #
-    # 但 `cycle` 仍跟随**采纳后的** `base` 走持续期语义吗？不：只要今天判定就绪，
-    # `label.cycle` 就是今天的事实。持续期约束的是「四档要不要改口」（保命档与机制
-    # 停用看的是它），而周期维是描述性的，它不需要防抖——把它也冻住只会让周期的
-    # 描述比行情慢一拍，且没有任何调用方依赖那份滞后。
-    axes_cycle = label.cycle
-    axes_volatility = project_to_axes(base)[1]
+    # 两维是**判出来的**，不是四档的影子：写入路径只认 `label.*` 与
+    # `apply_escalation_axes` 的结果。投影只服务于兼容读面与历史迁移回填。
     record, created = _record_once(
         symbol=symbol,
         attribute_date=attribute_date,
@@ -722,6 +726,7 @@ def run_daily_judgement(
         effective_regime=effective_regime,
         cycle=axes_cycle,
         volatility=axes_volatility,
+        volatility_source=volatility_source,
         evidence=build_evidence(
             label,
             {
@@ -747,9 +752,7 @@ def run_daily_judgement(
         # 波动维的**判据来源**（#65）：`proxy` = 事件驱动价格代理判出来的。
         # 日报要拿它说清「今天的高波动来自价格代理，没有消息面确认」——代理会
         # 有假阳性，不标注的话读者会以为每个高波动日都有新闻佐证。
-        "volatility_source": quant.VOLATILITY_SOURCE_PROXY
-        if axes_volatility is not None
-        else None,
+        "volatility_source": volatility_source,
         "decision": _DECISION_CARRIED if reason else _DECISION_ADOPTED,
         "reason": reason,
         "recorded": created,
@@ -757,6 +760,30 @@ def run_daily_judgement(
     if created:
         logger.info("[regime] 判定落库 %s", result)
     return result
+
+
+def _volatility_source(
+    judged: quant.Volatility | None, final: quant.Volatility | None
+) -> str | None:
+    """波动维落库时的**判据来源**（#65）。
+
+    三件事决定了这一列该写什么：
+
+    1. **没有波动结论**（`final is None`）⇒ 空。别把 `proxy` 写在一格空结论上。
+    2. **最终值与量化判定不同** ⇒ 它是被**资讯抬升**置上去的，写 `news_escalation`。
+       代理没判出事件，是消息面说「进入风险状态」——这两件事的假阳性特征完全不同，
+       混成一个 `proxy` 之后，#67 那句「本次高波动来自价格代理还是消息面」就答不上来了。
+    3. 否则 ⇒ `proxy`：波动维由事件驱动价格代理判出来。
+
+    `final` 与 `judged` 相等时**仍然**写 `proxy`，哪怕抬升标志也非空：抬升那天若代理
+    本来就已经判出事件，那这一格确实是代理的结论，抬升只是「恰好没有改变结果」。
+    归因要指向**实际产生这个取值的那条判据**，不是指向当时还开着的另一个开关。
+    """
+    if final is None:
+        return None
+    if judged is not final:
+        return quant.VOLATILITY_SOURCE_NEWS
+    return quant.VOLATILITY_SOURCE_PROXY
 
 
 def _find_record(symbol: str, effective_at: datetime) -> RegimeJudgement | None:
@@ -825,9 +852,10 @@ def _record_once(**fields) -> tuple[RegimeJudgement, bool]:
                     "volatility": fields["volatility"].value
                     if fields["volatility"]
                     else None,
-                    "volatility_source": quant.VOLATILITY_SOURCE_PROXY
-                    if fields["volatility"]
-                    else None,
+                    # 来源由写入路径算好传进来（见 `_volatility_source`）：它要区分
+                    # 「价格代理判出来的」与「资讯抬升置上去的」，而这两者的判据在
+                    # `_record_once` 这里是看不见的（它只有最终取值）。
+                    "volatility_source": fields["volatility_source"],
                     "evidence": fields["evidence"],
                     "config_snapshot": config.full_snapshot(),
                     "news_ref": fields["news_ref"],
