@@ -98,6 +98,21 @@ _DISPLAY = {
     BaseRegime.RANGE: "箱体震荡",
 }
 
+#: 周期维的展示名。与 `BaseRegime` 同一约定：**取值是落库契约**，中文只在展示层出现。
+CYCLE_DISPLAY = {
+    "bull": "上行周期",
+    "bear": "下行周期",
+    "sideways": "横盘",
+    "unclear": "判不出周期",
+}
+
+#: 波动维的展示名。`normal` 说的是「没有事件波动」，不是「波动很低」——本版还没有
+#: 波动程度的判据，这个措辞必须让读的人不会把它当成结论。
+VOLATILITY_DISPLAY = {
+    "normal": "无事件波动",
+    "event_spike": "事件波动",
+}
+
 #: 判定优先级，高到低；`RANGE` 是兜底因而居末。改这个顺序等于改机制语义，不要顺手动。
 PRIORITY: tuple[BaseRegime, ...] = (
     BaseRegime.HIGH_VOL,
@@ -105,6 +120,131 @@ PRIORITY: tuple[BaseRegime, ...] = (
     BaseRegime.UPTREND,
     BaseRegime.RANGE,
 )
+
+
+class Cycle(str, Enum):
+    """**周期维**（慢变量）：往哪走。
+
+    与 `BaseRegime` 的关系是「新结构 / 旧兼容层」：本版仍由 `BaseRegime` 投影出这一维
+    （见 `project_to_axes`），所以四个取值里这一版只会出现三个——`UNCLEAR` 要等
+    #64 把横盘改成显式判定之后才会产出。先把它列进来，是因为枚举一旦落库就是契约，
+    取值集合必须一次定完；事后补一个取值等于一次数据迁移。
+    """
+
+    BULL = "bull"
+    BEAR = "bear"
+    SIDEWAYS = "sideways"
+    UNCLEAR = "unclear"
+
+    @property
+    def display(self) -> str:
+        """展示层的中文名。与 `BaseRegime.display` 同一约定：取值不动中文。"""
+        return CYCLE_DISPLAY[self.value]
+
+
+class Volatility(str, Enum):
+    """**波动维**（快变量叠加层）：此刻要不要保命。
+
+    只有两个取值，且**只有 `EVENT_SPIKE` 意味着叠加层生效**。它与周期维并存而不是
+    互斥——`bull + event_spike` 是牛市暴跌日，这正是把两维拆开的全部理由。
+
+    `NORMAL` 是「没有事件波动」，**不是**「波动很低」：本版还没有波动程度的判据，
+    把它读成「平静」会让 #65 落地前的每一条 `NORMAL` 都被当成结论。
+    """
+
+    NORMAL = "normal"
+    EVENT_SPIKE = "event_spike"
+
+    @property
+    def display(self) -> str:
+        return VOLATILITY_DISPLAY[self.value]
+
+
+#: `volatility_source` 的取值。**取值即落库契约**，改名等于让新旧行出现两套口径。
+#:
+#: - `legacy_mapping`：迁移按 `base_regime` 回填的历史行（#63）。那不是判据，是投影。
+#: - `compatible_projection`：本版新写入的行。两维目前仍由四档投影而来，所以它与历史行
+#:   **同样是投影**，只是发生在写入时而不是迁移时。分开标是为了让「那天的高波动是判出来
+#:   的还是映射来的」答得上——#65 引入事件代理之后会写 `proxy`，届时三者必须可区分。
+VOLATILITY_SOURCE_LEGACY = "legacy_mapping"
+VOLATILITY_SOURCE_PROJECTION = "compatible_projection"
+
+#: 四档 → 两维。**唯一一处投影表**，两个方向都从它派生（反向表由它生成，不另写一份）。
+#:
+#: `high_vol` 的 cycle 是 `None` 而不是某个猜出来的方向：旧结构里 HIGH_VOL 排在
+#: `PRIORITY` 第一位，那天的周期信息**在判据里就不存在**。如实留空是本票的硬要求
+#: （issue #63：「旧结构里波动吃掉了周期，如实留空而不是编一个」）。
+_TO_AXES: Mapping[BaseRegime, tuple[Cycle | None, Volatility]] = {
+    BaseRegime.UPTREND: (Cycle.BULL, Volatility.NORMAL),
+    BaseRegime.DOWNTREND: (Cycle.BEAR, Volatility.NORMAL),
+    BaseRegime.RANGE: (Cycle.SIDEWAYS, Volatility.NORMAL),
+    BaseRegime.HIGH_VOL: (None, Volatility.EVENT_SPIKE),
+}
+
+
+def project_to_axes(
+    regime: BaseRegime | None,
+) -> tuple[Cycle | None, Volatility | None]:
+    """四档 → `(cycle, volatility)`。未判定日（`None`）两维都是 `None`。
+
+    两维**同进退**：判不出来的日子不许出现「有一维、没另一维」的半截结论。填个
+    `sideways + normal` 就是拿一个安静的假结论去喂切片。
+    """
+    if regime is None:
+        return (None, None)
+    return _TO_AXES[regime]
+
+
+def project_to_base_axes(
+    cycle: Cycle | str | None, volatility: Volatility | str | None
+) -> BaseRegime | None:
+    """`(cycle, volatility)` → 四档。**还原不出来的组合必须抛**，不许猜。
+
+    这是反向投影，唯一用途是把两维读回本版既有的四档世界（读面兼容、历史回填校验）。
+    它有两处「还原不了」，各自抛而不是回落到某档：
+
+    - `cycle is None`（且有波动结论）：这正是 `high_vol` 的形状，还原得出来。
+      但 `cycle is None` 配 `normal` 还原不出来——没有方向、也没有事件波动，
+      旧四档里没有这一格。
+    - `bull`/`bear`/`sideways` 配 `event_spike`：旧四档表达不了「有方向又高波动」，
+      只能退回 `high_vol` 而丢掉方向。那正是这次要结束的状态，静默丢一维比抛更坏。
+
+    `UNCLEAR`（判不出来）还原成 `None`：两维都说了「说不出来」，与未判定同形。
+    """
+    if cycle is None and volatility is None:
+        # 两维同时为空 = 未判定（数据不够，还没有资格下结论）。这正是 `regime=None`
+        # 的形状，还原得出来，而且是**唯一**允许两维同空的组合。
+        return None
+
+    cycle = Cycle(cycle) if cycle is not None else None
+    volatility = Volatility(volatility) if volatility is not None else None
+
+    if volatility is None:
+        # 只有一维为空是半截数据：那不是「某种状态」，是写入路径漏了一半。
+        raise ValueError("缺少波动维，无法还原四档——两维必须同时存在或同时为空")
+    if cycle is None:
+        if volatility is Volatility.EVENT_SPIKE:
+            return BaseRegime.HIGH_VOL
+        raise ValueError("cycle 为空且波动正常：旧四档里没有这一格")
+    if cycle is Cycle.UNCLEAR:
+        if volatility is Volatility.EVENT_SPIKE:
+            # 判不出方向 + 事件波动：旧结构里这天就是 high_vol。
+            return BaseRegime.HIGH_VOL
+        return None
+    if volatility is Volatility.EVENT_SPIKE:
+        raise ValueError(
+            f"{cycle.value} + event_spike 还原不了四档：旧结构表达不了「有方向又高波动」，"
+            "静默丢掉方向比报错更坏"
+        )
+    for regime, (mapped_cycle, mapped_vol) in _TO_AXES.items():
+        if mapped_cycle is cycle and mapped_vol is volatility:
+            return regime
+    raise ValueError(f"没有对应的四档：cycle={cycle}, volatility={volatility}")
+
+
+def project_to_base(label: "DayLabel") -> BaseRegime | None:
+    """一条标签 → 四档。`label_series` 的兼容投影，逐日等于是本票的验收判据。"""
+    return project_to_base_axes(label.cycle, label.volatility)
 
 
 @dataclass(frozen=True)
@@ -167,6 +307,12 @@ class DayLabel:
     date: date
     regime: BaseRegime | None
     metrics: DayMetrics
+
+    #: 两维（#63）。本版由 `regime` 投影而来，不是第二套判据——见 `project_to_axes`。
+    #: `cycle` 在 `high_vol` 那天是 `None`（旧结构里波动吃掉了周期，如实留空）。
+    #: 未判定日两维**同时**是 `None`。
+    cycle: "Cycle | None"
+    volatility: "Volatility | None"
 
     # 波动轴
     atr: float | None
@@ -456,10 +602,14 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
         and metrics.ema_slope is not None
         and metrics.separation is not None
     )
+    regime = _classify(metrics, params) if ready else None
+    cycle, volatility = project_to_axes(regime)
     return DayLabel(
         date=metrics.date,
-        regime=_classify(metrics, params) if ready else None,
+        regime=regime,
         metrics=metrics,
+        cycle=cycle,
+        volatility=volatility,
         atr=metrics.atr,
         atr_pct=metrics.atr_pct,
         atr_pct_rank=metrics.atr_pct_rank,

@@ -36,7 +36,7 @@ from django.db import models
 
 from apps.common.time_utils import business_day_start, business_tz
 from apps.regime.config import JUDGEMENT_LIFECYCLE, NewsSourceKind
-from apps.regime.quant import BaseRegime
+from apps.regime.quant import BaseRegime, Cycle, Volatility
 
 # 必须与下面 DecimalField 的 decimal_places 一致：写入方按这个精度量化后再落库，
 # 否则「刚从交易所解析出的值」与「从库里读回的值」不相等，幂等同步会每次运行都
@@ -254,6 +254,46 @@ class RegimeJudgement(models.Model):
         "生效阶段（基础阶段被抬升后的值）",
         max_length=16,
         choices=[(m.value, m.display) for m in BaseRegime],
+    )
+
+    # -- 两维（#63） -------------------------------------------------------- #
+    #
+    # 三列都可空：存量行是在这两列存在**之前**写下的，它们当时的世界里没有这两个维度。
+    # 迁移会把它们按 `base_regime` 回填并标 `legacy_mapping`，但那是**投影**不是判据
+    # ——回填出来的值与今后真正由两维判出来的值必须能分辨，否则「历史里那条高波动是
+    # 判出来的还是映射来的」永远答不上来。
+    #
+    # `cycle` 允许为 NULL **不只是兼容**：`high_vol` 那天的周期信息在旧判据里根本不
+    # 存在（HIGH_VOL 排 PRIORITY 第一位，波动吃掉了周期）。消费方必须容忍 NULL，
+    # 而不是拿它当「横盘」或「还没算」。
+    cycle = models.CharField(
+        "周期维（bull / bear / sideways / unclear）",
+        max_length=16,
+        choices=[(c.value, c.display) for c in Cycle],
+        null=True,
+        blank=True,
+    )
+    volatility = models.CharField(
+        "波动维（normal / event_spike，叠加层）",
+        max_length=16,
+        choices=[(v.value, v.display) for v in Volatility],
+        null=True,
+        blank=True,
+    )
+    #: 判据来源。**可空**，与另两列一致（issue #63：「迁移加三列，可空以兼容旧行」）。
+    #:
+    #: 为什么可空而不是 NOT NULL + `db_default`：两者都让「旧代码忽略新列」跑得通，
+    #: 但可空严格符合需求的字面要求，也少一层「`''` 与 NULL 谁表达缺失」的含混。
+    #: 回滚时旧代码的 `INSERT` 不写这一列，留 NULL 即可——它不需要任何数据库默认值。
+    #:
+    #: 取值见 `quant.VOLATILITY_SOURCE_*`：`legacy_mapping`（迁移回填）、
+    #: `compatible_projection`（本版写入）、将来的 `proxy`（#65）。
+    volatility_source = models.CharField(
+        "波动维判据来源（legacy_mapping / proxy / …）",
+        max_length=32,
+        null=True,
+        blank=True,
+        default="",
     )
 
     evidence = models.JSONField(

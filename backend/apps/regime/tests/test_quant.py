@@ -633,6 +633,288 @@ class TestSeriesShape(SimpleTestCase):
         self.assertIsNone(latest_label([]))
 
 
+class TestTwoAxesAreProjectedFromOneVerdict(SimpleTestCase):
+    """两维（cycle / volatility）与四档的**兼容投影**。
+
+    这一版不改判定结论：`label_series` 仍只算出 `BaseRegime`。两维是由那个结论**投影**
+    出来的，所以「把两维投影回四档」必须与 `label_series` 逐日相等——这是本票唯一的
+    等价性约束（#63）。
+
+    投影为什么是这个形状，逐条都有来处：
+
+    - `high_vol` → `cycle = None`。旧结构里波动吃掉了周期（HIGH_VOL 排 `PRIORITY`
+      第一位），那天的周期信息**本来就不存在**。如实留空，而不是从价格里再猜一个。
+    - `range` → `sideways`。旧口径的 range 是兜底档，它现在的语义就是「横盘」。
+    - 只有 `high_vol` 才是 `event_spike`。不是因为它是事件驱动的（本版还不是），
+      而是因为「投影回四档」必须能还原：若把 range 也标成 event_spike，投影就回不去。
+    """
+
+    def test_a_judged_day_always_carries_the_volatility_axis(self):
+        """判得出的日子**波动维必有值**；周期维可以合规地留空（见下一条）。
+
+        两条轴的不对称是 issue #63 明确要求的：`high_vol` 那天的周期信息在旧判据里
+        根本不存在，所以留 `None` 是如实，不是缺失。
+        """
+        labels = label_series(candles(RAMP), PARAMS)
+
+        for label in labels:
+            if not label.judged:
+                continue
+            with self.subTest(day=label.date):
+                self.assertIsNotNone(label.volatility)
+
+    def test_an_unjudged_day_carries_no_axes(self):
+        """判不出来的日子两维都是 `None`：与 `regime` 同进退，不填默认值。
+
+        填 `sideways + normal` 就是拿一个安静的假结论去喂切片——那正是本模块在防的。
+        """
+        labels = label_series(candles(RAMP), PARAMS)
+
+        for label in labels:
+            if label.judged:
+                continue
+            with self.subTest(day=label.date):
+                self.assertIsNone(label.regime)
+                self.assertIsNone(label.cycle)
+                self.assertIsNone(label.volatility)
+
+    def test_the_projection_round_trips_to_the_four_tiers(self):
+        """本票的核心断言：投影回四档必须逐日等于 `label_series` 的输出。
+
+        覆盖全部五组夹具——四档里除了 uptrend / downtrend / range，还有 high_vol，
+        而 high_vol 恰恰是「cycle 留空」的那一支，只测其中三档会漏掉它。
+        """
+        fixtures = {
+            "ramp": candles(RAMP),
+            "down_calming": candles(DOWN_CALMING),
+            "steady_down": candles(STEADY_DOWN),
+            "tiny_drift": candles(TINY_DRIFT),
+            "quiet_then_spike": candles(QUIET_THEN_SPIKE, bands=[1.0] * 15 + [30.0]),
+        }
+        for name, rows in fixtures.items():
+            with self.subTest(fixture=name):
+                labels = label_series(rows, PARAMS)
+                projected = [quant.project_to_base(label) for label in labels]
+                self.assertEqual(projected, [label.regime for label in labels])
+
+    def test_high_vol_leaves_the_cycle_axis_empty(self):
+        """旧结构里波动吃掉了周期，所以那天的周期**真的没有**结论。
+
+        从价格再猜一个 `bull`/`bear` 会让「那天是牛市暴跌」变成一句编出来的话：
+        本版没有独立的周期判据，猜出来的那个数与 `regime` 出自同一个判据，等于
+        把一趟结论说成两趟。
+        """
+        label = label_series(candles(STEADY_DOWN), PARAMS)[-1]
+
+        self.assertIs(label.regime, BaseRegime.HIGH_VOL)
+        self.assertIsNone(label.cycle)
+        self.assertIs(label.volatility, quant.Volatility.EVENT_SPIKE)
+        self.assertIs(quant.project_to_base(label), BaseRegime.HIGH_VOL)
+
+    def test_the_other_three_tiers_map_one_to_one(self):
+        expected = {
+            BaseRegime.UPTREND: (quant.Cycle.BULL, quant.Volatility.NORMAL),
+            BaseRegime.DOWNTREND: (quant.Cycle.BEAR, quant.Volatility.NORMAL),
+            BaseRegime.RANGE: (quant.Cycle.SIDEWAYS, quant.Volatility.NORMAL),
+        }
+        for regime, (cycle, volatility) in expected.items():
+            with self.subTest(regime=regime.value):
+                pair = quant.project_to_axes(regime)
+                self.assertEqual(pair, (cycle, volatility))
+                self.assertIs(quant.project_to_base_axes(cycle, volatility), regime)
+
+    def test_unclear_is_a_cycle_value_and_projects_to_nothing(self):
+        """`unclear` 是 cycle 的取值（判不出来），与 `None` 不是一回事：
+
+        `None` = 这一版没有周期结论（high_vol 吃掉了）；`unclear` = 有周期判定但判不出来。
+        本版还不产出 `unclear`（#64 才引入），但投影表必须先认它，否则 #64 落地时
+        这里会成为一处静默的 KeyError。
+        """
+        self.assertIn("unclear", {c.value for c in quant.Cycle})
+        self.assertIsNone(
+            quant.project_to_base_axes(quant.Cycle.UNCLEAR, quant.Volatility.NORMAL)
+        )
+
+    def test_projection_refuses_a_combination_it_cannot_restore(self):
+        """`bull + event_spike` 投影回四档是**不可还原**的，必须拒绝而不是猜。
+
+        两维并存是本结构的目的（牛市暴跌日是合法状态），但旧四档表达不了它。投影函数
+        的职责是「还原」，所以它在这里必须说「还原不了」，而不是悄悄丢掉一维。
+        """
+        with self.assertRaises(ValueError):
+            quant.project_to_base_axes(quant.Cycle.BULL, quant.Volatility.EVENT_SPIKE)
+
+
+class TestProjectionEquivalenceOnBulkHistory(SimpleTestCase):
+    """**全量历史**的投影等价：随机与极端输入下，两维都必须能投影回原四档。
+
+    `test_the_projection_round_trips_to_the_four_tiers` 只覆盖五组人工夹具；本组把
+    输入扩到几千条随机游走 + 四档各自的极端参数，钉的是「没有哪一类输入会让投影失真」。
+
+    这也是 issue #63 那句「跑一遍全量历史，两维投影回四档与原 `label_series` 逐日相等」
+    在没有生产库（本机 `DailyCandle` 为 0 行）时的可执行形态：等价性是**逐日**成立的，
+    而它成立的原因与具体哪天无关——所以用大批随机历史的逐日断言代替一次全量落库扫描，
+    两者证的是同一件事。
+    """
+
+    def _round_trip_every_day(self, rows, params):
+        labels = label_series(rows, params)
+        projected = [quant.project_to_base(label) for label in labels]
+        self.assertEqual(
+            projected,
+            [label.regime for label in labels],
+            f"{len(rows)} 根日线里出现了一天投影不回原档",
+        )
+        # 同时钉两维与四档的**同进退**：判得出的日子波动维必有值。
+        for label in labels:
+            if label.judged:
+                self.assertIsNotNone(label.volatility)
+
+    def test_a_long_random_walk_round_trips_every_day(self):
+        rng = np.random.default_rng(20261123)
+        closes = [100.0]
+        for _ in range(1200):
+            closes.append(max(1.0, closes[-1] * (1.0 + rng.normal(0, 0.03))))
+        # 振幅随价格漂移：让 ATR% 分位真的动起来，四档都会出现。
+        bands = [abs(rng.normal(0.02, 0.02)) + 0.001 for _ in closes]
+        self._round_trip_every_day(candles(closes, bands), PARAMS)
+
+    def test_every_tier_appears_in_that_history(self):
+        """前提检查：上面那条随机游走必须**真的产生四档**。
+
+        少了这条，上一行可能只是在「全是 range」的历史上通过了——那样的等价性是平凡
+        成立的，不证明任何事。
+        """
+        rng = np.random.default_rng(20261123)
+        closes = [100.0]
+        for _ in range(1200):
+            closes.append(max(1.0, closes[-1] * (1.0 + rng.normal(0, 0.03))))
+        bands = [abs(rng.normal(0.02, 0.02)) + 0.001 for _ in closes]
+        seen = {lb.regime for lb in label_series(candles(closes, bands), PARAMS)}
+
+        self.assertEqual(
+            seen - {None},
+            {
+                BaseRegime.UPTREND,
+                BaseRegime.DOWNTREND,
+                BaseRegime.RANGE,
+                BaseRegime.HIGH_VOL,
+            },
+            "夹具必须真的覆盖四档，否则等价性断言是空转的（`None` 是预热期，另算）",
+        )
+
+    def test_the_four_extreme_regimes_round_trip_under_every_parameter_set(self):
+        """四档各自的最短触发路径，在几组真实参数下都要往返相等。"""
+        variants = [
+            PARAMS,
+            replace(PARAMS, trend_separation_min_atr=0.15),
+            replace(PARAMS, high_vol_quantile=0.6),
+            replace(PARAMS, quantile_window_days=12),
+        ]
+        fixtures = {
+            "uptrend": candles(RAMP),
+            "downtrend": candles(DOWN_CALMING),
+            "high_vol": candles(STEADY_DOWN),
+            "range": candles(TINY_DRIFT),
+        }
+        for params in variants:
+            for name, rows in fixtures.items():
+                with self.subTest(params=params, fixture=name):
+                    self._round_trip_every_day(rows, params)
+
+    def test_empty_and_single_row_inputs_round_trip(self):
+        for rows in ([], candles([100.0])):
+            with self.subTest(n=len(rows)):
+                self._round_trip_every_day(rows, PARAMS)
+
+
+class TestProjectionBoundaries(SimpleTestCase):
+    """`project_to_base_axes` 的边界格。每一格都是一种「还原得出来 / 还原不出来」。"""
+
+    def test_unclear_with_an_event_spike_is_high_vol(self):
+        """判不出方向 + 事件波动 = 旧结构里的 `high_vol`（那天就是波动吃掉了周期）。"""
+        self.assertIs(
+            quant.project_to_base_axes(
+                quant.Cycle.UNCLEAR, quant.Volatility.EVENT_SPIKE
+            ),
+            BaseRegime.HIGH_VOL,
+        )
+
+    def test_an_empty_cycle_with_normal_volatility_cannot_be_restored(self):
+        """没有方向、也没有事件波动——旧四档里没有这一格，必须抛而不是猜。"""
+        with self.assertRaises(ValueError):
+            quant.project_to_base_axes(None, quant.Volatility.NORMAL)
+
+    def test_a_missing_volatility_axis_cannot_be_restored(self):
+        """**只有一维**是半截数据：那不是「某种状态」，是写入路径漏了一半。
+
+        `cycle=None` 不在这一组里：它与 `volatility=None` 同空时是合法的「未判定」，
+        由 `test_both_empty_is_the_undecided_day` 单独钉住。两维同空与「缺一维」的
+        区别正是这一格要守的线。
+        """
+        for cycle in (quant.Cycle.BULL, quant.Cycle.BEAR, quant.Cycle.SIDEWAYS):
+            with self.subTest(cycle=cycle):
+                with self.assertRaises(ValueError):
+                    quant.project_to_base_axes(cycle, None)
+
+    def test_both_empty_is_the_undecided_day(self):
+        """两维同空 = 未判定，还原成 `None`。这是唯一允许两维同空的组合。"""
+        self.assertIsNone(quant.project_to_base_axes(None, None))
+
+    def test_string_inputs_are_accepted(self):
+        """读面与迁移传的是字符串而非枚举值，投影必须认。"""
+        self.assertIs(
+            quant.project_to_base_axes("bear", "normal"), BaseRegime.DOWNTREND
+        )
+
+
+class TestMigrationBackfillTableIsInSync(SimpleTestCase):
+    """迁移 0018 的回填表必须与 `quant._TO_AXES` 一致。
+
+    迁移刻意**不 import** 应用代码（那样历史迁移会随代码漂移），所以它自带一份表。
+    重复是刻意的，但两份漂开就是静默的错：新写入的行按 `_TO_AXES` 投影，历史行按
+    迁移表回填，两者不一致时同一档会得到两个两维，而两边看起来都正常。
+
+    这条护栏只比较两张表、不碰数据库——所以它能看见「迁移在测试库里从未被执行」
+    这件事（测试库按 models 建表，RunPython 不跑）。
+    """
+
+    def _mapping(self):
+        """把迁移模块里的回填表取出来。
+
+        直接 `import` 模块文件而不是 `apps.get_model`：要读的是那份**常量表**，
+        不是模型。模块级只 import `django.db`，import 它不会碰数据库。
+        """
+        import importlib
+
+        module = importlib.import_module(
+            "apps.regime.migrations.0018_two_axis_cycle_volatility"
+        )
+        return module._LEGACY_MAPPING, module.LEGACY_SOURCE
+
+    def test_the_two_tables_agree(self):
+        mapping, _ = self._mapping()
+
+        from apps.regime.quant import _TO_AXES
+
+        self.assertEqual(
+            {
+                regime.value: (c.value if c else None, v.value)
+                for regime, (c, v) in _TO_AXES.items()
+            },
+            mapping,
+            "迁移回填表与 quant._TO_AXES 漂开了：历史行与新行会对同一档给出不同的两维",
+        )
+
+    def test_the_legacy_source_constant_matches_the_code(self):
+        """`legacy_mapping` 这个字面量在两处必须相同，否则读的人分不清来源。"""
+        _, source = self._mapping()
+
+        from apps.regime.quant import VOLATILITY_SOURCE_LEGACY
+
+        self.assertEqual(source, VOLATILITY_SOURCE_LEGACY)
+
+
 class TestPercentileRank(SimpleTestCase):
     """分位是整套阈值的标定基准，所以它的口径本身就是规格。"""
 

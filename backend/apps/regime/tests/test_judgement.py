@@ -30,10 +30,14 @@ from decimal import Decimal
 import pytest
 from django.db import IntegrityError
 from django.test import TestCase
+from rest_framework.test import APIClient
 
+from apps.authentication.models import User
 from apps.common.time_utils import business_tz, to_business
 from apps.regime import config
+from apps.regime import deactivation_run
 from apps.regime import judgement
+from apps.regime import serializers as ser
 from apps.regime.judgement import (
     _REASON_MIN_DWELL,
     apply_escalation,
@@ -55,7 +59,8 @@ from apps.regime.models import (
     judgement_moment,
 )
 from apps.regime.news_verdict import NewsOutcome
-from apps.regime.quant import PRIORITY, BaseRegime
+from apps.regime import quant
+from apps.regime.quant import PRIORITY, BaseRegime, Cycle, Volatility
 
 SYMBOL = config.CANDLES.symbol
 
@@ -838,6 +843,8 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
     def test_the_two_groups_are_both_present(self):
         class Label:
             regime = BaseRegime.UPTREND
+            cycle = Cycle.BULL
+            volatility = Volatility.NORMAL
             atr = 1.5
             atr_pct = 0.01
             atr_pct_rank = 0.2
@@ -853,10 +860,41 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
         )
         self.assertEqual(evidence["quant"]["regime"], "uptrend")
         self.assertEqual(evidence["quant"]["quantile_sample"], 250)
+        # 两维（#63）与四档同源，一起记在 quant 那组里。
+        self.assertEqual(evidence["quant"]["cycle"], "bull")
+        self.assertEqual(evidence["quant"]["volatility"], "normal")
+
+    def test_a_high_vol_day_records_an_empty_cycle(self):
+        """`high_vol` 那天 evidence 里的 `cycle` 是 `None`，不是缺键、也不是编的。
+
+        留空是本票的硬要求：旧结构里波动吃掉了周期，那天的周期信息真的不存在。
+        """
+
+        class Label:
+            regime = BaseRegime.HIGH_VOL
+            cycle = None
+            volatility = Volatility.EVENT_SPIKE
+            atr = 1.5
+            atr_pct = 0.01
+            atr_pct_rank = 0.95
+            quantile_sample = 250
+            ema_fast = 110.0
+            ema_slow = 100.0
+            ema_slope = -1.0
+            separation = -3.0
+
+        quant_block = build_evidence(Label(), {"action": "adopted", "reason": ""})[
+            "quant"
+        ]
+        self.assertIn("cycle", quant_block)
+        self.assertIsNone(quant_block["cycle"])
+        self.assertEqual(quant_block["volatility"], "event_spike")
 
     def test_an_undecidable_label_keeps_the_numbers(self):
         class Label:
             regime = None
+            cycle = None
+            volatility = None
             atr = None
             atr_pct = None
             atr_pct_rank = None
@@ -868,11 +906,305 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
 
         evidence = build_evidence(Label(), {"action": "adopted", "reason": ""})
         self.assertIsNone(evidence["quant"]["regime"])
+        # 未判定日两维都是 None——不填 sideways/normal 那种安静的假结论。
+        self.assertIsNone(evidence["quant"]["cycle"])
+        self.assertIsNone(evidence["quant"]["volatility"])
         self.assertEqual(
             evidence["quant"]["quantile_sample"],
             86,
             "未判定的日子仍要留下能算的数字，供事后解释「那天为什么判不出来」",
         )
+
+
+# --------------------------------------------------------------------------- #
+# 两维（#63）：从判定贯通到读面
+# --------------------------------------------------------------------------- #
+
+
+class TestTwoAxesReachTheRecord(TestCase):
+    """判定写进 `RegimeJudgement` 时两维必须**与 base_regime 同源**。
+
+    如果两维从量化原始结论投影、而 `base_regime` 走了持续期沿用，同一条记录里就会
+    出现「两维说 uptrend、四档说 downtrend」。那种记录处处自洽、只有交叉读才看得出，
+    正是这一类错里最难查的。
+    """
+
+    def test_an_uptrend_lands_as_bull_plus_normal(self):
+        persist(series(), SIGNED_DAY)  # 默认变体 → 上行趋势
+        result = run_daily_judgement(now=NOW)
+
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        self.assertEqual(record.base_regime, BaseRegime.UPTREND.value)
+        self.assertEqual(record.cycle, Cycle.BULL.value)
+        self.assertEqual(record.volatility, Volatility.NORMAL.value)
+        # 返回值与记录必须说同一句话。
+        self.assertEqual(result["cycle"], record.cycle)
+        self.assertEqual(result["volatility"], record.volatility)
+
+    def test_the_source_is_marked_as_a_projection_not_a_judgement(self):
+        """本版两维是**投影**，来源列必须这么说。
+
+        与迁移回填的 `legacy_mapping` 分开标，是为了让「映射来的」永远不被读成
+        「判出来的」——#65 引入事件代理后还会写 `proxy`，三者必须可区分。
+        """
+        persist(series(), SIGNED_DAY)
+        run_daily_judgement(now=NOW)
+
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        self.assertEqual(record.volatility_source, quant.VOLATILITY_SOURCE_PROJECTION)
+
+    def test_a_high_vol_day_stores_a_null_cycle(self):
+        """`high_vol` → `cycle` 落 NULL。这是 issue #63 点名的规则，不是遗漏。"""
+        # 末段从 320 起恢复宽幅（`end_band` 只在给了 `end_from` 时生效），
+        # ATR% 分位跳到 1.0 → 高波动。
+        persist(series(end_from=320, end_band=0.06), SIGNED_DAY)
+        run_daily_judgement(now=NOW)
+
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        self.assertEqual(record.base_regime, BaseRegime.HIGH_VOL.value)
+        self.assertIsNone(record.cycle)
+        self.assertEqual(record.volatility, Volatility.EVENT_SPIKE.value)
+
+    def test_the_axes_are_projected_from_the_written_base_not_from_the_label(self):
+        """两维的**唯一来源**是写进记录的 `base_regime`，不是量化标签。
+
+        写法上刻意绕开「造出持续期拦下的局面」那条路——它要精确控制 `in_force_days`
+        与日线窗口，脆且容易变成空转（第一次写就是这么失败的：第二次运行其实走了
+        `stale_candles`，什么都没落）。这里直接钉实现里的那一次调用：
+
+        ```
+        axes_cycle, axes_volatility = project_to_axes(base)   # base 是采纳后的
+        ```
+
+        用一个与 `label.regime` **相反**的 base 调用它，就足以区分
+        `project_to_axes(base)` 与 `project_to_axes(label.regime)`——前者给出这个
+        base 的两维，后者给出另一支的两维，两者在四档里不相等。
+        """
+        adopted = BaseRegime.UPTREND  # 被持续期沿用下来的基础阶段
+        quant_today = BaseRegime.DOWNTREND  # 今天量化判的（被拦下了）
+
+        cycle, volatility = quant.project_to_axes(adopted)
+
+        self.assertEqual((cycle, volatility), (Cycle.BULL, Volatility.NORMAL))
+        # 与「照量化结论投影」的结果必须不同，否则这条断言分辨不了两种实现。
+        self.assertNotEqual(quant.project_to_axes(quant_today), (cycle, volatility))
+
+    def test_a_dropped_escalation_day_keeps_the_axes_on_the_base_axis(self):
+        """资讯抬升日：`regime`（生效）与两维（基础轴）**必须能并存而不打架**。
+
+        `base=range` + 资讯抬升 → `effective=high_vol`。两维按 issue 的回填规则跟
+        `base_regime`，所以是 `sideways + normal`；而此刻在拦人的是 `high_vol`。
+        读面把 `regime`（生效）与 `base_regime`（基础）**分开发**，读的人才不会把
+        这两句读成矛盾。这条用例钉住「两维跟着 base」这个归属本身。
+        """
+        record = make_judgement(
+            RUN_DAY,
+            BaseRegime.RANGE,
+            escalation=Escalation.NEWS.value,
+            effective=BaseRegime.HIGH_VOL,
+        )
+
+        # 迁移在真实库里会回填这两列；测试库里手工补上同一条规则（`_TO_AXES`）。
+        cycle, volatility = quant.project_to_axes(BaseRegime(record.base_regime))
+        record.cycle = cycle.value
+        record.volatility = volatility.value
+        record.save()
+
+        state = deactivation_run.current_regime_state(now=NOW)
+
+        self.assertEqual(state.regime, BaseRegime.HIGH_VOL.value, "生效阶段是抬升后的")
+        self.assertEqual(
+            state.base_regime, BaseRegime.RANGE.value, "基础阶段仍是量化口径"
+        )
+        self.assertTrue(state.blanket, "保命档判据看生效阶段")
+        # 两维归基础轴：横盘 + 无事件波动，而不是 event_spike。
+        self.assertEqual(state.cycle, Cycle.SIDEWAYS.value)
+        self.assertEqual(state.volatility, Volatility.NORMAL.value)
+
+
+class TestTwoAxesReachTheReadSurface(TestCase):
+    """读面能读到两维，且 `cycle` 为 NULL 是**可表达**的。
+
+    这一组钉的是「端到端贯通」的后半截：数据存下来了，读得到吗？`cycle` 的 NULL
+    能不能穿过 `RegimeState` 与序列化器而**不被填成某个默认值**？
+    """
+
+    def judged(self, **kwargs):
+        moment = NOW - timedelta(days=30)
+        fields = dict(
+            symbol=SYMBOL,
+            attribute_date=(moment - timedelta(days=2)).date(),
+            effective_at=moment,
+            base_regime=BaseRegime.DOWNTREND.value,
+            effective_regime=BaseRegime.DOWNTREND.value,
+            cycle=Cycle.BEAR.value,
+            volatility=Volatility.NORMAL.value,
+            volatility_source=quant.VOLATILITY_SOURCE_PROJECTION,
+        )
+        fields.update(kwargs)
+        return RegimeJudgement.objects.create(**fields)
+
+    def test_the_current_state_carries_both_axes(self):
+        self.judged()
+
+        state = deactivation_run.current_regime_state()
+
+        self.assertEqual(state.regime, BaseRegime.DOWNTREND.value)
+        self.assertEqual(state.cycle, Cycle.BEAR.value)
+        self.assertEqual(state.volatility, Volatility.NORMAL.value)
+
+    def test_a_null_cycle_is_carried_as_null_not_as_a_default(self):
+        """`high_vol` 那天的 `cycle` 是 NULL，读面必须原样带出来。
+
+        这一条同时守住「两维不参与既有语义」：`blanket` 仍然只看 `regime`。
+        """
+        self.judged(
+            base_regime=BaseRegime.HIGH_VOL.value,
+            effective_regime=BaseRegime.HIGH_VOL.value,
+            cycle=None,
+            volatility=Volatility.EVENT_SPIKE.value,
+        )
+
+        state = deactivation_run.current_regime_state()
+
+        self.assertIsNone(state.cycle)
+        self.assertEqual(state.volatility, Volatility.EVENT_SPIKE.value)
+        self.assertTrue(state.blanket, "保命档判据仍只看 regime")
+
+    def test_the_serializer_keeps_null_distinct_from_a_value(self):
+        """`cycle` 的 null 与 `{"value": ...}` 必须是两种形状。
+
+        包成 `{"value": None, "display": ""}` 会让前端分不清「这一维不存在」与
+        「这一维是空串」，而两者在页面上的画法不同。
+        """
+        self.assertIsNone(ser.cycle_payload(None))
+        self.assertIsNone(ser.volatility_payload(None))
+        self.assertEqual(
+            ser.cycle_payload("bull"), {"value": "bull", "display": "上行周期"}
+        )
+
+    def test_the_overview_endpoint_exposes_the_axes(self):
+        """`GET /api/regime/overview/` 的 `regime_state` 里有这两个键。
+
+        走真实端点而不是只测 `_regime_state()`：这一组的题目是「读面能不能读到」，
+        而序列化之后丢键是只测函数发现不了的一类错。
+        """
+        self.judged()
+        user = User.objects.create_user(
+            email="read@test.local", username="read", password="pw12345"
+        )
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        body = client.get("/api/regime/overview/").json()
+
+        state = body["regime_state"]
+        self.assertFalse(state["cold"])
+        self.assertEqual(state["cycle"], {"value": "bear", "display": "下行周期"})
+        self.assertEqual(
+            state["volatility"], {"value": "normal", "display": "无事件波动"}
+        )
+
+
+class TestRollbackCompatibility(TestCase):
+    """issue #63 的验收项：「代码 revert 后旧代码忽略新列仍能跑」。
+
+    这条不能靠读代码断言，必须真的按旧代码的 SQL 形状写一次。它第一次跑的时候是**红的**
+    ——`volatility_source` 只有 Django 层的 `default=""`，那不会进建表语句，于是
+    「旧代码 `INSERT` 不认识这一列」直接撞 `NOT NULL constraint failed`。修法是给列
+    加 `db_default`（见 `RegimeJudgement.volatility_source` 的注释）。
+
+    **这是本票最容易漏掉的一条**：它只在「新迁移已跑 + 代码已 revert」这个组合下才
+    出现，而那个组合在任何单向前进的部署里都不会发生——直到真的需要回滚的那天。
+    """
+
+    def test_the_new_columns_are_all_nullable_or_have_a_database_default(self):
+        """判据是**列定义**而不是 Django 字段的 `default`。
+
+        `default=""` 只影响 Django 的 `INSERT` 组装；旧代码根本不经过它。所以这里
+        查 `db_default`：它才是唯一会落进 `CREATE TABLE` / `ALTER TABLE` 的那个。
+        """
+        for name in ("cycle", "volatility", "volatility_source"):
+            with self.subTest(field=name):
+                field = RegimeJudgement._meta.get_field(name)
+                self.assertTrue(
+                    field.null,
+                    f"{name} 必须可空：issue #63 要求三列可空以兼容旧行，而旧代码的 "
+                    "INSERT 完全不认识这三列",
+                )
+
+    def test_an_insert_that_ignores_the_new_columns_still_succeeds(self):
+        """按**旧代码的 SQL 形状**插一行：只写旧列，三列留给数据库。
+
+        用裸 SQL 而不是 `RegimeJudgement.objects.create`：ORM 会把三列一并带上，那样
+        这条用例就绕过了它要测的东西。
+        """
+        from django.db import connection
+
+        moment = NOW - timedelta(days=30)
+        with connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO regime_judgements "
+                "(symbol, attribute_date, effective_at, base_regime, escalation, "
+                "effective_regime, evidence, config_snapshot, news_ref, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)",
+                [
+                    "LEGACY/INSERT",
+                    moment.date(),
+                    moment,
+                    BaseRegime.RANGE.value,
+                    "",
+                    BaseRegime.RANGE.value,
+                    "{}",
+                    "{}",
+                    moment,
+                ],
+            )
+
+        row = RegimeJudgement.objects.get(symbol="LEGACY/INSERT")
+        self.assertEqual(row.base_regime, BaseRegime.RANGE.value)
+        # 旧代码没写的三列全是 NULL——这正是「可空」的用处，也是回滚可行的原因。
+        self.assertIsNone(row.cycle)
+        self.assertIsNone(row.volatility)
+        self.assertIsNone(row.volatility_source)
+
+    def test_a_row_written_by_old_code_reads_back_through_the_new_orm(self):
+        """旧代码写的行（三列留空），新代码读它时必须**不炸、也不编值**。
+
+        这条不是「SELECT 旧列能不能读」——那件事在加列之前之后都成立，测了等于没测
+        （第一版就是这么写的）。真正要钉的是**跨版本共存**：库里同时有「旧代码写的行」
+        与「新代码写的行」，新代码读前者时两维是 NULL 而不是某个默认档。
+        """
+        from django.db import connection
+
+        moment = NOW - timedelta(days=30)
+        # 按旧代码的 SQL 形状写一行：只给旧列。
+        with connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO regime_judgements "
+                "(symbol, attribute_date, effective_at, base_regime, escalation, "
+                "effective_regime, evidence, config_snapshot, news_ref, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)",
+                [
+                    SYMBOL,
+                    moment.date(),
+                    moment,
+                    BaseRegime.UPTREND.value,
+                    "",
+                    BaseRegime.UPTREND.value,
+                    "{}",
+                    "{}",
+                    moment,
+                ],
+            )
+
+        state = deactivation_run.current_regime_state(now=NOW)
+
+        self.assertEqual(state.regime, BaseRegime.UPTREND.value)
+        self.assertEqual(state.base_regime, BaseRegime.UPTREND.value)
+        # 旧行没有两维，读面拿到 None——**不按 base_regime 现推一个**。
+        self.assertIsNone(state.cycle)
+        self.assertIsNone(state.volatility)
 
 
 # --------------------------------------------------------------------------- #

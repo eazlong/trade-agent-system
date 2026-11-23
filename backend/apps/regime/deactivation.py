@@ -151,10 +151,28 @@ class RegimeState:
 
     `effective_at` 是那条判定的生效时刻（北京时间 08:00 那个业务日边界），不是它被
     算出来的时刻。过期判据问的是「这个结论从哪天开始在生效」，两者不是一回事。
+
+    两维（`cycle` / `volatility`，#63）随这条判定一起带出，**默认 `None`**：
+    它们是可选的解释性信息，不是判定的一部分。`regime` 仍是这个结构体的判据本体——
+    所有既有调用方（`blanket`、过期判断、派发）都只看它，两维插进来不许改变任何一条
+    既有语义。`cycle is None` 是合法且有意义的（旧结构里波动吃掉了周期），所以它
+    不能用来表达「冷启动」——冷启动仍然只看 `regime is None`。
     """
 
     regime: str | None = None
     effective_at: datetime | None = None
+    #: **基础阶段**（纯量化口径）。`regime` 是生效阶段——资讯抬升过的那个。
+    #:
+    #: 两维归**这一根轴**：它们描述的是「量化看到了什么」，而 issue #63 的回填规则
+    #: 也是按 `base_regime` 定的（`base=range` → `sideways + normal`）。把两者混在
+    #: 一起读会自相矛盾：`base=range` 被资讯抬成 `effective=high_vol` 的那天，
+    #: `regime` 是高波动而两维是「横盘 + 无事件波动」——两句都对，但说的不是同一件事。
+    #: 所以读面必须把它们分开摆，见 `views._regime_state`。
+    base_regime: str | None = None
+    #: 周期维（`bull`/`bear`/`sideways`/`unclear`），`None` 表示这条判定没有周期结论。
+    cycle: str | None = None
+    #: 波动维（`normal`/`event_spike`），`None` 表示这条判定没有波动结论。
+    volatility: str | None = None
 
     @property
     def cold(self) -> bool:

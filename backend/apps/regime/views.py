@@ -344,12 +344,27 @@ def _regime_state() -> dict[str, Any]:
     if state.regime is None:
         return {
             "regime": None,
+            "base_regime": None,
+            # 冷启动时两维必为 `None`（没有生效判定就没有它的两维）。照样发这两个键，
+            # 而不是省略：前端拿「键在、值为 null」与「键不在」写的是两种分支，前者
+            # 是可预期的形状，后者要靠 `in` 判断才不炸。
+            "cycle": None,
+            "volatility": None,
             "effective_at": ser.iso(state.effective_at),
             "cold": True,
             "display": COLD_STATE_DISPLAY,
         }
     return {
+        # `regime` = **生效阶段**（资讯抬升过的那个）。它仍是「此刻在拦谁」的依据。
         "regime": ser.regime_payload(state.regime),
+        # 两维（#63）归**基础**轴，所以必须连同 `base_regime` 一起发：`base=range` 被
+        # 资讯抬成 `effective=high_vol` 的那天，`regime` 是高波动而两维是「横盘 +
+        # 无事件波动」。不把基础阶段摆出来，读的人只会看到两句话打架。
+        "base_regime": ser.regime_payload(state.base_regime),
+        # **`cycle` 可以是 null 而有值**——旧结构里波动吃掉了周期的那天就是这样，
+        # 读面必须能表达它，不能拿 `sideways` 之类填上。
+        "cycle": ser.cycle_payload(state.cycle),
+        "volatility": ser.volatility_payload(state.volatility),
         "effective_at": ser.iso(state.effective_at),
         "cold": False,
         "display": "",

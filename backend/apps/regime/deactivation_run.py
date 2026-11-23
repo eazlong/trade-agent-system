@@ -242,7 +242,17 @@ def current_regime_state(
     if record is None:
         return deactivation.RegimeState()
     return deactivation.RegimeState(
-        regime=record.effective_regime, effective_at=record.effective_at
+        regime=record.effective_regime,
+        effective_at=record.effective_at,
+        # 两维（#63）归**基础**轴，不归 `regime`（生效阶段）。资讯抬升那天两者会不同：
+        # `base=range`（`sideways + normal`）被抬成 `effective=high_vol`。把 `base_regime`
+        # 一起带出来，读的人才不会把「生效阶段高波动」读成「两维说横盘却又高波动」。
+        base_regime=record.base_regime,
+        # 两维（#63）。存量行由迁移回填（`legacy_mapping`），所以这里读到的 `None`
+        # 有且只有两种来处：这条判定写于两列存在之前且回填认不出它的 `base_regime`，
+        # 或者它的 `cycle` 本就该空（`high_vol` 那天）。两者都不影响 `regime`。
+        cycle=record.cycle,
+        volatility=record.volatility,
     )
 
 

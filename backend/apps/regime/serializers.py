@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from apps.regime import deactivation_run
+from apps.regime import quant
 from apps.regime import slice as sl
 from apps.regime.quant import PRIORITY
 from apps.regime.models import (
@@ -122,6 +123,25 @@ def _enum_display(enum_cls, value: Any) -> str:
 def regime_payload(value: Any) -> dict[str, str]:
     """行情阶段。展示名走 `deactivation_run.regime_display`（脏值有「认不出的阶段」后缀）。"""
     return _labelled(value, deactivation_run.regime_display(value))
+
+
+def cycle_payload(value: Any) -> dict[str, str] | None:
+    """周期维（#63）。**空值原样回 `None`，不包装成 `{"value": None, "display": ""}`**。
+
+    `cycle` 为 NULL 是一个**有意义的结论**（旧结构里波动吃掉了周期），与「还没算」
+    不一样。包成空对象会让前端分不清「这一维不存在」与「这一维是空串」，而两者在
+    页面上的正确画法不同：前者整段不渲染，后者要显示「判不出」。
+    """
+    if value is None:
+        return None
+    return _labelled(value, _from_table(quant.CYCLE_DISPLAY, value))
+
+
+def volatility_payload(value: Any) -> dict[str, str] | None:
+    """波动维（#63）。空值同理原样回 `None`。"""
+    if value is None:
+        return None
+    return _labelled(value, _from_table(quant.VOLATILITY_DISPLAY, value))
 
 
 def _from_table(table: Mapping[str, str], value: Any) -> str:

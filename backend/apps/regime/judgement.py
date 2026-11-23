@@ -125,7 +125,8 @@ from apps.regime.models import (
     judgement_moment,
 )
 from apps.regime.news_verdict import run_news_judgement
-from apps.regime.quant import PRIORITY, BaseRegime, latest_label
+from apps.regime import quant
+from apps.regime.quant import PRIORITY, BaseRegime, latest_label, project_to_axes
 
 logger = logging.getLogger(__name__)
 
@@ -454,10 +455,18 @@ def build_evidence(label, decision: dict) -> dict:
     规则改写，含 `regime=None` 这种判不出来的情形）与「为什么最后用的不是它」（被持续期
     拦下、沿用了哪条记录、已持续几天）。混成一组之后，「今天的基础阶段为什么是箱体震荡」
     就需要读者自己去推。
+
+    `quant` 里另带两维（#63）。它们与 `regime` **同源**（都由 `project_to_axes` 投影），
+    所以在这一版里「两维」与「四档」不是两条独立证据，而是一条结论的两种记法——把它
+    记进 evidence 是为了让事后能分辨「那天两维各是什么」，而不是为了多一次判定。
     """
+    cycle, volatility = label.cycle, label.volatility
     return {
         "quant": {
             "regime": label.regime.value if label.regime else None,
+            # 两维（#63）。`cycle` 在 high_vol 那天是 None，如实留空。
+            "cycle": cycle.value if cycle is not None else None,
+            "volatility": volatility.value if volatility is not None else None,
             "atr": label.atr,
             "atr_pct": label.atr_pct,
             "atr_pct_rank": label.atr_pct_rank,
@@ -599,6 +608,11 @@ def run_daily_judgement(
     )
     effective_regime = apply_escalation(base, escalation)
 
+    # 三列从**采纳后的基础阶段**派生，不是从量化原始结论：持续期会把今天量化判的档
+    # 换掉（沿用昨天的），而记录说的是「这一天机制最终的基础阶段是什么」，两维必须与
+    # `base_regime` 同源，否则同一条记录里两维说 uptrend、四档说 downtrend。
+    # 量化原始投影另记在 `evidence["quant"]` 里（见 `build_evidence`），两者都可查。
+    axes_cycle, axes_volatility = project_to_axes(base)
     record, created = _record_once(
         symbol=symbol,
         attribute_date=attribute_date,
@@ -606,6 +620,8 @@ def run_daily_judgement(
         base_regime=base,
         escalation=escalation or "",
         effective_regime=effective_regime,
+        cycle=axes_cycle,
+        volatility=axes_volatility,
         evidence=build_evidence(
             label,
             {
@@ -625,6 +641,9 @@ def run_daily_judgement(
         "base_regime": base.value,
         "escalation": escalation or "",
         "effective_regime": effective_regime.value,
+        # 两维（#63），与落库的三列同源（都从 `base` 投影），所以返回值与记录一致。
+        "cycle": axes_cycle.value if axes_cycle else None,
+        "volatility": axes_volatility.value if axes_volatility else None,
         "decision": _DECISION_CARRIED if reason else _DECISION_ADOPTED,
         "reason": reason,
         "recorded": created,
@@ -658,6 +677,10 @@ def _describe(record: RegimeJudgement, run_day: date) -> dict:
         "base_regime": record.base_regime,
         "escalation": record.escalation,
         "effective_regime": record.effective_regime,
+        # 两维（#63）。读回落库的值，**不重算**——这条路径的职责是「今天早就有结论」，
+        # 重算会让返回值与记录里的那一行说不同的话（何况历史行是迁移映射来的）。
+        "cycle": record.cycle,
+        "volatility": record.volatility,
         "decision": decision.get("action", ""),
         "reason": decision.get("reason", ""),
         "recorded": False,
@@ -680,6 +703,14 @@ def _record_once(**fields) -> tuple[RegimeJudgement, bool]:
                     "base_regime": fields["base_regime"].value,
                     "escalation": fields["escalation"],
                     "effective_regime": fields["effective_regime"].value,
+                    # 两维（#63）。本版由 `base_regime` 投影而来，所以来源标成投影而不是
+                    # 判据——与迁移回填的 `legacy_mapping` 分开，才不会把「映射来的」
+                    # 说成「判出来的」。
+                    "cycle": fields["cycle"].value if fields["cycle"] else None,
+                    "volatility": fields["volatility"].value
+                    if fields["volatility"]
+                    else None,
+                    "volatility_source": quant.VOLATILITY_SOURCE_PROJECTION,
                     "evidence": fields["evidence"],
                     "config_snapshot": config.full_snapshot(),
                     "news_ref": fields["news_ref"],
