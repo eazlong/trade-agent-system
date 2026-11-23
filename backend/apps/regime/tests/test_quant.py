@@ -676,7 +676,7 @@ class TestSlowTrendIsNotSwallowedBySideways(SimpleTestCase):
     """
 
     def test_a_slow_bleed_is_bear_not_sideways(self):
-        """温和阴跌（每天 −0.6、振幅 1.0）：间距走不满门槛，但仍是一条下行。
+        """温和阴跌（每天 −0.2、振幅 1.0）：间距走不满门槛，但仍是一条下行。
 
         这是旧结构最典型的失败形态——`|separation|` 到不了 0.5，于是落箱体。
         用例先在真实指标上确认「间距确实不够」（否则它证明不了任何事），再断言
@@ -726,13 +726,38 @@ class TestUnclearIsProduced(SimpleTestCase):
 
         self.assertIn(quant.Cycle.UNCLEAR, produced)
 
-    def test_unclear_is_not_sideways(self):
-        """两者是不同的事实：`unclear` = 判了但方向证不出来；`sideways` = 证出了没方向。
+    def test_unclear_and_sideways_diverge_on_real_input(self):
+        """两者是不同的事实，**且用同一套输入能分别打出来**——不只是枚举值不同。
 
-        混同的代价已经量过——旧结构把前者当后者，207 天系统性错向。
+        `unclear` = 判了但方向证不出来；`sideways` = 证出了没方向。混同的代价已经
+        量过：旧结构把前者当后者，207 天系统性错向。
+
+        单纯的 `assertIsNot(UNCLEAR, SIDEWAYS)` 是恒真的（两个枚举成员当然不相等），
+        删掉实现也不会红。这里改成行为断言：两组只差一个数的中间量必须分别落两边。
         """
-        self.assertIsNot(quant.Cycle.UNCLEAR, quant.Cycle.SIDEWAYS)
-        self.assertNotEqual(quant.Cycle.UNCLEAR.value, quant.Cycle.SIDEWAYS.value)
+        # 间距与强度都弱 → 证出了「没方向」。
+        sideways = quant._classify_cycle(
+            metrics(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=(PARAMS.cycle_strength_min / 2),
+                slope_consistency=0.0,
+            ),
+            PARAMS,
+        )
+        # 强度够但一致性不足以证明方向 → 判不出来。
+        unclear = quant._classify_cycle(
+            metrics(
+                ema_slope=+1.0,
+                separation=+(PARAMS.cycle_separation_min_atr / 3),
+                slope_strength=(PARAMS.cycle_strength_min + 0.05),
+                slope_consistency=(PARAMS.cycle_consistency_min - 0.05),
+            ),
+            PARAMS,
+        )
+
+        self.assertIs(sideways, quant.Cycle.SIDEWAYS)
+        self.assertIs(unclear, quant.Cycle.UNCLEAR)
 
     def test_unclear_projects_to_nothing_in_the_legacy_layer(self):
         """`unclear + normal` 还原不回四档——旧结构里没有这一格，必须抛。
@@ -892,6 +917,43 @@ class TestCycleHasNoLookahead(SimpleTestCase):
 
         self.assertEqual(short.slope_consistency, long.slope_consistency)
         self.assertEqual(short.slope_strength, long.slope_strength)
+
+    def test_consistency_rejects_any_peek_at_later_bars(self):
+        """把「回看窗口」挪到**含当日之后**的写法必须被这条抓住。
+
+        上面那条只比对「截断到第 20 天」与「全量取第 19 天」，两者窗口起点相同，
+        因此**看不见**「窗口向右多取了几根」这类前视——变异测试证实过：把
+        `index` 往后推 5 天，那条仍然绿。
+
+        这里换成**不对称夹具**：让第 i 天之后的价格剧烈反向，于是只要实现读了未来，
+        一致性就会明显偏离。断言的是「一致性 == 手工按 `[i-window+1, i]` 算出的值」，
+        逐位对齐，不依赖任何阈值。
+        """
+        window = PARAMS.cycle_consistency_window
+        lookback = PARAMS.ema_slope_lookback_days
+        # 前段单边上行，之后急转直下：未来与过去方向相反，读数会立刻分家。
+        closes = [100.0 + i for i in range(40)] + [140.0 - 6.0 * i for i in range(40)]
+        series = candles(closes)
+        index = 45  # 落在转折之后，窗口 [index-window+1, index] 横跨拐点
+
+        metrics = quant.metrics_series(series, PARAMS)
+        fast = [m.ema_fast for m in metrics]
+
+        want = 1.0 if fast[index] > fast[index - lookback] else -1.0
+        same = total = 0
+        for j in range(index - window + 1, index + 1):
+            k = j - lookback
+            if k < 0:
+                continue
+            total += 1
+            if (1.0 if fast[j] > fast[k] else -1.0) == want:
+                same += 1
+        expected = same / total
+
+        self.assertEqual(metrics[index].slope_consistency, expected)
+        # 前提检查：这段窗口里必须**两种方向都有**，否则「读了未来」也读不出差异。
+        self.assertGreater(total, 1)
+        self.assertLess(expected, 1.0, "窗口内若全同向，这条断言分辨不了前视")
 
 
 class TestSeriesShape(SimpleTestCase):

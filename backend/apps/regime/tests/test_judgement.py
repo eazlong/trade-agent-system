@@ -928,11 +928,13 @@ class TestEvidenceSeparatesWhatQuantSawFromWhatWasDecided(TestCase):
 
 
 class TestTwoAxesReachTheRecord(TestCase):
-    """判定写进 `RegimeJudgement` 时两维必须**与 base_regime 同源**。
+    """判定写进 `RegimeJudgement` 时两维的来源**不同**，这是 #64 的核心结构变化。
 
-    如果两维从量化原始结论投影、而 `base_regime` 走了持续期沿用，同一条记录里就会
-    出现「两维说 uptrend、四档说 downtrend」。那种记录处处自洽、只有交叉读才看得出，
-    正是这一类错里最难查的。
+    - `volatility` 由采纳后的 `base_regime` 投影（#65 才改独立判定）；
+    - `cycle` 由 `label.cycle` 独立判定产出，与四档无关。
+
+    因此「两维与 base_regime 同源」这条旧不变量**已不成立**：`base=high_vol + cycle=bear`
+    是设计上要求的并存状态，不是矛盾。谁若把 `cycle` 改回投影，本组用例会红。
     """
 
     def test_an_uptrend_lands_as_bull_plus_normal(self):
@@ -948,7 +950,7 @@ class TestTwoAxesReachTheRecord(TestCase):
         self.assertEqual(result["volatility"], record.volatility)
 
     def test_the_source_is_marked_as_a_projection_not_a_judgement(self):
-        """本版两维是**投影**，来源列必须这么说。
+        """`volatility` 仍是**投影**，来源列必须这么说（#65 落地后才变 proxy）。
 
         与迁移回填的 `legacy_mapping` 分开标，是为了让「映射来的」永远不被读成
         「判出来的」——#65 引入事件代理后还会写 `proxy`，三者必须可区分。
@@ -983,29 +985,39 @@ class TestTwoAxesReachTheRecord(TestCase):
             "高波动不再吞掉周期：这天必须有方向，而不是空值",
         )
 
-    def test_the_axes_are_projected_from_the_written_base_not_from_the_label(self):
-        """两维的**唯一来源**是写进记录的 `base_regime`，不是量化标签。
+    def test_the_cycle_comes_from_the_label_while_volatility_follows_the_base(self):
+        """#64 之后两维的**来源分开了**，这条钉的就是那个不对称本身。
 
-        写法上刻意绕开「造出持续期拦下的局面」那条路——它要精确控制 `in_force_days`
-        与日线窗口，脆且容易变成空转（第一次写就是这么失败的：第二次运行其实走了
-        `stale_candles`，什么都没落）。这里直接钉实现里的那一次调用：
+        - `volatility` 仍由采纳后的 `base_regime` 投影（#65 才改独立判定）；
+        - `cycle` 由 `label.cycle` 独立判定产出，与四档无关。
 
-        ```
-        axes_cycle, axes_volatility = project_to_axes(base)   # base 是采纳后的
-        ```
+        为什么必须分开：拿 `project_to_axes(base)` 去顶替 `cycle`，等于在写入路径上把
+        「缓慢阴跌兜底成 sideways」这个本票要解决的缺陷悄悄装回去。
 
-        用一个与 `label.regime` **相反**的 base 调用它，就足以区分
-        `project_to_axes(base)` 与 `project_to_axes(label.regime)`——前者给出这个
-        base 的两维，后者给出另一支的两维，两者在四档里不相等。
+        断言方式：高波动日 `base=high_vol`，而 `project_to_axes(HIGH_VOL)` 的 cycle 是
+        `None`。于是「cycle 非空」这一条就足以区分两种实现——若有人改回投影，这里立刻红。
         """
-        adopted = BaseRegime.UPTREND  # 被持续期沿用下来的基础阶段
-        quant_today = BaseRegime.DOWNTREND  # 今天量化判的（被拦下了）
+        # 末段恢复宽幅 → ATR% 分位顶到 1.0 → base 判高波动。
+        persist(series(end_from=320, end_band=0.06), SIGNED_DAY)
+        run_daily_judgement(now=NOW)
 
-        cycle, volatility = quant.project_to_axes(adopted)
+        record = RegimeJudgement.objects.get(symbol=SYMBOL)
+        self.assertEqual(record.base_regime, BaseRegime.HIGH_VOL.value)
 
-        self.assertEqual((cycle, volatility), (Cycle.BULL, Volatility.NORMAL))
-        # 与「照量化结论投影」的结果必须不同，否则这条断言分辨不了两种实现。
-        self.assertNotEqual(quant.project_to_axes(quant_today), (cycle, volatility))
+        # 波动维仍是投影：high_vol 必是 event_spike。
+        projected_cycle, projected_volatility = quant.project_to_axes(
+            BaseRegime.HIGH_VOL
+        )
+        self.assertIsNone(projected_cycle, "投影在 high_vol 这天给不出方向")
+        self.assertEqual(record.volatility, projected_volatility.value)
+
+        # 而记录里的 cycle 来自独立判定，因此**不为 None**——这正是与投影的分歧点。
+        self.assertIsNotNone(record.cycle)
+        self.assertNotEqual(
+            record.cycle,
+            projected_cycle,
+            "cycle 若与投影同值，说明写入路径又退回 project_to_axes 了",
+        )
 
     def test_a_dropped_escalation_day_keeps_the_axes_on_the_base_axis(self):
         """资讯抬升日：`regime`（生效）与两维（基础轴）**必须能并存而不打架**。

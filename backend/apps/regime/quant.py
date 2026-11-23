@@ -142,10 +142,13 @@ PRIORITY: tuple[BaseRegime, ...] = (
 class Cycle(str, Enum):
     """**周期维**（慢变量）：往哪走。
 
-    与 `BaseRegime` 的关系是「新结构 / 旧兼容层」：本版仍由 `BaseRegime` 投影出这一维
-    （见 `project_to_axes`），所以四个取值里这一版只会出现三个——`UNCLEAR` 要等
-    #64 把横盘改成显式判定之后才会产出。先把它列进来，是因为枚举一旦落库就是契约，
-    取值集合必须一次定完；事后补一个取值等于一次数据迁移。
+    与 `BaseRegime` 的关系是「新结构 / 旧兼容层」，但**自 #64 起这一维不再由四档投影
+    出来**：它有独立的判据（`_classify_cycle` 的两条路径 + 显式横盘），四个取值全部会
+    实际产出。`project_to_axes` 仍在，但它只服务于兼容读面与迁移回填，不再决定
+    `DayLabel.cycle`。
+
+    两维与四档因此**允许不一致**，且不一致有意义：`base=high_vol + cycle=bear` 正是
+    ADR 0007 要的「两维并存、互不覆盖」。
     """
 
     BULL = "bull"
@@ -338,9 +341,10 @@ class DayLabel:
     regime: BaseRegime | None
     metrics: DayMetrics
 
-    #: 两维（#63）。本版由 `regime` 投影而来，不是第二套判据——见 `project_to_axes`。
-    #: `cycle` 在 `high_vol` 那天是 `None`（旧结构里波动吃掉了周期，如实留空）。
-    #: 未判定日两维**同时**是 `None`。
+    #: 两维。#64 之后**来源不同**，这一点必须看清：
+    #:   - `cycle` 由 `_classify_cycle` **独立判定**产出，与 `regime` 无关；
+    #:   - `volatility` 仍由 `regime` 投影而来（`project_to_axes`），#65 才改独立。
+    #: 未判定日两维**同时**是 `None`；`cycle` 判不出来时是 `UNCLEAR`，不是 `None`。
     cycle: "Cycle | None"
     volatility: "Volatility | None"
 
@@ -734,7 +738,7 @@ def classify_day(metrics: DayMetrics, params: JudgementConfig = JUDGEMENT) -> Da
     )
 
 
-def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle | None:
+def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle:
     """周期维的**真判定**（#64）：两条独立通道 + 显式横盘，判不出来就是 `unclear`。
 
     ## 它解决的两个已量化缺陷
@@ -760,11 +764,14 @@ def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle | Non
     而两者是不同的事实——前者是判不出来，后者是判出来了。混同的代价已经量过：
     207 天系统性错向。
 
-    ## 返回 `None` 而不是 `Cycle.UNCLEAR`
+    ## 本函数只产出四个取值，**不返回 `None`**
 
-    `None` = 这一行的周期维**不存在**（`classify_day` 在三个就绪条件缺一时的情形，
-    与 `regime is None` 同进退）。`unclear` = 就绪了、判了、但方向证明不出来。
-    上游要能分开这两件事，所以这里不替调用方折叠。
+    `None` 是 `classify_day` 在三个就绪条件缺一时给的（与 `regime is None` 同进退），
+    语义是「这一行的周期维**不存在**」。本函数的语义是「就绪了、判了」——
+    哪怕是「判不出来」，那也是 `Cycle.UNCLEAR` 这个取值，而不是 `None`。
+
+    这两件事必须能分开：上游要区分「今天没有周期结论」与「今天有结论，结论是判不出来」。
+    本函数不替调用方折叠，也不越权替它判断数据够不够。
 
     ## 只吃中间量，不碰 K 线
 
@@ -791,6 +798,12 @@ def _classify_cycle(metrics: DayMetrics, params: JudgementConfig) -> Cycle | Non
     if slope < 0 and (separation < -sep_min or strong_direction):
         return Cycle.BEAR
 
+    # 补充说明路径二**不校验 separation 与 slope 同向**（这是刻意的，不是遗漏）：
+    # 它问的是「快线自己在这段窗口里是否持续地朝一个方向走」，而 separation 是两条均线
+    # 的**相对位置**，回答「拉没拉开」。刚拐头的行情正是两者打架的时候——那时斜率已经
+    # 转向、间距还在旧方向——按斜率定向是对的（ADR 实验 #3「背离按斜率定向」比弃权
+    # 多 4.6 pt 一致率）。要求两者同向会把这类刚启动的趋势推回 unclear。
+    #
     # 走到这里说明两条路径都没走通。**只有「间距不足」与「强度不足」同时成立**
     # 才是横盘；任何一边够（甚至只是强度够而一致性不够）都不是横盘，是判不出来。
     weak_strength = (

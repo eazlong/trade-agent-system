@@ -456,15 +456,20 @@ def build_evidence(label, decision: dict) -> dict:
     拦下、沿用了哪条记录、已持续几天）。混成一组之后，「今天的基础阶段为什么是箱体震荡」
     就需要读者自己去推。
 
-    `quant` 里另带两维（#63）。它们与 `regime` **同源**（都由 `project_to_axes` 投影），
-    所以在这一版里「两维」与「四档」不是两条独立证据，而是一条结论的两种记法——把它
-    记进 evidence 是为了让事后能分辨「那天两维各是什么」，而不是为了多一次判定。
+    `quant` 里另带两维。#64 之后它们**不再同源**，记进 evidence 正是为了让这件事可查：
+
+    - `cycle` 来自独立判定（两条路径 + 显式横盘），`*_strength` / `*_consistency` 是它的
+      依据数字，能回答「那天为什么判 unclear」；
+    - `volatility` 仍是 `regime` 的投影（#65 才改独立）。
+
+    所以「两维说 bear、四档说 high_vol」是同一条记录里的**两条独立证据**，不是矛盾。
     """
     cycle, volatility = label.cycle, label.volatility
     return {
         "quant": {
             "regime": label.regime.value if label.regime else None,
-            # 两维（#63）。`cycle` 在 high_vol 那天是 None，如实留空。
+            # 两维。#64 起 `cycle` 独立判定，high_vol 那天也可以有方向（如 bear）；
+            # 只有「今天判不出来」时它才是 None。
             "cycle": cycle.value if cycle is not None else None,
             "volatility": volatility.value if volatility is not None else None,
             "atr": label.atr,
