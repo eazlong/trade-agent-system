@@ -21,6 +21,11 @@ backend/docs/
 
 # Production DB backup dumps (large binaries; keep local only)
 backend/backups/*.dump
+# 换轴 / 合并前的工作副本归档（patch + 文件清单）。它们是**过程的证据**，不是产品：
+# 进了版本库就会让每次重算都带着一份 4000 行的历史 diff 被人 diff。
+backend/backups/stash_archive_*/
+backend/backups/pre_cellaxis_*/
+backend/backups/pre_dwell_exempt_*/
 
 # ── 本地工具产物（不进版本库）─────────────────────────────────────────────
 # 这些目录是"每台机器各一份"的缓存与草稿，体积从几十 MB 到数 GB：
