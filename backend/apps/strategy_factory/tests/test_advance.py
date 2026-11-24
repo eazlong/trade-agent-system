@@ -2216,6 +2216,59 @@ class TestTheHoldHandsTheLayersVerdictBackInsteadOfCrashing:
         candidate.refresh_from_db()
         assert candidate.status == "oos_failed"
 
+    def test_the_paper_failure_lands_on_the_second_round(self):
+        """paper 侧的同一件事：轮 1 退回 `paper_running`，轮 2 由它自己判去 `paper_failed`（#53）。
+
+        上一条只钉了 oos 侧，而两侧走的是**两个不同的判定步**（`_oos_verdict` /
+        `_paper_running_step`）。#53 报的恰恰是 paper 那一支：「观察期未满 + 会话已
+        结束」在判定层的结论是 `PAPER_FAILED`，而停住位没有去 `paper_failed` 的边
+        （`status.py`：「暂停不是判定」），于是这条失败**晚一轮**才落库。
+
+        **这一条把「晚一轮」钉成契约，而不是钉成缺陷**：三个断言缺一不可——
+        轮 1 落 `paper_running` 且失败码原样带回、轮 2 落 `paper_failed`、终态落库。
+        少任一条，改法就能在两件坏事上安静地通过：退回后**原地不动**（失败永远不落库），
+        或直接落 `paper_failed`（撞非法边、整步回滚）。
+
+        若将来要让失败当轮落库，唯一合法的路径是给 `regime_hold` 加 `*_failed` 出边
+        ——那是状态机形状变更，票 #52 的 Q1 已明确否决过一次。真要做那一次变更的人，
+        必须连带改这条用例，而不是让它悄悄长成一句空话。
+        """
+        _open_regime_gate()
+        candidate = self._held(
+            tag="two_round_paper",
+            from_status=StrategyCandidateStatus.PAPER_RUNNING,
+            layer="paper",
+        )
+        deps = self._deps(
+            regime=lambda c: RegimeEvidence(
+                regime="range", cell=RegimePoolCellEvidence(state="fit")
+            ),
+            paper=PaperEvidence(
+                wall_clock_days=3.0,
+                running_days=3.0,
+                closed_trades=40,
+                return_pct=5.0,
+                risk_hits=0,
+                session_ended=True,
+            ),
+        )
+
+        first = advance(candidate, deps=deps)
+
+        assert first.to_status is StrategyCandidateStatus.PAPER_RUNNING, (
+            first.reason_code
+        )
+        assert first.reason_code is ReasonCode.PAPER_OBSERVATION_INCOMPLETE
+
+        second = advance(candidate, deps=deps)
+
+        assert second.to_status is StrategyCandidateStatus.PAPER_FAILED, (
+            second.reason_code
+        )
+        assert second.reason_code is ReasonCode.PAPER_OBSERVATION_INCOMPLETE
+        candidate.refresh_from_db()
+        assert candidate.status == "paper_failed"
+
     def test_a_still_unfit_regime_does_not_bounce_the_candidate(self):
         """**行情还没翻时，候选必须留在原地**——这一条钉的是本票实施时实测踩到的坑。
 
