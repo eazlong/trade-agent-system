@@ -29,6 +29,11 @@ from apps.agent.supervisor import (  # noqa: E402
 from apps.agent.registry import AgentRegistry  # noqa: E402
 from apps.memory.manager import _L1_CACHE  # noqa: E402
 
+# 整文件走真实 Supervisor 路由 + 真实 LLM / 网络研究（docstring：no mock agents）。
+# CI 提供不了 LLM 密钥与出网：默认全量跑用 -m "not integration and not e2e"
+# 排除本文件（#60 块 B）。本地有密钥时仍可单独跑。
+pytestmark = pytest.mark.e2e
+
 
 # ------------------------------------------------------------------ #
 #  Helpers                                                            #

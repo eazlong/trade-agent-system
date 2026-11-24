@@ -7,6 +7,10 @@ from typing import Any
 from apps.common.time_utils import business_now, business_tz_label
 
 PROMPT_BASE = Path.home() / ".tradelogx" / "agents"
+# 仓库镜像兜底（#60）：CI 与开发机可能没有部署位 ~/.tradelogx，但仓库自带
+# backend/prompts/v{N}/。部署位优先、仓库兜底——与 test_box_breakout_threshold.py
+# 的策略镜像同款契约：生产跑的是部署位那份，仓库份只给无部署位的环境补位。
+REPO_PROMPT_BASE = Path(__file__).resolve().parents[2] / "prompts"
 
 _cache: dict[str, str] = {}
 _meta_cache: dict[str, dict[str, Any]] = {}
@@ -68,6 +72,18 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
+def _resolve_version_dir(version: str) -> Path:
+    """部署位优先、仓库兜底（#60），整目录级回退。
+
+    load 与 list_agents 共用同一来源判定：部署目录在就用它那份（生产契约
+    对部署位成立），整个目录缺失才退回仓库镜像，避免两方法来源分裂。
+    """
+    version_dir = PROMPT_BASE / version
+    if not version_dir.exists():
+        version_dir = REPO_PROMPT_BASE / version
+    return version_dir
+
+
 class PromptLoader:
     @classmethod
     def load(cls, name: str, version: str = "v1") -> str:
@@ -79,9 +95,12 @@ class PromptLoader:
         """
         cache_key = f"{version}/{name}"
         if cache_key not in _cache:
-            file_path = PROMPT_BASE / version / f"{name}.txt"
+            file_path = _resolve_version_dir(version) / f"{name}.txt"
             if not file_path.exists():
-                raise FileNotFoundError(f"Prompt not found: {file_path}")
+                raise FileNotFoundError(
+                    f"Prompt not found: {name} ({version}), looked in "
+                    f"{PROMPT_BASE / version} and {REPO_PROMPT_BASE / version}"
+                )
             raw_text = file_path.read_text(encoding="utf-8")
             _, body = _parse_frontmatter(raw_text)
             _cache[cache_key] = body
@@ -102,7 +121,7 @@ class PromptLoader:
         仅当 frontmatter 中没有 description 时，fallback 到提取 body 前 5 行作为概述，
         供 Supervisor 的 LLM 意图识别使用。
         """
-        version_dir = PROMPT_BASE / version
+        version_dir = _resolve_version_dir(version)
         if not version_dir.exists():
             return []
 

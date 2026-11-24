@@ -113,6 +113,19 @@ jobs:
   full-tests:
     runs-on: ubuntu-latest
     needs: [l1-semantic, l2-dst, l3-invariants]
+    # Redis service（#60 块 A）：338 条视图/会话契约直连 Redis（REDIS_URL /
+    # Stream 总线），test settings 的 CACHES 虽是 LocMem，直连仍要真 Redis。
+    # 提供 service 让这些契约在 CI 真正被验证，而不是全标 integration 一关了之。
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -148,7 +161,10 @@ jobs:
           FERNET_KEY: qUnBCWUSE-vtGZuw6RhCNFAEft8glcswaGnIcvsWohE=
         run: |
           cd backend
-          pytest apps/ --cov=apps --cov-report=xml --cov-report=term-missing
+          # -m 排除（#60 块 B）：integration/e2e 用例需要 CI 提供不了的外部
+          # 依赖（真实 LLM / 交易所出网）。Redis 已由上面的 service 提供，
+          # 视图层契约不标 integration、照常跑。
+          pytest apps/ -m "not integration and not e2e" --cov=apps --cov-report=xml --cov-report=term-missing
 
       - name: Upload Coverage
         uses: codecov/codecov-action@v4
