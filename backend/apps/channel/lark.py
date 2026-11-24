@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 # 飞书 Open API 单条文本消息安全上限（API 整体 30KB，留余量给 JSON 开销）
 _LARK_MAX_LENGTH = 3800
+
+# 真实飞书 open_id 格式：`ou_` + 长串字母数字（如 ou_da5xxxxxxxx…dfe）。
+# 手写占位值（如 ou_opsnotice）远短于真实 id，不匹配即视为脏数据直接拒绝，
+# 避免无谓调用飞书 API 刷 99992351 错误。
+_OPEN_ID_RE = re.compile(r"^ou_[0-9a-zA-Z]{16,64}$")
 
 
 class LarkChannel(BaseChannel):
@@ -72,6 +78,13 @@ class LarkChannel(BaseChannel):
         """
         if not open_id:
             logger.warning("[LarkChannel] no open_id, skipping send_message_to_user")
+            return
+        if not _OPEN_ID_RE.fullmatch(open_id):
+            logger.warning(
+                "[LarkChannel] invalid open_id format %r (expected ou_+长串字母数字), "
+                "skipping send_message_to_user; 请检查 User.feishu_open_id 脏数据",
+                open_id,
+            )
             return
         for chunk in chunk_message(text, _LARK_MAX_LENGTH):
             await self._send_im(
@@ -437,34 +450,40 @@ class LarkChannel(BaseChannel):
         return hmac.compare_digest(computed, signature)
 
     def _save_feishu_user(self, open_id: str, chat_id: str) -> None:
-        """Save or update the user's feishu_open_id in the database."""
+        """Save or update the user's feishu_open_id in the database.
+
+        只有两种结果：
+        - 已存在同 feishu_open_id 的用户 → no-op（幂等）；
+        - 否则为新用户自动建号（首次飞书用户）。
+
+        不再猜测归属「第一个有 telegram_id 的用户」：没有可靠的
+        open_id → user 映射，猜测会把别人的 feishu_open_id 覆盖掉，
+        导致通知张冠李戴。既有用户与其飞书身份的关联走显式 OAuth 流程
+        （FeishuUserToken.user），不在此处处理。
+        """
         try:
+            if not _OPEN_ID_RE.fullmatch(open_id or ""):
+                logger.warning(
+                    "[LarkChannel] ignoring invalid open_id format %r (not saved to User)",
+                    open_id,
+                )
+                return
+
             from apps.authentication.models import User
 
-            user = User.objects.filter(feishu_open_id=open_id).first()
-            if not user:
-                # Try to find by telegram_id (user may have used Telegram before)
-                user = User.objects.filter(telegram_id__isnull=False).first()
-            if user:
-                if user.feishu_open_id != open_id:
-                    user.feishu_open_id = open_id
-                    user.save(update_fields=["feishu_open_id"])
-                    logger.info(
-                        "[LarkChannel] saved feishu_open_id for user %s: %s",
-                        user.username,
-                        open_id[:12],
-                    )
-            else:
-                # Auto-create a new User for first-time Feishu users
-                user = User.objects.create(
-                    email=f"{open_id}@lark.local",
-                    username=f"lark_{open_id[:8]}",
-                    feishu_open_id=open_id,
-                )
-                logger.info(
-                    "[LarkChannel] auto-created user %s with feishu_open_id: %s",
-                    user.username,
-                    open_id[:12],
-                )
+            if User.objects.filter(feishu_open_id=open_id).exists():
+                return
+
+            # Auto-create a new User for first-time Feishu users
+            user = User.objects.create(
+                email=f"{open_id}@lark.local",
+                username=f"lark_{open_id[:8]}",
+                feishu_open_id=open_id,
+            )
+            logger.info(
+                "[LarkChannel] auto-created user %s with feishu_open_id: %s",
+                user.username,
+                open_id[:12],
+            )
         except Exception as e:
             logger.warning("[LarkChannel] failed to save feishu user info: %s", e)
