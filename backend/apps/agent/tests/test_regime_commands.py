@@ -956,10 +956,17 @@ class TestTheLabelSubcommands:
         assert "3 个冲突日" in result.data, "01-18 ~ 01-20 三天"
         assert "不计入一致率的分母" in result.data
 
-        # 冲突日不进分母：并被集是 01-05 ~ 01-25（21 天），冲突 3 天，剩下 18 天。
+        # 并集是 01-05 ~ 01-25（21 天）。出分母的有两摊，**互斥且叠加**：
+        #   · 冲突 3 天（01-18 ~ 01-20，两段不同档位同时覆盖）
+        #   · 箱体 5 天（01-21 ~ 01-25，只被箱体那一段覆盖，按 ADR 0007 出分母）
+        # 剩下的 13 天全是下行趋势区间，才进分母。
         roster = _run(_call("/regime label")).data
         assert "另有 3 天被两段不同档位的人工区间同时覆盖" in roster
-        assert "分母 18 天" in roster
+        assert "另有 5 天人工标〈箱体震荡〉，不计入分母" in roster
+        assert "分母 13 天" in roster
+        # 口径本身也必须印在一致率旁边（#67 / ADR 0007）：不印的话，上面那个百分比会被
+        # 读成全档位的一致率。
+        assert "分母口径：除箱体区间外的日子计入、箱体区间不计入" in roster
 
     def test_rm_soft_deletes_and_keeps_the_original_text(self):
         _run(_call("/regime label add 2024-01-05 2024-01-20 下行趋势 某轮熊市"))

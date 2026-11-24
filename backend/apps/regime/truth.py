@@ -38,9 +38,20 @@
 
 ## 几个数不是一回事
 
-一段区间喂进来，天数会分成四摊（另有 `days` 是它们的和）：
+一段区间喂进来，天数会分成五摊（另有 `days` 是它们的和）：
 
-- `counted`：**分母**。区间覆盖、当天人工档位唯一确定、且那天机制用的就是纯量化结论。
+- `counted`：**分母**。区间覆盖、当天人工档位唯一确定、那天不是箱体区间、且那天机制用的
+  就是纯量化结论。
+- `boxed`：人工标成〈箱体震荡〉的**趋势外**日子。**不进分母**（ADR 0007）：箱体不可机械
+  识别（`detect_box_range` 在 2518 天里零检出），把它算进分母会让一致率变成一个说不出
+  是「哪一类日子的一致率」的数。它**单列**而不只是被扣掉，因为「75.0% 是除箱体外的
+  一致率」与「75.0% 是全档位的一致率」是两句完全不同的话——不印这个数，口径修订就只
+  活在 ADR 里。
+
+  **分母里剩的不只是趋势区间。** 人工**单独**标〈高波动〉的日子（`{高波动}`）按
+  `fold_overlay` 是保留的、不折叠，因此它不进 `boxed`、照常进分母。所以口径句一律
+  按「除箱体外都计入」正面说，不枚举「上行 / 下行计入」——后者在一份含高波动日的标注上
+  会变成假话，而它恰恰是用来防误读的那一句。
 - `missing`：算法当天**没有输出**（日线缺、预热不足）。按**不匹配**计（进分母、不进分子），
   但**单列**——「判错了」与「没判」是两种毛病，混成一个数会让「日线没回填」看起来像
   「量化判反了」。
@@ -53,9 +64,15 @@
 - `days`：所有活区间覆盖的自然日**并集**（不是各段之和）。同一天被两段**同档位**覆盖只
   算一天，且两段互为佐证。
 
-**四摊互斥，顺序是「冲突 → 抬升 → 缺口 → 比对」**（`tally` 里就是一个 `continue` 链），
-所以 `days == conflict_days + escalated + counted` 永远成立。互斥要紧了：那几个数会被
-人加起来验算，对不上就是这一页在骗人。
+**五摊互斥，顺序是「冲突 → 抬升 → 箱体 → 缺口 → 比对」**（`tally` 里就是一个 `continue`
+链），所以 `days == conflict_days + escalated + boxed + counted` 永远成立。
+
+箱体排在抬升**之后**：抬升日说的是「那天机制用的不是纯量化结论」，它与人工标了什么无关，
+是更硬的一层「不能比」；排在冲突**之后**同理（真值自己没定义的那天，理由更强）。
+
+**箱体退出的是分母，不是警报。** 「系统性错向」这条判据原样保留——它的语义是「把要命的
+行情判成平静」，本来就不需要箱体召回才有效。箱体那几天的人工标注是〈箱体震荡〉，永远不
+可能触发「人工标极端、算法判箱体」，所以这两件事在实现上也不相交（见 `EXTREME` / `CALM`）。
 
 ## 系统性错向：单向，一次即不达标（第 164 条）
 
@@ -168,6 +185,8 @@ class Agreement:
     escalated: int = 0
     #: `escalated` 里「人工标注与当天的生效阶段一致」的天数。只用于让排除可审计。
     escalated_matched: int = 0
+    #: 人工标成〈箱体震荡〉的日子。**不进分母**（ADR 0007），单列以便印出分母口径。
+    boxed: int = 0
     counted: int = 0
     matched: int = 0
     differed: int = 0
@@ -281,6 +300,7 @@ def tally(
     in_force = in_force or {}
 
     matched = differed = missing = misdirected = escalated = escalated_matched = 0
+    boxed = 0
     for day, regimes in covered.items():
         folded = fold_overlay(regimes)
         if len(folded) > 1:
@@ -295,6 +315,15 @@ def tally(
             escalated += 1  # 那天机制用的不是纯量化结论（资讯抬升）：也不进分母
             if truth == pair[1]:
                 escalated_matched += 1
+            continue
+        if truth is CALM:
+            # 箱体区间**退出分母**（ADR 0007）。位置在冲突与抬升之后、缺口之前：
+            # 那两层的理由是「这一天不能比」，比「这一天是什么档」更靠近输入侧。
+            #
+            # **只按人工标注判**，不看算法答了什么：口径问的是「拿哪些日子当分母」，
+            # 不是「算法答对没答对」——照算法判的话，判对的日子进分母、判错的日子被
+            # 剔出去，一致率会被系统性抬上去。
+            boxed += 1
             continue
         got = tags.get(day)
         if got is None:
@@ -313,6 +342,7 @@ def tally(
         conflict_days=len(conflicts),
         escalated=escalated,
         escalated_matched=escalated_matched,
+        boxed=boxed,
         counted=matched + differed + missing,
         matched=matched,
         differed=differed,
@@ -329,6 +359,17 @@ def describe(data: Agreement) -> list[str]:
 
     「同一件事两个说法」在这里代价格外高：一致率是**出 Shadow 的依据**，两个入口给出
     两个数的话，读到哪一个都会让人怀疑另一个。
+
+    ## 分母口径必须印在一致率旁边（#67，ADR 0007）
+
+    ADR 0007 定了「趋势区间计入分母、箱体区间不计入」。**这个口径不印出来，75.0% 就会被
+    读成全档位的一致率**——而它只是趋势区间的。所以：
+
+    - 有分母时，紧跟首行印一句 `分母口径`，明说哪一类日子计入、哪一类不计入；
+    - 箱体天数非零时，再印出这个数：读者要能自己验算「分母为什么比覆盖天数少」。
+
+    这一句**与箱体天数是否为零无关**（只看有没有分母）：口径本身是常设的，不是这天才
+    成立的；只在有箱体时才说，会让没箱体的那天读成「没有这个口径」。
     """
     if not data.intervals:
         return [
@@ -349,6 +390,23 @@ def describe(data: Agreement) -> list[str]:
         )
 
     lines = [head]
+    if rate is not None:
+        # 分母口径**紧跟首行**：它是「上面那个百分比是什么的一致率」的答案，隔开一行就会
+        # 被读成另一个话题的脚注。
+        #
+        # **措辞不能只说「趋势区间」**：分母里除了上行 / 下行，还可能有人工**单独**标的
+        # 〈高波动〉日（`fold_overlay` 明确保留 `{高波动}`，它不进 `boxed`）。只写「趋势
+        # 区间的一致率」时，分母含高波动日的那份标注会让这句话变成假的——而它恰恰是用来
+        # 防误读的那一句。所以这里按「谁出分母」正面说，不按「谁进分母」枚举。
+        lines.append(
+            "   · 分母口径：除箱体区间外的日子计入、箱体区间不计入（ADR 0007）"
+            f"——上面的 {rate:.0%} 不含箱体，不是全档位的一致率"
+        )
+    if data.boxed:
+        lines.append(
+            f"   · 另有 {data.boxed} 天人工标〈箱体震荡〉，不计入分母"
+            "（箱体不可机械识别，算进分母会让一致率说不出是哪一类日子的一致率）"
+        )
     if data.conflict_days:
         # 冲突不是算法的毛病，但它解释了「为什么 23 天只比了 18 天」。
         lines.append(
@@ -366,13 +424,15 @@ def describe(data: Agreement) -> list[str]:
             line += f"；其中 {data.escalated_matched} 天人工标注与当天的生效阶段一致"
         lines.append(line)
     if rate is None:
-        # 没有分母时要**说清是哪一种没有**：这句话是人唯一能拿到的解释，而两种原因
-        # （标注自相矛盾 / 那几天不能比）对应的是两个完全不同的下一步动作。
+        # 没有分母时要**说清是哪一种没有**：这句话是人唯一能拿到的解释，而几种原因
+        # （标注自相矛盾 / 那几天不能比 / 全是箱体区间）对应的是完全不同的下一步动作。
         why = []
         if data.conflict_days:
             why.append("互相冲突的档位")
         if data.escalated:
             why.append("资讯抬升日")
+        if data.boxed:
+            why.append("箱体区间")
         because = f"全部落在{'或'.join(why)}上，" if why else ""
         lines.append(
             f"   · 录入的 {data.intervals} 段（{data.days} 天）{because}"

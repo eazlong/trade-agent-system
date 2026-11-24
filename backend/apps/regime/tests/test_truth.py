@@ -109,12 +109,18 @@ class TestTally(SimpleTestCase):
         self.assertEqual(data.counted, 11)
 
     def test_conflicting_days_leave_the_denominator(self):
-        """性质 2 的后半。人工真值自己打架的那天，算法答什么都是错的——它不进分母。"""
+        """性质 2 的后半。人工真值自己打架的那天，算法答什么都是错的——它不进分母。
+
+        **01-14 / 01-15 之所以还得对得上**：那两天只被箱体那一段覆盖，而箱体现在也不进
+        分母（ADR 0007）。所以这里断言的是「冲突与箱体各自出分母之后**一共**只剩两天」，
+        并且那两天全对——用它顺带钉住两层排除是**叠加**而不是互相顶替。
+        """
         tags = {
             _d("2024-01-10"): DOWN,
             _d("2024-01-11"): DOWN,
-            _d("2024-01-14"): CALM,
-            _d("2024-01-15"): CALM,
+            # 01-14 / 01-15 是箱体段覆盖的日子，按理不进分母，所以随便判什么都无所谓。
+            _d("2024-01-14"): DOWN,
+            _d("2024-01-15"): DOWN,
         }
         data = truth.tally(
             [_iv("2024-01-10", "2024-01-13"), _iv("2024-01-12", "2024-01-15", CALM)],
@@ -122,8 +128,16 @@ class TestTally(SimpleTestCase):
         )
         self.assertEqual(data.days, 6)
         self.assertEqual(data.conflict_days, 2, "01-12、01-13 两天档位不同")
-        self.assertEqual(data.counted, 4, "冲突的两天不进分母")
-        self.assertEqual(data.matched, 4, "剩下四天都对上了")
+        self.assertEqual(
+            data.boxed, 2, "01-14、01-15 被箱体段单独覆盖，按 ADR 0007 出分母"
+        )
+        self.assertEqual(data.counted, 2, "冲突两天 + 箱体两天都不进分母")
+        self.assertEqual(data.matched, 2, "剩下两天都对上了")
+        self.assertEqual(
+            data.days,
+            data.conflict_days + data.escalated + data.boxed + data.counted,
+            "五摊互斥：这几个数会被人加起来验算",
+        )
 
     def test_conflicting_days_follow_the_one_definition(self):
         """`conflicting_days` 与 `tally` 报的必须是同一个数：录入时当场报的冲突，与后来
@@ -167,11 +181,26 @@ class TestSystematicMisdirection(SimpleTestCase):
 
     def test_the_other_directions_are_not_misdirection(self):
         """反过来的错（把箱体判成极端）是保守方向，代价是多停几次策略；判成上行趋势是普通
-        的不一致。两者都只算普通错——单向不是漏了一半，而是要堵的恰好是那一半。"""
-        for human, algo in ((CALM, VOL), (CALM, DOWN), (DOWN, UP), (VOL, UP)):
+        的不一致。两者都只算普通错——单向不是漏了一半，而是要堵的恰好是那一半。
+
+        **人工标〈箱体震荡〉那两天现在连分母都不进**（ADR 0007），所以它们不可能记成
+        错向——这也说明「箱体退出的只是分母，不是警报」：错向那条判据压根不看这类日子。
+        真正还留在分母里的是「人工标下行、算法判上行」这一种普通不一致。
+        """
+        # 人工标极端档而算法答非箱体：这些仍在分母里，只算普通不一致。
+        for human, algo in ((DOWN, UP), (VOL, UP), (VOL, DOWN)):
             with self.subTest(human=human, algo=algo):
                 data = self._one(human, algo)
                 self.assertEqual(data.differed, 1)
+                self.assertEqual(data.counted, 1)
+                self.assertEqual(data.misdirected, 0)
+        # 人工标箱体：整段出分母，既不是不一致、也不是错向。
+        for algo in (VOL, DOWN):
+            with self.subTest(human=CALM, algo=algo):
+                data = self._one(CALM, algo)
+                self.assertEqual(data.boxed, 1)
+                self.assertEqual(data.counted, 0)
+                self.assertEqual(data.differed, 0)
                 self.assertEqual(data.misdirected, 0)
 
     def test_a_missing_day_is_not_misdirection(self):
@@ -221,8 +250,8 @@ class TestNewsEscalatedDays(SimpleTestCase):
         self.assertEqual(data.days, 3)
         self.assertEqual(
             data.days,
-            data.conflict_days + data.escalated + data.counted,
-            "四摊互斥：这几个数会被人加起来验算",
+            data.conflict_days + data.escalated + data.boxed + data.counted,
+            "五摊互斥：这几个数会被人加起来验算（这一条 #67 之前写的是四摊）",
         )
 
     def test_the_would_be_misdirection_disappears(self):
@@ -354,6 +383,12 @@ class TestDescribe(SimpleTestCase):
         self.assertIn("哪怕一次", line)
 
     def test_a_gap_is_reported_as_a_gap_not_as_a_wrong_answer(self):
+        """缺口单列。
+
+        **取行时要挑「分母 N 天：」那一行**：首行下面紧跟的那一句 `分母口径` 里也含「分母」
+        二字（#67），照字面找 `"分母" in line` 会先撞上它。这一条与口径那一句必须能分开，
+        所以这里按行首特征取——两件事本来就说的是两件事。
+        """
         line = next(
             line
             for line in truth.describe(
@@ -361,10 +396,60 @@ class TestDescribe(SimpleTestCase):
                     intervals=1, days=4, counted=4, matched=2, differed=0, missing=2
                 )
             )
-            if "分母" in line
+            if "分母 4 天：" in line
         )
         self.assertIn("2 天一致", line)
         self.assertIn("2 天算法当天没有输出", line)
+
+    def test_the_denominator_scoping_is_printed_next_to_the_rate(self):
+        """ADR 0007 的硬要求：读这个数的人必须知道「箱体不计入分母」（#67）。
+
+        不印这一句，`75.0%` 会被读成全档位的一致率。三条一起钉：
+        口径句紧跟首行、说明**哪一类计入、哪一类不计入**、并且明说上面的比率**不是全档位**。
+        """
+        lines = truth.describe(
+            truth.Agreement(intervals=1, days=10, counted=8, matched=6, differed=2)
+        )
+        self.assertIn("8 天一致", lines[0])
+        self.assertIn("分母口径", lines[1], "口径句必须紧跟首行，否则会被读成别的话题")
+        self.assertIn("除箱体区间外的日子计入", lines[1])
+        self.assertIn("箱体区间不计入", lines[1])
+        self.assertIn("不是全档位的一致率", lines[1])
+        # **不许把分母说成「趋势区间」**：分母里还可能有人工单独标的〈高波动〉日
+        # （`fold_overlay` 保留 `{高波动}`，它不进 `boxed`）。只写趋势区间时，那份标注
+        # 会让这句话变成假的——而它恰恰是用来防误读的那一句。
+        self.assertNotIn("是趋势区间的一致率", lines[1])
+
+    def test_the_scoping_line_is_printed_even_when_no_box_days_exist(self):
+        """口径是常设的，不是这天才成立的。只在有箱体时才说，会让没箱体的那天读成
+        「没有这个口径」——而那一天的人数照样是趋势区间的一致率。"""
+        lines = truth.describe(
+            truth.Agreement(intervals=1, days=3, counted=3, matched=3)
+        )
+        self.assertTrue(any("分母口径" in line for line in lines))
+        self.assertFalse(
+            any("人工标〈箱体震荡〉" in line for line in lines),
+            "箱体天数为 0 时不报这个数（0 是一个噪声行，不是信息）",
+        )
+
+    def test_the_boxed_days_are_counted_out_loud(self):
+        """箱体天数必须单列：只说「分母 8 天」，读者无法验算「覆盖 10 天为什么只比了 8 天」。"""
+        lines = truth.describe(
+            truth.Agreement(
+                intervals=1, days=10, boxed=2, counted=8, matched=6, differed=2
+            )
+        )
+        line = next(line for line in lines if "人工标〈箱体震荡〉" in line)
+        self.assertIn("2 天", line)
+        self.assertIn("不计入分母", line)
+
+    def test_box_days_are_named_when_they_are_the_whole_reason(self):
+        """整份标注都是箱体区间时，`rate` 是 None——那句解释必须把这一个原因说出来，
+        否则人只会看到「没有一天可用于比对」，而不知道该去补哪一类标注。"""
+        lines = truth.describe(truth.Agreement(intervals=1, days=5, boxed=5, counted=0))
+        self.assertIn("无法判定", lines[0])
+        line = next(line for line in lines if "没有一天可用于比对" in line)
+        self.assertIn("箱体区间", line)
 
     def test_an_escalated_day_is_reported_apart(self):
         """摘掉的天必须报出来，否则它就是一个看不见底的黑洞。"""

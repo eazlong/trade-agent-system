@@ -225,6 +225,52 @@ VOLATILITY_SOURCE_PROXY = "proxy"
 #: 说的」混进去，「每个高波动日都有新闻佐证」这个误读就被焊死了。
 VOLATILITY_SOURCE_NEWS = "news_escalation"
 
+#: `volatility_source` 的展示名。**唯一一处**（#67）：日报第①段与 Web 读面都查它。
+#:
+#: 为什么必须收在这里而不是各入口各写一份：这四个取值的**区别本身就是要传出去的信息**。
+#: 尤其 `proxy` 那一句必须带上「没有消息面确认」——代理判据有假阳性，一次没有新闻的大波动
+#: 也会被判成事件波动；不把这个免责说明一起印出去，读者会以为每一个高波动日都有新闻佐证，
+#: 而那正是 #67 要结束的那个误读。两处各写一份时，改一处、漏一处就会让某一个入口更乐观。
+#:
+#: 取值查不到时**原样回显**（`serializers._from_table` / `report._enum_display` 的同一纪律）：
+#: 一个陌生的来源值是给人查的线索，编一句中文会把它盖掉。
+VOLATILITY_SOURCE_DISPLAY = {
+    VOLATILITY_SOURCE_PROXY: (
+        "价格代理（跳空 / 放量 / ATR 骤升 / 单日大幅），没有消息面确认"
+    ),
+    # 资讯抬升置上去的波动维。与 `proxy` 分开是必需的：读者要能分清「价格走出来了」
+    # 与「消息面说了要谨慎」，两者的假阳性特征完全不同。
+    VOLATILITY_SOURCE_NEWS: "资讯抬升置上（消息面要求进入风险状态，价格代理本身没判出事件）",
+    VOLATILITY_SOURCE_LEGACY: "按旧四档回填的映射值，不是判出来的",
+    VOLATILITY_SOURCE_PROJECTION: "旧版按四档投影写入的值，不是判出来的",
+}
+
+
+def volatility_source_reportable(volatility: object) -> bool:
+    """这一天的**来源**值不值得印出来。**唯一一处判据**（#67）。
+
+    只有 `event_spike` 才有「高波动从哪来」这个问题。`normal` 说的是「没有事件波动」——
+    在它旁边印一句「价格代理……没有消息面确认」，读者会读成「今天代理判出了波动」，
+    而那是一个由读面自己造出来的假结论。
+
+    ## 为什么必须是共用的一处，而不是各入口自己判
+
+    `judgement._volatility_source` 在**有波动结论时一律**写来源，`normal` 那天写的也是
+    `proxy`（归因指向「产生这个取值的那条判据」）。所以「值存在」与「值得印」是两件事，
+    而日报（`report._axes_lines`）与 Web 读面（`serializers.volatility_source_payload`）
+    都要回答后者。两处各写一遍时，其中一处写成 `is not None` 就会在 `normal` 天发出那句
+    免责声明——实测日报就是这样：`波动：无事件波动` 下面紧跟
+    `波动来源：价格代理（……没有消息面确认）`。
+
+    `volatility` 收 `object` 并统一转成 slug 再比：调用方一处传的是库里的 `str`，另一处
+    传的可能是 `Volatility` 枚举成员，而对 `str` 枚举做 `str()` 得到的是 `"Volatility.NORMAL"`
+    这种**不是取值**的串，那样比永远不相等、静默返回 `False`。
+    """
+    if volatility is None:
+        return False
+    return str(getattr(volatility, "value", volatility)) == Volatility.EVENT_SPIKE.value
+
+
 #: 四档 → 两维。**唯一一处投影表**，两个方向都从它派生（反向表由它生成，不另写一份）。
 #:
 #: `high_vol` 的 cycle 是 `None` 而不是某个猜出来的方向：旧结构里 HIGH_VOL 排在

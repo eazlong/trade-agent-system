@@ -1488,6 +1488,24 @@ export type RegimePoolState =
 
 export interface RegimeRegimeState {
   regime: Labelled | null;
+  /**
+   * 两维（#63）归**基础**轴。`regime` 是生效阶段（可能被资讯抬升过），所以两者会不同：
+   * `base=range` 被抬成 `effective=high_vol` 那天，`regime` 是高波动而两维是「横盘 +
+   * 无事件波动」——两句都对，说的不是同一件事。
+   *
+   * `null` 是**有意义的结论**（旧结构里波动吃掉了周期，或这一维还没算），不是「缺数据」。
+   */
+  cycle: Labelled | null;
+  volatility: Labelled | null;
+  /**
+   * 波动维的**来源**（#67）。`null` = 这条判定没有波动来源（`normal` 那天没有「高波动
+   * 从哪来」这个问题，旧行也没有这一列）。
+   *
+   * display 由后端成对给出，**前端不许自己把 `proxy` 翻成中文**：那一句带「没有消息面
+   * 确认」的免责说明本身就是要传出去的信息，两处各写一份时改一处、漏一处会让其中一个
+   * 入口更乐观。
+   */
+  volatility_source: Labelled | null;
   effective_at: string | null;
   /** `true` = 库中还没有任何生效过的判定（冷启动），`display` 是那句话。 */
   cold: boolean;

@@ -41,7 +41,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from apps.regime import breaker_switch, mechanism_switch, pool, pool_rebuild
+from apps.regime import breaker_switch, mechanism_switch, pool, pool_rebuild, quant
 from apps.regime import gate_switch
 from apps.regime import serializers as ser
 from apps.regime import slice as sl
@@ -126,11 +126,22 @@ class _Fixture(_GateRunFixture):
             add_cell(generation, strategy, regime, **kwargs)
         return generation
 
-    def judged(self, *, regime: str = DOWNTREND, effective_at=None):
+    def judged(
+        self,
+        *,
+        regime: str = DOWNTREND,
+        effective_at=None,
+        cycle: str | None = None,
+        volatility: str | None = None,
+        volatility_source: str | None = None,
+    ):
         """一条生效中的判定（`current_regime_state` 只读它的 `effective_regime` 与
         `effective_at`）。与 `test_gate_run._Fixture.judged` 同形，但**覆盖**它：那边
         的默认 `effective_at` 是 `NOW`，而 `current_regime_state()` 不注入时钟，于是
-        「现在生效」得落在真实时间之前。"""
+        「现在生效」得落在真实时间之前。
+
+        两维与来源默认留空（#63 之前的行就是这个形状），要测它们时显式给。
+        """
         moment = effective_at or (NOW - timedelta(days=30))
         return RegimeJudgement.objects.create(
             symbol="BTC/USDT",
@@ -138,6 +149,9 @@ class _Fixture(_GateRunFixture):
             effective_at=moment,
             base_regime=regime,
             effective_regime=regime,
+            cycle=cycle,
+            volatility=volatility,
+            volatility_source=volatility_source,
         )
 
     def shared_evidence(self) -> dict:
@@ -958,6 +972,104 @@ class TestOverviewStaysCheap(_Fixture):
         self.assertEqual(state["regime"]["value"], DOWNTREND.value)
         self.assertEqual(state["regime"]["display"], DOWNTREND.display)
         self.assertTrue(state["effective_at"])
+
+
+class TestRegimeStateAxes(_Fixture):
+    """`overview.regime_state` 的两维与波动来源（#67）。
+
+    **单独一个 class、不用 `TestOverviewStaysCheap` 那个 `setUp`**：两件事的理由都不允许
+    共用。一是那边 `setUp` 已经造了一条判定，而 `regime_judgements` 上
+    `(symbol, effective_at)` 是唯一的——这里再建一条会撞约束；二是冷启动那条用例要求
+    **一条判定都没有**，与「已经有一条生效判定」的夹具互斥。
+    """
+
+    def test_the_regime_state_carries_both_axes_at_once(self):
+        """`/regime` 必须能看出「牛市里的暴跌日」（#67 验收第 4 条）。
+
+        这两维**同时成立、互不覆盖**：`regime` 是生效阶段（被抬升过的那个），两维归基础
+        轴。所以一条 `base=high_vol` 而 `cycle=bull` 的行要能原样读出两维——若读面把它
+        投影回四档，`bull` 就会被抹成「没有方向」，而那正是 #64/#65 要结束的误读。
+        """
+        self.judged(
+            regime=BaseRegime.HIGH_VOL.value, cycle="bull", volatility="event_spike"
+        )
+        body = self.overview().json()
+
+        state = body["regime_state"]
+        self.assertFalse(state["cold"])
+        self.assertEqual(state["cycle"]["value"], "bull")
+        self.assertEqual(state["cycle"]["display"], quant.CYCLE_DISPLAY["bull"])
+        self.assertEqual(state["volatility"]["value"], "event_spike")
+        self.assertEqual(
+            state["volatility"]["display"], quant.VOLATILITY_DISPLAY["event_spike"]
+        )
+
+    def test_the_volatility_source_is_paired_with_its_display(self):
+        """代理来源必须成对发出去（#67 验收第 2 条 + 第 5 条）。
+
+        只发 slug（`proxy`）的话，前端要显示它只能自己翻中文——而那张免责说明（「没有
+        消息面确认」）恰恰是代理判据最容易被高估的地方，它不许在前端另写一份。
+        """
+        self.judged(
+            regime=BaseRegime.HIGH_VOL.value,
+            cycle="bull",
+            volatility="event_spike",
+            volatility_source=quant.VOLATILITY_SOURCE_PROXY,
+        )
+        state = self.overview().json()["regime_state"]
+
+        source = state["volatility_source"]
+        self.assertEqual(source["value"], quant.VOLATILITY_SOURCE_PROXY)
+        self.assertEqual(
+            source["display"],
+            quant.VOLATILITY_SOURCE_DISPLAY[quant.VOLATILITY_SOURCE_PROXY],
+        )
+        self.assertIn("没有消息面确认", source["display"])
+
+    def test_a_news_escalation_source_is_not_reported_as_a_proxy(self):
+        """资讯抬升置上的波动维不许被读面说成「价格代理」。两个来源的假阳性特征完全不同，
+        混成一个会让读者以为每个高波动日都有新闻佐证。"""
+        self.judged(
+            regime=BaseRegime.HIGH_VOL.value,
+            cycle="bear",
+            volatility="event_spike",
+            volatility_source=quant.VOLATILITY_SOURCE_NEWS,
+        )
+        source = self.overview().json()["regime_state"]["volatility_source"]
+
+        self.assertEqual(source["value"], quant.VOLATILITY_SOURCE_NEWS)
+        self.assertIn("资讯抬升置上", source["display"])
+        self.assertNotIn("没有消息面确认", source["display"])
+
+    def test_a_normal_volatility_day_prints_no_source(self):
+        """`normal` 那天没有「高波动从哪来」这个问题。
+
+        在 `normal` 旁边挂一句「价格代理」会被读成「今天代理判出了波动」——一个由读面
+        自己造出来的假结论。所以波动维为 `normal` 时来源**不发**（`None`）。
+        """
+        self.judged(
+            regime=BaseRegime.UPTREND.value,
+            cycle="bull",
+            volatility="normal",
+            volatility_source=quant.VOLATILITY_SOURCE_PROXY,
+        )
+        state = self.overview().json()["regime_state"]
+
+        self.assertEqual(state["volatility"]["value"], "normal")
+        self.assertIsNone(state["volatility_source"])
+
+    def test_a_cold_state_still_carries_the_two_axis_keys(self):
+        """冷启动时两维与来源都是 `None`，但**键必须在**：前端按「键在、值为 null」写
+        分支，缺键会逼它去 `in` 判断，而那正是 #63 立下的形状约定。"""
+        state = self.overview().json()["regime_state"]
+
+        self.assertTrue(state["cold"])
+        self.assertIn("cycle", state)
+        self.assertIn("volatility", state)
+        self.assertIn("volatility_source", state)
+        self.assertIsNone(state["cycle"])
+        self.assertIsNone(state["volatility"])
+        self.assertIsNone(state["volatility_source"])
 
 
 # --------------------------------------------------------------------------- #

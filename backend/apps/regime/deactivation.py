@@ -214,6 +214,10 @@ class RegimeState:
     cycle: str | None = None
     #: 波动维（`normal`/`event_spike`），`None` 表示这条判定没有波动结论。
     volatility: str | None = None
+    #: 波动维的**来源**（`proxy` / `news_escalation` / 两个旧值）。#67 起随两维一起带出：
+    #: 读面要说清「今天的高波动来自价格代理还是消息面确认」，而这件事只有这一列知道。
+    #: `None` 表示这条判定没有来源记录（本列存在之前的行）——**不是**「来源不明了」。
+    volatility_source: str | None = None
 
     @property
     def cold(self) -> bool:

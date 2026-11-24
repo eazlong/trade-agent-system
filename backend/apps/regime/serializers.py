@@ -162,6 +162,28 @@ def volatility_payload(value: Any) -> dict[str, str] | None:
     return _labelled(value, _from_table(quant.VOLATILITY_DISPLAY, value))
 
 
+def volatility_source_payload(value: Any, *, volatility: Any) -> dict[str, str] | None:
+    """波动维的**来源**（#67）。**只有波动维是 `event_spike` 时才发**，其余一律 `None`。
+
+    展示名取 `quant.VOLATILITY_SOURCE_DISPLAY`（**唯一一处**，日报第①段用的是同一张表）。
+    这一对存在的理由就是 #67 那句话：「今天的高波动来自价格代理还是消息面确认」——代理
+    判据有假阳性，不把来源成对给出去，前端只能显示 slug（`proxy`），而 slug 里不含任何
+    免责信息。**前端不许自己把 slug 翻成中文**：那张表在日报与读面之间必须只有一份。
+
+    ## 为什么收的是 `volatility` 而不是让调用方自己判
+
+    「来源只在有波动时才有意义」这条配对规则**就是**这一对的形状，和 `_labelled` 把
+    `value` 与 `display` 绑在一起是同一条纪律。留在调用方判的话，两个调用点各写一遍
+    `if volatility == ...`，其中一处写成 `is not None` 就会在 `normal` 那天发出
+    「价格代理」——而 `normal` 的意思是「没有事件波动」，那句话会被读成「今天代理判出了
+    波动」，是一个由读面自己造出来的假结论。**实测日报就是这样错的**，所以这条判据现在
+    收在 `quant.volatility_source_reportable`，本函数与 `report._axes_lines` 共用它。
+    """
+    if value is None or not quant.volatility_source_reportable(volatility):
+        return None
+    return _labelled(value, _from_table(quant.VOLATILITY_SOURCE_DISPLAY, value))
+
+
 def _from_table(table: Mapping[str, str], value: Any) -> str:
     """查展示名表。**查不到就原样回显**——不猜、不回落成某一档。
 

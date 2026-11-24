@@ -95,6 +95,20 @@ export default function RegimePage() {
   const generation = overview?.pool.has_generation ? overview.pool.generation : null;
 
   /**
+   * 两维里至少有一维有值。全空是**合法状态**（#63 之前的旧行，或这一天没有周期结论），
+   * 那时整段不渲染——写「没有结论」是噪音，而拿 `sideways` 填上是一个假结论。
+   *
+   * **判据用 `!= null` 而不是 `!== null`**：类型上这两维是 `Labelled | null`，但滚动部署
+   * 或响应被裁时那个键可能整个不在（`undefined`）。`undefined !== null` 为真，于是会
+   * 进入下面的分支取 `.display` —— 一次属性访问就能把整页打成白屏，而这正是「键在、值
+   * 为 null」与「键不在」必须分开写的理由。宽松比较把两者一起挡住。
+   */
+  const hasAxes =
+    overview != null &&
+    (overview.regime_state.cycle != null ||
+      overview.regime_state.volatility != null);
+
+  /**
    * 展开某一格时拉它的依据。**`generation` 用页面当前显示的那一代**：不钉住的话，
    * 展开的瞬间正好翻代会拿到「新一代的证据配旧一代的矩阵」——格子上的状态与新表的
    * 依据对不上，而两者看起来都正常。
@@ -133,6 +147,40 @@ export default function RegimePage() {
               ? overview.regime_state.regime.display
               : overview.regime_state.display}
         </p>
+        {/*
+          两维并存（#67 验收第 4 条）：这一页必须能看出「牛市里的暴跌日」。
+          **两维各自独立渲染、互不覆盖**——`cycle` 有值而 `volatility=event_spike` 时
+          两句话同时出现，不是二选一。旧结构里波动吃掉了周期，所以 `cycle` 可能是
+          `null`；那时整段不渲染，**不拿「横盘」之类填上**（后端也是这么发的）。
+        */}
+        {overview !== null && hasAxes && (
+          <div data-testid="regime-axes" className="text-[11px] text-text3 space-y-0.5">
+            {overview.regime_state.cycle != null && (
+              <p data-testid="regime-axis-cycle">
+                周期：{overview.regime_state.cycle.display}
+              </p>
+            )}
+            {overview.regime_state.volatility != null && (
+              <p data-testid="regime-axis-volatility">
+                波动：{overview.regime_state.volatility.display}
+              </p>
+            )}
+            {overview.regime_state.cycle != null &&
+              overview.regime_state.volatility != null && (
+                <p className="text-text3">（两维同时成立、互不覆盖：高波动是叠加层，不吞掉周期）</p>
+              )}
+            {/*
+              来源（#67 验收第 2 条）：只在后端发出来时渲染（= 波动维是 event_spike）。
+              **display 原样转述后端**，前端不把 `proxy` 翻成中文——那句话里的
+              「没有消息面确认」正是代理判据最容易被高估的地方，不能在前端另写一份。
+            */}
+            {overview.regime_state.volatility_source != null && (
+              <p data-testid="regime-axis-volatility-source" className="text-amber">
+                波动来源：{overview.regime_state.volatility_source.display}
+              </p>
+            )}
+          </div>
+        )}
         {!isStaff && (
           <p data-testid="write-permission-hint" className="text-[11px] text-text3">
             翻开关、重算池化表与删除策略（退役）需要管理员权限。（这是界面纪律，不是安全边界：服务端同样会挡。）

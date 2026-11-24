@@ -351,6 +351,9 @@ def _regime_state() -> dict[str, Any]:
             # 是可预期的形状，后者要靠 `in` 判断才不炸。
             "cycle": None,
             "volatility": None,
+            # 来源（#67）：冷启动时同样为 `None`，但键要在——前端拿「键在、值为 null」
+            # 写的是与「键不在」不同的分支（见上一段的同一理由）。
+            "volatility_source": None,
             "effective_at": ser.iso(state.effective_at),
             "cold": True,
             "display": COLD_STATE_DISPLAY,
@@ -366,6 +369,11 @@ def _regime_state() -> dict[str, Any]:
         # 读面必须能表达它，不能拿 `sideways` 之类填上。
         "cycle": ser.cycle_payload(state.cycle),
         "volatility": ser.volatility_payload(state.volatility),
+        # 波动维的来源（#67）。**只有 `event_spike` 才发**——那条配对规则收在
+        # `serializers.volatility_source_payload` 里（它是这一对的形状，不是视图的判断）。
+        "volatility_source": ser.volatility_source_payload(
+            state.volatility_source, volatility=state.volatility
+        ),
         "effective_at": ser.iso(state.effective_at),
         "cold": False,
         "display": "",

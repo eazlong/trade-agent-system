@@ -159,6 +159,10 @@ def _mechanism_details(data: Any) -> dict[str, Any]:
             "conflict_days": agreement.conflict_days,
             "escalated": agreement.escalated,
             "escalated_matched": agreement.escalated_matched,
+            # 箱体天数（#67 / ADR 0007）。**必须摆出来**：上面那个 `counted` 是趋势区间的
+            # 分母，与 `days` 差着箱体与另外两摊。只给 `counted` 的话，人拿 `matched /
+            # days` 自己一除，就会得到一个不是一致率的数。
+            "boxed": agreement.boxed,
             "counted": agreement.counted,
             "matched": agreement.matched,
             "differed": agreement.differed,

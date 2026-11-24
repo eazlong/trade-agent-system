@@ -509,6 +509,65 @@ class TestPureRendering(TestCase):
         self.assertIn("旧四档回填", body)
         self.assertNotIn("价格代理", body)
 
+    def test_a_normal_day_prints_no_volatility_source_at_all(self):
+        """`normal` 那天**不许**印来源（#67 复核）。
+
+        这是实测发现的真缺陷：判定层 `judgement._volatility_source` 在**有波动结论时一律**
+        写来源，`normal` 那天写的也是 `proxy`（归因指向「产生这个取值的那条判据」）。于是
+        「值存在」与「值得印」是两件事，而日报原来的判据是 `volatility is not None`——
+        它把 `normal` 也算成有值，结果印出了
+
+            波动：无事件波动
+            波动来源：价格代理（……没有消息面确认）
+
+        上一行说「没有事件波动」，下一行说「价格代理判出来的」。读者只会读成「今天代理判出
+        了波动」，而那正是本票要防的那个误读。判据现在收在
+        `quant.volatility_source_reportable`，与 Web 读面共用。
+        """
+        result = concluded_payload(regime="uptrend", with_record=False)
+        result["cycle"] = "bull"
+        result["volatility"] = "normal"
+        result["volatility_source"] = "proxy"
+        body = report._section_today(result, None, SYMBOL)
+
+        self.assertIn("波动：无事件波动", body, "两维本身照常印")
+        self.assertNotIn("波动来源", body)
+        # 两种来源值都不许漏出来：`legacy_mapping` 在 `normal` 天同样是错的。
+        result["volatility_source"] = "legacy_mapping"
+        body = report._section_today(result, None, SYMBOL)
+        self.assertNotIn("波动来源", body)
+
+    def test_the_daily_report_and_the_web_read_side_agree_on_the_source(self):
+        """日报与 Web 读面对**同一条记录**必须给出**同一个**结论（#67 复核）。
+
+        两个入口对「这一天有没有来源可报」各判一次的话，实测就是日报先出错（它在 `normal`
+        天印了代理免责句，而读面一个字不印）。这条用例把两边绑在一起验：现在两边共用
+        `quant.volatility_source_reportable`，任一边单独走偏都会红。
+        """
+        from apps.regime import serializers as ser
+
+        for volatility, source, should_report in (
+            ("event_spike", "proxy", True),
+            ("event_spike", "news_escalation", True),
+            ("normal", "proxy", False),
+        ):
+            with self.subTest(volatility=volatility, source=source):
+                result = concluded_payload(regime="uptrend", with_record=False)
+                result["cycle"] = "bull"
+                result["volatility"] = volatility
+                result["volatility_source"] = source
+
+                in_report = "波动来源" in report._section_today(result, None, SYMBOL)
+                in_read_side = (
+                    ser.volatility_source_payload(source, volatility=volatility)
+                    is not None
+                )
+                self.assertEqual(in_report, should_report, "日报那一边")
+                self.assertEqual(in_read_side, should_report, "读面那一边")
+                self.assertEqual(
+                    in_report, in_read_side, "两个入口对同一记录不许有两个说法"
+                )
+
     def test_a_record_that_says_nothing_yields_no_numbers(self):
         # 取不到就不写，不拿别的量凑：一句编出来的「依据」比没有依据更坏。
         self.assertEqual(report._quant_lines(None), [])

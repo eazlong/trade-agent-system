@@ -477,15 +477,9 @@ def _missing_judgement_lines(
     return lines
 
 
-#: 波动维的来源取值。与 `quant.VOLATILITY_SOURCE_*` 同源，这里只做展示映射。
-_VOLATILITY_SOURCE_DISPLAY = {
-    "proxy": "价格代理（跳空 / 放量 / ATR 骤升 / 单日大幅），没有消息面确认",
-    # 资讯抬升置上去的波动维。与 `proxy` 分开是必需的：读者要能分清「价格走出来了」
-    # 与「消息面说了要谨慎」，两者的假阳性特征完全不同。
-    "news_escalation": "资讯抬升置上（消息面要求进入风险状态，价格代理本身没判出事件）",
-    "legacy_mapping": "按旧四档回填的映射值，不是判出来的",
-    "compatible_projection": "旧版按四档投影写入的值，不是判出来的",
-}
+#: 波动维的来源取值与它的展示名都收在 `quant.VOLATILITY_SOURCE_DISPLAY`（#67）。
+#: 这里**不另写一份表**：日报与 Web 读面要按同一个口径说「今天的高波动从哪来」，
+#: 两处各写一份时，改一处、漏一处会让其中一个入口更乐观（代理那一句的免责说明最容易漏）。
 
 
 def _axes_lines(judgement_result: dict, record: RegimeJudgement | None) -> list[str]:
@@ -528,8 +522,12 @@ def _axes_lines(judgement_result: dict, record: RegimeJudgement | None) -> list[
             lines.append("（两维同时成立、互不覆盖：高波动是叠加层，不吞掉周期）")
 
     source = _axis(record, judgement_result, "volatility_source")
-    if volatility is not None:
-        text = _VOLATILITY_SOURCE_DISPLAY.get(source or "")
+    # **`volatility` 有值不等于有「来源」可报**（#67）：`normal` 那天判定层照样写了
+    # `proxy`（归因指向产生该取值的判据），而「没有事件波动」旁边印一句「价格代理」
+    # 会被读成「今天代理判出了波动」。判据收在 `quant.volatility_source_reportable`，
+    # 与 Web 读面共用同一处——两处各判一次时，实测就是日报先出错。
+    if quant.volatility_source_reportable(volatility):
+        text = quant.VOLATILITY_SOURCE_DISPLAY.get(source or "")
         if text:
             lines.append(f"波动来源：{text}")
     return lines

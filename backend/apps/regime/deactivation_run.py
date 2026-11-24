@@ -258,6 +258,9 @@ def current_regime_state(
         # 或者它的 `cycle` 本就该空（`high_vol` 那天）。两者都不影响 `regime`。
         cycle=record.cycle,
         volatility=record.volatility,
+        # 来源（#67）。与波动维同进退：`volatility` 为空时它也无意义，但两者**不互相推导**
+        # ——旧行的 `volatility` 可能是投影来的，而 `volatility_source` 才说得清是哪一种。
+        volatility_source=record.volatility_source,
     )
 
 
