@@ -1,3 +1,17 @@
+# 同镜像（backend/Dockerfile）的三个长驻服务共用：
+# - backend  : 每条前端 WS 连接 = 1 个 socket + 1 个 Redis 连接
+# - celery   : concurrency=2 的多子进程，各自持有 Redis/PG 连接
+# - lark-ws  : 长连 WS + Redis Stream 消费
+# 容器默认继承 dockerd 的 nofile（常见 1024/2048）。前端页面「挂着不动」时
+# 上面这些连接会长时间累积，1024 在挂机数小时后被打满，表现为 accept 报
+# EMFILE —— 进程还在、端口还通，但新请求全进不来（与内存 OOM 的
+# 「端口通但不响应」是同一个外部形态，排障时极易混淆）。
+# soft/hard 同时抬到 65535：只抬 soft 的话进程自己无法再提高上限。
+x-backend-nofile: &backend-nofile
+  nofile:
+    soft: 65535
+    hard: 65535
+
 services:
   db:
     restart: unless-stopped
@@ -74,6 +88,8 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: uvicorn core.asgi:application --host 0.0.0.0 --port 8000 --no-access-log
+    # 打开文件数上限，见文件末尾 x-backend-common 的注释。
+    ulimits: *backend-nofile
     deploy:
       resources:
         limits:
@@ -132,6 +148,7 @@ services:
       celery -A celery_app worker -l info --concurrency=2 -Q celery,grid_search
       --max-tasks-per-child=50
       --max-memory-per-child=800000
+    ulimits: *backend-nofile
     deploy:
       resources:
         limits:
@@ -173,6 +190,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: python -m apps.channel.lark_ws
+    ulimits: *backend-nofile
     volumes:
       - ./backend:/app
       - ~/.tradelogx:/root/.tradelogx

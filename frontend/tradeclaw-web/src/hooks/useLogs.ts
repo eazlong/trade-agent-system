@@ -97,8 +97,25 @@ export function useLogs(params?: LogQueryParams, live = true) {
     return () => {
       unsub();
       clearInterval(statusInterval);
+      // 这里刻意不发 unsubscribe：改筛选条件时本 effect 会重跑，而此时
+      // 回调已删、监听数为 0，判定必然成立 —— 每敲一个字符就会让服务端
+      // 停掉 Redis 读流再重建一个客户端，中间产生的日志直接丢。
+      // 重跑前总会有一次新的 subscribe（服务端订阅路径内部会关掉旧池），
+      // 真正的取订与断连统一交给下面的卸载 effect。
     };
   }, [live, paramsKey]);
+
+  // 组件真的卸载时才取订并断开连接。原先没有任何地方调 disconnect：每进出
+  // 一次日志页，后端就多留一条常驻 WS 连接，挂机久了把 nofile 吃满。
+  useEffect(() => {
+    return () => {
+      // 还有其他订阅者（多实例共存）就不断连，避免拖断别人的流
+      if (logWS.listenerCount === 0) {
+        logWS.unsubscribe();
+        logWS.disconnect();
+      }
+    };
+  }, []);
 
   return { logs, loading, error, hasNext, loadingMore, loadMore, refetch: () => fetchLogs(1, false), wsConnected, wsError };
 }
