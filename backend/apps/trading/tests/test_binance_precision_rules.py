@@ -72,7 +72,9 @@ class TestPrecisionRulesFailLoud(SimpleTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             asyncio.run(self.a.place_order(_req()))
 
-        self.assertIn("精度规则不可用", str(ctx.exception))
+        # 2026-11-27：文案拆成两类——「品种不在该执行场所」与「精度规则取不到」。
+        # 这里的事实是规则表里确实没有该 symbol，不是拉取失败，也不是精度缺失。
+        self.assertIn("品种不在该执行场所", str(ctx.exception))
         self.assertEqual(self._order_posts(client), [])
 
     def test_valid_rules_still_normalize_and_send(self):

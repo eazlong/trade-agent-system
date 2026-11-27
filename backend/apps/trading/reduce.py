@@ -743,7 +743,11 @@ async def cancel_opening_orders(
 async def account_positions(
     adapter: BaseExchangeAdapter,
 ) -> dict[str, tuple[str, Decimal]]:
-    """账户此刻的持仓：``{交易所口径品种: (方向, 数量)}``。
+    """账户此刻的持仓：``{用户口径品种: (方向, 数量)}``（无斜杠，如 ``PEPEUSDT``）。
+
+    数量与价格都是**用户口径**（基础币个数 / 每基础币价格）：适配器已把
+    ``1000PEPEUSDT`` 这类乘数合约的张数/每张价格换算回来（见 ``binance_contracts``），
+    所以这里的键与会话/事件作用域（``BASE/QUOTE`` 归一后）是同一个口径。
 
     **交易所是持仓的唯一真相**（本地没有持仓表）。所以减仓的「一半」只能从这里算：
     任何本地推算都是第二份持仓算术，而它与交易所分叉的那一刻，减仓就会减错。

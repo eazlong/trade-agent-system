@@ -31,6 +31,7 @@ from .base import (
     Position,
     SymbolRules,
 )
+from .binance_contracts import ContractSymbol, from_contract, to_contract
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +351,8 @@ class BinanceAdapter(BaseExchangeAdapter):
                 "GET",
                 "/fapi/v1/order",
                 {
-                    "symbol": symbol.upper().replace("/", ""),
+                    # 口径换算：用户口径 PEPEUSDT → 合约口径 1000PEPEUSDT
+                    "symbol": self._contract(symbol).venue_symbol,
                     "origClientOrderId": client_order_id,
                 },
             )
@@ -374,22 +376,40 @@ class BinanceAdapter(BaseExchangeAdapter):
             f"{resp.status_code} - {(resp.text or '')[:200]}"
         )
 
-    def _order_response_from_raw(self, data: dict) -> OrderResponse:
+    def _order_response_from_raw(
+        self, data: dict, *, multiplier: Decimal = Decimal("1")
+    ) -> OrderResponse:
         """交易所订单 dict → OrderResponse（下单与对账共用，保持与原来一致的**原始**
-        交易所状态；本地状态由 executor._map_exchange_status 统一映射）。"""
+        交易所状态；本地状态由 executor._map_exchange_status 统一映射）。
+
+        **口径一律翻译回用户口径**：合约的张数与每张价格（`1000PEPEUSDT`：139159 张、
+        每张 0.0107）换回基础币个数与每基础币价格（139159000 个、0.0000107）。不换算
+        的话台账上的成交价会与策略/K 线的价格差 1000 倍，而已实现盈亏恰好仍是同一个数，
+        这种错最难在事后看出来。乘数 1（绝大多数品种）时逐位不变。
+        """
+        venue_symbol = str(data.get("symbol", "") or "")
+        user_symbol = from_contract(venue_symbol)[0] if venue_symbol else ""
         return OrderResponse(
             exchange_order_id=str(data["orderId"]),
             status=data.get("status", ""),
-            filled_qty=Decimal(data.get("executedQty", "0")),
-            avg_price=Decimal(data["avgPrice"]) if data.get("avgPrice") else None,
+            filled_qty=self._to_user_quantity(
+                Decimal(data.get("executedQty", "0")), multiplier
+            ),
+            avg_price=(
+                self._to_user_price(Decimal(data["avgPrice"]), multiplier)
+                if data.get("avgPrice")
+                else None
+            ),
             fee=None,
             raw=data,
-            symbol=str(data.get("symbol", "") or ""),
+            symbol=user_symbol,
             side=str(data.get("side", "") or "").lower(),
             # **委托量**（origQty），不是成交量（executedQty）：撤单要报的是
             # 「撤掉了多大一张单」，而 `filled_qty` 已经在上面单独给了。
             quantity=(
-                Decimal(data["origQty"]) if data.get("origQty") is not None else None
+                self._to_user_quantity(Decimal(data["origQty"]), multiplier)
+                if data.get("origQty") is not None
+                else None
             ),
         )
 
@@ -434,10 +454,16 @@ class BinanceAdapter(BaseExchangeAdapter):
             f"status={raw.get('status')} executedQty={raw.get('executedQty')} "
             f"avgPrice={raw.get('avgPrice')}"
         )
-        return self._order_response_from_raw(raw)
+        # 对账命中同样要换回用户口径（乘数与下单那次一致，取自同一份 request.symbol）
+        return self._order_response_from_raw(
+            raw, multiplier=self._contract(request.symbol).multiplier
+        )
 
     async def _ensure_leverage(self, symbol: str) -> None:
-        """下单前确保已设置杠杆。每个交易对只需设置一次。"""
+        """下单前确保已设置杠杆。每个交易对只需设置一次（按**合约口径**记）。"""
+        # 自己解析一次：当前唯一调用方（place_order）传的已是合约口径，幂等；写成
+        # 自解析是为了让将来任何直接调用都不会把 PEPEUSDT 发给交易所（-1121）。
+        symbol = self._contract(symbol).venue_symbol
         if symbol in self._leverage_set:
             return
         resp = await self._request(
@@ -499,14 +525,91 @@ class BinanceAdapter(BaseExchangeAdapter):
             )
             raise
 
+    # ------------------------------------------------------------------ #
+    # 用户口径 ↔ 合约口径（1000PEPEUSDT 这类「乘数合约」）
+    # ------------------------------------------------------------------ #
+
+    def _contract(self, symbol: str) -> ContractSymbol:
+        """用户口径 symbol → 合约口径 symbol + 乘数（见 binance_contracts）。
+
+        品种不在映射表里时原样返回、乘数 1——**不猜**：是不是合法品种交给
+        exchangeInfo 判定（`place_order` 那里 fail-closed）。
+        """
+        return to_contract(symbol)
+
+    @staticmethod
+    def _to_venue_quantity(quantity: Decimal, multiplier: Decimal) -> Decimal:
+        """用户口径数量（基础币个数）→ 合约张数。乘数 1 时原样返回。"""
+        if multiplier and multiplier != 1:
+            return quantity / multiplier
+        return quantity
+
+    @staticmethod
+    def _to_user_quantity(quantity: Decimal, multiplier: Decimal) -> Decimal:
+        """合约张数 → 用户口径数量（基础币个数）。乘数 1 时原样返回。"""
+        if multiplier and multiplier != 1:
+            return quantity * multiplier
+        return quantity
+
+    @staticmethod
+    def _to_venue_price(price: Decimal, multiplier: Decimal) -> Decimal:
+        """用户口径价（每 1 个基础币）→ 合约价（每 1 张）。乘数 1 时原样返回。"""
+        if multiplier and multiplier != 1:
+            return price * multiplier
+        return price
+
+    @staticmethod
+    def _to_user_price(price: Decimal, multiplier: Decimal) -> Decimal:
+        """合约价（每 1 张）→ 用户口径价（每 1 个基础币）。乘数 1 时原样返回。"""
+        if multiplier and multiplier != 1:
+            return price / multiplier
+        return price
+
+    def _user_scale_trades(
+        self, trades: list[dict], multiplier: Decimal, *, symbol: str = ""
+    ) -> list[dict]:
+        """成交明细的 qty/price 换回用户口径；其余字段（名义额、盈亏、手续费）原样。
+
+        解析不了就**整份原样返回**：宁可将交易所原值交出去，也不要在动钱的数据里
+        塞一个猜出来的数（与 `Decimal` 解析一贯的 fail-loud 纪律相反的地方只有一处：
+        这里丢了原值比丢了解析更重要，所以不抛、只退原值）。
+        """
+        if not trades or not multiplier or multiplier == 1:
+            return trades
+        converted: list[dict] = []
+        for trade in trades:
+            item = dict(trade)
+            try:
+                if item.get("qty") is not None:
+                    item["qty"] = format(Decimal(str(item["qty"])) * multiplier, "f")
+                if item.get("price") is not None:
+                    item["price"] = format(
+                        Decimal(str(item["price"])) / multiplier, "f"
+                    )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                # 回退原值但必须留痕：静默返回张级数字会被直接落进用户口径的成本桶
+                logger.warning(
+                    f"Binance userTrades 口径换算失败，回退交易所原值 "
+                    f"(symbol={symbol}, multiplier={multiplier}): {exc!r}"
+                )
+                return trades
+            converted.append(item)
+        return converted
+
     def _normalize_quantity(self, symbol: str, quantity: Decimal) -> Decimal:
-        """按 LOT_SIZE stepSize 向下取整数量，避免 -1111 精度错误。"""
+        """按 LOT_SIZE stepSize 向下取整数量，避免 -1111 精度错误。
+
+        `quantity` 与 `symbol` 都必须是**合约口径**：stepSize 是「张」的步长，
+        拿用户口径的基础币个数来取整会差一个乘数（2026-11-27）。
+        """
         if self._symbol_rules and symbol in self._symbol_rules:
             step = self._symbol_rules[symbol]["stepSize"]
             if step and step > 0:
                 q = (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
-                # 归一化指数位数，避免 0.01000000 之类超出精度的表示
-                q = q.quantize(step)
+                # 归一化指数位数，避免 0.01000000 之类超出精度的表示。
+                # 显式 ROUND_DOWN：默认 ROUND_HALF_EVEN 在「数量不是 step 整数倍」时会
+                # 向上舍入，而下单只能**只减不增**（多出来的部分超出意图仓位）。
+                q = q.quantize(step, rounding=ROUND_DOWN)
                 return q
         return quantity
 
@@ -533,7 +636,11 @@ class BinanceAdapter(BaseExchangeAdapter):
         return price
 
     async def place_order(self, request: OrderRequest) -> OrderResponse:
-        symbol = request.symbol.upper().replace("/", "")
+        # 用户口径（现货口径：数量=基础币个数、价格=每 1 个基础币）→ 合约口径
+        # （张数 / 每张价格）。PEPE/USDT → 1000PEPEUSDT，乘数 1000；普通品种乘数 1，
+        # 下面的换算全部退化为恒等，行为与改动前逐位一致（2026-11-27）。
+        contract = self._contract(request.symbol)
+        symbol = contract.venue_symbol
 
         # 首次下单前加载交易所精度规则（懒加载 + 缓存）
         if self._symbol_rules is None:
@@ -542,16 +649,32 @@ class BinanceAdapter(BaseExchangeAdapter):
         # 精度规则不可用 → 无法保证数量/价格合法：拒绝下单。
         # 2026-09-21 实测：加载失败被静默吞掉 → _normalize_quantity 原样返回 →
         # 5332.37953400 直发 DOGEUSDT（stepSize=1）→ 交易所 -1111。
-        if not self._symbol_rules or symbol not in self._symbol_rules:
+        if not self._symbol_rules:
             raise RuntimeError(
-                f"exchangeInfo 精度规则不可用（symbol={symbol}）"
+                f"exchangeInfo 精度规则为空（symbol={symbol}）"
                 "：拒绝下单以避免 -1111 精度错误"
             )
+        if symbol not in self._symbol_rules:
+            # 与「规则缺失」区分开：2026-11-27 txy 事故里这句文案把「合约上根本
+            # 没有这个品种」说成了「精度取不到」，用户按字面去查精度自然查不到。
+            raise RuntimeError(
+                f"品种不在该执行场所（symbol={symbol}，用户口径 {request.symbol}）"
+                "：拒绝下单以避免 -1111 精度错误；"
+                "请核对它在 USD-M 合约上的名字"
+                "（例：现货 PEPE/USDT 对应合约 1000PEPEUSDT）。"
+                "若它是 1000× / 1M× 乘数合约，核对后登记到 "
+                "binance_contracts.CONTRACT_SPECS"
+            )
 
-        # 精度归一化：数量按 stepSize 向下取整，价格按 tickSize 对齐
-        quantity = self._normalize_quantity(symbol, request.quantity)
+        # 精度归一化：数量按 stepSize 向下取整，价格按 tickSize 对齐。
+        # 乘法顺序要紧：**先换算口径、再归一化**——stepSize/tickSize 都是合约口径的。
+        quantity = self._normalize_quantity(
+            symbol, self._to_venue_quantity(request.quantity, contract.multiplier)
+        )
         price = (
-            self._normalize_price(symbol, request.price)
+            self._normalize_price(
+                symbol, self._to_venue_price(request.price, contract.multiplier)
+            )
             if request.price is not None
             else None
         )
@@ -577,7 +700,10 @@ class BinanceAdapter(BaseExchangeAdapter):
             # 「减仓反而反向开仓」的一层（CONTEXT.md:47/:48）。
             params["reduceOnly"] = "true"
         if request.stop_loss:
-            params["stopPrice"] = str(request.stop_loss)
+            # 止损价同样是用户口径（每 1 个基础币），合约侧要的是每张价格
+            params["stopPrice"] = format(
+                self._to_venue_price(request.stop_loss, contract.multiplier), "f"
+            )
             params["workType"] = "STOP"
 
         try:
@@ -612,7 +738,9 @@ class BinanceAdapter(BaseExchangeAdapter):
             # 抛出包含 Binance 错误详情的异常
             raise RuntimeError(f"Binance API {resp.status_code}: {error_detail}")
 
-        return self._order_response_from_raw(resp.json())
+        return self._order_response_from_raw(
+            resp.json(), multiplier=contract.multiplier
+        )
 
     # Binance 订单状态 → 本地 Order.status 映射
     _STATUS_MAP = {
@@ -634,7 +762,7 @@ class BinanceAdapter(BaseExchangeAdapter):
             "DELETE",
             "/fapi/v1/order",
             {
-                "symbol": symbol.upper().replace("/", ""),
+                "symbol": self._contract(symbol).venue_symbol,
                 "orderId": exchange_order_id,
             },
         )
@@ -647,10 +775,11 @@ class BinanceAdapter(BaseExchangeAdapter):
         列表——halt 的撤单步骤若把「没查到」当成「没有挂单」，就会在真的挂着开仓单时
         报告「市场上没有需要撤的单」，而那份报告正是用户据以相信敞口已经收住的东西。
         """
+        contract = self._contract(symbol)
         resp = await self._request(
             "GET",
             "/fapi/v1/openOrders",
-            {"symbol": symbol.upper().replace("/", "")},
+            {"symbol": contract.venue_symbol},
         )
         if resp.status_code != 200:
             raise RuntimeError(
@@ -662,7 +791,11 @@ class BinanceAdapter(BaseExchangeAdapter):
             raise RuntimeError(
                 f"Binance openOrders 响应不是订单数组：{str(payload)[:300]}"
             )
-        return [self._order_response_from_raw(item) for item in payload]
+        # 挂单的委托量同样换回用户口径（撤单报告会显示它）
+        return [
+            self._order_response_from_raw(item, multiplier=contract.multiplier)
+            for item in payload
+        ]
 
     async def fetch_mid_price(self, symbol: str) -> Optional[Decimal]:
         """该品种的中间价 (best bid + best ask) / 2（/fapi/v1/ticker/bookTicker）。
@@ -674,7 +807,7 @@ class BinanceAdapter(BaseExchangeAdapter):
         resp = await self._request(
             "GET",
             "/fapi/v1/ticker/bookTicker",
-            {"symbol": symbol.upper().replace("/", "")},
+            {"symbol": self._contract(symbol).venue_symbol},
             signed=False,
         )
         if resp.status_code != 200:
@@ -695,7 +828,9 @@ class BinanceAdapter(BaseExchangeAdapter):
                 f"Binance bookTicker {symbol} 盘口不可用：bid={bid} ask={ask}"
             )
             return None
-        return (bid + ask) / 2
+        # 合约价（每 1 张 = 每 1000 个 PEPE）→ 用户口径价（每 1 个 PEPE）。
+        # 调用方拿它跟 K 线比、跟成交均价比、记滑点，必须同一个口径（2026-11-27）。
+        return self._to_user_price((bid + ask) / 2, self._contract(symbol).multiplier)
 
     async def min_notional(self, symbol: str) -> Decimal:
         """该品种的最小名义价值（exchangeInfo 的 ``MIN_NOTIONAL.notional``）。
@@ -707,7 +842,9 @@ class BinanceAdapter(BaseExchangeAdapter):
         if self._symbol_rules is None:
             await self._load_symbol_rules()
         rules = self._symbol_rules or {}
-        rule = rules.get(symbol.upper().replace("/", ""))
+        # 名义价值的单位是计价币（USDT），与乘数无关：一张 1000PEPE 的名义额
+        # 就是 1000 × 每 PEPE 价格，换算前后是同一个数。
+        rule = rules.get(self._contract(symbol).venue_symbol)
         return rule["minNotional"] if rule else Decimal("0")
 
     async def symbol_rules(self, symbol: str) -> Optional[SymbolRules]:
@@ -727,18 +864,34 @@ class BinanceAdapter(BaseExchangeAdapter):
         if self._symbol_rules is None:
             await self._load_symbol_rules()
         rules = self._symbol_rules or {}
-        rule = rules.get(symbol.upper().replace("/", ""))
+        contract = self._contract(symbol)
+        rule = rules.get(contract.venue_symbol)
         if not rule:
             return None
-        return SymbolRules(step_size=rule["stepSize"], min_qty=rule["minQty"])
+        # 规则必须换回**用户口径**：stepSize/minQty 是「张」，而调用方（regime 减仓
+        # 分片）手里的数量是「基础币个数」。不乘乘数就会把 139159000 个 PEPE 按
+        # 「整张」的粒度取整（差 1000 倍），只能等交易所 -1111 来兜——那是一次
+        # 本可避免的失败。乘数 1 的品种逐位不变。
+        multiplier = contract.multiplier
+        step_size = rule["stepSize"]
+        min_qty = rule["minQty"]
+        if multiplier != 1:
+            step_size = step_size * multiplier
+            min_qty = min_qty * multiplier
+        return SymbolRules(step_size=step_size, min_qty=min_qty)
 
     async def fetch_order(self, exchange_order_id: str, symbol: str) -> OrderFill:
-        """查询订单当前状态与成交情况（/fapi/v1/order）。"""
+        """查询订单当前状态与成交情况（/fapi/v1/order）。
+
+        成交数量与成交均价都换回**用户口径**（见 `_order_response_from_raw`）：
+        调用方拿它与台账、与 K 线比，差 1000 倍时「已经平仓」会被看成「还差一点」。
+        """
+        contract = self._contract(symbol)
         resp = await self._request(
             "GET",
             "/fapi/v1/order",
             {
-                "symbol": symbol.upper().replace("/", ""),
+                "symbol": contract.venue_symbol,
                 "orderId": str(exchange_order_id),
             },
         )
@@ -754,8 +907,15 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         data = resp.json()
         status = self._STATUS_MAP.get(data.get("status"), "submitted")
-        filled_qty = Decimal(data.get("executedQty", "0"))
-        avg_price = Decimal(data["avgPrice"]) if data.get("avgPrice") else None
+        multiplier = contract.multiplier
+        filled_qty = self._to_user_quantity(
+            Decimal(data.get("executedQty", "0")), multiplier
+        )
+        avg_price = (
+            self._to_user_price(Decimal(data["avgPrice"]), multiplier)
+            if data.get("avgPrice")
+            else None
+        )
         if status == "submitted" and filled_qty > 0:
             status = "partial"
 
@@ -775,8 +935,15 @@ class BinanceAdapter(BaseExchangeAdapter):
         最后一笔的 ``id`` 作 ``fromId`` 续拉（币安的 ``userTrades`` 以成交 id 递增）。
         与 ``find_order_by_client_id`` 同一条纪律：**拿不到就抛**，绝不返回空列表——
         空列表的含义必须是「该品种确实没有成交」，否则盈亏会被落成 0。
+
+        **qty / price 换回用户口径**（乘数合约：张→个、每张价→每个价），其余字段原样：
+        这份返回会被 ``reconcile_realized_pnl_from_exchange`` 落成 ``Order.quantity`` /
+        ``avg_fill_price``，与 executor 落库的成交同处一个品种桶。不换算就是两种单位
+        混排，``Σqty`` 加权出来的成本会差 1000 倍。``quoteQty``（名义额）与
+        ``realizedPnl``/``commission``（USDT）与乘数无关，保持交易所原值。
         """
-        native = symbol.upper().replace("/", "")
+        contract = self._contract(symbol)
+        native = contract.venue_symbol
         out: list[dict] = []
         cursor = from_id
         while True:
@@ -795,7 +962,7 @@ class BinanceAdapter(BaseExchangeAdapter):
                 # 游标没前进（交易所没给 id / 给了个不递增的）→ 停，避免死循环。
                 break
             cursor = int(last_id)
-        return out
+        return self._user_scale_trades(out, contract.multiplier, symbol=symbol)
 
     async def get_positions(self) -> list[Position]:
         resp = await self._request("GET", "/fapi/v2/positionRisk")
@@ -805,16 +972,29 @@ class BinanceAdapter(BaseExchangeAdapter):
         for p in resp.json():
             if float(p["positionAmt"]) == 0:
                 continue
+            # 口径换算：合约张数 / 每张价格 → 基础币个数 / 每基础币价格。
+            # **必须换**：会话台账里的数量是用户口径（PEPE 个数），拿 1000PEPEUSDT 的
+            # 张数去比会差 1000 倍——2026-11-27 txy 上表现为「账户真值 0 → 台账被
+            # 下钳成 0」；而按 PEPEUSDT 精确匹配更是永远匹配不到 1000PEPEUSDT。
+            venue_symbol = str(p["symbol"])
+            user_symbol, multiplier = from_contract(venue_symbol)
             positions.append(
                 Position(
-                    symbol=p["symbol"],
+                    symbol=user_symbol,
+                    venue_symbol=venue_symbol,
                     side="long" if float(p["positionAmt"]) > 0 else "short",
-                    quantity=abs(Decimal(p["positionAmt"])),
-                    entry_price=Decimal(p["entryPrice"]),
+                    quantity=self._to_user_quantity(
+                        abs(Decimal(p["positionAmt"])), multiplier
+                    ),
+                    entry_price=self._to_user_price(
+                        Decimal(p["entryPrice"]), multiplier
+                    ),
                     unrealized_pnl=Decimal(p["unRealizedProfit"]),
                     leverage=int(p["leverage"]),
                     mark_price=(
-                        Decimal(p["markPrice"]) if p.get("markPrice") else None
+                        self._to_user_price(Decimal(p["markPrice"]), multiplier)
+                        if p.get("markPrice")
+                        else None
                     ),
                 )
             )
@@ -942,7 +1122,7 @@ class BinanceAdapter(BaseExchangeAdapter):
 
         while True:
             params: dict = {"limit": page_limit}
-            native = (symbol or "").upper().replace("/", "")
+            native = self._contract(symbol).venue_symbol if symbol else ""
             if native:
                 params["symbol"] = native
             if income_type:

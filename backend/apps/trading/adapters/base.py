@@ -78,7 +78,16 @@ class OrderResponse:
 
 @dataclass
 class Position:
-    """持仓信息"""
+    """持仓信息（symbol / quantity / entry_price / mark_price 一律**用户口径**）。
+
+    币安 USD-M 合约把小币种按「每张 = 1000 个基础币」上市（1000PEPEUSDT），而会话
+    台账、策略与 K 线都是用户口径（PEPE 的个数与每个的价格）。所以适配器必须把
+    交易所返回的张数 / 每张价格翻译成基础币个数 / 每基础币价格后再交出来，否则两边
+    差 1000 倍，且 quantity × mark_price 恰好不变——这种错不会红任何一条校验。
+
+    venue_symbol 保留交易所侧原名，供调用方做**两种配置形态**的匹配（用户可能按
+    PEPE/USDT 也可能按 1000PEPE/USDT 配置）。
+    """
 
     symbol: str
     side: str  # 'long' | 'short'
@@ -87,6 +96,7 @@ class Position:
     unrealized_pnl: Decimal
     leverage: int
     mark_price: Optional[Decimal] = None  # 实时标记价（交易所提供，可能缺失）
+    venue_symbol: str = ""  # 交易所侧原名（如 1000PEPEUSDT），空串 = 两个口径相同
 
 
 @dataclass
@@ -251,6 +261,10 @@ class BaseExchangeAdapter(ABC):
     ) -> list[dict]:
         """拉取该品种的**账户成交明细**（``userTrades``），按交易所原始字段返回。
 
+        ``symbol`` 按**用户口径**传（`PEPE/USDT`）；乘数合约的 ``qty``/``price`` 在返回
+        前已换回用户口径（张→个、每张价→每个价），``quoteQty``/``realizedPnl`` 等 USDT
+        字段不动。**不要**再自己乘一次乘数——重复换算就是 1000 倍错账。
+
         减仓成交的已实现盈亏以**交易所的 ``realizedPnl``** 为权威口径：空头回补的盈亏
         本地推不出来（``compute_realized_pnl`` 只做平多），只能靠它。回填命令
         ``reconcile_realized_pnl_from_exchange`` 与 ``reduce_ledger`` 的 best-effort 取数
@@ -324,7 +338,8 @@ class BaseExchangeAdapter(ABC):
         23 USDT」会被读成「什么都没发生」，而那正是这次要消灭的那类沉默。
 
         Args:
-            symbol: 交易对（交易所口径，如 ``BTCUSDT``）；``None`` = 全部品种
+            symbol: 交易对（**用户口径**，如 `PEPE/USDT`；适配器负责换算合约名）；
+                ``None`` = 全部品种
             income_type: ``FUNDING_FEE`` / ``REALIZED_PNL`` / ``COMMISSION`` /
                 ``TRANSFER`` / ``INSURANCE_CLEAR`` 等；``None`` = 全部类型
             start_ms: 起始时间（毫秒）。**不给则交易所只回最近 7 天**——要查更早的账

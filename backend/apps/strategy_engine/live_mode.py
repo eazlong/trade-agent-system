@@ -21,6 +21,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def position_matches(session_symbol: str, position) -> bool:
+    """这条持仓是不是本会话的品种（**两种配置形态都要认**）。
+
+    * 会话按现货名配 `PEPE/USDT` → 适配器给出的用户口径符号是 `PEPEUSDT`；
+    * 会话直接按合约名配 `1000PEPE/USDT` → 持仓上的 `venue_symbol` 是 `1000PEPEUSDT`。
+
+    只比其中一个的话，另一种形态的持仓对账**恒为 0**：2026-11-27 txy 上正是这一条
+    让台账每小时被「下钳」成 0（账户如果真按合约名持有，本会话也认不出来）。
+    """
+    wanted = (session_symbol or "").replace("/", "").upper()
+    if not wanted:
+        return False
+    for candidate in (
+        getattr(position, "symbol", "") or "",
+        getattr(position, "venue_symbol", "") or "",
+    ):
+        if candidate.replace("/", "").upper() == wanted:
+            return True
+    return False
+
+
 def _declared_history_demand(strategy) -> int | None:
     """策略**自己算出来的**最小历史根数（`min_bars`），没有就 `None`。
 
@@ -186,11 +207,28 @@ class LiveStrategyRunner:
         # 最近一次决策使用的 K 线 timestamp（用于识别"新 bar"→ 强制刷新持仓）
         self._last_bar_ts = None
 
+    def _reject_contract_style_symbol(self) -> None:
+        """配置按**合约名**写（如 `1000PEPE/USDT`）时拒绝启动。
+
+        数量口径只有一种：用户口径 = 基础币个数，价格取自**该字面 symbol 的现货
+        K 线**。配成合约名会让下单数量与 K 线口径差一个乘数（名义只剩意图的 1/1000，
+        反向信号则接近清仓）——2026-11-27 review 指出的残留形态。宁可开不了会话，
+        也不要在错口径上跑一个动钱的策略。
+        """
+        from apps.trading.adapters.binance_contracts import contract_style_error
+
+        error = contract_style_error(self.symbol)
+        if error:
+            raise ValueError(error)
+
     async def start(self) -> None:
         """启动实盘策略运行"""
         if self._running:
             logger.warning(f"[LiveStrategyRunner] already running for {self.symbol}")
             return
+
+        # 口径前置校验：错口径的会话根本不让起来（见方法 docstring）
+        self._reject_contract_style_symbol()
 
         self._running = True
         self._kline_history = []
@@ -469,14 +507,16 @@ class LiveStrategyRunner:
                 return False
 
             positions = await adapter.get_positions()
-            symbol_norm = self.symbol.replace("/", "").upper()
 
+            # 持仓与台账都是**用户口径**（基础币个数）：适配器已把 1000PEPEUSDT 的
+            # 张数 / 每张价格换算回来（见 binance_contracts）。匹配则两种配置形态
+            # 都认（PEPE/USDT 与 1000PEPE/USDT），见 position_matches。
             actual_qty = Decimal("0")
             for pos in positions:
-                pos_symbol = pos.symbol.replace("/", "").upper()
-                if pos_symbol == symbol_norm:
-                    actual_qty = pos.quantity if pos.side == "long" else -pos.quantity
-                    break
+                if not position_matches(self.symbol, pos):
+                    continue
+                actual_qty = pos.quantity if pos.side == "long" else -pos.quantity
+                break
 
             # 账户级真值：_target_to_order 卖出侧钳制的唯一依据
             self._last_actual_position = actual_qty
